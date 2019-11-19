@@ -68,6 +68,7 @@ const config = ConfigStore.getConfig();
 if (config && config.isApmDataSamplingEnabled) {
   startApm();
 }
+startApm();
 // -----------------------------------------------------------------
 
 // these get exported to a global variable, which is important as its the only

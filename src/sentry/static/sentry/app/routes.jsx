@@ -1083,6 +1083,20 @@ function routes() {
             component={errorHandler(LazyLoad)}
           />
           <Route
+            path="/organizations/:orgId/performance/"
+            componentPromise={() =>
+              import(/* webpackChunkName: "Performance" */ 'app/views/performance')
+            }
+            component={errorHandler(LazyLoad)}
+          />
+          <Route
+            path="/organizations/:orgId/performance/:projectId/"
+            componentPromise={() =>
+              import(/* webpackChunkName: "PerformanceProjectDetails" */ 'app/views/performance/projectDetails')
+            }
+            component={errorHandler(LazyLoad)}
+          />
+          <Route
             path="/organizations/:orgId/monitors/"
             componentPromise={() =>
               import(/* webpackChunkName: "MonitorsContainer" */ 'app/views/monitors')
