@@ -113,7 +113,7 @@ export const GridHead = styled('thead')`
 export const GridHeadCell = styled('th')`
   /* By default, a grid item cannot be smaller than the size of its content.
      We override this by setting min-width to be 0. */
-  position: relative;
+  position: relative; /* Used by GridResizer */
   min-width: 0;
   height: ${GRID_HEADER_HEIGHT}px;
 
@@ -301,6 +301,7 @@ export const GridBody = styled('tbody')`
   }
 `;
 export const GridBodyCell = styled('td')`
+  position: relative; /* Used by GridResizer */
   /* By default, a grid item cannot be smaller than the size of its content.
      We override this by setting min-width to be 0. */
   min-width: 0;
@@ -308,7 +309,7 @@ export const GridBodyCell = styled('td')`
 
   background-color: ${p => p.theme.white};
   border-bottom: 1px solid ${p => p.theme.borderLight};
-  border-right: 1px solid ${p => p.theme.borderDark};
+  /* border-right: 1px solid ${p => p.theme.borderDark}; */
 
   font-size: ${p => p.theme.fontSizeMedium};
 
@@ -325,4 +326,43 @@ export const GridBodyCellLoading = styled('div')`
 
 export const GridBodyErrorAlert = styled(Alert)`
   margin: 0;
+`;
+
+// Splitting props out because syntax-highlighting is wonky on vscode.
+type GridResizerProps = {
+  isHidden?: boolean;
+};
+export const GridResizer = styled('div')<GridResizerProps>`
+  position: absolute;
+  top: 0;
+  right: -2px;
+  display: ${p => (p.isHidden ? 'none' : 'block')};
+  width: 5px;
+  height: 100%;
+
+  padding: 0 2px; /* Constrain ::after to 1px width */
+  /* background-color: red; */
+
+  cursor: col-resize;
+  z-index: ${Z_INDEX_RESIZER};
+
+  /**
+   * This element allows us to have a fat GridResizer that is easy to hover and
+   * drag, but draws an appealing thin line for the border
+   */
+  &::after {
+    content: ' ';
+    display: block;
+    width: 100%;
+    height: 100%;
+    background-color: green;
+  }
+
+  &:hover {
+    /* background-color: green; */
+
+    &::after {
+      background-color: red;
+    }
+  }
 `;

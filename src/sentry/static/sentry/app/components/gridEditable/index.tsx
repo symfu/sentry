@@ -30,6 +30,7 @@ import {
   GridBodyCellSpan,
   GridBodyCellLoading,
   GridBodyErrorAlert,
+  GridResizer,
 } from './styles';
 
 type GridEditableProps<DataRow, ColumnKey> = {
@@ -220,15 +221,15 @@ class GridEditable<
     return (
       <GridHead>
         <GridRow>
-          {columnOrder.map((column, columnIndex) => (
+          {columnOrder.map((column, i) => (
             <GridHeadCell
               openModalAddColumnAt={this.openModalAddColumnAt}
-              isLast={columnOrder.length - 1 === columnIndex}
-              key={`${columnIndex}.${column.key}`}
+              isLast={columnOrder.length - 1 === i}
+              key={`${i}.${column.key}`}
               isColumnDragging={this.props.isColumnDragging}
               isPrimary={column.isPrimary}
               isEditing={enableEdit}
-              indexColumnOrder={columnIndex}
+              indexColumnOrder={i}
               column={column}
               gridHeadCellButtonProps={this.props.gridHeadCellButtonProps || {}}
               actions={{
@@ -238,9 +239,8 @@ class GridEditable<
                 toggleModalEditColumn: this.toggleModalEditColumn,
               }}
             >
-              {grid.renderHeaderCell
-                ? grid.renderHeaderCell(column, columnIndex)
-                : column.name}
+              {grid.renderHeaderCell ? grid.renderHeaderCell(column, i) : column.name}
+              {/* <GridResizer isHidden={i + 1 === columnOrder.length} /> */}
             </GridHeadCell>
           ))}
         </GridRow>
@@ -267,13 +267,14 @@ class GridEditable<
   };
 
   renderGridBodyRow = (dataRow: DataRow, row: number) => {
-    const {grid} = this.props;
+    const {columnOrder, grid} = this.props;
 
     return (
       <GridRow key={row}>
-        {this.props.columnOrder.map((col, i) => (
+        {columnOrder.map((col, i) => (
           <GridBodyCell key={`${col.key}${i}`}>
             {grid.renderBodyCell ? grid.renderBodyCell(col, dataRow) : dataRow[col.key]}
+            <GridResizer isHidden={i + 1 === columnOrder.length} />
           </GridBodyCell>
         ))}
       </GridRow>
