@@ -48,24 +48,21 @@ type RenderSearchInputArgs = Omit<
  * Wraps methods on the AsyncComponent to catch errors and set the `error`
  * state on error.
  */
-function wrapErrorHandling<T extends any[], U>(
-  component: AsyncComponent,
-  fn: (...args: T) => U
-) {
-  return (...args: T): U | null => {
-    try {
-      return fn(...args);
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error(error);
-      setTimeout(() => {
-        throw error;
-      });
-      component.setState({error});
-      return null;
-    }
-  };
-}
+// function wrapErrorHandling<T extends any[], U>(
+//   component: AsyncComponent,
+//   fn: (...args: T) => U
+// ) {
+//   return (...args: T): U | null => {
+//     try {
+//       return fn(...args);
+//     } catch (error) {
+//       // eslint-disable-next-line no-console
+//       console.error(error);
+//       component.setState({error});
+//       return null;
+//     }
+//   };
+// }
 
 export default class AsyncComponent<
   P extends AsyncComponentProps = AsyncComponentProps,
@@ -106,8 +103,8 @@ export default class AsyncComponent<
   constructor(props: P, context: any) {
     super(props, context);
 
-    this.fetchData = wrapErrorHandling(this, this.fetchData.bind(this));
-    this.render = wrapErrorHandling(this, this.render.bind(this));
+    // this.fetchData = wrapErrorHandling(this, this.fetchData.bind(this));
+    // this.render = wrapErrorHandling(this, this.render.bind(this));
 
     this.state = this.getDefaultState() as Readonly<S>;
 

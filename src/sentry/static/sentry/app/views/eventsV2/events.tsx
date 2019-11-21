@@ -3,26 +3,27 @@ import styled from 'react-emotion';
 import * as ReactRouter from 'react-router';
 import {Location} from 'history';
 import omit from 'lodash/omit';
-import uniqBy from 'lodash/uniqBy';
+// import uniqBy from 'lodash/uniqBy';
 
 import {trackAnalyticsEvent} from 'app/utils/analytics';
 import {Organization} from 'app/types';
 import space from 'app/styles/space';
-import SearchBar from 'app/views/events/searchBar';
-import {Panel} from 'app/components/panels';
-import EventsChart from 'app/views/events/eventsChart';
-import getDynamicText from 'app/utils/getDynamicText';
+// import SearchBar from 'app/views/events/searchBar';
+// import {Panel} from 'app/components/panels';
+// import EventsChart from 'app/views/events/eventsChart';
+// import getDynamicText from 'app/utils/getDynamicText';
 
 import {getParams} from 'app/components/organizations/globalSelectionHeader/getParams';
 
 import Table from './table';
 import Tags from './tags';
-import EventView, {Field} from './eventView';
+// import EventView, {Field} from './eventView';
+import EventView from './eventView';
 
-const CHART_AXIS_OPTIONS = [
-  {label: 'count', value: 'count(id)'},
-  {label: 'users', value: 'count_unique(user)'},
-];
+// const CHART_AXIS_OPTIONS = [
+//   {label: 'count', value: 'count(id)'},
+//   {label: 'users', value: 'count_unique(user)'},
+// ];
 
 type EventsProps = {
   router: ReactRouter.InjectedRouter;
@@ -81,32 +82,37 @@ export default class Events extends React.Component<EventsProps> {
   };
 
   render() {
-    const {organization, eventView, location, router} = this.props;
-    const query = location.query.query || '';
+    const {
+      organization,
+      eventView,
+      location,
+      // router
+    } = this.props;
+    // const query = location.query.query || '';
 
     // Make option set and add the default options in.
-    const yAxisOptions = uniqBy(
-      eventView
-        .getAggregateFields()
-        // Exclude last_seen and latest_event as they don't produce useful graphs.
-        .filter(
-          (field: Field) => ['last_seen', 'latest_event'].includes(field.field) === false
-        )
-        .map((field: Field) => {
-          return {label: field.title, value: field.field};
-        })
-        .concat(CHART_AXIS_OPTIONS),
-      'value'
-    );
+    // const yAxisOptions = uniqBy(
+    //   eventView
+    //     .getAggregateFields()
+    //     // Exclude last_seen and latest_event as they don't produce useful graphs.
+    //     .filter(
+    //       (field: Field) => ['last_seen', 'latest_event'].includes(field.field) === false
+    //     )
+    //     .map((field: Field) => {
+    //       return {label: field.title, value: field.field};
+    //     })
+    //     .concat(CHART_AXIS_OPTIONS),
+    //   'value'
+    // );
 
     return (
       <React.Fragment>
-        <StyledSearchBar
+        {/* <StyledSearchBar
           organization={organization}
           query={query}
           onSearch={this.handleSearch}
-        />
-        <Panel>
+        /> */}
+        {/* <Panel>
           {getDynamicText({
             value: (
               <EventsChart
@@ -121,7 +127,7 @@ export default class Events extends React.Component<EventsProps> {
             ),
             fixed: 'events chart',
           })}
-        </Panel>
+        </Panel> */}
         <Container hasTags={eventView.tags.length > 0}>
           <Table organization={organization} eventView={eventView} location={location} />
           {this.renderTagsTable()}
@@ -144,6 +150,6 @@ const Container = styled('div')<{hasTags: boolean}>`
   }};
 `;
 
-const StyledSearchBar = styled(SearchBar)`
-  margin-bottom: ${space(2)};
-`;
+// const StyledSearchBar = styled(SearchBar)`
+//   margin-bottom: ${space(2)};
+// `;

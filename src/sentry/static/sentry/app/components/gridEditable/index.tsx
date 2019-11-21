@@ -105,6 +105,9 @@ type GridEditableProps<DataRow, ColumnKey> = {
 type GridEditableState = {
   isEditing: boolean;
   numColumn: number;
+
+  isResizeActive: number;
+  isResizeHover: number;
 };
 
 class GridEditable<
@@ -118,6 +121,9 @@ class GridEditable<
   state = {
     numColumn: 0,
     isEditing: false,
+
+    isResizeActive: -1,
+    isResizeHover: -1,
   };
 
   // Static methods do not allow the use of generics bounded to the parent class
@@ -131,6 +137,29 @@ class GridEditable<
       numColumn: props.columnOrder.length,
     };
   }
+
+  private refGrid = React.createRef<HTMLTableElement>();
+  // private refResize
+
+  onMouseEnterResize = (i: number) => {
+    this.setState({isResizeHover: i});
+  };
+  onMouseLeaveResize = () => {
+    this.setState({isResizeHover: -1, isResizeActive: -1});
+  };
+  onMouseDownResize = (e: React.MouseEvent, i: number) => {
+    console.log('onMouseDownResize');
+    this.setState({isResizeActive: i});
+    this.resizeInitialize(e, i);
+  };
+  onMouseUpResize = (_e: React.MouseEvent) => {
+    console.log('onMouseUpResize');
+    this.setState({isResizeActive: -1});
+  };
+  onMouseMoveResize = (_e: React.MouseEvent, _i: number) => {
+    console.log('onMouseMoveResize');
+    this.resizeRun(_e, _i);
+  };
 
   toggleEdit = () => {
     const nextValue = !this.state.isEditing;
@@ -168,6 +197,28 @@ class GridEditable<
         renderFooter={modalEditColumn.renderFooter}
       />
     ));
+  };
+
+  resizeInitialize = (e: React.MouseEvent, i: number) => {
+    console.log('resizeStart');
+
+    const happyFunction = () => this.onMouseMoveResize(e, i);
+    window.addEventListener('mousemove', happyFunction);
+    window.addEventListener('mouseup', () => {
+      window.removeEventListener('mousemove', happyFunction);
+    });
+  };
+  resizeRun = (e: React.MouseEvent, _i: number) => {
+    const grid = this.refGrid.current;
+    if (!grid) {
+      return;
+    }
+    const resizer = e.target;
+    console.log(grid.offsetWidth);
+    console.log(grid.scrollLeft);
+    console.log(window.scrollX);
+    // console.log(resizer.offsetWidth);
+    // console.log(resizer.scrollLeft);
   };
 
   renderHeaderButton = () => {
@@ -268,13 +319,23 @@ class GridEditable<
 
   renderGridBodyRow = (dataRow: DataRow, row: number) => {
     const {columnOrder, grid} = this.props;
+    const {isResizeActive, isResizeHover} = this.state;
 
     return (
       <GridRow key={row}>
         {columnOrder.map((col, i) => (
           <GridBodyCell key={`${col.key}${i}`}>
             {grid.renderBodyCell ? grid.renderBodyCell(col, dataRow) : dataRow[col.key]}
-            <GridResizer isHidden={i + 1 === columnOrder.length} />
+            <GridResizer
+              isHidden={i + 1 === columnOrder.length}
+              isActive={i === isResizeActive}
+              isHover={i === isResizeHover}
+              onMouseEnter={() => this.onMouseEnterResize(i)}
+              onMouseLeave={() => this.onMouseLeaveResize()}
+              onMouseDown={e => this.onMouseDownResize(e, i)}
+              // onMouseUp={e => this.onMouseUpResize(e, i)}
+              // onMouseMove={e => this.onMouseMoveResize(e, i)}
+            />
           </GridBodyCell>
         ))}
       </GridRow>
@@ -348,6 +409,7 @@ class GridEditable<
 
         <Body>
           <Grid
+            innerRef={this.refGrid}
             isEditable={this.props.isEditable}
             isEditing={this.state.isEditing}
             numColumn={this.state.numColumn}

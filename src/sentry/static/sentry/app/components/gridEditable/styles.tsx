@@ -81,13 +81,14 @@ export const Body: React.FC = props => (
 export const Grid = styled('table')<GridEditableProps>`
   position: relative;
   display: grid;
-  grid-template-columns: 2.5fr repeat(${p => (p.numColumn ? p.numColumn - 1 : 0)}, 1fr);
+  grid-template-columns: 500px repeat(${p => (p.numColumn ? p.numColumn - 1 : 0)}, 400px);
 
   box-sizing: border-box;
   border-collapse: collapse;
   margin: 0;
 
   /* background-color: ${p => p.theme.offWhite}; */
+  overflow-x: scroll;
 `;
 export const GridRow = styled('tr')`
   display: contents;
@@ -331,6 +332,8 @@ export const GridBodyErrorAlert = styled(Alert)`
 // Splitting props out because syntax-highlighting is wonky on vscode.
 type GridResizerProps = {
   isHidden?: boolean;
+  isHover?: boolean;
+  isActive?: boolean;
 };
 export const GridResizer = styled('div')<GridResizerProps>`
   position: absolute;
@@ -341,7 +344,7 @@ export const GridResizer = styled('div')<GridResizerProps>`
   height: 100%;
 
   padding: 0 2px; /* Constrain ::after to 1px width */
-  /* background-color: red; */
+  background-color: ${p => (p.isActive ? 'blue' : p.isHover ? 'green' : 'red')};
 
   cursor: col-resize;
   z-index: ${Z_INDEX_RESIZER};
@@ -355,14 +358,10 @@ export const GridResizer = styled('div')<GridResizerProps>`
     display: block;
     width: 100%;
     height: 100%;
-    background-color: green;
+    background-color: ${p => (p.isActive ? 'blue' : p.isHover ? 'green' : 'red')};
   }
 
   &:hover {
     /* background-color: green; */
-
-    &::after {
-      background-color: red;
-    }
   }
 `;
