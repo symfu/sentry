@@ -32,6 +32,16 @@ class Event(EventCommon):
 
         return state
 
+    def __getattr__(self, name):
+        """
+        Depending on what snuba data this event was initialized with, we may
+        have the data available to return, or we may have to look in the
+        `data` dict (which would force a nodestore load). All unresolved
+        self.foo type accesses will come through here.
+        """
+        if name in ("_project_cache", "_group_cache", "_environment_cache"):
+            raise AttributeError()
+
     @property
     def data(self):
         return self._data
@@ -53,6 +63,20 @@ class Event(EventCommon):
         date = datetime.fromtimestamp(recorded_timestamp)
         date = date.replace(tzinfo=timezone.utc)
         return date
+
+    # TODO: Implement
+    def get_minimal_user(self):
+        pass
+        # from sentry.interfaces.user import User
+
+        # return User.to_python(
+        #     {
+        #         "id": self.user_id,
+        #         "email": self.email,
+        #         "username": self.username,
+        #         "ip_address": self.ip_address,
+        #     }
+        # )
 
     def save(self):
         """

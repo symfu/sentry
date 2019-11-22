@@ -16,6 +16,7 @@ from django.views.generic import View
 from loremipsum import Generator
 from random import Random
 
+from sentry import eventstore
 from sentry.app import tsdb
 from sentry.constants import LOG_LEVELS
 from sentry.digests import Record
@@ -32,7 +33,6 @@ from sentry.models import (
     Project,
     Release,
     Rule,
-    SnubaEvent,
     Team,
 )
 from sentry.event_manager import EventManager
@@ -194,15 +194,8 @@ class ActivityMailDebugView(View):
         group.message = event_manager.get_search_message()
         group.data = {"type": event_type.key, "metadata": event_type.get_metadata(data)}
 
-        event = SnubaEvent(
-            {
-                "event_id": "a" * 32,
-                "project_id": project.id,
-                "group_id": group.id,
-                "message": event_manager.get_search_message(),
-                "data": data.data,
-                "timestamp": data["timestamp"],
-            }
+        event = eventstore.from_data(
+            event_id="a" * 32, project_id=project.id, group_id=group.id, data=data
         )
 
         activity = Activity(group=group, project=event.project, **self.get_activity(request, event))
@@ -347,20 +340,16 @@ def digest(request):
             event_manager.normalize()
             data = event_manager.get_data()
 
-            timestamp = to_datetime(
-                random.randint(to_timestamp(group.first_seen), to_timestamp(group.last_seen))
+            timestamp = random.randint(
+                to_timestamp(group.first_seen), to_timestamp(group.last_seen)
             )
 
-            event = SnubaEvent(
-                {
-                    "event_id": uuid.uuid4().hex,
-                    "project_id": project.id,
-                    "group_id": group.id,
-                    "message": group.message,
-                    "data": data.data,
-                    "timestamp": timestamp.strftime("%Y-%m-%dT%H:%M:%S"),
-                }
+            data["timestamp"] = timestamp
+
+            event = eventstore.from_data(
+                event_id=uuid.uuid4().hex, project_id=project.id, group_id=group.id, data=data
             )
+
             event.group = group
 
             records.append(
