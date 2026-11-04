@@ -1,0 +1,865 @@
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {useTheme} from '@emotion/react';
+import {mergeRefs} from '@react-aria/utils';
+import * as Sentry from '@sentry/react';
+import type {SeriesOption, XAXisComponentOption, YAXisComponentOption} from 'echarts';
+import type {
+  TooltipFormatterCallback,
+  TopLevelFormatterParams,
+} from 'echarts/types/dist/shared';
+import sum from 'lodash/sum';
+import unescape from 'lodash/unescape';
+
+import {Container, Stack} from '@sentry/scraps/layout';
+
+import {BaseChart} from 'sentry/components/charts/baseChart';
+import type {LegendItem} from 'sentry/components/charts/chartLegend';
+import {ChartLegend} from 'sentry/components/charts/chartLegend';
+import {getFormatter} from 'sentry/components/charts/components/tooltip';
+import {
+  useChartXRangeSelection,
+  type ChartXRangeSelectionProps,
+} from 'sentry/components/charts/useChartXRangeSelection';
+import {useChartZoom} from 'sentry/components/charts/useChartZoom';
+import {isChartHovered, truncationFormatter} from 'sentry/components/charts/utils';
+import {mergeDroppedDataBand} from 'sentry/components/droppedData/band/mergeDroppedDataBand';
+import {useDroppedDataBand} from 'sentry/components/droppedData/band/useDroppedDataBand';
+import type {DroppedDataProps} from 'sentry/components/droppedData/types';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {t} from 'sentry/locale';
+import type {
+  EChartClickHandler,
+  EChartDataZoomHandler,
+  EChartDownplayHandler,
+  EChartHighlightHandler,
+  EChartLegendSelectChangeHandler,
+  ECharts,
+  ReactEchartsRef,
+} from 'sentry/types/echarts';
+import {escape} from 'sentry/utils';
+import {getUserTimezone} from 'sentry/utils/dates';
+import {defined} from 'sentry/utils/defined';
+import {RangeMap, type Range} from 'sentry/utils/number/rangeMap';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useWidgetSyncContext} from 'sentry/views/dashboards/contexts/widgetSyncContext';
+import {getAxisRange, type AxisRange} from 'sentry/views/dashboards/utils/axisRange';
+import {NO_PLOTTABLE_VALUES} from 'sentry/views/dashboards/widgets/common/settings';
+import type {
+  LegendSelection,
+  Release,
+} from 'sentry/views/dashboards/widgets/common/types';
+import {WidgetLoadingPanel} from 'sentry/views/dashboards/widgets/common/widgetLoadingPanel';
+import {WidgetNoDataPanel} from 'sentry/views/dashboards/widgets/common/widgetNoDataPanel';
+import {plottablesCanBeVisualized} from 'sentry/views/dashboards/widgets/plottablesCanBeVisualized';
+import {
+  RELEASE_BUBBLE_SERIES_NAME,
+  useReleaseBubbles,
+} from 'sentry/views/explore/releases/releaseBubbles/useReleaseBubbles';
+import {makeReleaseDrawerPathname} from 'sentry/views/explore/releases/utils/pathnames';
+import type {LoadableChartWidgetProps} from 'sentry/views/insights/common/components/widgets/types';
+
+import {formatTooltipValue} from './formatters/formatTooltipValue';
+import {formatXAxisTimestamp} from './formatters/formatXAxisTimestamp';
+import {formatYAxisValue} from './formatters/formatYAxisValue';
+import type {Plottable} from './plottables/plottable';
+import {assignPlottablesToYAxes} from './assignPlottablesToYAxes';
+import {createReleaseSeriesOptions} from './createReleaseSeriesOptions';
+import {createTimeSeriesWidgetYAxisOptions} from './createTimeSeriesWidgetYAxisOptions';
+import {generateTimezoneAlignedTicks} from './generateTimezoneAlignedTicks';
+import {FALLBACK_TYPE} from './settings';
+
+const {warn} = Sentry.logger;
+
+export interface TimeSeriesWidgetVisualizationProps extends Partial<LoadableChartWidgetProps> {
+  /**
+   * An array of `Plottable` objects. This can be any object that implements the `Plottable` interface.
+   */
+  plottables: Plottable[];
+
+  /**
+   * Sets the range of the Y axis.
+   *
+   * - `auto`: The Y axis starts at 0, and ends at the maximum value of the data.
+   * - `dataMin`: The Y axis starts at a round tick value at or just below the minimum value of the data, and ends at the maximum value of the data.
+   * Default: `auto`
+   */
+  axisRange?: AxisRange;
+
+  /**
+   * Reference to the chart instance
+   */
+  chartRef?: React.Ref<ReactEchartsRef>;
+  /**
+   * The props for the chart x range selection on drag.
+   */
+  chartXRangeSelection?: Partial<ChartXRangeSelectionProps>;
+
+  /**
+   * Disables drag-to-zoom, so zooming never updates the URL or page filters.
+   */
+  disableZoom?: boolean;
+
+  /**
+   * Dropped-data annotations rendered as a severity band between the plot and
+   * the x-axis line. The band is hidden when no bucket has enough dropped data to
+   * highlight. `onClick` is called when the band is clicked.
+   */
+  droppedData?: DroppedDataProps;
+
+  /**
+   * A mapping of time series field name to boolean. If the value is `false`, the series is hidden from view
+   */
+  legendSelection?: LegendSelection;
+
+  /**
+   * Callback that returns an updated `LegendSelection` after a user manipulations the selection via the legend
+   */
+  onLegendSelectionChange?: (selection: LegendSelection) => void;
+
+  /**
+   * Callback that returns an updated ECharts zoom selection. If omitted, the default behavior is to update the URL with updated `start` and `end` query parameters.
+   */
+  onZoom?: EChartDataZoomHandler;
+
+  ref?: React.Ref<ReactEchartsRef>;
+
+  /**
+   * Array of `Release` objects. If provided, they are plotted on line and area visualizations as vertical lines
+   */
+  releases?: Release[];
+
+  /**
+   * Returns extra HTML to append to the tooltip's series block.
+   */
+  renderTooltipSeriesDetails?: (seriesNames: string[], timestamp: number) => string;
+
+  /**
+   * Defines the legend's visibility.
+   *
+   * - `auto`: Show the legend if there are multiple series.
+   * - `never`: Never show the legend.
+   *
+   * Default: `auto`
+   */
+  showLegend?: 'auto' | 'never' | 'always';
+
+  /**
+   * Defines the X axis visibility. Note that hiding the X axis also hides release bubbles.
+   *
+   * - `auto`: Show the X axis.
+   * - `never`: Hide the X axis.
+   *
+   * Default: `auto`
+   */
+  showXAxis?: 'auto' | 'never';
+
+  /**
+   * Defines the Y axis visibility.
+   *
+   * - `auto`: Show the Y axis (or axes when multiple scales are used).
+   * - `never`: Hide the Y axis while keeping axes in the option so series
+   *   `yAxisIndex` references remain valid.
+   *
+   * Default: `auto`
+   */
+  showYAxis?: 'auto' | 'never';
+
+  /**
+   * Maximum number of series listed in the tooltip. When set, series are
+   * listed from the highest value to the lowest with zero values last, and the
+   * rest are summarized as "+X more".
+   */
+  tooltipLimit?: number;
+
+  /**
+   * Truncate the legend's "+n more" menu labels to the width the legend row
+   * already caps its own at, instead of letting the menu size to its content.
+   *
+   * For charts in a box narrow enough to clip the menu. A Seer embed's card is
+   * one, and the series names it charts are model-written, so the menu came out
+   * wider than the card and was cut off (CW-2052). A full-width surface has the
+   * room and should keep the untruncated names, which is the default.
+   */
+  truncateLegendMenuLabels?: boolean;
+}
+
+export function TimeSeriesWidgetVisualization(props: TimeSeriesWidgetVisualizationProps) {
+  const {ref: forwardedRef, chartRef: externalChartRef} = props;
+  if (!plottablesCanBeVisualized(props.plottables)) {
+    throw new Error(NO_PLOTTABLE_VALUES);
+  }
+
+  // TODO: It would be polite to also scan for gaps (i.e., the items don't all
+  // have the same difference in `timestamp`s) even though this is rare, since
+  // the backend zerofills the data
+
+  const chartRef = useRef<ReactEchartsRef | null>(null);
+  const connectChartRef = useCallback((e: ReactEchartsRef | null) => {
+    chartRef.current = e;
+  }, []);
+  const unregisterRef = useRef<(() => void) | null>(null);
+  const {register: registerWithWidgetSyncContext, groupName} = useWidgetSyncContext();
+
+  useEffect(() => {
+    return () => {
+      unregisterRef.current?.();
+    };
+  }, []);
+
+  const pageFilters = usePageFilters();
+  const {start, end, period, utc} =
+    props.pageFilters?.datetime || pageFilters.selection.datetime;
+
+  const theme = useTheme();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const hasReleaseBubbles =
+    props.showReleaseAs !== 'none' && props.showReleaseAs === 'bubble';
+
+  // Local legend selection state used when the parent doesn't manage it
+  const [localLegendSelection, setLocalLegendSelection] = useState<
+    Record<string, boolean>
+  >({});
+  const legendSelection = props.legendSelection ?? localLegendSelection;
+  const {onLegendSelectionChange} = props;
+  const handleLegendSelectionChange = useCallback(
+    (selection: Record<string, boolean>) => {
+      setLocalLegendSelection(selection);
+      onLegendSelectionChange?.(selection);
+    },
+    [onLegendSelectionChange]
+  );
+
+  const {
+    onDataZoom,
+    onChartReady: onChartReadyZoom,
+    ...chartZoomProps
+  } = useChartZoom({
+    disabled: props.disableZoom,
+    saveOnZoom: true,
+  });
+
+  const {brush, onBrushEnd, onBrushStart, toolBox, ActionMenu} = useChartXRangeSelection({
+    chartRef,
+    deps: [props.plottables],
+    disabled: true,
+    chartsGroupName: groupName,
+    ...props.chartXRangeSelection,
+  });
+
+  // Partition plottables across left/right Y axes by data type. Shared with
+  // the Slack dashboards-widget unfurl chart so unfurls render multi-aggregate
+  // widgets (e.g. `count` + `avg(duration)`) the same way the UI does.
+  const {leftYAxisType, rightYAxisType, unitForType, getYAxisPosition} =
+    assignPlottablesToYAxes(props.plottables);
+
+  const axisRangeProp = getAxisRange(props.axisRange) ?? 'auto';
+
+  const leftYAxis = createTimeSeriesWidgetYAxisOptions(
+    {
+      axisLabel: {
+        hideOverlap: true,
+        formatter: (value: number) =>
+          formatYAxisValue(value, leftYAxisType, unitForType[leftYAxisType] ?? undefined),
+      },
+      position: 'left',
+    },
+    leftYAxisType,
+    axisRangeProp
+  );
+
+  const rightYAxis = rightYAxisType
+    ? createTimeSeriesWidgetYAxisOptions(
+        {
+          axisLabel: {
+            hideOverlap: true,
+            formatter: (value: number) =>
+              formatYAxisValue(
+                value,
+                rightYAxisType,
+                unitForType[rightYAxisType] ?? undefined
+              ),
+          },
+          position: 'right',
+        },
+        rightYAxisType,
+        axisRangeProp
+      )
+    : undefined;
+
+  // Set up a fallback palette for any plottable without a color
+  const paletteSize = props.plottables.filter(plottable => plottable.needsColor).length;
+
+  const palette = useMemo(
+    () => (paletteSize > 0 ? theme.chart.getColorPalette(paletteSize - 1) : []),
+    [paletteSize, theme.chart]
+  );
+
+  // Create a lookup of series names (given to ECharts) to labels (from
+  // Plottable). This makes it easier to look up alises when rendering tooltips
+  // and legends
+  const aliases = Object.fromEntries(
+    props.plottables.map(plottable => [plottable.name, plottable.label])
+  );
+
+  // Create tooltip formatter
+  const formatTooltip: TooltipFormatterCallback<TopLevelFormatterParams> = (
+    params,
+    asyncTicket
+  ) => {
+    // Only show the tooltip of the current chart. Otherwise, all tooltips
+    // in the chart group appear.
+    if (!isChartHovered(chartRef?.current)) {
+      return '';
+    }
+
+    let deDupedParams = params;
+
+    if (Array.isArray(params)) {
+      // We split each series into a complete and incomplete series, and they
+      // have the same name. The two series overlap at one point on the chart,
+      // to create a continuous line. This code prevents both series from
+      // showing up on the tooltip
+      const uniqueSeries = new Set<string>();
+
+      deDupedParams = params.filter(param => {
+        // When a chart re-renders while its tooltip is open, ECharts replays the
+        // pre-render data indices against the new data. A shrunk series leaves
+        // the index past the end, so the param has no data tuple to read
+        if (!Array.isArray(param.value)) {
+          return false;
+        }
+
+        // Filter null values from tooltip
+        if (param.value[1] === null) {
+          return false;
+        }
+
+        // @ts-expect-error TS(2345): Argument of type 'string | undefined' is not assig... Remove this comment to see the full error message
+        if (uniqueSeries.has(param.seriesName)) {
+          return false;
+        }
+
+        // @ts-expect-error TS(2345): Argument of type 'string | undefined' is not assig... Remove this comment to see the full error message
+        uniqueSeries.add(param.seriesName);
+        return true;
+      });
+
+      // A shrunk series makes every replayed index stale, so nothing survives
+      // the filter. `getFormatter` reads the tooltip timestamp off the first
+      // series, so hand it an empty list and it throws
+      if (deDupedParams.length === 0) {
+        return '';
+      }
+    }
+
+    return getFormatter({
+      isGroupedByDate: true,
+      showTimeInTooltip: true,
+      nameFormatter: function (seriesName, nameFormatterParams) {
+        if (!nameFormatterParams) {
+          return seriesName;
+        }
+
+        if (
+          nameFormatterParams.seriesType === 'scatter' &&
+          Array.isArray(nameFormatterParams.data)
+        ) {
+          // For scatter series, the third point in the `data` array should be the sample's ID
+          const sampleId = nameFormatterParams.data.at(2);
+          return defined(sampleId) ? sampleId.toString() : seriesName;
+        }
+
+        // seriesName may be HTML-escaped, so we need to unescape it before looking up the alias
+        // to ensure the lookup works correctly for series with characters that are escaped.
+        const alias = aliases[unescape(seriesName)];
+        if (alias) {
+          // The alias value comes from `plottable.label` and is not
+          // HTML-escaped. Escape it for safe insertion into raw HTML
+          // tooltip strings.
+          return escape(truncationFormatter(alias, true, false));
+        }
+        // `seriesName` is already HTML-escaped by `getFormatter`, so
+        // skip escaping to avoid double-encoding (e.g., `>` → `&gt;`
+        // → `&amp;gt;`).
+        return truncationFormatter(seriesName, true, false);
+      },
+      valueFormatter: function (value, _field, valueFormatterParams) {
+        // Use the series to figure out the corresponding `Plottable`, and get the field type. From that, use whichever unit we chose for that field type.
+
+        if (!valueFormatterParams || !defined(valueFormatterParams?.seriesIndex)) {
+          // The series might be missing if this is a formatter for a mark line.
+          // We don't currently handle this, so this behaviour is just here for
+          // safety. The series index might be missing in unknown circumstances
+          warn(
+            '`TimeSeriesWidgetVisualization` could not format value due to missing `Series` information',
+            {
+              seriesName: valueFormatterParams?.seriesName,
+              seriesType: valueFormatterParams?.seriesType,
+            }
+          );
+          return value.toLocaleString();
+        }
+
+        const correspondingPlottable = seriesIndexToPlottableRangeMap.get(
+          valueFormatterParams.seriesIndex
+        );
+
+        const fieldType = correspondingPlottable?.dataType ?? FALLBACK_TYPE;
+
+        return escape(
+          formatTooltipValue(value, fieldType, unitForType[fieldType] ?? undefined)
+        );
+      },
+      renderSeriesDetails: props.renderTooltipSeriesDetails,
+      limit: props.tooltipLimit,
+      truncate: false,
+      utc: utc ?? false,
+    })(deDupedParams, asyncTicket);
+  };
+
+  const yAxes: YAXisComponentOption[] = [leftYAxis, rightYAxis].filter(axis => !!axis);
+
+  // find min/max timestamp of *all* timeSeries. Drop null boundaries from
+  // non-time-bounded plottables (e.g. `Thresholds`) so they cannot become
+  // `latestTimeStamp`, leaving release bubbles with no `maxTime` to bucket.
+  // Find the bounds in one pass rather than sorting all boundaries.
+  const [earliestTimeStamp, latestTimeStamp] = useMemo(() => {
+    let earliest: number | undefined;
+    let latest: number | undefined;
+    for (const plottable of props.plottables) {
+      for (const timestamp of [plottable.start, plottable.end]) {
+        if (defined(timestamp)) {
+          earliest = earliest === undefined ? timestamp : Math.min(earliest, timestamp);
+          latest = latest === undefined ? timestamp : Math.max(latest, timestamp);
+        }
+      }
+    }
+    return [earliest, latest] as const;
+  }, [props.plottables]);
+  const bubbleReleases = useMemo(
+    () =>
+      hasReleaseBubbles
+        ? props.releases?.map(({timestamp, version}) => ({
+            date: timestamp,
+            version,
+          }))
+        : [],
+    [hasReleaseBubbles, props.releases]
+  );
+
+  const {
+    connectReleaseBubbleChartRef,
+    onReleaseBubbleLegendSelectChanged,
+    releaseBubbleSeries,
+    releaseBubbleXAxis,
+    releaseBubbleGrid,
+    releaseBubbleYAxis,
+  } = useReleaseBubbles({
+    chartId: props.id,
+    minTime: earliestTimeStamp,
+    maxTime: latestTimeStamp,
+    releases: bubbleReleases,
+    legendSelected: legendSelection[RELEASE_BUBBLE_SERIES_NAME] !== false,
+    yAxisIndex: yAxes.length,
+  });
+
+  if (releaseBubbleYAxis) {
+    yAxes.push(releaseBubbleYAxis);
+  }
+
+  // `useReleaseBubbles` returns an empty object when there are no bubbles to draw.
+  const releaseBandHeight =
+    'offset' in releaseBubbleXAxis ? releaseBubbleXAxis.offset : 0;
+  const releaseGridBottom = 'bottom' in releaseBubbleGrid ? releaseBubbleGrid.bottom : 0;
+
+  const droppedDataBand = useDroppedDataBand({
+    chartRef,
+    droppedData: props.droppedData,
+    bandOffset: releaseBandHeight,
+    utc,
+  });
+
+  const showYAxisProp = props.showYAxis ?? 'auto';
+  const showYAxis = showYAxisProp === 'auto';
+
+  const releaseSeries =
+    props.releases && props.showReleaseAs !== 'none'
+      ? hasReleaseBubbles
+        ? releaseBubbleSeries
+        : createReleaseSeriesOptions(
+            theme,
+            props.releases,
+            function onReleaseClick(release: Release) {
+              navigate(
+                makeReleaseDrawerPathname({
+                  location,
+                  release: release.version,
+                  source: 'time-series-widget',
+                })
+              );
+            },
+            utc ?? false
+          )
+      : null;
+
+  const handleChartRef = useCallback(
+    (e: ReactEchartsRef | null) => {
+      connectReleaseBubbleChartRef(e);
+      if (!e?.getEchartsInstance) {
+        return;
+      }
+
+      for (const plottable of props.plottables) {
+        plottable.handleChartRef?.(e);
+      }
+    },
+    [connectReleaseBubbleChartRef, props.plottables]
+  );
+
+  const mergedChartRef = useMemo(
+    () => mergeRefs(forwardedRef, externalChartRef, connectChartRef, handleChartRef),
+    [forwardedRef, externalChartRef, connectChartRef, handleChartRef]
+  );
+
+  const handleLegendSelectChanged = useCallback<EChartLegendSelectChangeHandler>(
+    (event, instance) => {
+      onReleaseBubbleLegendSelectChanged(event, instance);
+      handleLegendSelectionChange(event.selected);
+    },
+    [onReleaseBubbleLegendSelectChanged, handleLegendSelectionChange]
+  );
+
+  const handleChartReady = useCallback(
+    (instance: ECharts) => {
+      onChartReadyZoom(instance);
+      unregisterRef.current?.();
+      unregisterRef.current = registerWithWidgetSyncContext(instance);
+    },
+    [onChartReadyZoom, registerWithWidgetSyncContext]
+  );
+
+  const showXAxisProp = props.showXAxis ?? 'auto';
+  const showXAxis = showXAxisProp === 'auto';
+
+  const timezone = utc ? 'UTC' : getUserTimezone();
+  const customTicks = useMemo(() => {
+    if (earliestTimeStamp === undefined || latestTimeStamp === undefined) {
+      return;
+    }
+    return generateTimezoneAlignedTicks(
+      earliestTimeStamp,
+      latestTimeStamp,
+      X_AXIS_SPLIT_NUMBER,
+      timezone
+    );
+  }, [earliestTimeStamp, latestTimeStamp, timezone]);
+
+  const hasCustomTicks = customTicks && customTicks.length > 0;
+
+  const xAxis = showXAxis
+    ? {
+        animation: false,
+        type: 'value' as const,
+        min: 'dataMin' as const,
+        max: 'dataMax' as const,
+        axisLabel: {
+          padding: [0, 10, 0, 10],
+          formatter: (value: number) => {
+            return formatXAxisTimestamp(value, timezone);
+          },
+          ...(hasCustomTicks
+            ? // With `customValues`, `showMinLabel`/`showMaxLabel` govern the
+              // first and last custom tick. ECharts auto-hides them when it
+              // thinks they'd clip at the axis edge, so force both on.
+              {customValues: customTicks, showMinLabel: true, showMaxLabel: true}
+            : {}),
+        },
+        axisTick: {
+          show: true,
+          ...(hasCustomTicks ? {customValues: customTicks} : {}),
+        },
+        // When customValues are provided, suppress auto-tick generation
+        // so ECharts only renders our timezone-aligned ticks.
+        splitNumber: hasCustomTicks ? 0 : X_AXIS_SPLIT_NUMBER,
+        axisLine: {onZero: releaseBandHeight === 0},
+        offset: releaseBandHeight,
+      }
+    : HIDDEN_AXIS;
+
+  // Hiding the X axis removes all chart elements under the X axis line. This
+  // will cut off the bottom of the lowest Y axis label. To create space for
+  // that label, add some grid padding.
+  const xAxisGrid = showXAxis ? {} : {bottom: 5};
+
+  let visibleSeriesCount = props.plottables.length;
+  if (releaseSeries) {
+    visibleSeriesCount += 1;
+  }
+
+  const showLegendProp = props.showLegend ?? 'auto';
+  const showLegend =
+    (showLegendProp !== 'never' && visibleSeriesCount > 1) || showLegendProp === 'always';
+
+  const thresholdMaxOffset = 10;
+
+  // Keep track of which `Series[]` indexes correspond to which `Plottable` so
+  // we can look up the types in the tooltip. We need this so we can find the
+  // plottable responsible for a given value in the tooltip formatter. The only
+  // tool ECharts gives us is the `seriesIndex` properly. Any given `Plottable`
+  // can be mapped to 1 or more `Series`, so we need to maintain a reverse
+  // lookup
+  let seriesIndex = 0;
+  const seriesIndexToPlottableMapRanges: Array<Range<Plottable>> = [];
+
+  // Keep track of what color in the chosen palette we're assigning
+  let seriesColorIndex = 0;
+  const seriesFromPlottables: SeriesOption[] = [];
+  for (const plottable of props.plottables) {
+    let color: string | undefined;
+
+    if (plottable.needsColor) {
+      // For any timeseries in need of a color, pull from the chart palette
+      color = palette[seriesColorIndex % palette.length]!; // Mod the index in case the number of plottables exceeds the palette length
+      seriesColorIndex += 1;
+    }
+
+    // TODO: Type checking would be welcome here, but `plottingOptions` is unknown, since it depends on the implementation of the `Plottable` interface
+    const seriesOfPlottable = plottable.toSeries({
+      color,
+      yAxisPosition: getYAxisPosition(plottable),
+      unit: unitForType[plottable.dataType ?? FALLBACK_TYPE],
+      theme,
+      maxOffset: thresholdMaxOffset,
+    });
+
+    seriesIndexToPlottableMapRanges.push({
+      min: seriesIndex,
+      max: seriesIndex + seriesOfPlottable.length,
+      value: plottable,
+    });
+    seriesIndex += seriesOfPlottable.length;
+
+    seriesFromPlottables.push(...seriesOfPlottable);
+  }
+
+  const seriesIndexToPlottableRangeMap = new RangeMap<Plottable>(
+    seriesIndexToPlottableMapRanges
+  );
+
+  // Build legend items by extracting colors from the generated ECharts
+  // series. This is the single source of truth for color — we avoid
+  // re-deriving palette assignments so legend swatches can never diverge
+  // from the actual chart series. Some plottables (e.g. Samples) use a
+  // callback function for itemStyle.color; in that case we fall back to
+  // a neutral theme color for the legend swatch.
+  const chartLegendItems: LegendItem[] = props.plottables.map(plottable => {
+    const series = seriesFromPlottables.find(s => s.name === plottable.name);
+    const seriesColor =
+      (series as {color?: unknown})?.color ??
+      (series as {itemStyle?: {color?: unknown}})?.itemStyle?.color;
+    const color = typeof seriesColor === 'string' ? seriesColor : theme.colors.gray300;
+    return {
+      name: plottable.name,
+      label: plottable.label,
+      color,
+    };
+  });
+
+  if (releaseSeries) {
+    const releaseName = typeof releaseSeries.name === 'string' ? releaseSeries.name : '';
+    const releaseColor =
+      typeof releaseSeries.color === 'string' ? releaseSeries.color : '';
+    chartLegendItems.push({
+      name: releaseName,
+      label: hasReleaseBubbles ? t('Releases') : releaseName,
+      color: releaseColor,
+    });
+  }
+
+  // ECharts needs every known legend item to be present in the selection state.
+  // This ensures that when the legend is clicked, none of the series are permanently hidden.
+  const normalizedLegendSelection = chartLegendItems.reduce<Record<string, boolean>>(
+    (acc, item) => {
+      acc[item.name] = legendSelection[item.name] !== false;
+      return acc;
+    },
+    {}
+  );
+
+  const allSeries = [...seriesFromPlottables, releaseSeries].filter(defined);
+
+  const runHandler = (
+    batch: {dataIndex: number; seriesIndex?: number},
+    handlerName: 'onClick' | 'onHighlight' | 'onDownplay'
+  ): void => {
+    if (batch.seriesIndex === undefined) {
+      return;
+    }
+
+    const affectedRange = seriesIndexToPlottableRangeMap.getRange(batch.seriesIndex);
+    const affectedPlottable = affectedRange?.value;
+
+    if (
+      !defined(affectedRange) ||
+      !defined(affectedPlottable) ||
+      !defined(affectedPlottable[handlerName])
+    ) {
+      return;
+    }
+
+    affectedPlottable[handlerName](
+      getPlottableEventDataIndex(allSeries, batch, affectedRange)
+    );
+  };
+
+  const handleClick: EChartClickHandler = event => {
+    runHandler(event, 'onClick');
+  };
+
+  const handleHighlight: EChartHighlightHandler = event => {
+    // Unlike click events, highlights happen to potentially more than one
+    // series at a time. We have to iterate each item in the batch
+    for (const batch of event.batch ?? []) {
+      runHandler(batch, 'onHighlight');
+    }
+  };
+
+  const handleDownplay: EChartDownplayHandler = event => {
+    // Unlike click events, downplays happen to potentially more than one
+    // series at a time. We have to iterate each item in the batch
+    for (const batch of event.batch ?? []) {
+      // Downplay events sometimes trigger for the entire series, rather than
+      // for individual points. We are ignoring these. It's not clear why or
+      // when they are called, but they appear to be redundant.
+      if (defined(batch.dataIndex) && defined(batch.seriesIndex)) {
+        runHandler(batch, 'onDownplay');
+      }
+    }
+  };
+
+  const band = mergeDroppedDataBand(
+    {
+      grid: {
+        // NOTE: Adding a few pixels of left padding prevents ECharts from
+        // incorrectly truncating long labels. See
+        // https://github.com/apache/echarts/issues/15562
+        left: 2,
+        top: 10,
+        right: 8,
+        bottom: releaseGridBottom,
+        containLabel: true,
+      },
+      xAxis,
+      yAxes,
+      series: allSeries,
+      onClick: handleClick,
+    },
+    droppedDataBand,
+    props.droppedData?.onClick
+  );
+
+  return (
+    <Stack height="100%">
+      {ActionMenu}
+      {showLegend && (
+        <ChartLegend
+          items={chartLegendItems}
+          selected={normalizedLegendSelection}
+          onSelectionChange={handleLegendSelectionChange}
+          truncateMenuLabels={props.truncateLegendMenuLabels}
+        />
+      )}
+      <Container flex="1 1 0%" minHeight="0">
+        <BaseChart
+          ref={mergedChartRef}
+          autoHeightResize
+          renderer="canvas"
+          series={band.series}
+          grid={{...band.grid, ...xAxisGrid}}
+          legend={
+            showLegend
+              ? {
+                  show: false,
+                  selected: normalizedLegendSelection,
+                }
+              : undefined
+          }
+          onLegendSelectChanged={handleLegendSelectChanged}
+          tooltip={{
+            appendToBody: true,
+            trigger: 'axis',
+            axisPointer: {
+              type: 'cross',
+            },
+            formatter: formatTooltip,
+          }}
+          xAxis={band.xAxis}
+          yAxes={showYAxis ? band.yAxes : band.yAxes.map(() => HIDDEN_AXIS)}
+          {...chartZoomProps}
+          onDataZoom={props.onZoom ?? onDataZoom}
+          toolBox={toolBox ?? chartZoomProps.toolBox}
+          brush={brush}
+          onBrushStart={onBrushStart}
+          onBrushEnd={onBrushEnd}
+          onChartReady={handleChartReady}
+          isGroupedByDate
+          useMultilineDate
+          start={start ? new Date(start) : undefined}
+          end={end ? new Date(end) : undefined}
+          period={period}
+          utc={utc ?? undefined}
+          onHighlight={handleHighlight}
+          onDownplay={handleDownplay}
+          onClick={band.onClick}
+        />
+      </Container>
+    </Stack>
+  );
+}
+
+/**
+ * Each plottable creates anywhere from 1 to N `Series` objects. When an event fires on a `Series` object, ECharts reports a `dataIndex`. This index won't match the data inside inside the original `Plottable`, since it produced more than on `Series`. To map backwards, we need to calculate an offset, based on how many other `Series` this plottable produced.
+ *
+ * e.g., If this is the third series of the plottable, the data index in the plottable needs to be offset by the data counts of the first two.
+ *
+ * @param series All series plotted on the chart
+ * @param affectedRange The range of series that the plottable is responsible for
+ * @param seriesIndex The index of the series where the event fires
+ * @returns The offset, as a number, of how many points the previous series are responsible for
+ */
+function getPlottableEventDataIndex(
+  series: SeriesOption[],
+  event: {
+    dataIndex: number;
+    seriesIndex?: number;
+  },
+  affectedRange: Range<Plottable>
+): number {
+  const {dataIndex, seriesIndex} = event;
+
+  const dataIndexOffset = sum(
+    series.slice(affectedRange.min ?? 0, seriesIndex).map(seriesOfPlottable => {
+      return Array.isArray(seriesOfPlottable.data) ? seriesOfPlottable.data.length : 0;
+    })
+  );
+
+  return dataIndexOffset + dataIndex;
+}
+
+// Hide every part of the axis so ECharts will remove those elements and also
+const X_AXIS_SPLIT_NUMBER = 10;
+
+// remove the visual space they would take up if they were there.
+const HIDDEN_AXIS = {
+  show: false,
+  splitLine: {show: false},
+  axisLine: {show: false},
+  axisTick: {show: false},
+  axisLabel: {show: false},
+  axisPointer: {label: {show: false}},
+} satisfies XAXisComponentOption | YAXisComponentOption;
+
+TimeSeriesWidgetVisualization.LoadingPlaceholder = WidgetLoadingPanel;
+TimeSeriesWidgetVisualization.NoData = WidgetNoDataPanel;

@@ -1,48 +1,88 @@
-from datetime import datetime, timedelta
+from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from functools import cached_property
+from typing import Any
+
+from django.test import override_settings
+from django.urls import reverse
 from django.utils import timezone
-from exam import fixture
-from freezegun import freeze_time
 
 from sentry.api.serializers import serialize
+from sentry.models.organization import Organization
 from sentry.models.recentsearch import RecentSearch
 from sentry.models.search_common import SearchType
-from sentry.testutils import APITestCase
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.users.models.user import User
+from sentry.viewer_context import Actor, ActorType, ViewerContext, encode_viewer_context
 
 
 class RecentSearchesListTest(APITestCase):
     endpoint = "sentry-api-0-organization-recent-searches"
 
-    @fixture
-    def user(self):
+    @cached_property
+    def user(self) -> User:
         return self.create_user("test@test.com")
 
-    def check_results(self, expected, search_type, query=None):
+    def check_results(
+        self, expected: list[RecentSearch], search_type: SearchType, query: str | None = None
+    ) -> None:
         self.login_as(user=self.user)
         kwargs = {}
         if query:
             kwargs["query"] = query
-        response = self.get_valid_response(self.organization.slug, type=search_type.value, **kwargs)
+        response = self.get_success_response(
+            self.organization.slug, type=search_type.value, **kwargs
+        )
         assert response.data == serialize(expected)
 
-    def test_simple(self):
+    def test_simple(self) -> None:
         self.create_team(members=[self.user])
         RecentSearch.objects.create(
             organization=self.organization,
-            user=self.create_user("other@user.com"),
+            user_id=self.create_user("other@user.com").id,
             type=SearchType.ISSUE.value,
             query="some test",
         )
         RecentSearch.objects.create(
             organization=self.create_organization(),
-            user=self.user,
+            user_id=self.user.id,
             type=SearchType.ISSUE.value,
             query="some test",
         )
         event_recent_search = RecentSearch.objects.create(
             organization=self.organization,
-            user=self.user,
+            user_id=self.user.id,
             type=SearchType.EVENT.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
+        session_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.SESSION.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
+        metric_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.METRIC.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
+        span_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.SPAN.value,
             query="some test",
             last_seen=timezone.now(),
             date_added=timezone.now(),
@@ -50,7 +90,7 @@ class RecentSearchesListTest(APITestCase):
         issue_recent_searches = [
             RecentSearch.objects.create(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=SearchType.ISSUE.value,
                 query="some test",
                 last_seen=timezone.now(),
@@ -58,7 +98,7 @@ class RecentSearchesListTest(APITestCase):
             ),
             RecentSearch.objects.create(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=SearchType.ISSUE.value,
                 query="older query",
                 last_seen=timezone.now() - timedelta(minutes=30),
@@ -66,20 +106,59 @@ class RecentSearchesListTest(APITestCase):
             ),
             RecentSearch.objects.create(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=SearchType.ISSUE.value,
                 query="oldest query",
                 last_seen=timezone.now() - timedelta(hours=1),
                 date_added=timezone.now() - timedelta(hours=1),
             ),
         ]
+        error_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.ERROR.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
+        transaction_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.TRANSACTION.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
+        logs_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.LOG.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
+        tracemetric_recent_search = RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.TRACEMETRIC.value,
+            query="some test",
+            last_seen=timezone.now(),
+            date_added=timezone.now(),
+        )
         self.check_results(issue_recent_searches, search_type=SearchType.ISSUE)
         self.check_results([event_recent_search], search_type=SearchType.EVENT)
+        self.check_results([session_recent_search], search_type=SearchType.SESSION)
+        self.check_results([metric_recent_search], search_type=SearchType.METRIC)
+        self.check_results([span_recent_search], search_type=SearchType.SPAN)
+        self.check_results([error_recent_search], search_type=SearchType.ERROR)
+        self.check_results([transaction_recent_search], search_type=SearchType.TRANSACTION)
+        self.check_results([logs_recent_search], search_type=SearchType.LOG)
+        self.check_results([tracemetric_recent_search], search_type=SearchType.TRACEMETRIC)
 
-    def test_param_validation(self):
+    def test_param_validation(self) -> None:
         self.login_as(user=self.user)
-        error_cases = [
-            ({"type": 5}, "Invalid input for `type`"),
+        error_cases: list[tuple[dict[str, Any], str]] = [
+            ({"type": 1000}, "Invalid input for `type`"),
             ({"type": "hi"}, "Invalid input for `type`"),
             ({"limit": "hi"}, "Invalid input for `limit`"),
         ]
@@ -88,11 +167,11 @@ class RecentSearchesListTest(APITestCase):
             assert response.status_code == 400
             assert response.data["detail"].startswith(expected_error)
 
-    def test_query(self):
+    def test_query(self) -> None:
         issue_recent_searches = [
             RecentSearch.objects.create(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=SearchType.ISSUE.value,
                 query="some test",
                 last_seen=timezone.now(),
@@ -100,7 +179,7 @@ class RecentSearchesListTest(APITestCase):
             ),
             RecentSearch.objects.create(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=SearchType.ISSUE.value,
                 query="older query",
                 last_seen=timezone.now() - timedelta(minutes=30),
@@ -108,7 +187,7 @@ class RecentSearchesListTest(APITestCase):
             ),
             RecentSearch.objects.create(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=SearchType.ISSUE.value,
                 query="oldest query",
                 last_seen=timezone.now() - timedelta(hours=1),
@@ -117,44 +196,161 @@ class RecentSearchesListTest(APITestCase):
         ]
         self.check_results(issue_recent_searches[1:], search_type=SearchType.ISSUE, query="lde")
 
+    @override_settings(SEER_API_SHARED_SECRET="service-account-secret")
+    @with_feature("organizations:service-accounts")
+    def test_service_account_sees_no_recent_searches(self) -> None:
+        RecentSearch.objects.create(
+            organization=self.organization,
+            user_id=self.user.id,
+            type=SearchType.ISSUE.value,
+            query="some test",
+        )
+        service_account = self.create_service_account(
+            organization=self.organization, scope_list=["org:read"]
+        )
+        viewer_context = encode_viewer_context(
+            ViewerContext(
+                actor=Actor(type=ActorType.SERVICE_ACCOUNT, actor_id=service_account.id),
+                organization_id=self.organization.id,
+            ),
+            key="service-account-secret",
+        )
+        url = reverse(self.endpoint, args=[self.organization.slug])
+
+        response = self.client.get(
+            url, {"type": SearchType.ISSUE.value}, HTTP_X_VIEWER_CONTEXT=viewer_context
+        )
+        assert response.status_code == 200, response.content
+        assert response.data == []
+
 
 class RecentSearchesCreateTest(APITestCase):
     endpoint = "sentry-api-0-organization-recent-searches"
     method = "post"
 
-    @fixture
-    def organization(self):
+    @cached_property
+    def organization(self) -> Organization:
         return self.create_organization()
 
-    @fixture
-    def user(self):
+    @cached_property
+    def user(self) -> User:
         user = self.create_user("test@test.com")
         self.create_team(members=[user], organization=self.organization)
         return user
 
-    def test(self):
+    def test(self) -> None:
         self.login_as(self.user)
         search_type = 1
         query = "something"
-        the_date = datetime(2019, 1, 1, 1, 1, 1)
+        the_date = datetime(2019, 1, 1, 1, 1, 1, tzinfo=UTC)
         with freeze_time(the_date):
             response = self.get_response(self.organization.slug, type=search_type, query=query)
             assert response.status_code == 201
             assert RecentSearch.objects.filter(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=search_type,
                 query=query,
                 last_seen=the_date,
             ).exists()
-        the_date = datetime(2019, 1, 1, 2, 2, 2)
+        the_date = datetime(2019, 1, 1, 2, 2, 2, tzinfo=UTC)
         with freeze_time(the_date):
             response = self.get_response(self.organization.slug, type=search_type, query=query)
             assert response.status_code == 204, response.content
             assert RecentSearch.objects.filter(
                 organization=self.organization,
-                user=self.user,
+                user_id=self.user.id,
                 type=search_type,
                 query=query,
                 last_seen=the_date,
             ).exists()
+
+
+@with_feature("organizations:granular-permission-scopes")
+class RecentSearchesScopeTest(APITestCase):
+    endpoint = "sentry-api-0-organization-recent-searches"
+
+    def _use_token(self, scope_list: list[str]) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.client.logout()
+            token = self.create_user_auth_token(user=self.user, scope_list=scope_list)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+    def test_read_scope_can_list(self) -> None:
+        self._use_token(["user_preference:read"])
+        self.get_success_response(self.organization.slug, type=SearchType.ISSUE.value)
+
+    def test_read_scope_cannot_create(self) -> None:
+        self._use_token(["user_preference:read"])
+        self.get_error_response(
+            self.organization.slug,
+            method="post",
+            type=SearchType.ISSUE.value,
+            query="is:unresolved",
+            status_code=403,
+        )
+        assert not RecentSearch.objects.filter(user_id=self.user.id).exists()
+
+    def test_write_scope_can_create(self) -> None:
+        self._use_token(["user_preference:write"])
+        self.get_success_response(
+            self.organization.slug,
+            method="post",
+            type=SearchType.ISSUE.value,
+            query="is:unresolved",
+            status_code=201,
+        )
+        assert RecentSearch.objects.filter(
+            organization=self.organization, user_id=self.user.id, query="is:unresolved"
+        ).exists()
+
+    def test_write_scope_cannot_list(self) -> None:
+        # Write does not imply read.
+        self._use_token(["user_preference:write"])
+        self.get_error_response(
+            self.organization.slug, type=SearchType.ISSUE.value, status_code=403
+        )
+
+
+@with_feature("organizations:granular-permission-scopes")
+@override_options({"auth.deprecated-scope-translation.enabled": True})
+class RecentSearchesGranularScopesTest(APITestCase):
+    """With granular scopes, recent searches require user_preference:* instead of org:read."""
+
+    endpoint = "sentry-api-0-organization-recent-searches"
+
+    def _use_token(self, scope_list: list[str]) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.client.logout()
+            token = self.create_user_auth_token(user=self.user, scope_list=scope_list)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+    def test_org_read_token_is_translated(self) -> None:
+        self._use_token(["org:read"])
+        self.get_success_response(self.organization.slug, type=SearchType.ISSUE.value)
+        self.get_success_response(
+            self.organization.slug,
+            method="post",
+            type=SearchType.ISSUE.value,
+            query="is:unresolved",
+            status_code=201,
+        )
+
+    @override_settings(DEPRECATED_SCOPE_TRANSLATIONS={})
+    def test_org_read_not_accepted(self) -> None:
+        self._use_token(["org:read"])
+        self.get_error_response(
+            self.organization.slug, type=SearchType.ISSUE.value, status_code=403
+        )
+
+    @override_settings(DEPRECATED_SCOPE_TRANSLATIONS={})
+    @with_feature({"organizations:granular-permission-scopes": False})
+    def test_org_read_accepted_without_granular_scopes(self) -> None:
+        self._use_token(["org:read"])
+        self.get_success_response(self.organization.slug, type=SearchType.ISSUE.value)
+
+    def test_member_session_has_access(self) -> None:
+        member = self.create_user()
+        self.create_member(user=member, organization=self.organization, role="member")
+        self.login_as(member)
+        self.get_success_response(self.organization.slug, type=SearchType.ISSUE.value)

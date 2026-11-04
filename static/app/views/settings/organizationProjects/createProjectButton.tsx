@@ -1,0 +1,33 @@
+import {IconAdd} from '@sentry/icons/add';
+
+import {LinkButton} from '@sentry/scraps/button';
+
+import {t} from 'sentry/locale';
+import {useCanCreateProject} from 'sentry/utils/useCanCreateProject';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {makeProjectsPathname} from 'sentry/views/projects/pathname';
+
+export function CreateProjectButton() {
+  const organization = useOrganization();
+  const canUserCreateProject = useCanCreateProject();
+
+  return (
+    <LinkButton
+      variant="primary"
+      size="sm"
+      disabled={!canUserCreateProject}
+      tooltipProps={{
+        title: canUserCreateProject
+          ? undefined
+          : t('You do not have permission to create projects'),
+      }}
+      to={makeProjectsPathname({
+        path: '/new/',
+        organization,
+      })}
+      icon={<IconAdd />}
+    >
+      {t('Create Project')}
+    </LinkButton>
+  );
+}

@@ -1,0 +1,106 @@
+import type {ComponentProps} from 'react';
+import {LocationFixture} from 'sentry-fixture/locationFixture';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {RouteComponentPropsFixture} from 'sentry-fixture/routeComponentPropsFixture';
+
+import {BillingConfigFixture} from 'getsentry-test/fixtures/billingConfig';
+import {SubscriptionFixture} from 'getsentry-test/fixtures/subscription';
+import {PlanTier} from 'getsentry-test/planTier';
+import {render, screen, userEvent, within} from 'sentry-test/reactTestingLibrary';
+
+import {SubscriptionStore} from 'getsentry/stores/subscriptionStore';
+import AMCheckout from 'getsentry/views/amCheckout/';
+
+describe('BuildYourPlan', () => {
+  const api = new MockApiClient();
+  const organization = OrganizationFixture();
+  const subscription = SubscriptionFixture({organization, plan: 'am3_f'});
+
+  beforeEach(() => {
+    api.clear();
+    MockApiClient.clearMockResponses();
+    SubscriptionStore.set(organization.slug, subscription);
+
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/`,
+      method: 'GET',
+      body: {},
+    });
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/billing-config/`,
+      method: 'GET',
+      body: BillingConfigFixture(PlanTier.AM3),
+    });
+    MockApiClient.addMockResponse({
+      method: 'POST',
+      url: '/_experiment/log_exposure/',
+      body: {},
+    });
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/subscription/preview/`,
+      method: 'GET',
+      body: {
+        invoiceItems: [],
+      },
+    });
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/billing-details/`,
+      method: 'GET',
+    });
+  });
+
+  const routeProps = RouteComponentPropsFixture();
+
+  function ExampleAMCheckout({
+    location,
+  }: {
+    location: ComponentProps<typeof AMCheckout>['location'];
+  }) {
+    return (
+      <AMCheckout {...routeProps} api={api} location={location} navigate={jest.fn()} />
+    );
+  }
+
+  it('renders', async () => {
+    render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+
+    expect(await screen.findByText('Select a plan')).toBeInTheDocument();
+    expect(screen.queryByTestId('body-choose-your-plan')).not.toBeInTheDocument();
+  });
+  describe('PlanSubstep', () => {
+    it('annotates the current plan', async () => {
+      const bizOrg = OrganizationFixture();
+      const businessSubscription = SubscriptionFixture({
+        organization: bizOrg,
+        plan: 'am3_business',
+      });
+      SubscriptionStore.set(bizOrg.slug, businessSubscription);
+
+      render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+
+      const businessPlan = await screen.findByRole('radio', {name: 'Business'});
+      expect(businessPlan).toBeInTheDocument();
+      expect(
+        within(screen.getByTestId('plan-option-am3_business')).getByText('Current')
+      ).toBeInTheDocument();
+      expect(screen.getByRole('radio', {name: 'Team'})).toBeInTheDocument();
+      expect(
+        within(screen.getByTestId('plan-option-am3_team')).queryByText('Current')
+      ).not.toBeInTheDocument();
+    });
+
+    it('can select plan', async () => {
+      render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+
+      const teamPlan = await screen.findByRole('radio', {name: 'Team'});
+      const businessPlan = screen.getByRole('radio', {name: 'Business'});
+
+      expect(teamPlan).not.toBeChecked();
+      expect(businessPlan).toBeChecked();
+
+      await userEvent.click(teamPlan);
+      expect(teamPlan).toBeChecked();
+      expect(businessPlan).not.toBeChecked();
+    });
+  });
+});

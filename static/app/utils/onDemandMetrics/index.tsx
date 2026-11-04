@@ -1,0 +1,81 @@
+import type {ParseResult, TokenResult} from 'sentry/components/searchSyntax/parser';
+import {parseSearch, Token} from 'sentry/components/searchSyntax/parser';
+import {AggregationKey, FieldKey, getFieldDefinition} from 'sentry/utils/fields';
+import {
+  ON_DEMAND_METRICS_UNSUPPORTED_TAGS,
+  STANDARD_SEARCH_FIELD_KEYS,
+} from 'sentry/utils/onDemandMetrics/constants';
+
+function isStandardSearchFilterKey(key: string): boolean {
+  return STANDARD_SEARCH_FIELD_KEYS.has(key as FieldKey);
+}
+
+function isOnDemandSupportedFilterKey(key: string): boolean {
+  return !ON_DEMAND_METRICS_UNSUPPORTED_TAGS.has(key as FieldKey);
+}
+
+function isCustomTag(key: string): boolean {
+  return !getFieldDefinition(key);
+}
+
+export function isOnDemandAggregate(aggregate: string): boolean {
+  return aggregate.includes(AggregationKey.APDEX);
+}
+
+export function isOnDemandQueryString(query: string): boolean {
+  const searchFilterKeys = getSearchFilterKeys(query);
+  const queryTokens = parseSearch(query);
+
+  // Free text is almost exclusively used in the errors side of the discover dataset.
+  // It's possible free text is intended to be a transaction, but until we split the discover dataset it's impossible to determine.
+  // We err towards not sending on-demand for free text since the free-text for errors is more prevalent.
+  const hasFreeText = queryTokens?.some(token => token.type === Token.FREE_TEXT);
+
+  const isStandardSearch = searchFilterKeys.every(isStandardSearchFilterKey);
+  const isOnDemandSupportedSearch = searchFilterKeys.some(isOnDemandSupportedFilterKey);
+  const hasCustomTags = searchFilterKeys.some(isCustomTag);
+
+  return (
+    !hasFreeText && !isStandardSearch && (isOnDemandSupportedSearch || hasCustomTags)
+  );
+}
+
+type SearchFilter = {key: string; operator: string; value: string};
+
+function getSearchFilterKeys(query: string): string[] {
+  try {
+    return getSearchFilters(query).map(({key}) => key);
+  } catch (e) {
+    return [];
+  }
+}
+
+function getSearchFilters(query: string): SearchFilter[] {
+  try {
+    const tokens = parseSearch(query);
+    if (!tokens) {
+      return [];
+    }
+
+    return getSearchFiltersFromTokens(tokens);
+  } catch (e) {
+    return [];
+  }
+}
+
+function getSearchFiltersFromTokens(tokens: ParseResult): SearchFilter[] {
+  return tokens.flatMap(getTokenKeyValuePair).filter(Boolean) as SearchFilter[];
+}
+
+function getTokenKeyValuePair(
+  token: TokenResult<Token>
+): SearchFilter[] | SearchFilter | null {
+  if (token.type === Token.LOGIC_GROUP) {
+    return getSearchFiltersFromTokens(token.inner);
+  }
+  if (token.type === Token.FILTER) {
+    return {key: token.key.text, operator: token.operator, value: token.value.text};
+  }
+
+  return null;
+}

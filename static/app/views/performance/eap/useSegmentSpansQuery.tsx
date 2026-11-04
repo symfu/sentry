@@ -1,0 +1,232 @@
+import {useQueryStates} from 'nuqs';
+
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import type {Sort} from 'sentry/utils/discover/fields';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {parseAsScalar} from 'sentry/views/explore/queryParams/parsers';
+import {useSpans} from 'sentry/views/insights/common/queries/useDiscover';
+import {SpanFields, type SpanProperty} from 'sentry/views/insights/types';
+import {SEGMENT_SPANS_CURSOR_NAME} from 'sentry/views/performance/transactionSummary/transactionOverview/constants';
+import {TransactionFilterOptions} from 'sentry/views/performance/transactionSummary/utils';
+
+type Options = {
+  p95: number;
+  query: string;
+  sort: Sort;
+  limit?: number;
+};
+
+const DEFAULT_LIMIT = 5;
+
+const segmentSpansParsers = {
+  [SpanFields.SPAN_CATEGORY]: parseAsScalar,
+  showTransactions: parseAsScalar,
+  [SEGMENT_SPANS_CURSOR_NAME]: parseAsScalar,
+};
+
+function useSegmentSpansQueryParams() {
+  const [params] = useQueryStates(segmentSpansParsers);
+  return {
+    spanCategoryUrlParam: params[SpanFields.SPAN_CATEGORY],
+    selectedOption: params.showTransactions,
+    cursor: params[SEGMENT_SPANS_CURSOR_NAME] ?? undefined,
+  };
+}
+
+const FIELDS: SpanProperty[] = [
+  'span_id',
+  'user.id',
+  'user.email',
+  'user.username',
+  'user.ip',
+  'span.duration',
+  'trace',
+  'timestamp',
+  'replayId',
+  'profile.id',
+  'profiler.id',
+  'thread.id',
+  'precise.start_ts',
+  'precise.finish_ts',
+];
+
+export function useSegmentSpansQuery({query, sort, p95, limit = DEFAULT_LIMIT}: Options) {
+  const {spanCategoryUrlParam, selectedOption} = useSegmentSpansQueryParams();
+
+  const isSingleQueryEnabled =
+    selectedOption === TransactionFilterOptions.RECENT || !spanCategoryUrlParam;
+
+  const {
+    data: singleQueryData,
+    isLoading: isSingleQueryLoading,
+    error: singleQueryError,
+    pageLinks: singleQueryPageLinks,
+    meta: singleQueryMeta,
+  } = useSingleQuery({
+    query,
+    sort,
+    p95,
+    enabled: isSingleQueryEnabled,
+    limit,
+  });
+
+  const isMultipleQueriesEnabled = Boolean(
+    spanCategoryUrlParam && selectedOption !== TransactionFilterOptions.RECENT
+  );
+
+  const {
+    data: multipleQueriesData,
+    isLoading: isMultipleQueriesLoading,
+    error: multipleQueriesError,
+    pageLinks: multipleQueriesPageLinks,
+    meta: multipleQueriesMeta,
+  } = useMultipleQueries({
+    query,
+    sort,
+    p95,
+    enabled: isMultipleQueriesEnabled,
+    limit,
+  });
+
+  if (isSingleQueryEnabled) {
+    return {
+      data: singleQueryData,
+      isLoading: isSingleQueryLoading,
+      error: singleQueryError,
+      pageLinks: singleQueryPageLinks,
+      meta: singleQueryMeta,
+    };
+  }
+
+  return {
+    data: multipleQueriesData,
+    isLoading: isMultipleQueriesLoading,
+    error: multipleQueriesError,
+    pageLinks: multipleQueriesPageLinks,
+    meta: multipleQueriesMeta,
+  };
+}
+
+type UseSingleQueryOptions = {
+  limit: number;
+  p95: number;
+  query: string;
+  sort: Sort;
+  enabled?: boolean;
+};
+
+// Hook for executing the default query to fetch table data for spans when no category is selected
+function useSingleQuery(options: UseSingleQueryOptions) {
+  const {cursor, selectedOption} = useSegmentSpansQueryParams();
+  const {selection} = usePageFilters();
+  const {query, sort, p95, enabled, limit} = options;
+  const newQuery = new MutableSearch(query);
+
+  if (selectedOption === TransactionFilterOptions.SLOW && p95) {
+    newQuery.addFilterValue('span.duration', `<=${p95.toFixed(0)}`);
+  }
+
+  if (selectedOption === TransactionFilterOptions.RECENT) {
+    newQuery.removeFilter('span.category');
+  }
+
+  const {data, isLoading, pageLinks, meta, error} = useSpans(
+    {
+      search: newQuery,
+      fields: FIELDS,
+      sorts: [sort],
+      limit,
+      cursor,
+      pageFilters: selection,
+      enabled,
+    },
+    'api.insights.segment-spans-table'
+  );
+
+  return {
+    data,
+    isLoading,
+    pageLinks,
+    meta,
+    error,
+  };
+}
+
+type UseMultipleQueriesOptions = {
+  limit: number;
+  p95: number;
+  query: string;
+  sort: Sort;
+  enabled?: boolean;
+};
+
+function useMultipleQueries(options: UseMultipleQueriesOptions) {
+  const {query, sort, p95, enabled, limit} = options;
+  const {cursor, selectedOption, spanCategoryUrlParam} = useSegmentSpansQueryParams();
+  const {selection} = usePageFilters();
+
+  const categorizedSpansQuery = new MutableSearch(query);
+  categorizedSpansQuery.addFilterValue('span.category', spanCategoryUrlParam ?? '');
+
+  // The slow (p95) option is the only one that requires an explicit duration filter
+  if (selectedOption === TransactionFilterOptions.SLOW && p95) {
+    categorizedSpansQuery.addFilterValue('span.duration', `<=${p95.toFixed(0)}`);
+  }
+
+  const {
+    data: categorizedSpanIds,
+    isLoading: isCategorizedSpanIdsLoading,
+    error: categorizedSpanIdsError,
+  } = useSpans(
+    {
+      search: categorizedSpansQuery,
+      fields: ['transaction.span_id', 'sum(span.self_time)'],
+      sorts: [
+        {
+          field: 'sum(span.self_time)',
+          kind: sort.kind,
+        },
+      ],
+      limit,
+      cursor,
+      pageFilters: selection,
+      enabled,
+    },
+    'api.insights.segment-spans-table'
+  );
+
+  const specificSpansQuery = new MutableSearch('');
+  if (categorizedSpanIds && !isCategorizedSpanIdsLoading) {
+    const spanIdsString = categorizedSpanIds
+      .map(datum => datum['transaction.span_id'])
+      .join(',');
+    specificSpansQuery.addFilterValue('span_id', `[${spanIdsString}]`);
+  }
+
+  // Second query to fetch the table data for these spans
+  const {
+    data: categorizedSpansData,
+    isLoading: isCategorizedSpansLoading,
+    pageLinks: categorizedSpansPageLinks,
+    meta: categorizedSpansMeta,
+    error: categorizedSpansError,
+  } = useSpans(
+    {
+      search: specificSpansQuery,
+      fields: FIELDS,
+      cursor,
+      sorts: [sort],
+      limit,
+      enabled: !!categorizedSpanIds && categorizedSpanIds.length > 0,
+    },
+    'api.insights.segment-spans-table-with-category'
+  );
+
+  return {
+    data: categorizedSpansData,
+    isLoading: isCategorizedSpanIdsLoading || isCategorizedSpansLoading,
+    pageLinks: categorizedSpansPageLinks,
+    meta: categorizedSpansMeta,
+    error: categorizedSpanIdsError || categorizedSpansError,
+  };
+}

@@ -1,0 +1,100 @@
+import {useContext} from 'react';
+
+import type {ButtonProps} from '@sentry/scraps/button';
+import {Button} from '@sentry/scraps/button';
+
+import {t} from 'sentry/locale';
+import type {IntegrationWithConfig} from 'sentry/types/integrations';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import type {AddIntegrationParams} from 'sentry/utils/integrations/useAddIntegration';
+import {useAddIntegration} from 'sentry/utils/integrations/useAddIntegration';
+import {useAutoOpenInstallModal} from 'sentry/utils/integrations/useAutoOpenInstallModal';
+import {IntegrationContext} from 'sentry/views/settings/organizationIntegrations/integrationContext';
+
+interface AddIntegrationButtonProps
+  extends
+    Omit<ButtonProps, 'children' | 'analyticsParams' | 'onError'>,
+    Pick<
+      AddIntegrationParams,
+      | 'provider'
+      | 'organization'
+      | 'analyticsParams'
+      | 'suppressSuccessMessage'
+      | 'modalParams'
+      | 'onCancel'
+      | 'onError'
+    > {
+  onAddIntegration: (data: IntegrationWithConfig) => void;
+  buttonText?: string;
+  installStatus?: string;
+}
+
+export function AddIntegrationButton({
+  provider,
+  buttonText,
+  onAddIntegration,
+  organization,
+  analyticsParams,
+  installStatus,
+  suppressSuccessMessage,
+  modalParams,
+  onCancel,
+  onError,
+  ...buttonProps
+}: AddIntegrationButtonProps) {
+  const label =
+    buttonText ??
+    (installStatus === 'Disabled' ? t('Reinstall') : t('Add %s', provider.metadata.noun));
+
+  const {startFlow} = useAddIntegration();
+  const {configurations} = useContext(IntegrationContext) ?? {};
+
+  // This is hooked to the button since the button is only rendered when all the flags/plan checks pass.
+  useAutoOpenInstallModal({
+    provider,
+    organization,
+    onInstall: onAddIntegration,
+    analyticsParams,
+    suppressSuccessMessage,
+    startFlow,
+    configurations,
+  });
+
+  return (
+    <Button
+      tooltipProps={
+        provider.canAdd
+          ? undefined
+          : {
+              title: t(
+                'Integration cannot be added on Sentry. Enable this integration via the %s instance.',
+                provider.name
+              ),
+            }
+      }
+      aria-label={t('Add integration')}
+      {...buttonProps}
+      disabled={!provider.canAdd || buttonProps.disabled}
+      onClick={() => {
+        if (label === t('Reinstall')) {
+          trackAnalytics('integrations.integration_reinstall_clicked', {
+            organization,
+            provider: provider.metadata.noun,
+          });
+        }
+        startFlow({
+          provider,
+          organization,
+          onInstall: onAddIntegration,
+          analyticsParams,
+          suppressSuccessMessage,
+          modalParams,
+          onCancel,
+          onError,
+        });
+      }}
+    >
+      {label}
+    </Button>
+  );
+}

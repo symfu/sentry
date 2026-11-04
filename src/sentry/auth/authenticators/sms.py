@@ -1,13 +1,34 @@
-from django.utils.translation import ugettext_lazy as _
+from __future__ import annotations
 
-from sentry.utils.decorators import classproperty
+import logging
+from hashlib import md5
+from typing import TYPE_CHECKING, Any, cast
+
+from django.http.request import HttpRequest
+from django.utils.functional import classproperty
+from django.utils.translation import gettext_lazy as _
+
+from sentry.ratelimits import backend as ratelimiter
 from sentry.utils.otp import TOTP
-from sentry.utils.sms import send_sms, sms_available
+from sentry.utils.sms import phone_number_as_e164, send_sms, sms_available
 
-from .base import AuthenticatorInterface, ActivationMessageResult, OtpMixin
+from .base import ActivationMessageResult, ActivationRateLimited, OtpMixin
+
+if TYPE_CHECKING:
+    from django.utils.functional import _StrPromise
+
+logger = logging.getLogger("sentry.auth")
 
 
-class SmsInterface(OtpMixin, AuthenticatorInterface):
+class SMSRateLimitExceeded(ActivationRateLimited):
+    def __init__(self, phone_number: str, user_id: int | None, remote_ip: str | None) -> None:
+        super().__init__()
+        self.phone_number = phone_number
+        self.user_id = user_id
+        self.remote_ip = remote_ip
+
+
+class SmsInterface(OtpMixin):
     """This interface sends OTP codes via text messages to the user."""
 
     type = 2
@@ -22,27 +43,26 @@ class SmsInterface(OtpMixin, AuthenticatorInterface):
     code_ttl = 45
 
     @classproperty
-    def is_available(cls):
+    def is_available(cls) -> bool:
         return sms_available()
 
-    def generate_new_config(self):
+    def generate_new_config(self) -> dict[str, Any]:
         config = super().generate_new_config()
         config["phone_number"] = None
         return config
 
-    def make_otp(self):
+    def make_otp(self) -> TOTP:
         return TOTP(self.config["secret"], digits=6, interval=self.code_ttl, default_window=1)
 
-    def _get_phone_number(self):
+    @property
+    def phone_number(self) -> str | None:
         return self.config["phone_number"]
 
-    def _set_phone_number(self, value):
+    @phone_number.setter
+    def phone_number(self, value: str) -> None:
         self.config["phone_number"] = value
 
-    phone_number = property(_get_phone_number, _set_phone_number)
-    del _get_phone_number, _set_phone_number
-
-    def activate(self, request):
+    def activate(self, request: HttpRequest) -> ActivationMessageResult:
         phone_number = self.config["phone_number"]
         if len(phone_number) == 10:
             mask = "(***) ***-**%s" % (phone_number[-2:])
@@ -55,7 +75,8 @@ class SmsInterface(OtpMixin, AuthenticatorInterface):
                     "A confirmation code was sent to %(phone_mask)s. "
                     "It is valid for %(ttl)d seconds."
                 )
-                % {"phone_mask": "<strong>%s</strong>" % mask, "ttl": self.code_ttl}
+                % {"phone_mask": "<strong>%s</strong>" % mask, "ttl": self.code_ttl},
+                expires_in=self.code_ttl,
             )
         return ActivationMessageResult(
             _(
@@ -65,11 +86,11 @@ class SmsInterface(OtpMixin, AuthenticatorInterface):
             type="error",
         )
 
-    def send_text(self, for_enrollment=False, request=None):
+    def send_text(self, *, request: HttpRequest, for_enrollment: bool = False) -> bool:
         ctx = {"code": self.make_otp().generate_otp()}
 
         if for_enrollment:
-            text = _(
+            text: _StrPromise | str = _(
                 "%(code)s is your Sentry two-factor enrollment code. "
                 "You are about to set up text message based two-factor "
                 "authentication."
@@ -78,7 +99,33 @@ class SmsInterface(OtpMixin, AuthenticatorInterface):
             text = _("%(code)s is your Sentry authentication code.")
 
         if request is not None:
-            text = "{}\n\n{}".format(text, _("Requested from %(ip)s"))
+            text = f"{text}\n"
             ctx["ip"] = request.META["REMOTE_ADDR"]
 
-        return send_sms(text % ctx, to=self.phone_number)
+        if request and request.user.is_authenticated:
+            user_id = request.user.id
+        elif self.authenticator:
+            user_id = self.authenticator.user_id
+        else:
+            user_id = None
+
+        phone_number = phone_number_as_e164(cast("str", self.phone_number))
+
+        if ratelimiter.is_limited(
+            f"sms:{md5(phone_number.encode('utf-8')).hexdigest()}",
+            limit=3,
+            window=300,
+        ):
+            raise SMSRateLimitExceeded(phone_number, user_id, request.META.get("REMOTE_ADDR", None))
+
+        logger.info(
+            "mfa.twilio-request",
+            extra={
+                "ip": request.META["REMOTE_ADDR"] if request else None,
+                "user_id": user_id,
+                "authenticator_id": self.authenticator.id if self.authenticator else None,
+                "phone_number": phone_number,
+            },
+        )
+
+        return send_sms(text % ctx, to=phone_number)

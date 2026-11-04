@@ -1,0 +1,270 @@
+import {lazy, Suspense, useCallback, useEffect} from 'react';
+import {Outlet} from 'react-router';
+import styled from '@emotion/styled';
+
+import {GlobalModal} from '@sentry/scraps/modal';
+
+import {
+  displayDeployPreviewAlert,
+  displayExperimentalSpaAlert,
+} from 'sentry/actionCreators/developmentAlerts';
+import {fetchGuides} from 'sentry/actionCreators/guides';
+import {fetchOrganizations} from 'sentry/actionCreators/organizations';
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import {Override} from 'sentry/components/override';
+import {getOverride} from 'sentry/overrideRegistry';
+import {ConfigStore} from 'sentry/stores/configStore';
+import {GuideStore} from 'sentry/stores/guideStore';
+import {OrganizationsStore} from 'sentry/stores/organizationsStore';
+import {useLegacyStore} from 'sentry/stores/useLegacyStore';
+import type {Config} from 'sentry/types/system';
+import {isValidOrgSlug} from 'sentry/utils/isValidOrgSlug';
+import {onRenderCallback, Profiler} from 'sentry/utils/performanceForSentry';
+import {shouldPreloadData} from 'sentry/utils/shouldPreloadData';
+import {testableWindowLocation} from 'sentry/utils/testableWindowLocation';
+import {useApi} from 'sentry/utils/useApi';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useParams} from 'sentry/utils/useParams';
+import {useUser} from 'sentry/utils/useUser';
+import {AppProviders} from 'sentry/views/app/appProviders';
+import {useGlobalAlerts} from 'sentry/views/app/globalAlerts';
+
+const InstallWizard = lazy(() => import('sentry/views/admin/installWizard'));
+const NewsletterConsent = lazy(() => import('sentry/views/newsletterConsent'));
+const BeaconConsent = lazy(() => import('sentry/views/beaconConsent'));
+
+/**
+ * Runs the App's startup alert effects (deploy preview / SPA banners, server
+ * health checks, forwarded Django messages). Lives inside AppProviders so it
+ * can consume the GlobalAlertProvider context.
+ */
+function AppAlerts() {
+  const {addAlert} = useGlobalAlerts();
+  const api = useApi();
+  const config = useLegacyStore(ConfigStore);
+  const preloadData = shouldPreloadData(config);
+
+  useEffect(() => {
+    displayDeployPreviewAlert(addAlert);
+    displayExperimentalSpaAlert(addAlert);
+  }, [addAlert]);
+
+  useEffect(() => {
+    if (!preloadData || !config.isSelfHosted) {
+      return;
+    }
+    api
+      .requestPromise('/internal/health/')
+      .then(data => {
+        data?.problems?.forEach?.((problem: any) => {
+          const {id, message, url} = problem;
+          const variant = problem.severity === 'critical' ? 'danger' : 'warning';
+          addAlert({id, message, variant, url, opaque: true});
+        });
+      })
+      .catch(() => {
+        // TODO: do something?
+      });
+  }, [api, config.isSelfHosted, preloadData, addAlert]);
+
+  useEffect(() => {
+    if (!preloadData) {
+      return;
+    }
+    // Show system-level alerts that were forwarded by the initial client config request
+    config.messages.forEach(msg =>
+      addAlert({
+        message: msg.message,
+        variant:
+          // These are django message level tags that need to be mapped to our alert variant types.
+          // See client config in ./src/sentry/web/client_config.py
+          msg.level === 'error' ? 'danger' : msg.level === 'debug' ? 'muted' : msg.level,
+        neverExpire: true,
+      })
+    );
+  }, [config.messages, preloadData, addAlert]);
+
+  return null;
+}
+
+type AppBodyProps = {
+  beaconConsentPrompt: boolean | undefined;
+  clearNewsletterConsent: () => void;
+  clearUpgrade: () => void;
+  displayInstallWizard: boolean | undefined;
+  isOrgSlugValid: boolean;
+  newsletterConsentPrompt: boolean | undefined;
+  organizationSlug: string | undefined;
+  partnershipAgreementPrompt: Config['partnershipAgreementPrompt'];
+};
+
+function AppBody({
+  beaconConsentPrompt,
+  clearNewsletterConsent,
+  clearUpgrade,
+  displayInstallWizard,
+  isOrgSlugValid,
+  newsletterConsentPrompt,
+  organizationSlug,
+  partnershipAgreementPrompt,
+}: AppBodyProps) {
+  if (displayInstallWizard) {
+    return (
+      <Suspense fallback={null}>
+        <InstallWizard onConfigured={clearUpgrade} />
+      </Suspense>
+    );
+  }
+
+  if (beaconConsentPrompt) {
+    return (
+      <Suspense fallback={null}>
+        <BeaconConsent
+          onSubmitSuccess={() => {
+            ConfigStore.set('shouldShowBeaconConsentPrompt', false);
+          }}
+        />
+      </Suspense>
+    );
+  }
+
+  if (partnershipAgreementPrompt) {
+    return (
+      <Suspense fallback={null}>
+        <Override
+          name="component:partnership-agreement"
+          partnerDisplayName={partnershipAgreementPrompt.partnerDisplayName}
+          agreements={partnershipAgreementPrompt.agreements}
+          onSubmitSuccess={() => {
+            ConfigStore.set('partnershipAgreementPrompt', null);
+          }}
+          organizationSlug={organizationSlug}
+        />
+      </Suspense>
+    );
+  }
+
+  if (newsletterConsentPrompt) {
+    return (
+      <Suspense fallback={null}>
+        <NewsletterConsent onSubmitSuccess={clearNewsletterConsent} />
+      </Suspense>
+    );
+  }
+
+  if (!isOrgSlugValid) {
+    return null;
+  }
+
+  return <Outlet />;
+}
+
+/**
+ * App is the root level container for all authenticated routes.
+ */
+export function App() {
+  const api = useApi();
+  const user = useUser();
+  const config = useLegacyStore(ConfigStore);
+  const preloadData = shouldPreloadData(config);
+
+  /**
+   * Loads the users organization list into the OrganizationsStore
+   */
+  const loadOrganizations = useCallback(async () => {
+    try {
+      const data = await fetchOrganizations(api, {member: '1'});
+      OrganizationsStore.load(data);
+    } catch {
+      // TODO: do something?
+    }
+  }, [api]);
+
+  const {sentryUrl} = ConfigStore.get('links');
+  const {orgId} = useParams<{orgId?: string}>();
+  const isOrgSlugValid = orgId ? isValidOrgSlug(orgId) : true;
+
+  useEffect(() => {
+    if (orgId === undefined) {
+      return;
+    }
+
+    if (!isOrgSlugValid) {
+      testableWindowLocation.replace(sentryUrl);
+      return;
+    }
+  }, [orgId, sentryUrl, isOrgSlugValid]);
+
+  // Update guide store on location change
+  const location = useLocation();
+  // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  useEffect(() => GuideStore.onURLChange(), [location]);
+
+  useEffect(() => {
+    // Skip loading organization-related data before the user is logged in,
+    // because it triggers a 401 error in the UI.
+    if (!preloadData) {
+      return;
+    }
+
+    loadOrganizations();
+
+    // Set the user for analytics
+    if (user) {
+      getOverride('analytics:init-user')?.(user);
+    }
+
+    fetchGuides();
+
+    // When the app is unloaded clear the organizations list
+    return () => OrganizationsStore.load([]);
+  }, [loadOrganizations, user, preloadData]);
+
+  function clearUpgrade() {
+    ConfigStore.set('needsUpgrade', false);
+  }
+
+  function clearNewsletterConsent() {
+    const flags = {...user.flags, newsletter_consent_prompt: false};
+    ConfigStore.set('user', {...user, flags});
+  }
+
+  const displayInstallWizard =
+    user?.isSuperuser && config.needsUpgrade && config.isSelfHosted;
+  const newsletterConsentPrompt = user?.flags?.newsletter_consent_prompt;
+  const partnershipAgreementPrompt = config.partnershipAgreementPrompt;
+  const beaconConsentPrompt =
+    user?.isSuperuser && config.isSelfHosted && config.shouldShowBeaconConsentPrompt;
+
+  return (
+    <Profiler id="App" onRender={onRenderCallback}>
+      <AppProviders preloadData={preloadData}>
+        <MainContainer tabIndex={-1}>
+          <Override name="component:feedback-init" />
+          <AppAlerts />
+          <GlobalModal />
+          <Override name="component:replay-init" />
+          <ErrorBoundary>
+            <AppBody
+              beaconConsentPrompt={beaconConsentPrompt}
+              clearUpgrade={clearUpgrade}
+              clearNewsletterConsent={clearNewsletterConsent}
+              displayInstallWizard={displayInstallWizard}
+              isOrgSlugValid={isOrgSlugValid}
+              newsletterConsentPrompt={newsletterConsentPrompt}
+              organizationSlug={config.customerDomain?.subdomain}
+              partnershipAgreementPrompt={partnershipAgreementPrompt}
+            />
+          </ErrorBoundary>
+        </MainContainer>
+      </AppProviders>
+    </Profiler>
+  );
+}
+
+const MainContainer = styled('div')`
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  outline: none;
+`;

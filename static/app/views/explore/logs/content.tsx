@@ -1,0 +1,155 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+
+import {Stack} from '@sentry/scraps/layout';
+
+import {AnalyticsArea} from 'sentry/components/analyticsArea';
+import {DocumentationHint} from 'sentry/components/documentationHint';
+import {FeedbackButton} from 'sentry/components/feedbackButton/feedbackButton';
+import {PageFiltersContainer} from 'sentry/components/pageFilters/container';
+import {AiQueryProvider} from 'sentry/components/searchQueryBuilder/askSeerCombobox/aiQueryContext';
+import {SentryDocumentTitle} from 'sentry/components/sentryDocumentTitle';
+import {t} from 'sentry/locale';
+import {DataCategory} from 'sentry/types/core';
+import {LogsAnalyticsPageSource} from 'sentry/utils/analytics/logsAnalyticsEvent';
+import {defined} from 'sentry/utils/defined';
+import {useDatePageFilterProps} from 'sentry/utils/useDatePageFilterProps';
+import {useMaxPickableDays} from 'sentry/utils/useMaxPickableDays';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {ExploreSavedQueryBreadcrumbs} from 'sentry/views/explore/components/exploreSavedQueryBreadcrumbs';
+import {LogsPageDataProvider} from 'sentry/views/explore/contexts/logs/logsPageData';
+import {useGetSavedQuery} from 'sentry/views/explore/hooks/useGetSavedQueries';
+import {useVisitQuery} from 'sentry/views/explore/hooks/useVisitQuery';
+import {LogsTabOnboarding} from 'sentry/views/explore/logs/logsOnboarding';
+import {LogsQueryParamsProvider} from 'sentry/views/explore/logs/logsQueryParamsProvider';
+import {LogsTabContent} from 'sentry/views/explore/logs/logsTab';
+import {
+  useQueryParamsId,
+  useQueryParamsTitle,
+} from 'sentry/views/explore/queryParams/context';
+import {useOnboardingProject} from 'sentry/views/insights/common/queries/useOnboardingProject';
+import {TopBar} from 'sentry/views/navigation/topBar';
+
+export default function LogsContent() {
+  const organization = useOrganization();
+  const maxPickableDays = useMaxPickableDays({
+    dataCategories: [DataCategory.LOG_BYTE],
+  });
+  const datePageFilterProps = useDatePageFilterProps(maxPickableDays);
+
+  const onboardingProject = useOnboardingProject({property: 'hasLogs'});
+
+  return (
+    <SentryDocumentTitle title={t('Logs')} orgSlug={organization?.slug}>
+      <PageFiltersContainer
+        maxPickableDays={datePageFilterProps.maxPickableDays}
+        defaultSelection={
+          datePageFilterProps.defaultPeriod
+            ? {
+                datetime: {
+                  period: datePageFilterProps.defaultPeriod,
+                  start: null,
+                  end: null,
+                  utc: null,
+                },
+              }
+            : undefined
+        }
+      >
+        <AnalyticsArea name="explore.logs">
+          <AiQueryProvider strategy="Logs">
+            <LogsPageStack flex={1} data-hide-footer>
+              <LogsQueryParamsProvider
+                analyticsPageSource={LogsAnalyticsPageSource.EXPLORE_LOGS}
+                source="location"
+              >
+                <LogsHeader />
+                <LogsPageDataProvider allowHighFidelity>
+                  {defined(onboardingProject) ? (
+                    <LogsTabOnboarding
+                      organization={organization}
+                      project={onboardingProject}
+                      datePageFilterProps={datePageFilterProps}
+                    />
+                  ) : (
+                    <LogsTabContent datePageFilterProps={datePageFilterProps} />
+                  )}
+                </LogsPageDataProvider>
+              </LogsQueryParamsProvider>
+            </LogsPageStack>
+          </AiQueryProvider>
+        </AnalyticsArea>
+      </PageFiltersContainer>
+    </SentryDocumentTitle>
+  );
+}
+
+const LogsPageStack = styled(Stack)`
+  &[data-hide-footer] ~ footer {
+    display: none;
+  }
+`;
+
+const logsFeedbackOptions = {
+  messagePlaceholder: t('How can we make logs work better for you?'),
+  tags: {
+    'feedback.source': 'logs-listing',
+    'feedback.owner': 'performance',
+  },
+};
+
+function LogsHeader() {
+  const pageId = useQueryParamsId();
+  const title = useQueryParamsTitle();
+  const organization = useOrganization();
+  const {data: savedQuery} = useGetSavedQuery(pageId);
+
+  useVisitQuery(pageId);
+
+  const hasSavedQueryTitle =
+    defined(pageId) && defined(savedQuery) && savedQuery.name.length > 0;
+
+  const documentTitle = hasSavedQueryTitle ? (
+    <SentryDocumentTitle
+      title={`${savedQuery.name} — ${t('Logs')}`}
+      orgSlug={organization?.slug}
+    />
+  ) : null;
+
+  return (
+    <Fragment>
+      {documentTitle}
+      {defined(pageId) && title ? (
+        <ExploreSavedQueryBreadcrumbs
+          surface="logs"
+          savedQueryId={pageId}
+          title={title}
+        />
+      ) : (
+        <TopBar.Slot
+          name="breadcrumbs"
+          title={{
+            type: 'page-title',
+            label: title || t('Logs'),
+            labelTooltip: (
+              <DocumentationHint docsUrl="https://docs.sentry.io/product/explore/logs/">
+                {t(
+                  'Detailed structured logs, linked to errors and traces, for debugging and investigation.'
+                )}
+              </DocumentationHint>
+            ),
+          }}
+        />
+      )}
+      <TopBar.Slot name="feedback">
+        <FeedbackButton
+          feedbackOptions={logsFeedbackOptions}
+          aria-label={t('Give Feedback')}
+          tooltipProps={{title: t('Give Feedback')}}
+        >
+          {null}
+        </FeedbackButton>
+      </TopBar.Slot>
+    </Fragment>
+  );
+}

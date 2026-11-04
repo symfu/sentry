@@ -1,0 +1,25 @@
+import {useState} from 'react';
+import {IconClose} from '@sentry/icons/close';
+
+import {Alert} from '@sentry/scraps/alert';
+import {Button} from '@sentry/scraps/button';
+
+export function DismissableInfoAlert({children}: {children: React.ReactNode}) {
+  const [dismissed, setDismissed] = useState(false);
+  return dismissed ? null : (
+    <Alert
+      variant="info"
+      trailingItems={
+        <Button
+          aria-label="Dismiss banner"
+          icon={<IconClose variant="accent" />}
+          variant="transparent"
+          onClick={() => setDismissed(true)}
+          size="zero"
+        />
+      }
+    >
+      {children}
+    </Alert>
+  );
+}

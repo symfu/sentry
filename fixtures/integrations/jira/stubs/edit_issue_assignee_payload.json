@@ -1,0 +1,27 @@
+{
+  "changelog": {
+    "items": [
+      {
+        "to": "admin",
+        "field": "assignee",
+        "toString": "Jess MacQueen",
+        "from": null,
+        "fromString": null,
+        "fieldtype": "jira",
+        "fieldId": "assignee"
+      }
+    ],
+    "id": "10172"
+  },
+  "issue": {
+    "id": "101",
+    "fields": {
+      "assignee": {
+        "emailAddress": "jess@sentry.io",
+        "accountId": "deadbeef123"
+      },
+      "updated": "2023-01-01T00:00:00.000+0000"
+    },
+    "key": "APP-123"
+  }
+}

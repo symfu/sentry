@@ -1,20 +1,63 @@
-import responses
-
+from collections.abc import Generator
+from unittest import mock
+from unittest.mock import call, patch
 from urllib.parse import urlencode
 
-from sentry.models import Integration
-from sentry.integrations.msteams.client import MsTeamsClient
-from sentry.testutils import TestCase
-from sentry.utils.compat.mock import patch
+import pytest
+import responses
+from django.test import override_settings
+from requests import Request
+
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.msteams.client import MsTeamsClient, OAuthMsTeamsClient, get_token_data
+from sentry.integrations.msteams.metrics import record_lifecycle_termination_level
+from sentry.shared_integrations.exceptions import (
+    ApiError,
+    ApiHostError,
+    ApiInvalidRequestError,
+    IntegrationError,
+)
+from sentry.silo.base import SiloMode
+from sentry.silo.util import (
+    PROXY_BASE_PATH,
+    PROXY_BASE_URL_HEADER,
+    PROXY_OI_HEADER,
+    PROXY_PATH,
+    PROXY_SIGNATURE_HEADER,
+)
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.silo import control_silo_test
+from tests.sentry.integrations.test_helpers import add_control_silo_proxy_response
 
 
+@control_silo_test
 class MsTeamsClientTest(TestCase):
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _setup_metric_patch(self) -> Generator[None]:
+        with mock.patch("sentry.shared_integrations.client.base.metrics") as self.metrics:
+            yield
+
+    def setUp(self) -> None:
         self.expires_at = 1594768808
-        self.integration = Integration.objects.create(
+        self.organization = self.create_organization(owner=self.user)
+        self.integration = self.create_integration(
+            organization=self.organization,
             provider="msteams",
+            external_id="foobar",
             name="my_team",
-            metadata={"access_token": "my_token", "expires_at": self.expires_at},
+            metadata={
+                "access_token": "my_token",
+                "expires_at": self.expires_at,
+                "service_url": "https://smba.trafficmanager.net/amer/",
+            },
+        )
+
+        responses.add(
+            responses.GET,
+            "https://smba.trafficmanager.net/amer/v3/teams/foobar/conversations",
+            json={},
         )
 
         # token mock
@@ -25,14 +68,14 @@ class MsTeamsClientTest(TestCase):
             json=access_json,
         )
 
-        self.client = MsTeamsClient(self.integration)
+        self.msteams_client = MsTeamsClient(self.integration)
 
     @responses.activate
-    def test_token_refreshes(self):
+    def test_token_refreshes(self) -> None:
         with patch("time.time") as mock_time:
             mock_time.return_value = self.expires_at
             # accessing the property should refresh the token
-            self.client.access_token
+            self.msteams_client.access_token
             body = responses.calls[0].request.body
             assert body == urlencode(
                 {
@@ -47,18 +90,328 @@ class MsTeamsClientTest(TestCase):
             assert integration.metadata == {
                 "access_token": "my_new_token",
                 "expires_at": self.expires_at + 86399 - 60 * 5,
+                "service_url": "https://smba.trafficmanager.net/amer/",
             }
 
     @responses.activate
-    def test_no_token_refresh(self):
+    def test_token_refreshes_with_integration_not_found(self) -> None:
+        self.integration.delete()
+        with patch("time.time") as mock_time:
+            mock_time.return_value = self.expires_at
+            # accessing the property should refresh the token
+            with pytest.raises(IntegrationError):
+                self.msteams_client.access_token
+
+    @responses.activate
+    def test_no_token_refresh(self) -> None:
         with patch("time.time") as mock_time:
             mock_time.return_value = self.expires_at - 100
             # accessing the property should refresh the token
-            self.client.access_token
+            self.msteams_client.access_token
             assert not responses.calls
 
             integration = Integration.objects.get(provider="msteams")
             assert integration.metadata == {
                 "access_token": "my_token",
                 "expires_at": self.expires_at,
+                "service_url": "https://smba.trafficmanager.net/amer/",
             }
+
+    @responses.activate
+    def test_records_client_secret_expiry_gauge(self) -> None:
+        with (
+            patch("sentry.integrations.msteams.client.metrics") as mock_metrics,
+            self.options({"msteams.client-secret-expires-at": "2020-09-01T00:00:00Z"}),
+            freeze_time("2020-08-01T00:00:00Z"),
+        ):
+            get_token_data()
+
+            # 2020-08-01 -> 2020-09-01 is 31 days.
+            mock_metrics.gauge.assert_called_once_with(
+                "integrations.msteams.client_secret.seconds_until_expiry",
+                31 * 24 * 60 * 60,
+                sample_rate=0.01,
+            )
+
+    @responses.activate
+    def test_skips_client_secret_expiry_gauge_when_unset(self) -> None:
+        with patch("sentry.integrations.msteams.client.metrics") as mock_metrics:
+            get_token_data()
+            mock_metrics.gauge.assert_not_called()
+
+    @responses.activate
+    def test_skips_client_secret_expiry_gauge_when_invalid(self) -> None:
+        with (
+            patch("sentry.integrations.msteams.client.metrics") as mock_metrics,
+            self.options({"msteams.client-secret-expires-at": "not-a-date"}),
+        ):
+            get_token_data()
+            mock_metrics.gauge.assert_not_called()
+
+    @responses.activate
+    def test_simple(self) -> None:
+        self.msteams_client.get_channel_list("foobar")
+        assert len(responses.calls) == 2
+        token_request = responses.calls[0].request
+
+        # Token request
+        assert (
+            "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+            == token_request.url
+        )
+
+        # API request to service url
+        request = responses.calls[1].request
+        assert "https://smba.trafficmanager.net/amer/v3/teams/foobar/conversations" == request.url
+        assert self.msteams_client.base_url in request.url
+
+        # Check if metrics is generated properly
+        calls = [
+            call("integrations.http_request", sample_rate=1.0, tags={"integration": "msteams"}),
+            call("integrations.http_request", sample_rate=1.0, tags={"integration": "msteams"}),
+            call(
+                "integrations.http_response",
+                sample_rate=1.0,
+                tags={"integration": "msteams", "status": 200},
+            ),
+            call(
+                "integrations.http_response",
+                sample_rate=1.0,
+                tags={"integration": "msteams", "status": 200},
+            ),
+        ]
+        assert self.metrics.incr.mock_calls == calls
+
+    @responses.activate
+    def test_invalid_request_records_failure(self) -> None:
+        lifecycle = mock.MagicMock()
+
+        record_lifecycle_termination_level(lifecycle, ApiInvalidRequestError("Invalid request"))
+
+        lifecycle.record_failure.assert_called_once()
+        lifecycle.record_halt.assert_not_called()
+
+    @responses.activate
+    def test_bad_syntax_records_halt(self) -> None:
+        lifecycle = mock.MagicMock()
+        error = ApiInvalidRequestError(
+            '{"error":{"code":"BadSyntax","message":"Bad format of conversation ID"}}'
+        )
+
+        record_lifecycle_termination_level(lifecycle, error)
+
+        lifecycle.record_halt.assert_called_once()
+        lifecycle.record_failure.assert_not_called()
+
+    @responses.activate
+    def test_integration_error_records_failure(self) -> None:
+        lifecycle = mock.MagicMock()
+
+        record_lifecycle_termination_level(lifecycle, IntegrationError("nope"))
+
+        lifecycle.record_failure.assert_called_once()
+        lifecycle.record_halt.assert_not_called()
+
+    @responses.activate
+    @patch("sentry.integrations.msteams.client.IntegrationProxyClient.request")
+    def test_conversation_not_found_is_invalid_request(self, mock_request: mock.MagicMock) -> None:
+        mock_request.side_effect = ApiError(
+            '{"error":{"code":"ConversationNotFound","message":"Conversation not found."}}',
+            code=404,
+        )
+
+        with pytest.raises(ApiInvalidRequestError):
+            self.msteams_client.get_channel_list("foobar")
+
+    @responses.activate
+    @patch("sentry.integrations.msteams.client.IntegrationProxyClient.request")
+    def test_bad_syntax_is_invalid_request(self, mock_request: mock.MagicMock) -> None:
+        mock_request.side_effect = ApiError(
+            '{"error":{"code":"BadSyntax","message":"Bad format of conversation ID"}}',
+            code=400,
+        )
+
+        with pytest.raises(ApiInvalidRequestError):
+            self.msteams_client.get_channel_list("foobar")
+
+    @responses.activate
+    @patch("sentry.integrations.msteams.client.IntegrationProxyClient.request")
+    def test_unknown_api_error_is_integration_error(self, mock_request: mock.MagicMock) -> None:
+        mock_request.side_effect = ApiError(
+            '{"error":{"code":"SomeOtherError","message":"nope"}}',
+            code=500,
+        )
+
+        with pytest.raises(IntegrationError):
+            self.msteams_client.get_channel_list("foobar")
+
+    @responses.activate
+    @patch("sentry.integrations.msteams.client.IntegrationProxyClient.request")
+    def test_raw_response_preserves_transport_error(self, mock_request: mock.MagicMock) -> None:
+        error = ApiHostError("Unable to reach host")
+        mock_request.side_effect = error
+
+        with pytest.raises(ApiHostError) as exc_info:
+            self.msteams_client.request("GET", "/", raw_response=True)
+
+        assert exc_info.value is error
+
+    @responses.activate
+    def test_api_client_from_integration_installation(self) -> None:
+        installation = self.integration.get_installation(organization_id=self.organization.id)
+        client = installation.get_client()
+        assert isinstance(client, MsTeamsClient)
+
+        client.get_channel_list("foobar")
+        assert len(responses.calls) == 2
+        token_request = responses.calls[0].request
+
+        # Token request
+        assert (
+            "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+            == token_request.url
+        )
+
+        # API request to service url
+        request = responses.calls[1].request
+        assert "https://smba.trafficmanager.net/amer/v3/teams/foobar/conversations" == request.url
+        assert self.msteams_client.base_url in request.url
+
+        # Check if metrics is generated properly
+        calls = [
+            call("integrations.http_request", sample_rate=1.0, tags={"integration": "msteams"}),
+            call("integrations.http_request", sample_rate=1.0, tags={"integration": "msteams"}),
+            call(
+                "integrations.http_response",
+                sample_rate=1.0,
+                tags={"integration": "msteams", "status": 200},
+            ),
+            call(
+                "integrations.http_response",
+                sample_rate=1.0,
+                tags={"integration": "msteams", "status": 200},
+            ),
+        ]
+        assert self.metrics.incr.mock_calls == calls
+
+
+def assert_proxy_request(request: Request, is_proxy: bool = True) -> None:
+    assert (PROXY_BASE_PATH in request.url) == is_proxy
+    assert (PROXY_OI_HEADER in request.headers) == is_proxy
+    assert (PROXY_SIGNATURE_HEADER in request.headers) == is_proxy
+    assert ("Authorization" in request.headers) != is_proxy
+    if is_proxy:
+        assert request.headers[PROXY_OI_HEADER] is not None
+
+
+@override_settings(
+    SENTRY_SUBNET_SECRET="hush-hush-im-invisible",
+    SENTRY_CONTROL_ADDRESS="http://controlserver",
+)
+class MsTeamsProxyApiClientTest(TestCase):
+    def setUp(self) -> None:
+        self.expires_at = 1594768808
+        self.organization = self.create_organization(owner=self.user)
+        self.integration = self.create_integration(
+            organization=self.organization,
+            provider="msteams",
+            external_id="foobar",
+            name="my_team",
+            metadata={
+                "access_token": "my_token",
+                "expires_at": self.expires_at,
+                "service_url": "https://smba.trafficmanager.net/amer/",
+            },
+        )
+
+        access_json = {"expires_in": 86399, "access_token": "my_new_token"}
+        responses.add(
+            responses.POST,
+            "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+            json=access_json,
+        )
+        responses.add(
+            responses.GET,
+            "https://smba.trafficmanager.net/amer/v3/teams/foobar/conversations",
+            json={},
+        )
+        self.control_proxy_response = add_control_silo_proxy_response(
+            method=responses.GET,
+            path="v3/teams/foobar/conversations",
+            json={},
+        )
+
+    @responses.activate
+    def test_integration_proxy_is_active(self) -> None:
+        class MsTeamsProxyApiTestClient(MsTeamsClient):
+            _use_proxy_url_for_tests = True
+
+        with override_settings(SILO_MODE=SiloMode.MONOLITH):
+            client = MsTeamsProxyApiTestClient(self.integration)
+            client.get_channel_list("foobar")
+            assert len(responses.calls) == 2
+            token_request = responses.calls[0].request
+
+            # Token request
+            assert (
+                "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+                == token_request.url
+            )
+
+            # API request to service url
+            request = responses.calls[1].request
+            assert (
+                "https://smba.trafficmanager.net/amer/v3/teams/foobar/conversations" == request.url
+            )
+            assert client.base_url in request.url
+            assert_proxy_request(request, is_proxy=False)
+
+        responses.calls.reset()
+        with override_settings(SILO_MODE=SiloMode.CONTROL):
+            client = MsTeamsProxyApiTestClient(self.integration)
+            client.get_channel_list("foobar")
+            assert len(responses.calls) == 2
+            token_request = responses.calls[0].request
+
+            # Token request
+            assert (
+                "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+                == token_request.url
+            )
+
+            # API request to service url
+            request = responses.calls[1].request
+            assert (
+                "https://smba.trafficmanager.net/amer/v3/teams/foobar/conversations" == request.url
+            )
+            assert client.base_url in request.url
+            assert_proxy_request(request, is_proxy=False)
+
+        responses.calls.reset()
+        with override_settings(SILO_MODE=SiloMode.CELL):
+            client = MsTeamsProxyApiTestClient(self.integration)
+            client.get_channel_list("foobar")
+            assert len(responses.calls) == 1
+
+            # API request to service url
+            request = responses.calls[0].request
+            assert self.control_proxy_response.call_count == 1
+            assert request.headers[PROXY_PATH] == "v3/teams/foobar/conversations"
+            assert request.headers[PROXY_BASE_URL_HEADER] == "https://smba.trafficmanager.net/amer"
+            assert client.base_url not in request.url
+            assert_proxy_request(request, is_proxy=True)
+
+
+@control_silo_test
+class OAuthMsTeamsClientTest(TestCase):
+    def test_defaults_to_botframework_authority(self) -> None:
+        client = OAuthMsTeamsClient("client-id", "client-secret")
+        assert client.base_url == "https://login.microsoftonline.com/botframework.com"
+
+    @override_options({"msteams.tenant-id": "00000000-1111-2222-3333-444444444444"})
+    def test_uses_tenant_authority_when_configured(self) -> None:
+        client = OAuthMsTeamsClient("client-id", "client-secret")
+        assert (
+            client.base_url
+            == "https://login.microsoftonline.com/00000000-1111-2222-3333-444444444444"
+        )

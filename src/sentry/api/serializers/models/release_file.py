@@ -1,14 +1,72 @@
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TypedDict
+
+from django.contrib.auth.models import AnonymousUser
+
 from sentry.api.serializers import Serializer, register
-from sentry.models import ReleaseFile
+from sentry.models.distribution import Distribution
+from sentry.models.releasefile import ReleaseFile
+from sentry.users.models.user import User
+from sentry.users.services.user.model import RpcUser
+
+
+class ReleaseFileSerializerResponse(TypedDict):
+    id: str | bytes | None
+    name: str
+    dist: str | None
+    headers: dict[str, object]
+    size: int | None
+    sha1: str | None
+    dateCreated: datetime
+
+
+def encode_release_file_id(obj: ReleaseFile) -> str | bytes | None:
+    """Generate ID for artifacts that only exist in a bundle
+
+    This ID is only unique per release.
+
+    We use the name of the release file because it is also the key for lookups
+    in ArtifactIndex. To prevent any urlencode confusion, we base64 encode it.
+
+    """
+    if obj.id:
+        return str(obj.id)
+    if obj.name:
+        dist_name = ""
+        if obj.dist_id:
+            dist_name = Distribution.objects.get(pk=obj.dist_id).name
+        return urlsafe_b64encode(f"{dist_name}_{obj.name}".encode())
+    return None
+
+
+def decode_release_file_id(id: str) -> int | tuple[str | None, str]:
+    """May raise ValueError"""
+    try:
+        return int(id)
+    except ValueError:
+        decoded = urlsafe_b64decode(id).decode()
+        dist, url = decoded.split("_", 1)
+        return dist or None, url
 
 
 @register(ReleaseFile)
-class ReleaseFileSerializer(Serializer):
-    def serialize(self, obj, attrs, user):
+class ReleaseFileSerializer(Serializer[ReleaseFileSerializerResponse]):
+    def serialize(
+        self,
+        obj: ReleaseFile,
+        attrs: Mapping[object, object],
+        user: User | RpcUser | AnonymousUser,
+        **kwargs: object,
+    ) -> ReleaseFileSerializerResponse:
+        dist_name = None
+        if obj.dist_id:
+            dist_name = Distribution.objects.get(pk=obj.dist_id).name
         return {
-            "id": str(obj.id),
+            "id": encode_release_file_id(obj),
             "name": obj.name,
-            "dist": obj.dist_id and obj.dist.name or None,
+            "dist": dist_name,
             "headers": obj.file.headers,
             "size": obj.file.size,
             "sha1": obj.file.checksum,

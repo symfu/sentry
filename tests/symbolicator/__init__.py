@@ -1,14 +1,13 @@
-import os
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, cast
 
-
+from sentry.db.models.fields.node import NodeData
+from sentry.testutils.pytest.fixtures import InstaSnapshotter
 from sentry.utils.safe import get_path
 
 
-def get_fixture_path(name):
-    return os.path.join(os.path.dirname(__file__), os.pardir, "fixtures", "native", name)
-
-
-def strip_frame(frame):
+def strip_frame(frame: Mapping[str, object] | None) -> Mapping[str, object] | None:
     if frame:
         frame = {
             "data": {
@@ -27,24 +26,63 @@ def strip_frame(frame):
     return frame
 
 
-def strip_stacktrace(stacktrace):
+def strip_stacktrace(
+    stacktrace: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
     if stacktrace:
-        stacktrace = dict(stacktrace)
-        stacktrace["frames"] = [strip_frame(x) for x in stacktrace.get("frames") or ()]
+        result = dict(stacktrace)
+        result["frames"] = [
+            strip_frame(cast(Mapping[str, object] | None, x))
+            for x in cast(Sequence[object], stacktrace.get("frames") or ())
+        ]
+        try:
+            registers = cast(Mapping[str, object], stacktrace["registers"])
+        except KeyError:
+            pass
+        else:
+            result["registers"] = {k: v for k, v in registers.items()}
+        return result
 
     return stacktrace
 
 
-def strip_stacktrace_container(container):
+STRIP_TRAILING_ADDR_RE = re.compile(" ?/ 0x[0-9a-fA-F]+$")
+SNAPSHOT_CONTEXTS_TO_STRIP = frozenset(("reprocessing", "trace"))
+
+
+def strip_trailing_addr(value: str) -> str:
+    return STRIP_TRAILING_ADDR_RE.sub("", value)
+
+
+def normalize_native_exception(
+    exc: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    if exc:
+        normalized = dict(exc)
+        normalized["type"] = strip_trailing_addr(cast(str, exc["type"]))
+        normalized["value"] = strip_trailing_addr(cast(str, exc["value"]))
+        return normalized
+
+    return exc
+
+
+def strip_stacktrace_container(
+    container: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
     if container:
-        container = dict(container)
-        container["stacktrace"] = strip_stacktrace(container.get("stacktrace"))
-        container["raw_stacktrace"] = strip_stacktrace(container.get("raw_stacktrace"))
+        result = dict(container)
+        result["stacktrace"] = strip_stacktrace(
+            cast(Mapping[str, object] | None, container.get("stacktrace"))
+        )
+        result["raw_stacktrace"] = strip_stacktrace(
+            cast(Mapping[str, object] | None, container.get("raw_stacktrace"))
+        )
+        return result
 
     return container
 
 
-def insta_snapshot_stacktrace_data(self, event, **kwargs):
+def insta_snapshot_native_stacktrace_data(self: Any, event: NodeData, **kwargs: Any) -> None:
     # limit amount of data going into a snapshot so that they don't break all
     # the time due to unrelated changes.
     self.insta_snapshot(
@@ -52,7 +90,7 @@ def insta_snapshot_stacktrace_data(self, event, **kwargs):
             "stacktrace": strip_stacktrace(event.get("stacktrace")),
             "exception": {
                 "values": [
-                    strip_stacktrace_container(x)
+                    normalize_native_exception(strip_stacktrace_container(x))
                     for x in get_path(event, "exception", "values") or ()
                 ]
             },
@@ -64,10 +102,41 @@ def insta_snapshot_stacktrace_data(self, event, **kwargs):
             },
             "debug_meta": event.get("debug_meta"),
             "contexts": {
-                k: v for k, v in (event.get("contexts") or {}).items() if k != "reprocessing"
+                k: v
+                for k, v in (event.get("contexts") or {}).items()
+                if k not in SNAPSHOT_CONTEXTS_TO_STRIP
             }
             or None,
             "errors": [e for e in event.get("errors") or () if e.get("name") != "timestamp"],
         },
         **kwargs,
     )
+
+
+def insta_snapshot_javascript_stacktrace_data(
+    insta_snapshot: InstaSnapshotter, event: NodeData
+) -> None:
+    # limit amount of data going into a snapshot so that they don't break all
+    # the time due to unrelated changes.
+    insta_snapshot(
+        {
+            "exception": {"values": [x for x in get_path(event, "exception", "values") or ()]},
+            "errors": [e for e in event.get("errors") or () if e.get("name") != "timestamp"],
+        }
+    )
+
+
+def redact_location(candidates: Iterable[dict[str, object]]) -> None:
+    """Redacts the sentry location URI to be independent of the specific ID.
+
+    This modifies the data passed in, returns None.
+    """
+    location_re = re.compile("^sentry://project_debug_file/[0-9]+$")
+    for candidate in candidates:
+        try:
+            location = candidate["location"]
+        except KeyError:
+            continue
+        else:
+            if location_re.search(cast(str, location)):
+                candidate["location"] = "sentry://project_debug_file/x"

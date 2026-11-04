@@ -1,0 +1,1025 @@
+import {MutableSearch, TokenType} from 'sentry/utils/tokenizeSearch';
+
+describe('utils/tokenizeSearch', () => {
+  describe('MutableSearch.fromQueryObject', () => {
+    it.each([
+      [{transaction: '/index'}, 'transaction:/index'],
+      [{transaction: '/index', has: 'span.domain'}, 'transaction:/index has:span.domain'],
+      [{transaction: '/index', 'span.domain': undefined}, 'transaction:/index'],
+      [{'span.domain': '*hello*'}, 'span.domain:*hello*'],
+      [{'span.description': '*hello*'}, 'span.description:*hello*'],
+      [{'span.duration': ['>0', '<100']}, 'span.duration:>0 span.duration:<100'],
+      [{transaction: '(empty)'}, '!has:transaction'],
+    ])('converts %s to search string', (query, result) => {
+      expect(MutableSearch.fromQueryObject(query).formatString()).toEqual(result);
+    });
+  });
+
+  describe('new MutableSearch()', () => {
+    const cases = [
+      {
+        name: 'should convert a basic query string to a query object',
+        string: 'is:unresolved',
+        object: {
+          tokens: [{type: TokenType.FILTER, key: 'is', value: 'unresolved'}],
+        },
+      },
+      {
+        name: 'should convert quoted strings',
+        string: 'is:unresolved browser:"Chrome 36"',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'is', value: 'unresolved'},
+            {type: TokenType.FILTER, key: 'browser', value: 'Chrome 36'},
+          ],
+        },
+      },
+      {
+        name: 'should populate the text query',
+        string: 'python is:unresolved browser:"Chrome 36"',
+        object: {
+          tokens: [
+            {type: TokenType.FREE_TEXT, value: 'python'},
+            {type: TokenType.FILTER, key: 'is', value: 'unresolved'},
+            {type: TokenType.FILTER, key: 'browser', value: 'Chrome 36'},
+          ],
+        },
+      },
+      {
+        name: 'should tokenize the text query',
+        string: 'python   exception',
+        object: {
+          tokens: [
+            {type: TokenType.FREE_TEXT, value: 'python'},
+            {type: TokenType.FREE_TEXT, value: 'exception'},
+          ],
+        },
+      },
+      {
+        name: 'should tokenize has condition',
+        string: 'has:user has:browser',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'has', value: 'user'},
+            {type: TokenType.FILTER, key: 'has', value: 'browser'},
+          ],
+        },
+      },
+      {
+        name: 'should tokenize !has condition',
+        string: '!has:user has:browser',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: '!has', value: 'user'},
+            {type: TokenType.FILTER, key: 'has', value: 'browser'},
+          ],
+        },
+      },
+      {
+        name: 'should remove spaces in the query',
+        string: 'python  is:unresolved exception',
+        object: {
+          tokens: [
+            {type: TokenType.FREE_TEXT, value: 'python'},
+            {type: TokenType.FILTER, key: 'is', value: 'unresolved'},
+            {type: TokenType.FREE_TEXT, value: 'exception'},
+          ],
+        },
+      },
+      {
+        name: 'should tokenize the quoted tags',
+        string: 'event.type:error title:"QueryExecutionError: Code: 141."',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'event.type', value: 'error'},
+            {
+              type: TokenType.FILTER,
+              key: 'title',
+              value: 'QueryExecutionError: Code: 141.',
+            },
+          ],
+        },
+      },
+      {
+        name: 'should tokenize words with :: in them',
+        string: 'key:Resque::DirtyExit',
+        object: {
+          tokens: [{type: TokenType.FILTER, key: 'key', value: 'Resque::DirtyExit'}],
+        },
+      },
+      {
+        name: 'tokens that begin with a colon are still queries',
+        string: 'country:canada :unresolved',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'country', value: 'canada'},
+            {type: TokenType.FREE_TEXT, value: ':unresolved'},
+          ],
+        },
+      },
+      {
+        name: 'correctly preserve boolean operators',
+        string: 'country:canada Or country:newzealand',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'country', value: 'canada'},
+            {type: TokenType.OPERATOR, value: 'OR'},
+            {type: TokenType.FILTER, key: 'country', value: 'newzealand'},
+          ],
+        },
+      },
+      {
+        name: 'correctly preserve parens',
+        string: '(country:canada Or country:newzealand) AnD province:pei',
+        object: {
+          tokens: [
+            {type: TokenType.OPERATOR, value: '('},
+            {type: TokenType.FILTER, key: 'country', value: 'canada'},
+            {type: TokenType.OPERATOR, value: 'OR'},
+            {type: TokenType.FILTER, key: 'country', value: 'newzealand'},
+            {type: TokenType.OPERATOR, value: ')'},
+            {type: TokenType.OPERATOR, value: 'AND'},
+            {type: TokenType.FILTER, key: 'province', value: 'pei'},
+          ],
+        },
+      },
+      {
+        name: 'query tags boolean and parens are all stitched back together correctly',
+        string: '(a:a OR (b:b AND c d e)) OR f g:g',
+        object: {
+          tokens: [
+            {type: TokenType.OPERATOR, value: '('},
+            {type: TokenType.FILTER, key: 'a', value: 'a'},
+            {type: TokenType.OPERATOR, value: 'OR'},
+            {type: TokenType.OPERATOR, value: '('},
+            {type: TokenType.FILTER, key: 'b', value: 'b'},
+            {type: TokenType.OPERATOR, value: 'AND'},
+            {type: TokenType.FREE_TEXT, value: 'c'},
+            {type: TokenType.FREE_TEXT, value: 'd'},
+            {type: TokenType.FREE_TEXT, value: 'e'},
+            {type: TokenType.OPERATOR, value: ')'},
+            {type: TokenType.OPERATOR, value: ')'},
+            {type: TokenType.OPERATOR, value: 'OR'},
+            {type: TokenType.FREE_TEXT, value: 'f'},
+            {type: TokenType.FILTER, key: 'g', value: 'g'},
+          ],
+        },
+      },
+      {
+        name: 'correctly preserve filters with functions',
+        string: 'country:>canada OR coronaFree():<newzealand',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'country', value: '>canada'},
+            {type: TokenType.OPERATOR, value: 'OR'},
+            {type: TokenType.FILTER, key: 'coronaFree()', value: '<newzealand'},
+          ],
+        },
+      },
+      {
+        name: 'correctly preserves leading/trailing escaped quotes',
+        string: 'a:"\\"a\\""',
+        object: {
+          tokens: [{type: TokenType.FILTER, key: 'a', value: '\\"a\\"'}],
+        },
+      },
+      {
+        name: 'correctly tokenizes escaped quotes',
+        string: 'a:"i \\" quote" b:"b\\"bb" c:"cc"',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'a', value: 'i \\" quote'},
+            {type: TokenType.FILTER, key: 'b', value: 'b\\"bb'},
+            {type: TokenType.FILTER, key: 'c', value: 'cc'},
+          ],
+        },
+      },
+      {
+        name: 'should handle explicit tags keys containing colons when quoted',
+        string: 'tags["foo:bar",string]:asdf',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'tags["foo:bar",string]', value: 'asdf'},
+          ],
+        },
+      },
+      {
+        name: 'should handle explicit typed tag keys containing colons',
+        string: 'tags[foo:bar,string]:asdf',
+        object: {
+          tokens: [{type: TokenType.FILTER, key: 'tags[foo:bar,string]', value: 'asdf'}],
+        },
+      },
+      {
+        name: 'should not split a bracketed list on whitespace between items',
+        string: 'span.op:pageload transaction:[/issues/, /issues/:groupId/] python',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'span.op', value: 'pageload'},
+            {
+              type: TokenType.FILTER,
+              key: 'transaction',
+              value: '[/issues/, /issues/:groupId/]',
+            },
+            {type: TokenType.FREE_TEXT, value: 'python'},
+          ],
+        },
+      },
+      {
+        name: 'should not split a bracketed list of quoted items on whitespace',
+        string: 'sentry.segment.name:["/issues/", "/issues/:groupId/"]',
+        object: {
+          tokens: [
+            {
+              type: TokenType.FILTER,
+              key: 'sentry.segment.name',
+              value: '["/issues/", "/issues/:groupId/"]',
+            },
+          ],
+        },
+      },
+      {
+        name: 'should ignore a closing bracket inside a quoted list item',
+        string: 'key:["a ]", b] c',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'key', value: '["a ]", b]'},
+            {type: TokenType.FREE_TEXT, value: 'c'},
+          ],
+        },
+      },
+      {
+        name: 'should treat an unclosed bracket as plain text',
+        string: 'key:[a, b c',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'key', value: '[a,'},
+            {type: TokenType.FREE_TEXT, value: 'b'},
+            {type: TokenType.FREE_TEXT, value: 'c'},
+          ],
+        },
+      },
+      {
+        name: 'should not let a later explicit tag key close an unclosed bracket',
+        string: 'key:[a, b tags[foo]:bar',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'key', value: '[a,'},
+            {type: TokenType.FREE_TEXT, value: 'b'},
+            {type: TokenType.FILTER, key: 'tags[foo]', value: 'bar'},
+          ],
+        },
+      },
+      {
+        name: 'should handle a nested list inside a bracketed list',
+        string: 'key:[[a, b], c] d',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'key', value: '[[a, b], c]'},
+            {type: TokenType.FREE_TEXT, value: 'd'},
+          ],
+        },
+      },
+      {
+        name: 'should not treat a bracket inside quotes as a list',
+        string: 'key:"[a, b" c',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'key', value: '[a, b'},
+            {type: TokenType.FREE_TEXT, value: 'c'},
+          ],
+        },
+      },
+      {
+        name: 'should keep an explicit typed key whole when it contains a space',
+        string: 'tags[foo, string]:bar span.op:pageload',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'tags[foo, string]', value: 'bar'},
+            {type: TokenType.FILTER, key: 'span.op', value: 'pageload'},
+          ],
+        },
+      },
+      {
+        name: 'should keep an explicit typed flag key whole when it contains a space',
+        string: 'flags[foo, number]:>10',
+        object: {
+          tokens: [{type: TokenType.FILTER, key: 'flags[foo, number]', value: '>10'}],
+        },
+      },
+      {
+        name: 'should keep an array membership typed key whole when it contains a space',
+        string: 'tags[foo[*], array]:x',
+        object: {
+          tokens: [{type: TokenType.FILTER, key: 'tags[foo[*], array]', value: 'x'}],
+        },
+      },
+      {
+        name: 'should not treat a bracket after a word ending in tags as a typed key',
+        string: 'mytags[a, b] c',
+        object: {
+          tokens: [
+            {type: TokenType.FREE_TEXT, value: 'mytags[a,'},
+            {type: TokenType.FREE_TEXT, value: 'b]'},
+            {type: TokenType.FREE_TEXT, value: 'c'},
+          ],
+        },
+      },
+      {
+        name: 'should keep splitting free text that contains a bracketed span',
+        string: 'foo [bar baz] qux',
+        object: {
+          tokens: [
+            {type: TokenType.FREE_TEXT, value: 'foo'},
+            {type: TokenType.FREE_TEXT, value: '[bar'},
+            {type: TokenType.FREE_TEXT, value: 'baz]'},
+            {type: TokenType.FREE_TEXT, value: 'qux'},
+          ],
+        },
+      },
+      {
+        name: 'should not let a stray bracket pair with the closer of a later list',
+        string: '[stray key:[a], b]',
+        object: {
+          tokens: [
+            {type: TokenType.FREE_TEXT, value: '[stray'},
+            {type: TokenType.FILTER, key: 'key', value: '[a],'},
+            {type: TokenType.FREE_TEXT, value: 'b]'},
+          ],
+        },
+      },
+      {
+        name: 'should tokenize around a stray bracket between two filters',
+        string: 'a:1 [stray b:[x], y] c:2',
+        object: {
+          tokens: [
+            {type: TokenType.FILTER, key: 'a', value: '1'},
+            {type: TokenType.FREE_TEXT, value: '[stray'},
+            {type: TokenType.FILTER, key: 'b', value: '[x],'},
+            {type: TokenType.FREE_TEXT, value: 'y]'},
+            {type: TokenType.FILTER, key: 'c', value: '2'},
+          ],
+        },
+      },
+      {
+        name: 'should handle quoted filter keys containing colons',
+        string: '"imaginary.attribute:made_up_key":asdf',
+        object: {
+          tokens: [
+            {
+              type: TokenType.FILTER,
+              key: 'imaginary.attribute:made_up_key',
+              value: 'asdf',
+            },
+          ],
+        },
+      },
+      {
+        name: 'should handle negated quoted filter keys containing colons',
+        string: '!"imaginary.attribute:made_up_key":asdf',
+        object: {
+          tokens: [
+            {
+              type: TokenType.FILTER,
+              key: '!imaginary.attribute:made_up_key',
+              value: 'asdf',
+            },
+          ],
+        },
+      },
+      {
+        name: 'should handle contains filter',
+        string: 'message:\uF00DContains\uF00D"test value"',
+        object: {
+          tokens: [
+            {type: TokenType.CONTAINS_FILTER, key: 'message', value: 'test value'},
+          ],
+        },
+      },
+      {
+        name: 'should keep a bracketed list whole behind a wildcard operator',
+        string: 'message:Contains[a, b] c',
+        object: {
+          tokens: [
+            {type: TokenType.CONTAINS_FILTER, key: 'message', value: '[a, b]'},
+            {type: TokenType.FREE_TEXT, value: 'c'},
+          ],
+        },
+      },
+      {
+        name: 'should handle starts with filter',
+        string: 'message:\uF00DStartsWith\uF00D"test value"',
+        object: {
+          tokens: [
+            {type: TokenType.STARTS_WITH_FILTER, key: 'message', value: 'test value'},
+          ],
+        },
+      },
+      {
+        name: 'should handle ends with filter',
+        string: 'message:\uF00DEndsWith\uF00D"test value"',
+        object: {
+          tokens: [
+            {type: TokenType.ENDS_WITH_FILTER, key: 'message', value: 'test value'},
+          ],
+        },
+      },
+      {
+        name: 'should handle trailing paren when quoted value contains parens',
+        string: '(key:"value with (parens)")',
+        object: {
+          tokens: [
+            {type: TokenType.OPERATOR, value: '('},
+            {type: TokenType.FILTER, key: 'key', value: 'value with (parens)'},
+            {type: TokenType.OPERATOR, value: ')'},
+          ],
+        },
+      },
+      {
+        name: 'should handle complex SQL-like query in quoted value with grouping parens',
+        string: '(span.category:db description:"SELECT * FROM users WHERE id = func(1)")',
+        object: {
+          tokens: [
+            {type: TokenType.OPERATOR, value: '('},
+            {type: TokenType.FILTER, key: 'span.category', value: 'db'},
+            {
+              type: TokenType.FILTER,
+              key: 'description',
+              value: 'SELECT * FROM users WHERE id = func(1)',
+            },
+            {type: TokenType.OPERATOR, value: ')'},
+          ],
+        },
+      },
+    ];
+
+    for (const {name, string, object} of cases) {
+      // https://github.com/jest-community/eslint-plugin-jest/issues/1940
+      // eslint-disable-next-line jest/valid-title
+      it(name, () => expect(new MutableSearch(string)).toEqual(object));
+    }
+  });
+
+  describe('regex filters', () => {
+    it('parses a regex filter with spaces and parens into a single token', () => {
+      const search = new MutableSearch('!message://(GET|POST) /api// level:error');
+
+      expect(search.tokens).toEqual([
+        {type: TokenType.REGEX_FILTER, key: '!message', value: '(GET|POST) /api'},
+        {type: TokenType.FILTER, key: 'level', value: 'error'},
+      ]);
+    });
+
+    it.each([
+      ['spaces and parens', 'message://(GET|POST) /api//'],
+      ['a negation', '!message://^ERROR \\d+//'],
+      ['an asterisk and quotes', 'message://^"a".*//'],
+      ['inner slashes', 'message://a//b//'],
+      ['a closing paren', 'message://(a b)// OR level:error'],
+    ])('round-trips a pattern with %s unchanged', (_name, query) => {
+      expect(new MutableSearch(query).formatString()).toBe(query);
+    });
+
+    it('splits a trailing paren group closer from the regex filter', () => {
+      const search = new MutableSearch('(message://a b//)');
+
+      expect(search.tokens).toEqual([
+        {type: TokenType.OPERATOR, value: '('},
+        {type: TokenType.REGEX_FILTER, key: 'message', value: 'a b'},
+        {type: TokenType.OPERATOR, value: ')'},
+      ]);
+    });
+
+    it('keeps a quoted literal that starts with the regex delimiter quoted', () => {
+      expect(new MutableSearch('url:"//a b//"').formatString()).toBe('url:"//a b//"');
+    });
+
+    it('quotes an added value that starts with the regex delimiter', () => {
+      const search = new MutableSearch('');
+      search.addFilterValue('url', '//a//');
+
+      expect(search.formatString()).toBe('url:"//a//"');
+    });
+
+    it('keeps a regex filter unescaped when another filter is added', () => {
+      const search = new MutableSearch('message://^ERROR.*//');
+      search.addFilterValue('level', 'error');
+
+      expect(search.formatString()).toBe('message://^ERROR.*// level:error');
+    });
+  });
+
+  describe('QueryResults operations', () => {
+    it('round-trips a bracketed list with whitespace between items unchanged', () => {
+      const query =
+        'span.op:pageload sentry.segment.name:["/issues/", "/issues/:groupId/"]';
+      expect(new MutableSearch(query).formatString()).toBe(query);
+    });
+
+    it('add tokens to query object', () => {
+      const results = new MutableSearch([]);
+
+      results.addStringFilter('a:a');
+      expect(results.formatString()).toBe('a:a');
+
+      results.addFilterValues('b', ['b']);
+      expect(results.formatString()).toBe('a:a b:b');
+
+      results.addFilterValues('c', ['c1', 'c2']);
+      expect(results.formatString()).toBe('a:a b:b c:c1 c:c2');
+
+      results.addFilterValues('d', ['d']);
+      expect(results.formatString()).toBe('a:a b:b c:c1 c:c2 d:d');
+
+      results.addFilterValues('e', ['e1*e2\\e3']);
+      expect(results.formatString()).toBe('a:a b:b c:c1 c:c2 d:d e:"e1\\*e2\\e3"');
+
+      results.addStringFilter('d:d2');
+      expect(results.formatString()).toBe('a:a b:b c:c1 c:c2 d:d e:"e1\\*e2\\e3" d:d2');
+    });
+
+    it('adds individual values to query object', () => {
+      const results = new MutableSearch([]);
+
+      results.addFilterValue('e', 'e1*e2\\e3');
+      expect(results.formatString()).toBe('e:"e1\\*e2\\e3"');
+    });
+
+    it('adds a list filter and quotes values that contain spaces', () => {
+      const results = new MutableSearch([]);
+
+      results.addFilterValueList('browser.name', ['Chrome', 'Chrome Mobile']);
+      results.addFilterValueList('user.geo.subregion', ['21', '154']);
+      expect(results.formatString()).toBe(
+        'browser.name:[Chrome,"Chrome Mobile"] user.geo.subregion:[21,154]'
+      );
+    });
+
+    it('quotes filter keys containing colons', () => {
+      const results = new MutableSearch([]);
+
+      results.addFilterValue('imaginary.attribute:made_up_key', 'asdf');
+      results.addFilterValue('!imaginary.attribute:made_up_key', 'fdsa');
+      results.addFilterValue('has', 'imaginary.attribute:made_up_key');
+      results.addFilterValue('!has', 'imaginary.attribute:made_up_key');
+
+      expect(results.formatString()).toBe(
+        '"imaginary.attribute:made_up_key":asdf ' +
+          '!"imaginary.attribute:made_up_key":fdsa ' +
+          'has:"imaginary.attribute:made_up_key" ' +
+          '!has:"imaginary.attribute:made_up_key"'
+      );
+    });
+
+    it('add text searches to query object', () => {
+      const results = new MutableSearch(['a:a']);
+
+      results.addFreeText('b');
+      expect(results.formatString()).toBe('a:a b');
+      expect(results.freeText).toEqual(['b']);
+
+      results.addFreeText('c');
+      expect(results.formatString()).toBe('a:a b c');
+      expect(results.freeText).toEqual(['b', 'c']);
+
+      results.addStringFilter('d:d').addFreeText('e');
+      expect(results.formatString()).toBe('a:a b c d:d e');
+      expect(results.freeText).toEqual(['b', 'c', 'e']);
+
+      results.freeText = ['x', 'y'];
+      expect(results.formatString()).toBe('a:a d:d x y');
+      expect(results.freeText).toEqual(['x', 'y']);
+
+      results.freeText = ['a b c'];
+      expect(results.formatString()).toBe('a:a d:d "a b c"');
+      expect(results.freeText).toEqual(['a b c']);
+
+      results.freeText = ['invalid literal for int() with base'];
+      expect(results.formatString()).toBe(
+        'a:a d:d "invalid literal for int() with base"'
+      );
+      expect(results.freeText).toEqual(['invalid literal for int() with base']);
+    });
+
+    it('add ops to query object', () => {
+      const results = new MutableSearch(['x', 'a:a', 'y']);
+
+      results.addOp('OR');
+      expect(results.formatString()).toBe('x a:a y OR');
+
+      results.addFreeText('z');
+      expect(results.formatString()).toBe('x a:a y OR z');
+
+      results
+        .addOp('(')
+        .addStringFilter('b:b')
+        .addOp('AND')
+        .addStringFilter('c:c')
+        .addOp(')');
+      expect(results.formatString()).toBe('x a:a y OR z ( b:b AND c:c )');
+    });
+
+    it('adds tags to query', () => {
+      const results = new MutableSearch(['tag:value']);
+
+      results.addStringFilter('new:too');
+      expect(results.formatString()).toBe('tag:value new:too');
+    });
+
+    it('setTag() replaces tags', () => {
+      const results = new MutableSearch(['tag:value']);
+
+      results.setFilterValues('tag', ['too']);
+      expect(results.formatString()).toBe('tag:too');
+    });
+
+    it('setTag() replaces tags in OR', () => {
+      let results = new MutableSearch([
+        '(',
+        'transaction:xyz',
+        'OR',
+        'transaction:abc',
+        ')',
+      ]);
+
+      results.setFilterValues('transaction', ['def']);
+      expect(results.formatString()).toBe('transaction:def');
+
+      results = new MutableSearch(['(transaction:xyz', 'OR', 'transaction:abc)']);
+      results.setFilterValues('transaction', ['def']);
+      expect(results.formatString()).toBe('transaction:def');
+    });
+
+    it('does not remove boolean operators after setting tag values', () => {
+      const results = new MutableSearch([
+        '(',
+        'start:xyz',
+        'AND',
+        'end:abc',
+        ')',
+        'OR',
+        '(',
+        'start:abc',
+        'AND',
+        'end:xyz',
+        ')',
+      ]);
+
+      results.setFilterValues('transaction', ['def']);
+      expect(results.formatString()).toBe(
+        '( start:xyz AND end:abc ) OR ( start:abc AND end:xyz ) transaction:def'
+      );
+    });
+
+    it('removes tags from query object', () => {
+      let results = new MutableSearch(['x', 'a:a', 'b:b']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('x b:b');
+
+      results = new MutableSearch(['a:a']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('');
+
+      results = new MutableSearch(['x', 'a:a', 'a:a2']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('x');
+
+      results = new MutableSearch(['a:a', 'OR', 'b:b']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('b:b');
+
+      results = new MutableSearch(['a:a', 'OR', 'a:a1', 'AND', 'b:b']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('b:b');
+
+      results = new MutableSearch(['(a:a', 'OR', 'b:b)']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('b:b');
+
+      results = new MutableSearch(['(a:a', 'OR', 'b:b', 'OR', 'y)']);
+      results.removeFilter('a');
+      expect(results.formatString()).toBe('( b:b OR y )');
+
+      results = new MutableSearch(['(a:a', 'OR', '(b:b1', 'OR', '(c:c', 'OR', 'b:b2)))']);
+      results.removeFilter('b');
+      expect(results.formatString()).toBe('( a:a OR c:c )');
+
+      results = new MutableSearch(['(((a:a', 'OR', 'b:b1)', 'OR', 'c:c)', 'OR', 'b:b2)']);
+      results.removeFilter('b');
+      expect(results.formatString()).toBe('( ( a:a OR c:c ) )');
+
+      results = new MutableSearch(['a:a', '(b:b1', 'OR', 'b:b2', 'OR', 'b:b3)', 'c:c']);
+      results.removeFilter('b');
+      expect(results.formatString()).toBe('a:a c:c');
+
+      results = new MutableSearch(['a:a', 'message:\uF00DContains\uF00D"test value"']);
+      results.removeFilter('message');
+      expect(results.formatString()).toBe('a:a');
+
+      results = new MutableSearch(['a:a', 'message:\uF00DStartsWith\uF00D"test value"']);
+      results.removeFilter('message');
+      expect(results.formatString()).toBe('a:a');
+
+      results = new MutableSearch(['a:a', 'message:\uF00DEndsWith\uF00D"test value"']);
+      results.removeFilter('message');
+      expect(results.formatString()).toBe('a:a');
+    });
+
+    it('can return the tag keys', () => {
+      const results = new MutableSearch(['tag:value', 'other:value', 'additional text']);
+
+      expect(results.getFilterKeys()).toEqual(['tag', 'other']);
+    });
+
+    it('getTagValues', () => {
+      const results = new MutableSearch([
+        'tag:value',
+        'other:value',
+        'tag:value2',
+        'additional text',
+      ]);
+      expect(results.getFilterValues('tag')).toEqual(['value', 'value2']);
+
+      expect(results.getFilterValues('nonexistent')).toEqual([]);
+    });
+
+    it('handles adding wildcard filters', () => {
+      const results = new MutableSearch(['a:a']);
+
+      results.addContainsFilterValue('b', 'b');
+      expect(results.formatString()).toBe('a:a b:\uF00DContains\uF00Db');
+
+      results.addStartsWithFilterValue('c', 'c');
+      expect(results.formatString()).toBe(
+        'a:a b:\uF00DContains\uF00Db c:\uF00DStartsWith\uF00Dc'
+      );
+
+      results.addEndsWithFilterValue('d', 'd');
+      expect(results.formatString()).toBe(
+        'a:a b:\uF00DContains\uF00Db c:\uF00DStartsWith\uF00Dc d:\uF00DEndsWith\uF00Dd'
+      );
+    });
+  });
+
+  describe('QueryResults.formatString', () => {
+    const cases = [
+      {
+        name: 'should convert a basic object to a query string',
+        object: new MutableSearch(['is:unresolved']),
+        string: 'is:unresolved',
+      },
+      {
+        name: 'should quote tags with spaces',
+        object: new MutableSearch(['is:unresolved', 'browser:"Chrome 36"']),
+        string: 'is:unresolved browser:"Chrome 36"',
+      },
+      {
+        name: 'should stringify the query',
+        object: new MutableSearch(['python', 'is:unresolved', 'browser:"Chrome 36"']),
+        string: 'python is:unresolved browser:"Chrome 36"',
+      },
+      {
+        name: 'should join tokenized queries',
+        object: new MutableSearch(['python', 'exception']),
+        string: 'python exception',
+      },
+      {
+        name: 'should quote tags with spaces',
+        object: new MutableSearch([
+          'oh',
+          'me',
+          'oh',
+          'my',
+          'browser:"Chrome 36"',
+          'browser:"Firefox 60"',
+        ]),
+        string: 'oh me oh my browser:"Chrome 36" browser:"Firefox 60"',
+      },
+      {
+        name: 'should quote tags with parens',
+        object: new MutableSearch([
+          'bad',
+          'things',
+          'repository_id:"UUID(\'long-value\')"',
+        ]),
+        string: 'bad things repository_id:"UUID(\'long-value\')"',
+      },
+      {
+        // values with quotes do not need to be quoted
+        // furthermore, timestamps contain colons
+        // but the backend currently does not support quoted date formats
+        name: 'should not quote tags with colon',
+        object: new MutableSearch(['bad', 'things', 'user:"id:123"']),
+        string: 'bad things user:id:123',
+      },
+      {
+        name: 'should escape quote tags with double quotes',
+        object: new MutableSearch([
+          'bad',
+          'things',
+          'name:"Ernest \\"Papa\\" Hemingway"',
+        ]),
+        string: 'bad things name:"Ernest \\"Papa\\" Hemingway"',
+      },
+      {
+        name: 'should include blank strings',
+        object: new MutableSearch(['bad', 'things', 'name:""']),
+        string: 'bad things name:""',
+      },
+      {
+        name: 'correctly preserve boolean operators',
+        object: new MutableSearch(['country:canada', 'OR', 'country:newzealand']),
+        string: 'country:canada OR country:newzealand',
+      },
+      {
+        name: 'correctly preserve parens',
+        object: new MutableSearch([
+          '(country:canada',
+          'OR',
+          'country:newzealand)',
+          'AND',
+          'province:pei',
+        ]),
+        string: '( country:canada OR country:newzealand ) AND province:pei',
+      },
+      {
+        name: 'query tags boolean and parens are all stitched back together correctly',
+        object: new MutableSearch([
+          '(a:a',
+          'OR',
+          '(b:b',
+          'AND',
+          'c',
+          'd',
+          'e))',
+          'OR',
+          'f',
+          'g:g',
+        ]),
+        string: '( a:a OR ( b:b AND c d e ) ) OR f g:g',
+      },
+      {
+        name: 'correctly preserve filters with functions',
+        object: new MutableSearch(['country:>canada', 'OR', 'coronaFree():<newzealand']),
+        string: 'country:>canada OR coronaFree():<newzealand',
+      },
+      {
+        name: 'preserves grouping parens after aggregate filters',
+        object: new MutableSearch(
+          '(transaction:"Example Transaction" count(span.duration):>100) AND is_transaction:1'
+        ),
+        string:
+          '( transaction:"Example Transaction" count(span.duration):>100 ) AND is_transaction:1',
+      },
+      {
+        name: 'preserves grouping parens when a quoted value ends with a backslash',
+        object: new MutableSearch('(key:"value\\\\")'),
+        string: '( key:"value\\\\" )',
+      },
+      {
+        name: 'should quote tags with parens and spaces',
+        object: new MutableSearch(['release:4.9.0 build (0.0.01)', 'error.handled:0']),
+        string: 'release:"4.9.0 build (0.0.01)" error.handled:0',
+      },
+      {
+        name: 'should not enclose the entire query in quotes if there are no spaces in brackets shorthand',
+        object: new MutableSearch(['transaction:[alpha,beta]']),
+        string: 'transaction:[alpha,beta]',
+      },
+      {
+        name: 'should not enclose the entire query in quotes if there are quotes around args',
+        object: new MutableSearch(['transaction:["alpha","beta"]']),
+        string: 'transaction:["alpha","beta"]',
+      },
+      {
+        name: 'should not enclose the entire query in quotes if some args are quoted in brackets',
+        object: new MutableSearch(['transaction:["alpha",beta]']),
+        string: 'transaction:["alpha",beta]',
+      },
+      {
+        name: 'should not enclose the entire query in quotes if there are spaces in quoted args',
+        object: new MutableSearch(['transaction:["this has a space",thisdoesnot]']),
+        string: 'transaction:["this has a space",thisdoesnot]',
+      },
+      {
+        name: 'should preserve quotes around bracket expressions when parsing and formatting',
+        object: new MutableSearch(['message:"[filtered]"']),
+        string: 'message:"[filtered]"',
+      },
+      {
+        name: 'should preserve quotes around bracket expressions when parsing and formatting',
+        object: new MutableSearch(['message:"[Filtered]"']),
+        string: 'message:"[Filtered]"',
+      },
+      {
+        name: 'should not add quotes to unquoted bracket expressions',
+        object: new MutableSearch(['message:[Test]']),
+        string: 'message:[Test]',
+      },
+      {
+        name: 'should not add quotes to unquoted bracket expressions',
+        object: new MutableSearch(['message:[test]']),
+        string: 'message:[test]',
+      },
+      {
+        name: 'should not add quotes to unquoted bracket expressions',
+        object: new MutableSearch(['message:[test,[test2]]']),
+        string: 'message:[test,[test2]]',
+      },
+      {
+        name: 'should preserve brackets within quoted strings when flattening',
+        object: new MutableSearch(['message:["[test]",test,[test2]]']),
+        string: 'message:["[test]",test,[test2]]',
+      },
+      {
+        name: 'should correctly handle nested brackets with quoted brackets inside',
+        object: new MutableSearch(['message:[test,"[nested]",other]']),
+        string: 'message:[test,"[nested]",other]',
+      },
+      {
+        name: 'should handle escaped quotes in array syntax correctly',
+        object: new MutableSearch(['message:["value with \\" escaped quote",other]']),
+        string: 'message:["value with \\" escaped quote",other]',
+      },
+      {
+        name: 'should handle complex escape sequences in array syntax correctly',
+        object: new MutableSearch([
+          'message:["value with \\\\\\" complex escape",other]',
+        ]),
+        string: 'message:["value with \\\\\\" complex escape",other]',
+      },
+      {
+        name: 'should leave escaped brackets as is',
+        object: new MutableSearch(['message:"[test, "[Filtered]"]"']),
+        string: 'message:"[test, "[Filtered]"]"',
+      },
+      {
+        name: 'handles contains filter',
+        object: new MutableSearch(['message:\uF00DContains\uF00D"test value"']),
+        string: 'message:\uF00DContains\uF00D"test value"',
+      },
+      {
+        name: 'handles starts with filter',
+        object: new MutableSearch(['message:\uF00DStartsWith\uF00D"test value"']),
+        string: 'message:\uF00DStartsWith\uF00D"test value"',
+      },
+      {
+        name: 'handles ends with filter',
+        object: new MutableSearch(['message:\uF00DEndsWith\uF00D"test value"']),
+        string: 'message:\uF00DEndsWith\uF00D"test value"',
+      },
+      {
+        name: 'should preserve grouping parens when quoted value contains parens',
+        object: new MutableSearch(['(key:"value with (parens)")']),
+        string: '( key:"value with (parens)" )',
+      },
+      {
+        name: 'should preserve complex query with SQL-like quoted value and grouping parens',
+        object: new MutableSearch([
+          '(span.category:db',
+          'description:"SELECT * FROM users WHERE id = func(1)")',
+        ]),
+        string:
+          '( span.category:db description:"SELECT * FROM users WHERE id = func(1)" )',
+      },
+    ];
+
+    for (const {name, string, object} of cases) {
+      // https://github.com/jest-community/eslint-plugin-jest/issues/1940
+      // eslint-disable-next-line jest/valid-title
+      it(name, () => expect(object.formatString()).toEqual(string));
+    }
+  });
+
+  describe('renameFilter', () => {
+    it('renames a simple filter key', () => {
+      const search = new MutableSearch('request.method:GET');
+      search.renameFilter('request.method', 'http.method');
+      expect(search.formatString()).toBe('http.method:GET');
+    });
+
+    it('renames negated filter keys', () => {
+      const search = new MutableSearch('!request.method:GET');
+      search.renameFilter('request.method', 'http.method');
+      expect(search.formatString()).toBe('!http.method:GET');
+    });
+
+    it('preserves OR grouping', () => {
+      const search = new MutableSearch('(request.method:GET OR request.method:POST)');
+      search.renameFilter('request.method', 'http.method');
+      expect(search.formatString()).toBe('( http.method:GET OR http.method:POST )');
+    });
+
+    it('does not rename unrelated keys', () => {
+      const search = new MutableSearch('request.method:GET browser:Chrome');
+      search.renameFilter('request.method', 'http.method');
+      expect(search.formatString()).toBe('http.method:GET browser:Chrome');
+    });
+
+    it('is a no-op when key is not present', () => {
+      const search = new MutableSearch('browser:Chrome');
+      search.renameFilter('request.method', 'http.method');
+      expect(search.formatString()).toBe('browser:Chrome');
+    });
+  });
+});

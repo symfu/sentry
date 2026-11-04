@@ -1,0 +1,533 @@
+from datetime import timedelta
+from types import UnionType
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
+
+from sentry.api.serializers import serialize
+from sentry.incidents.grouptype import (
+    MetricIssue,
+    MetricIssueDetectorHandler,
+    SessionsAggregate,
+    get_alert_type_from_aggregate_dataset,
+)
+from sentry.incidents.typings.metric_issue_evidence import MetricIssueOccurrenceResponse
+from sentry.incidents.utils.types import (
+    DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION,
+    ProcessedSubscriptionUpdate,
+)
+from sentry.issues.issue_occurrence import IssueOccurrence
+from sentry.services.eventstore.models import Event
+from sentry.snuba.dataset import Dataset
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.workflow_engine.models import DataCondition, DataPacket, DetectorState
+from sentry.workflow_engine.models.data_condition import Condition
+from sentry.workflow_engine.processors.data_packet import process_data_packet
+from tests.sentry.incidents.utils.test_metric_issue_base import BaseMetricIssueTest
+
+
+def assert_matches_typed_dict(value: Any, hint: Any, path: str = "$") -> None:
+    """Assert `value` has exactly the keys its TypedDict `hint` declares, recursively."""
+    origin, args = get_origin(hint), get_args(hint)
+    if is_typeddict(hint):
+        assert isinstance(value, dict), path
+        hints = get_type_hints(hint)
+        missing = hint.__required_keys__ - value.keys()
+        extra = value.keys() - hints.keys()
+        assert not missing and not extra, f"{path}: missing {missing}, extra {extra}"
+        for key, item in value.items():
+            assert_matches_typed_dict(item, hints[key], f"{path}.{key}")
+    elif origin is list:
+        assert isinstance(value, list), path
+        for index, item in enumerate(value):
+            assert_matches_typed_dict(item, args[0], f"{path}[{index}]")
+    elif origin is Literal:
+        assert value in args, path
+    elif origin is Union or origin is UnionType:
+        typed_dicts = [arg for arg in args if is_typeddict(arg)]
+        if isinstance(value, dict) and typed_dicts:
+            assert_matches_typed_dict(value, typed_dicts[0], path)
+
+
+@freeze_time()
+class TestEvaluateMetricDetector(BaseMetricIssueTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.handler = MetricIssueDetectorHandler(self.detector)
+
+    def generate_evidence_data(
+        self,
+        value: int,
+        detector_trigger: DataCondition,
+        extra_trigger: DataCondition | None = None,
+    ) -> dict[str, object]:
+        self.query_subscription.refresh_from_db()
+
+        conditions = [
+            {
+                "id": detector_trigger.id,
+                "type": detector_trigger.type,
+                "comparison": detector_trigger.comparison,
+                "condition_result": detector_trigger.condition_result.value,
+            },
+        ]
+
+        if extra_trigger:
+            conditions.append(
+                {
+                    "id": extra_trigger.id,
+                    "type": extra_trigger.type,
+                    "comparison": extra_trigger.comparison,
+                    "condition_result": extra_trigger.condition_result.value,
+                }
+            )
+
+        evidence_data = {
+            "detector_id": self.detector.id,
+            "value": value,
+            "alert_id": self.alert_rule.id,
+            "data_packet_source_id": str(self.query_subscription.id),
+            "conditions": conditions,
+            "config": self.detector.config,
+            "data_sources": [
+                {
+                    "id": str(self.data_source.id),
+                    "organization_id": str(self.organization.id),
+                    "type": self.data_source.type,
+                    "source_id": str(self.query_subscription.id),
+                    "query_obj": {
+                        "id": str(self.query_subscription.id),
+                        "status": self.query_subscription.status,
+                        "subscription": self.query_subscription.subscription_id,
+                        "snuba_query": {
+                            "id": str(self.snuba_query.id),
+                            "dataset": self.snuba_query.dataset,
+                            "query": self.snuba_query.query,
+                            "aggregate": self.snuba_query.aggregate,
+                            "time_window": self.snuba_query.time_window,
+                            "environment": self.environment.name,
+                            "event_types": ["error"],
+                            "extrapolation_mode": "unknown",
+                        },
+                    },
+                }
+            ],
+        }
+
+        return evidence_data
+
+    def verify_issue_occurrence(
+        self,
+        occurrence: IssueOccurrence,
+        evidence_data: dict[str, object],
+        detector_trigger: DataCondition,
+    ) -> None:
+        assert occurrence is not None
+        assert occurrence.issue_title == self.detector.name
+        assert occurrence.subtitle == self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=detector_trigger,
+            priority=detector_trigger.condition_result,
+        )
+        assert occurrence.evidence_data == evidence_data
+        assert occurrence.level == "error"
+        assert occurrence.priority == detector_trigger.condition_result
+        assert occurrence.assignee
+        assert occurrence.assignee.id == self.detector.owner_user_id
+
+    def test_metric_issue_occurrence(self) -> None:
+        value = self.critical_detector_trigger.comparison + 1
+        data_packet = self.create_subscription_packet(value)
+        evidence_data = self.generate_evidence_data(
+            value, self.critical_detector_trigger, self.warning_detector_trigger
+        )
+
+        occurrence = self.process_packet_and_return_result(data_packet)
+        assert isinstance(occurrence, IssueOccurrence)
+
+        self.verify_issue_occurrence(occurrence, evidence_data, self.critical_detector_trigger)
+
+    def test_warning_level(self) -> None:
+        value = self.warning_detector_trigger.comparison + 1
+        data_packet = self.create_subscription_packet(value)
+        evidence_data = self.generate_evidence_data(value, self.warning_detector_trigger)
+
+        occurrence = self.process_packet_and_return_result(data_packet)
+        assert isinstance(occurrence, IssueOccurrence)
+
+        self.verify_issue_occurrence(occurrence, evidence_data, self.warning_detector_trigger)
+
+    def test_does_not_trigger(self) -> None:
+        value = self.warning_detector_trigger.comparison - 1
+        data_packet = self.create_subscription_packet(value)
+        result = self.process_packet_and_return_result(data_packet)
+        assert result is None
+
+    def test_missing_detector_trigger(self) -> None:
+        value = self.critical_detector_trigger.comparison + 1
+        data_packet = self.create_subscription_packet(value)
+        DataCondition.objects.all().delete()
+        result = self.process_packet_and_return_result(data_packet)
+        assert result is None
+
+    def test_event_data_environment(self) -> None:
+        value = self.critical_detector_trigger.comparison + 1
+        data_packet = self.create_subscription_packet(value)
+        results = process_data_packet(data_packet, DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION)
+        evaluation_result = results[0][1][self.detector_group_key]
+        assert evaluation_result.data["event_data"] is not None
+        assert evaluation_result.data["event_data"]["environment"] == self.environment.name
+
+    def test_event_data_environment_unset(self) -> None:
+        self.snuba_query.environment = None
+        self.snuba_query.save()
+        value = self.critical_detector_trigger.comparison + 1
+        data_packet = self.create_subscription_packet(value)
+        results = process_data_packet(data_packet, DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION)
+        evaluation_result = results[0][1][self.detector_group_key]
+        assert evaluation_result.data["event_data"] is not None
+        assert evaluation_result.data["event_data"]["environment"] is None
+
+    def test_flipped_detector_trigger(self) -> None:
+        self.warning_detector_trigger.delete()
+        self.critical_detector_trigger.update(type=Condition.LESS)
+        value = self.critical_detector_trigger.comparison - 1
+        data_packet = self.create_subscription_packet(value)
+        evidence_data = self.generate_evidence_data(value, self.critical_detector_trigger)
+
+        occurrence = self.process_packet_and_return_result(data_packet)
+        assert isinstance(occurrence, IssueOccurrence)
+
+        self.verify_issue_occurrence(occurrence, evidence_data, self.critical_detector_trigger)
+
+
+class TestConstructTitle(TestEvaluateMetricDetector):
+    def test_title_critical(self) -> None:
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == f"Critical: Number of events in the last minute above {self.critical_detector_trigger.comparison}"
+        )
+
+    def test_title_warning(self) -> None:
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.warning_detector_trigger,
+            priority=self.warning_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == f"Warning: Number of events in the last minute above {self.warning_detector_trigger.comparison}"
+        )
+
+    def test_title_comparison_delta(self) -> None:
+        self.detector.config.update({"comparison_delta": 60 * 60})
+
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == "Critical: Number of events in the last minute greater than same time one hour ago"
+        )
+
+    def test_title_below_threshold(self) -> None:
+        self.warning_detector_trigger.type = Condition.LESS
+        self.warning_detector_trigger.save()
+
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.warning_detector_trigger,
+            priority=self.warning_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == f"Warning: Number of events in the last minute below {self.warning_detector_trigger.comparison}"
+        )
+
+    def test_title_different_aggregate(self) -> None:
+        self.snuba_query.aggregate = "count_unique(tags[sentry:user])"
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == f"Critical: Number of users affected in the last minute above {self.critical_detector_trigger.comparison}"
+        )
+
+        self.snuba_query.aggregate = "percentage(sessions_crashed, sessions)"
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == f"Critical: Crash free session rate in the last minute above {self.critical_detector_trigger.comparison}"
+        )
+
+    def test_title_equation_aggregate(self) -> None:
+        self.snuba_query.aggregate = (
+            'equation|count_if(`agent_name:"Agent Run"`,value,metric_name,distribution,none) * 2'
+        )
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert (
+            title
+            == f'Critical: count_if(`agent_name:"Agent Run"`,value,metric_name,distribution,none) * 2 in the last minute above {self.critical_detector_trigger.comparison}'
+        )
+
+    def test_dynamic_alert_title(self) -> None:
+        self.detector.config.update({"detection_type": "dynamic"})
+        self.snuba_query.aggregate = "count_unique(user)"
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert title == "Detected an anomaly in the query for users_experiencing_errors"
+
+        self.snuba_query.aggregate = "p95(transaction.duration)"
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert title == "Detected an anomaly in the query for custom_transactions"
+
+    def test_dynamic_alert_title_default(self) -> None:
+        self.detector.config.update({"detection_type": "dynamic"})
+        self.snuba_query.dataset = "asdf"
+        self.snuba_query.aggregate = "default_aggregate"
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert title == "Detected an anomaly in the query for default_aggregate"
+
+    def test_dynamic_alert_title_equation(self) -> None:
+        self.detector.config.update({"detection_type": "dynamic"})
+        self.snuba_query.aggregate = (
+            'equation|count_if(`agent_name:"Agent Run"`,value,metric_name,distribution,none) * 2'
+        )
+        self.snuba_query.dataset = Dataset.EventsAnalyticsPlatform.value
+        title = self.handler.construct_title(
+            snuba_query=self.snuba_query,
+            detector_trigger=self.critical_detector_trigger,
+            priority=self.critical_detector_trigger.condition_result,
+        )
+        assert title == "Detected an anomaly in the query for eap_metrics"
+
+
+class TestGetAnomalyDetectionIssueTitle(TestCase):
+    def test_extract_lcp_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset("p95(measurements.lcp)", Dataset.Transactions)
+            == "lcp"
+        )
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                "percentile(measurements.lcp,0.7)", Dataset.Transactions
+            )
+            == "lcp"
+        )
+        assert (
+            get_alert_type_from_aggregate_dataset("avg(measurements.lcp)", Dataset.Transactions)
+            == "lcp"
+        )
+
+    def test_extract_duration_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset("p95(transaction.duration)", Dataset.Transactions)
+            == "trans_duration"
+        )
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                "percentile(transaction.duration,0.3)", Dataset.Transactions
+            )
+            == "trans_duration"
+        )
+        assert (
+            get_alert_type_from_aggregate_dataset("avg(transaction.duration)", Dataset.Transactions)
+            == "trans_duration"
+        )
+
+    def test_extract_throughput_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset("count()", Dataset.Transactions) == "throughput"
+        )
+
+    def test_extract_user_error_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset("count_unique(user)", Dataset.Events)
+            == "users_experiencing_errors"
+        )
+
+    def test_extract_error_count_alert(self) -> None:
+        assert get_alert_type_from_aggregate_dataset("count()", Dataset.Events) == "num_errors"
+
+    def test_extract_crash_free_sessions_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                SessionsAggregate.CRASH_FREE_SESSIONS, Dataset.Metrics
+            )
+            == "crash_free_sessions"
+        )
+
+    def test_extract_crash_free_users_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                SessionsAggregate.CRASH_FREE_USERS, Dataset.Metrics
+            )
+            == "crash_free_users"
+        )
+
+    def test_extract_eap_metrics_alert(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                "count(span.duration)", Dataset.EventsAnalyticsPlatform
+            )
+            == "eap_metrics"
+        )
+
+    def test_extract_eap_metrics_alert_trace_metrics(self) -> None:
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                "per_second(value,metric_name_one,counter,-)", Dataset.EventsAnalyticsPlatform
+            )
+            == "eap_metrics"
+        )
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                "count(metric.name,metric_name_two,distribution,-)",
+                Dataset.EventsAnalyticsPlatform,
+            )
+            == "eap_metrics"
+        )
+        assert (
+            get_alert_type_from_aggregate_dataset(
+                'equation|count_if(`agent_name:"Agent Run"`,value,metric_name,distribution,none) * 2',
+                Dataset.EventsAnalyticsPlatform,
+            )
+            == "eap_metrics"
+        )
+
+
+@freeze_time()
+class TestMetricIssueOccurrenceResponse(BaseMetricIssueTest):
+    def test_serialized_occurrence_matches_response_type(self) -> None:
+        assert get_args(get_type_hints(MetricIssueOccurrenceResponse)["type"]) == (
+            MetricIssue.type_id,
+        )
+
+        # The factory's default config still has `threshold_period`, which the schema dropped.
+        self.detector.update(config={"detection_type": "static"})
+        data_packet = self.create_subscription_packet(self.critical_detector_trigger.comparison + 1)
+        occurrence = self.process_packet_and_return_result(data_packet)
+        assert isinstance(occurrence, IssueOccurrence)
+
+        event = Event(
+            project_id=self.project.id,
+            event_id=occurrence.event_id,
+            data={"timestamp": occurrence.detection_time.timestamp()},
+        ).for_group(self.create_group(project=self.project, type=MetricIssue.type_id))
+        event.occurrence = occurrence
+        serialized = serialize(event)["occurrence"]
+
+        assert_matches_typed_dict(serialized, MetricIssueOccurrenceResponse)
+        snuba_query = serialized["evidenceData"]["dataSources"][0]["queryObj"]["snubaQuery"]
+        assert snuba_query["timeWindow"] == self.snuba_query.time_window
+
+
+class TestMetricIssueDetectorActivationId(BaseMetricIssueTest):
+    def firing_packet(self, time_jump: int) -> DataPacket[ProcessedSubscriptionUpdate]:
+        value = self.critical_detector_trigger.comparison + 1
+
+        return self.create_subscription_packet(value, time_jump)
+
+    def resolution_packet(self, time_jump: int) -> DataPacket[ProcessedSubscriptionUpdate]:
+        value = self.resolve_detector_trigger.comparison - 1
+
+        return self.create_subscription_packet(value, time_jump)
+
+    def fingerprint(self, packet: DataPacket[ProcessedSubscriptionUpdate]) -> list[str]:
+        detector_result = self.process_packet_and_return_result(packet)
+
+        assert detector_result is not None
+        return list(detector_result.fingerprint)
+
+    def activation_id(self) -> int | None:
+        return DetectorState.objects.get(detector=self.detector).activation_id
+
+    def stable_fingerprint(self) -> list[str]:
+        return [f"detector:{self.detector.id}"]
+
+    def activation_fingerprint(self, activation_id: int | None) -> list[str]:
+        return [f"detector:{self.detector.id}:activation:{activation_id}"]
+
+    def test_detector_each_activation_gets_its_own_fingerprint(self) -> None:
+        with (
+            self.feature("organizations:workflow-engine-rotate-activation-id"),
+            freeze_time() as frozen_time,
+        ):
+            firing_update_fingerprint = self.fingerprint(self.firing_packet(1))
+
+            initial_activation_id = self.activation_id()
+
+            resolution_update_fingerprint = self.fingerprint(self.resolution_packet(2))
+
+            frozen_time.shift(timedelta(hours=24))
+
+            next_firing_update_fingerprint = self.fingerprint(self.firing_packet(3))
+
+            assert firing_update_fingerprint == self.activation_fingerprint(initial_activation_id)
+
+            # The resolve has to match the firing it closes, or the issue is stranded open.
+            assert resolution_update_fingerprint == firing_update_fingerprint
+
+            assert next_firing_update_fingerprint != firing_update_fingerprint
+
+    def test_detector_refiring_within_a_day_in_ok_keeps_fingerprint(self) -> None:
+        with (
+            self.feature("organizations:workflow-engine-rotate-activation-id"),
+            freeze_time() as frozen_time,
+        ):
+            firing_update_fingerprint = self.fingerprint(self.firing_packet(1))
+
+            resolution_update_fingerprint = self.fingerprint(self.resolution_packet(2))
+
+            frozen_time.shift(timedelta(hours=23, minutes=59))
+
+            next_firing_update_fingerprint = self.fingerprint(self.firing_packet(3))
+
+            assert resolution_update_fingerprint == firing_update_fingerprint
+
+            # A flappy monitor regresses the issue it just resolved instead of opening a new one.
+            assert next_firing_update_fingerprint == firing_update_fingerprint
+
+    def test_detector_with_flag_off_keeps_stable_fingerprint(self) -> None:
+        with self.feature({"organizations:workflow-engine-rotate-activation-id": False}):
+            firing_update_fingerprint = self.fingerprint(self.firing_packet(1))
+
+            resolution_update_fingerprint = self.fingerprint(self.resolution_packet(2))
+
+            next_firing_update_fingerprint = self.fingerprint(self.firing_packet(3))
+
+            assert self.activation_id() is None
+
+            assert firing_update_fingerprint == self.stable_fingerprint()
+
+            assert resolution_update_fingerprint == self.stable_fingerprint()
+
+            assert next_firing_update_fingerprint == self.stable_fingerprint()

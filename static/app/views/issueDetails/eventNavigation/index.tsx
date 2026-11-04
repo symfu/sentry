@@ -1,0 +1,475 @@
+import {Fragment, useCallback, useRef, useState} from 'react';
+import {useTheme} from '@emotion/react';
+import {useResizeObserver} from '@react-aria/utils';
+import {IconTelescope} from '@sentry/icons/telescope';
+import {keepPreviousData} from '@tanstack/react-query';
+
+import {Badge} from '@sentry/scraps/badge';
+import {LinkButton} from '@sentry/scraps/button';
+import {DropdownMenu} from '@sentry/scraps/dropdownMenu';
+import {Container, Flex, Grid} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {TabList, Tabs} from '@sentry/scraps/tabs';
+import {Text} from '@sentry/scraps/text';
+
+import Feature from 'sentry/components/acl/feature';
+import {CopyAsDropdown} from 'sentry/components/copyAsDropdown';
+import {Count} from 'sentry/components/count';
+import {useExplorerAutofix} from 'sentry/components/events/autofix/useExplorerAutofix';
+import {AutofixReferrerInfoTip} from 'sentry/components/events/autofix/v3/autofixReferrerInfoTip';
+import {SeerPanelActions} from 'sentry/components/events/autofix/v3/seerPanelActions';
+import {TourElement} from 'sentry/components/tours/components';
+import {t} from 'sentry/locale';
+import type {Event} from 'sentry/types/event';
+import type {Group} from 'sentry/types/group';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {SavedQueryDatasets} from 'sentry/utils/discover/types';
+import {getConfigForIssueType} from 'sentry/utils/issueTypeConfig';
+import {parseLinkHeader} from 'sentry/utils/parseLinkHeader';
+import {useReplayCountForIssues} from 'sentry/utils/replayCount/useReplayCountForIssues';
+import {areAiFeaturesAllowed} from 'sentry/utils/seer/areAiFeaturesAllowed';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {hasDatasetSelector} from 'sentry/views/dashboards/utils';
+import {useAutofixPanel} from 'sentry/views/issueDetails/autofix/context';
+import {hasAutofixPage} from 'sentry/views/issueDetails/autofix/utils';
+import {useIssueDetails} from 'sentry/views/issueDetails/context';
+import {IssueDetailsEventNavigation} from 'sentry/views/issueDetails/eventNavigation/issueDetailsEventNavigation';
+import {useGroupEventAttachments} from 'sentry/views/issueDetails/groupEventAttachments/useGroupEventAttachments';
+import {
+  issueAndEventToMarkdown,
+  useActiveThreadId,
+} from 'sentry/views/issueDetails/hooks/useCopyIssueDetails';
+import {useIssueDetailsEventView} from 'sentry/views/issueDetails/hooks/useIssueDetailsDiscoverQuery';
+import {
+  IssueDetailsTour,
+  IssueDetailsTourContext,
+} from 'sentry/views/issueDetails/issueDetailsTour';
+import {Tab, TabPaths} from 'sentry/views/issueDetails/types';
+import {useGroupDetailsRoute} from 'sentry/views/issueDetails/useGroupDetailsRoute';
+import {useIsSampleEvent} from 'sentry/views/issueDetails/utils';
+
+interface IssueEventNavigationProps {
+  event: Event | undefined;
+  group: Group;
+}
+
+interface ContentTab {
+  /**
+   * The bare count, unstyled: tabs put it in a Badge, the dropdown right-aligns
+   * it in muted text. Null when the tab has nothing to count.
+   */
+  count: React.ReactNode;
+  hidden: boolean;
+  key: Tab;
+  name: string;
+}
+
+const LIST_VIEW_TABS = new Set([
+  Tab.EVENTS,
+  Tab.OPEN_PERIODS,
+  Tab.CHECK_INS,
+  Tab.UPTIME_CHECKS,
+]);
+
+export function IssueEventNavigation({event, group}: IssueEventNavigationProps) {
+  const organization = useOrganization();
+  const {baseUrl, currentTab} = useGroupDetailsRoute();
+  const location = useLocation();
+  const eventView = useIssueDetailsEventView({group});
+  const {eventCount} = useIssueDetails();
+  const issueTypeConfig = getConfigForIssueType(group, group.project);
+  const theme = useTheme();
+
+  function checkNavIsSmall() {
+    const navEl = navigationRef.current;
+    return !!navEl && navEl.clientWidth < parseInt(theme.breakpoints.sm, 10);
+  }
+
+  const navigationRef = useRef<HTMLDivElement>(null);
+  // oxlint-disable-next-line react/refs
+  const [isSmallNav, setSmallNav] = useState(checkNavIsSmall);
+
+  useResizeObserver({
+    ref: navigationRef,
+    onResize: () => setSmallNav(checkNavIsSmall),
+  });
+
+  // `autofix-page` rolls out with Seer, so the orgs that hide AI keep the
+  // dropdown rather than getting the tab list ahead of everyone else.
+  const showContentTabs =
+    hasAutofixPage(organization) && areAiFeaturesAllowed(organization);
+
+  // Autofix does not run on some issue types or on sample events, so those
+  // issues get the tab list without an Autofix tab.
+  const isSampleEvent = useIsSampleEvent();
+  const showAutofixTab = showContentTabs && issueTypeConfig.autofix && !isSampleEvent;
+
+  // Only consulted on the dropdown path, which tabs replace outright.
+  const hideDropdownButton =
+    !issueTypeConfig.pages.attachments.enabled &&
+    !issueTypeConfig.pages.userFeedback.enabled &&
+    !issueTypeConfig.pages.replays.enabled;
+
+  const discoverUrl = eventView.getResultsViewUrlTarget(
+    organization,
+    false,
+    hasDatasetSelector(organization) ? SavedQueryDatasets.ERRORS : undefined
+  );
+
+  const {getReplayCountForIssue} = useReplayCountForIssues({
+    statsPeriod: '90d',
+  });
+  const replaysCount = getReplayCountForIssue(group.id, group.issueCategory) ?? 0;
+
+  const attachments = useGroupEventAttachments({
+    group,
+    activeAttachmentsTab: 'all',
+    options: {placeholderData: keepPreviousData},
+  });
+
+  const attachmentPagination = parseLinkHeader(attachments.pageLinks);
+  // Since we reuse whatever page the user was on, we can look at pagination to determine if there are more attachments
+  const hasManyAttachments =
+    attachmentPagination.next?.results || attachmentPagination.previous?.results;
+
+  const TabName: Partial<Record<Tab, string>> = {
+    [Tab.DETAILS]: issueTypeConfig.customCopy.eventUnits,
+    [Tab.EVENTS]: issueTypeConfig.customCopy.eventUnits,
+    [Tab.REPLAYS]: t('Replays'),
+    [Tab.ATTACHMENTS]: t('Attachments'),
+    [Tab.USER_FEEDBACK]: t('Feedback'),
+    [Tab.AUTOFIX]: t('Autofix'),
+  };
+
+  const contentTabs: ContentTab[] = [
+    {
+      key: Tab.DETAILS,
+      name: TabName[Tab.DETAILS]!,
+      count: <Count value={eventCount ?? 0} />,
+      hidden: false,
+    },
+    {
+      key: Tab.AUTOFIX,
+      name: TabName[Tab.AUTOFIX]!,
+      // Autofix has no count to show; it is a single ongoing analysis.
+      count: null,
+      hidden: !showAutofixTab,
+    },
+    {
+      key: Tab.REPLAYS,
+      name: TabName[Tab.REPLAYS]!,
+      count: replaysCount > 50 ? '50+' : <Count value={replaysCount} />,
+      hidden: !issueTypeConfig.pages.replays.enabled,
+    },
+    {
+      key: Tab.ATTACHMENTS,
+      name: TabName[Tab.ATTACHMENTS]!,
+      count: hasManyAttachments ? '50+' : attachments.attachments.length,
+      hidden: !issueTypeConfig.pages.attachments.enabled,
+    },
+    {
+      key: Tab.USER_FEEDBACK,
+      name: TabName[Tab.USER_FEEDBACK]!,
+      count: <Count value={group.userReportCount} />,
+      hidden: !issueTypeConfig.pages.userFeedback.enabled,
+    },
+  ];
+
+  // List views such as "View more events" have no tab of their own, so they
+  // keep Events selected, as the dropdown label did.
+  const selectedContentTab = contentTabs.some(
+    tab => tab.key === currentTab && !tab.hidden
+  )
+    ? currentTab
+    : Tab.DETAILS;
+
+  const trackContentSelected = (key: Tab) => {
+    trackAnalytics('issue_details.issue_content_selected', {
+      organization,
+      content: TabName[key]!,
+      surface: showContentTabs ? 'tabs' : 'dropdown',
+    });
+  };
+
+  const contentLocation = (key: Tab) => ({
+    ...location,
+    pathname: `${baseUrl}${TabPaths[key]}`,
+    hash: undefined,
+  });
+
+  const isListView = LIST_VIEW_TABS.has(currentTab);
+
+  const activeThreadId = useActiveThreadId();
+  const autofixPanel = useAutofixPanel();
+
+  // Get data for markdown copy functionality
+  const {runState: autofixData, autofixFormatted} = useExplorerAutofix(group, {
+    enabled: false,
+  });
+
+  const handleCopyMarkdown = useCallback(() => {
+    const markdownText = issueAndEventToMarkdown({
+      group,
+      event,
+      autofixData,
+      activeThreadId,
+      organization,
+      autofixFormatted,
+    });
+
+    trackAnalytics('issue_details.copy_issue_details_as_markdown', {
+      organization,
+      groupId: group.id,
+      eventId: event?.id,
+      hasAutofix: Boolean(autofixData),
+    });
+
+    return markdownText;
+  }, [activeThreadId, event, group, autofixData, organization, autofixFormatted]);
+
+  return (
+    <Flex
+      role="navigation"
+      ref={navigationRef}
+      flexGrow={1}
+      minWidth={0}
+      wrap="wrap"
+      gap="sm xl"
+      direction={{zero: 'column', lg: 'row'}}
+      justify="between"
+      align={{zero: 'stretch', lg: 'center'}}
+    >
+      {showContentTabs ? (
+        <Container maxWidth="100%">
+          {props => (
+            <Tabs
+              {...props}
+              size="sm"
+              value={selectedContentTab}
+              onChange={key => trackContentSelected(key as Tab)}
+            >
+              <TabList variant="floating">
+                {contentTabs.map(tab => (
+                  <TabList.Item
+                    key={tab.key}
+                    hidden={tab.hidden}
+                    to={contentLocation(tab.key)}
+                    textValue={tab.name}
+                  >
+                    <Flex as="span" align="center" gap="xs">
+                      {tab.name}
+                      {tab.count === null ? null : (
+                        <Badge variant="muted">
+                          <Text tabular variant="inherit">
+                            {tab.count}
+                          </Text>
+                        </Badge>
+                      )}
+                    </Flex>
+                  </TabList.Item>
+                ))}
+              </TabList>
+            </Tabs>
+          )}
+        </Container>
+      ) : (
+        <Flex align="center" gap="2xs" flexShrink={0}>
+          <DropdownMenu
+            usePortal
+            zIndex={theme.zIndex.stickyHeader + 1}
+            onAction={key => trackContentSelected(key as Tab)}
+            items={contentTabs.map(tab => ({
+              key: tab.key,
+              label: (
+                <Flex align="center" justify="between" gap="2xl">
+                  <Text tabular bold={currentTab === tab.key} variant="inherit">
+                    {tab.name}
+                  </Text>
+                  <Text tabular bold={currentTab === tab.key} variant="muted">
+                    {tab.count}
+                  </Text>
+                </Flex>
+              ),
+              textValue: tab.name,
+              to: contentLocation(tab.key),
+              hidden: tab.hidden,
+            }))}
+            offset={[-2, 1]}
+            trigger={(triggerProps, isOpen) =>
+              hideDropdownButton ? (
+                <Flex padding="0 2xs 0 lg">
+                  <Text size="lg" bold variant="inherit">
+                    {TabName[currentTab] ?? TabName[Tab.DETAILS]}
+                  </Text>
+                </Flex>
+              ) : (
+                <OverlayTrigger.Button
+                  {...triggerProps}
+                  isOpen={isOpen}
+                  variant="transparent"
+                  size="sm"
+                  disabled={hideDropdownButton}
+                  aria-label={t('Select issue content')}
+                  aria-description={TabName[currentTab]}
+                  analyticsEventName="Issue Details: Issue Content Dropdown Opened"
+                  analyticsEventKey="issue_details.issue_content_dropdown_opened"
+                >
+                  <Text size="lg" bold variant="inherit">
+                    {TabName[currentTab] ?? TabName[Tab.DETAILS]}
+                  </Text>
+                </OverlayTrigger.Button>
+              )
+            }
+          />
+          <Text as="div" size="lg" bold variant="muted" density="compressed" aria-hidden>
+            {t('in this issue')}
+          </Text>
+        </Flex>
+      )}
+      <TourElement<IssueDetailsTour>
+        tourContext={IssueDetailsTourContext}
+        id={IssueDetailsTour.NAVIGATION}
+        title={t('Compare and copy events')}
+        description={t(
+          'Review the events associated with an issue. Compare the first, latest, or recommended event to see what changed, or use Copy as to copy the issue details as Markdown.'
+        )}
+      >
+        {tourProps => (
+          <Container {...tourProps} width={{zero: '100%', lg: 'auto'}} maxWidth="100%">
+            <Flex wrap="wrap" gap={{zero: 'sm', sm: 'xs'}}>
+              {currentTab === Tab.AUTOFIX && autofixPanel && (
+                <Flex align="center" gap="xs">
+                  <AutofixReferrerInfoTip referrer={autofixPanel.referrer} />
+                  <SeerPanelActions
+                    autofixState={autofixPanel.runState}
+                    enableBashMode={autofixPanel.enableBashMode}
+                    onCopyMarkdown={autofixPanel.handleCopyMarkdown}
+                    onEnableBashModeChange={autofixPanel.setEnableBashMode}
+                    onOpenSeerAgent={autofixPanel.handleOpenSeerAgent}
+                    onReset={autofixPanel.handleRestart}
+                  />
+                </Flex>
+              )}
+              {currentTab === Tab.DETAILS && (
+                <Fragment>
+                  <Flex align="center" wrap="wrap" gap="xs">
+                    <IssueDetailsEventNavigation
+                      event={event}
+                      group={group}
+                      isSmallNav={isSmallNav}
+                    />
+                  </Flex>
+                  <Flex align="center" wrap="wrap" gap="xs" marginLeft="auto">
+                    {issueTypeConfig.pages.events.enabled && (
+                      <Feature features="discover-basic" organization={organization}>
+                        <LinkButton
+                          to={{
+                            pathname: `${baseUrl}${TabPaths[Tab.EVENTS]}`,
+                            query: location.query,
+                          }}
+                          size="xs"
+                          analyticsEventKey="issue_details.all_events_clicked"
+                          analyticsEventName="Issue Details: All Events Clicked"
+                        >
+                          {isSmallNav
+                            ? t('More %s', issueTypeConfig.customCopy.eventUnits)
+                            : t('View More %s', issueTypeConfig.customCopy.eventUnits)}
+                        </LinkButton>
+                      </Feature>
+                    )}
+                    <CopyAsDropdown
+                      usePortal
+                      size="xs"
+                      zIndex={theme.zIndex.stickyHeader + 1}
+                      items={CopyAsDropdown.makeDefaultCopyAsOptions({
+                        text: undefined,
+                        json: undefined,
+                        markdown: handleCopyMarkdown,
+                      })}
+                    />
+                    {issueTypeConfig.pages.openPeriods.enabled && (
+                      <LinkButton
+                        to={{
+                          pathname: `${baseUrl}${TabPaths[Tab.OPEN_PERIODS]}`,
+                          query: location.query,
+                        }}
+                        size="xs"
+                        analyticsEventKey="issue_details.all_open_periods_clicked"
+                        analyticsEventName="Issue Details: All Open Periods Clicked"
+                      >
+                        {isSmallNav
+                          ? t('More Open Periods')
+                          : t('View More Open Periods')}
+                      </LinkButton>
+                    )}
+                    {issueTypeConfig.pages.checkIns.enabled && (
+                      <LinkButton
+                        to={{
+                          pathname: `${baseUrl}${TabPaths[Tab.CHECK_INS]}`,
+                          query: location.query,
+                        }}
+                        size="xs"
+                        analyticsEventKey="issue_details.all_checks_ins_clicked"
+                        analyticsEventName="Issue Details: All Checks-Ins Clicked"
+                      >
+                        {isSmallNav ? t('More Check-Ins') : t('View More Check-Ins')}
+                      </LinkButton>
+                    )}
+                    {issueTypeConfig.pages.uptimeChecks.enabled && (
+                      <LinkButton
+                        to={{
+                          pathname: `${baseUrl}${TabPaths[Tab.UPTIME_CHECKS]}`,
+                          query: location.query,
+                        }}
+                        size="xs"
+                        analyticsEventKey="issue_details.all_uptime_checks_clicked"
+                        analyticsEventName="Issue Details: All Uptime Checks Clicked"
+                      >
+                        {isSmallNav
+                          ? t('More Uptime Checks')
+                          : t('View More Uptime Checks')}
+                      </LinkButton>
+                    )}
+                  </Flex>
+                </Fragment>
+              )}
+              {isListView && (
+                <Grid flow="column" align="center" gap="md">
+                  {issueTypeConfig.discover.enabled && currentTab === Tab.EVENTS && (
+                    <LinkButton
+                      to={{
+                        pathname: discoverUrl.pathname,
+                        query: {
+                          ...discoverUrl.query,
+                          sort: location.query.sort ?? '-timestamp',
+                        },
+                      }}
+                      aria-label={t('Open in Explore')}
+                      size="xs"
+                      icon={<IconTelescope />}
+                      analyticsEventKey="issue_details.discover_clicked"
+                      analyticsEventName="Issue Details: Discover Clicked"
+                    >
+                      {t('Open in Explore')}
+                    </LinkButton>
+                  )}
+                  <LinkButton
+                    to={{
+                      pathname: `${baseUrl}${TabPaths[Tab.DETAILS]}`,
+                      query: {...location.query, cursor: undefined},
+                    }}
+                    aria-label={t('Return to event details')}
+                    size="xs"
+                  >
+                    {t('Close')}
+                  </LinkButton>
+                </Grid>
+              )}
+            </Flex>
+          </Container>
+        )}
+      </TourElement>
+    </Flex>
+  );
+}

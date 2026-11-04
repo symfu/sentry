@@ -1,0 +1,79 @@
+import {useMemo} from 'react';
+import cloneDeep from 'lodash/cloneDeep';
+
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+
+import {t} from 'sentry/locale';
+import type {
+  AggregationKeyWithAlias,
+  QueryFieldValue,
+} from 'sentry/utils/discover/fields';
+import {sortSelectedFirst} from 'sentry/views/dashboards/widgetBuilder/components/visualize/selectRow';
+import {AggregateCompactSelect} from 'sentry/views/dashboards/widgetBuilder/components/visualize/utils';
+import {useWidgetBuilderContext} from 'sentry/views/dashboards/widgetBuilder/contexts/useWidgetBuilderContext';
+import {
+  buildTraceMetricAggregate,
+  getTraceMetricAggregateActionType,
+  getTraceMetricDisplayFields,
+} from 'sentry/views/dashboards/widgetBuilder/utils/buildTraceMetricAggregate';
+import {OPTIONS_BY_TYPE} from 'sentry/views/explore/metrics/constants';
+import type {TraceMetric} from 'sentry/views/explore/metrics/metricQuery';
+
+export function AggregateSelector({
+  disabled,
+  traceMetric,
+  field,
+  index,
+}: {
+  disabled: boolean;
+  field: QueryFieldValue;
+  index: number;
+  traceMetric: TraceMetric;
+}) {
+  const {state, dispatch} = useWidgetBuilderContext();
+
+  const displayFields = getTraceMetricDisplayFields(
+    state.displayType,
+    state.yAxis,
+    state.fields
+  );
+  const actionType = getTraceMetricAggregateActionType(state.displayType);
+
+  const aggregateOptions = useMemo(
+    () => OPTIONS_BY_TYPE[traceMetric?.type ?? ''] ?? [],
+    [traceMetric?.type]
+  );
+
+  const aggregateValue = useMemo(() => {
+    return displayFields?.[index]?.kind === 'function'
+      ? (displayFields?.[index]?.function?.[0] ?? '')
+      : '';
+  }, [displayFields, index]);
+
+  return (
+    <AggregateCompactSelect
+      search
+      hasColumnParameter={false}
+      disabled={disabled || aggregateOptions.length <= 1}
+      options={sortSelectedFirst(aggregateValue, aggregateOptions)}
+      value={aggregateValue}
+      position="bottom-start"
+      onChange={option => {
+        if (field.kind === 'function') {
+          const newAggregates = cloneDeep(displayFields) ?? [];
+          newAggregates[index] = buildTraceMetricAggregate(
+            option.value as AggregationKeyWithAlias,
+            traceMetric
+          );
+          dispatch({
+            type: actionType,
+            payload: newAggregates,
+          });
+        }
+      }}
+      trigger={triggerProps => (
+        <OverlayTrigger.Button {...triggerProps} aria-label={t('Aggregate Selection')} />
+      )}
+    />
+  );
+}

@@ -1,0 +1,37 @@
+import {IconClose} from '@sentry/icons/close';
+import {parseAsBoolean, useQueryState} from 'nuqs';
+
+import {Alert} from '@sentry/scraps/alert';
+import {Button} from '@sentry/scraps/button';
+
+import {t} from 'sentry/locale';
+
+export function InsightsRedirectNotice({children}: {children: React.ReactNode}) {
+  const [wasRedirectedFromInsights, setWasRedirectedFromInsights] = useQueryState(
+    'insightsRedirect',
+    parseAsBoolean.withOptions({history: 'replace'}).withDefault(false)
+  );
+
+  if (!wasRedirectedFromInsights) {
+    return null;
+  }
+
+  return (
+    <Alert
+      variant="info"
+      trailingItems={
+        <Button
+          size="zero"
+          variant="transparent"
+          icon={<IconClose />}
+          aria-label={t('Dismiss')}
+          onClick={() => {
+            setWasRedirectedFromInsights(false);
+          }}
+        />
+      }
+    >
+      {children}
+    </Alert>
+  );
+}

@@ -1,0 +1,445 @@
+import {Fragment} from 'react';
+import {QueryClientProvider} from '@tanstack/react-query';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+
+import {makeTestQueryClient} from 'sentry-test/queryClient';
+import {
+  act,
+  render,
+  renderHookWithProviders,
+  screen,
+  userEvent,
+  waitFor,
+} from 'sentry-test/reactTestingLibrary';
+
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import {useSpanSearchQueryBuilderProps} from 'sentry/components/performance/spanSearchQueryBuilder';
+import {SearchQueryBuilderProvider} from 'sentry/components/searchQueryBuilder/context';
+import {FieldKind} from 'sentry/utils/fields';
+import {
+  TraceItemSearchQueryBuilder,
+  useTraceItemSearchQueryBuilderProps,
+  type TraceItemSearchQueryBuilderProps,
+} from 'sentry/views/explore/components/traceItemSearchQueryBuilder';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+
+const defaultInitialProps: TraceItemSearchQueryBuilderProps = {
+  itemType: TraceItemDataset.SPANS,
+  booleanAttributes: {},
+  booleanSecondaryAliases: {},
+  numberAttributes: {},
+  numberSecondaryAliases: {},
+  stringAttributes: {},
+  stringSecondaryAliases: {},
+  initialQuery: '',
+  searchSource: 'test',
+};
+const organization = OrganizationFixture({
+  features: ['search-query-attribute-validation'],
+});
+
+// Explore supplies a provider outside the builder; both register attribute metadata.
+function SpansSearchQueryBuilder() {
+  const {spanSearchQueryBuilderProviderProps, spanSearchQueryBuilderProps} =
+    useSpanSearchQueryBuilderProps({
+      initialQuery: '',
+      searchSource: 'explore',
+      disableRecentSearches: true,
+    });
+
+  return (
+    <SearchQueryBuilderProvider {...spanSearchQueryBuilderProviderProps}>
+      <TraceItemSearchQueryBuilder {...spanSearchQueryBuilderProps} />
+    </SearchQueryBuilderProvider>
+  );
+}
+
+describe('useTraceItemSearchQueryBuilderProps', () => {
+  beforeEach(() => {
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {
+        period: '14d',
+        start: null,
+        end: null,
+        utc: false,
+      },
+    });
+  });
+
+  afterEach(() => {
+    MockApiClient.clearMockResponses();
+  });
+
+  it('does not retain attributes after switching projects', async () => {
+    const queryClient = makeTestQueryClient();
+    const url = '/organizations/org-slug/trace-items/attributes/';
+    MockApiClient.addMockResponse({
+      url,
+      body: [
+        {
+          key: 'custom.unique',
+          name: 'custom.unique',
+          attributeType: 'number',
+          attributeSource: {source_type: 'user'},
+        },
+      ],
+    });
+    const projectResponse = Promise.withResolvers<void>();
+    const projectRequest = MockApiClient.addMockResponse({
+      url,
+      body: [],
+      match: [MockApiClient.matchQuery({project: ['2']})],
+      asyncDelay: projectResponse.promise,
+    });
+
+    render(<SpansSearchQueryBuilder />, {
+      additionalWrapper: ({children}) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    });
+    await userEvent.click(screen.getByRole('combobox'));
+    await userEvent.keyboard('custom.unique');
+    expect(
+      await screen.findByRole('option', {name: 'custom.unique'})
+    ).toBeInTheDocument();
+
+    act(() => PageFiltersStore.updateProjects([2], null));
+    await waitFor(() => expect(projectRequest).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('option', {name: 'custom.unique'})
+      ).not.toBeInTheDocument()
+    );
+    act(() => projectResponse.resolve());
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    expect(screen.queryByRole('option', {name: 'custom.unique'})).not.toBeInTheDocument();
+
+    // An empty result in the new scope must not hide attributes when returning.
+    act(() => PageFiltersStore.updateProjects([1], null));
+    expect(
+      await screen.findByRole('option', {name: 'custom.unique'})
+    ).toBeInTheDocument();
+  });
+
+  it('wires boolean attributes into filter keys, aliases, and sections', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        booleanAttributes: {
+          'feature.enabled': {
+            key: 'feature.enabled',
+            name: 'feature.enabled',
+            kind: FieldKind.BOOLEAN,
+          },
+        },
+        booleanSecondaryAliases: {
+          'feature.enabled_alias': {
+            key: 'feature.enabled_alias',
+            name: 'feature.enabled_alias',
+            kind: FieldKind.BOOLEAN,
+          },
+        },
+      },
+      organization,
+    });
+
+    expect(result.current.filterKeys['feature.enabled']).toBeDefined();
+    expect(result.current.filterKeyAliases?.['feature.enabled_alias']).toBeDefined();
+  });
+
+  it('wires number attributes into filter keys and aliases', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        numberAttributes: {
+          'transaction.duration': {
+            key: 'transaction.duration',
+            name: 'transaction.duration',
+            kind: FieldKind.MEASUREMENT,
+          },
+        },
+        numberSecondaryAliases: {
+          'transaction.duration_alias': {
+            key: 'transaction.duration_alias',
+            name: 'transaction.duration_alias',
+            kind: FieldKind.MEASUREMENT,
+          },
+        },
+      },
+      organization,
+    });
+
+    expect(result.current.filterKeys['transaction.duration']).toBeDefined();
+    expect(result.current.filterKeyAliases?.['transaction.duration_alias']).toBeDefined();
+  });
+
+  it('resolves a tag array and its [*] membership form to the array definition', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        arrayAttributes: {
+          'tags[csv_headers,array]': {
+            key: 'tags[csv_headers,array]',
+            name: 'csv_headers',
+            kind: FieldKind.ARRAY,
+          },
+        },
+      },
+      organization,
+    });
+
+    const getFieldDefinition = result.current.fieldDefinitionGetter;
+
+    // The stored backend key and its `[*]` membership form both resolve to the
+    // array definition (the `[*]` is stripped before lookup).
+    expect(getFieldDefinition('tags[csv_headers,array]')?.kind).toBe(FieldKind.ARRAY);
+    expect(getFieldDefinition('tags[csv_headers[*],array]')?.kind).toBe(FieldKind.ARRAY);
+  });
+
+  it('wires string attributes into filter keys and aliases', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        stringAttributes: {
+          'log.message': {
+            key: 'log.message',
+            name: 'log.message',
+            kind: FieldKind.TAG,
+          },
+        },
+        stringSecondaryAliases: {
+          'log.message_alias': {
+            key: 'log.message_alias',
+            name: 'log.message_alias',
+            kind: FieldKind.TAG,
+          },
+        },
+      },
+      organization,
+    });
+
+    expect(result.current.filterKeys['log.message']).toBeDefined();
+    expect(result.current.filterKeyAliases?.['log.message_alias']).toBeDefined();
+  });
+
+  it('uses preferred search aliases in deprecation warnings', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: defaultInitialProps,
+      organization,
+    });
+
+    expect(result.current.filterKeyAliases?.['sentry.segment.name']?.alias).toBe(
+      'transaction'
+    );
+
+    render(
+      <Fragment>{result.current.getFilterTokenWarning?.('sentry.segment.name')}</Fragment>
+    );
+
+    expect(document.body).toHaveTextContent(
+      'sentry.segment.name is deprecated. Use transaction instead.'
+    );
+  });
+
+  it('does not warn for product fields that opt out of convention deprecation', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        itemType: TraceItemDataset.REPLAYS,
+      },
+      organization,
+    });
+
+    expect(result.current.getFilterTokenWarning?.('url')).toBeUndefined();
+  });
+
+  it.each([TraceItemDataset.ERRORS, TraceItemDataset.PROCESSING_ERRORS])(
+    'does not apply convention aliases or deprecation warnings for %s',
+    itemType => {
+      const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+        initialProps: {...defaultInitialProps, itemType},
+        organization,
+      });
+
+      expect(result.current.filterKeyAliases?.['http.method']).toBeUndefined();
+      expect(result.current.getFilterTokenWarning?.('http.method')).toBeUndefined();
+    }
+  );
+
+  it('merges all secondary alias types into filterKeyAliases', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        booleanSecondaryAliases: {
+          'feature.enabled_alias': {
+            key: 'feature.enabled_alias',
+            name: 'feature.enabled_alias',
+            kind: FieldKind.BOOLEAN,
+          },
+        },
+        numberSecondaryAliases: {
+          'transaction.duration_alias': {
+            key: 'transaction.duration_alias',
+            name: 'transaction.duration_alias',
+            kind: FieldKind.MEASUREMENT,
+          },
+        },
+        stringSecondaryAliases: {
+          'log.message_alias': {
+            key: 'log.message_alias',
+            name: 'log.message_alias',
+            kind: FieldKind.TAG,
+          },
+        },
+      },
+      organization,
+    });
+
+    expect(result.current.filterKeyAliases).toMatchObject({
+      'feature.enabled_alias': expect.any(Object),
+      'transaction.duration_alias': expect.any(Object),
+      'log.message_alias': expect.any(Object),
+    });
+  });
+
+  it('exposes getTagKeys and allows unsupported filters when async keys are enabled', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: defaultInitialProps,
+      organization,
+    });
+
+    expect(result.current.getTagKeys).toEqual(expect.any(Function));
+    expect(result.current.disallowUnsupportedFilters).toBe(false);
+  });
+
+  it.each([TraceItemDataset.SPANS, TraceItemDataset.LOGS, TraceItemDataset.TRACEMETRICS])(
+    'disables recent searches when disableRecentSearches is true for item type %s',
+    itemType => {
+      const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+        initialProps: {
+          ...defaultInitialProps,
+          itemType,
+          disableRecentSearches: true,
+        },
+        organization,
+      });
+
+      expect(result.current.recentSearches).toBeUndefined();
+      expect(result.current.namespace).toBeUndefined();
+    }
+  );
+
+  it('enables recent searches by default', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: defaultInitialProps,
+      organization,
+    });
+
+    expect(result.current.recentSearches).toBeDefined();
+  });
+
+  it('passes disabled through to search query builder provider props', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        disabled: true,
+      },
+      organization,
+    });
+
+    expect(result.current.disabled).toBe(true);
+  });
+
+  it('passes invalid filter keys through to search query builder provider props', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        invalidFilterKeys: ['missing.key'],
+      },
+      organization,
+    });
+
+    expect(result.current.invalidFilterKeys).toEqual(['missing.key']);
+  });
+
+  it('getTagKeys fetches keys across string, number, and boolean attributes', async () => {
+    const traceItemAttributesMock = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      body: [
+        {attributeType: 'string', key: 'log.message', name: 'log.message'},
+        {attributeType: 'number', key: 'log.duration', name: 'log.duration'},
+        {attributeType: 'boolean', key: 'log.flag', name: 'log.flag'},
+      ],
+      match: [
+        (_url, options) => {
+          const query = options?.query || {};
+          return (
+            query.itemType === TraceItemDataset.SPANS &&
+            Array.isArray(query.attributeType) &&
+            query.attributeType.includes('string') &&
+            query.attributeType.includes('number') &&
+            query.attributeType.includes('boolean')
+          );
+        },
+      ],
+    });
+
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: defaultInitialProps,
+      organization,
+    });
+    const tags = await result.current.getTagKeys?.('search-query');
+
+    expect(traceItemAttributesMock).toHaveBeenCalled();
+    expect(tags?.map(tag => tag.key)).toEqual([
+      'log.message',
+      'log.duration',
+      'log.flag',
+    ]);
+  });
+
+  it('uses a custom placeholder when provided', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        placeholder: 'Custom placeholder text',
+      },
+      organization,
+    });
+
+    expect(result.current.placeholder).toBe('Custom placeholder text');
+  });
+
+  it('falls back to the default placeholder for logs when no placeholder is provided', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {
+        ...defaultInitialProps,
+        itemType: TraceItemDataset.LOGS,
+      },
+      organization,
+    });
+
+    expect(result.current.placeholder).toBe('Search for logs, users, tags, and more');
+  });
+
+  it('allows regex operators when the dataset is logs', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {...defaultInitialProps, itemType: TraceItemDataset.LOGS},
+      organization,
+    });
+
+    expect(result.current.allowRegexOperators).toBe(true);
+  });
+
+  it('does not allow regex operators when the dataset is spans', () => {
+    const {result} = renderHookWithProviders(useTraceItemSearchQueryBuilderProps, {
+      initialProps: {...defaultInitialProps, itemType: TraceItemDataset.SPANS},
+      organization,
+    });
+
+    expect(result.current.allowRegexOperators).toBe(false);
+  });
+});

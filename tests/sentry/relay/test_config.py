@@ -1,9 +1,43 @@
-import pytest
+import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from unittest import mock
+from unittest.mock import ANY, MagicMock, patch
 
-from sentry.models import ProjectKey
-from sentry.relay.config import get_project_config
-from sentry.utils.safe import get_path
+import pytest
+from sentry_relay.processing import normalize_project_config
+
+from sentry import quotas
+from sentry.constants import HEALTH_CHECK_GLOBS, ObjectStatus
+from sentry.discover.models import TeamKeyTransaction
+from sentry.dynamic_sampling import (
+    ENVIRONMENT_GLOBS,
+    RESERVED_IDS,
+    Platform,
+    RuleType,
+    get_redis_client_for_ds,
+)
+from sentry.dynamic_sampling.per_org.cache import set_adjusted_factor
+from sentry.dynamic_sampling.rules.base import NEW_MODEL_THRESHOLD_IN_MINUTES
+from sentry.ingest.inbound_filters import CUSTOM_INBOUND_FILTER_ID_PREFIX
+from sentry.models.custominboundfilter import LegacyFilter
+from sentry.models.project import Project
+from sentry.models.projectkey import ProjectKey
+from sentry.models.projectteam import ProjectTeam
+from sentry.models.team import Team
+from sentry.relay.config import ProjectConfig, TransactionNameRule, get_project_config
+from sentry.testutils.factories import Factories
 from sentry.testutils.helpers import Feature
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.pytest.fixtures import InstaSnapshotter, django_db_all
+from sentry.testutils.silo import cell_silo_test
+from sentry.utils.safe import get_path
+from tests.sentry.dynamic_sampling.per_org.test_helpers import (
+    store_per_org_project_sample_rate,
+)
 
 PII_CONFIG = """
 {
@@ -14,7 +48,6 @@ PII_CONFIG = """
         "@ip",
         "@mac"
       ],
-      "hide_rule": false,
       "redaction": {
         "method": "remove"
       }
@@ -26,17 +59,84 @@ PII_CONFIG = """
 }
 """
 
+DEFAULT_ENVIRONMENT_RULE = {
+    "sampleRate": 1,
+    "type": "trace",
+    "condition": {
+        "op": "or",
+        "inner": [
+            {
+                "op": "glob",
+                "name": "trace.environment",
+                "value": ENVIRONMENT_GLOBS,
+                "options": {"ignoreCase": True},
+            }
+        ],
+    },
+    "id": 1001,
+}
 
-@pytest.mark.django_db
-@pytest.mark.parametrize("full", [False, True])
-def test_get_project_config(default_project, insta_snapshot, full):
+DEFAULT_IGNORE_HEALTHCHECKS_RULE = {
+    "sampleRate": 0.02,
+    "type": "transaction",
+    "condition": {
+        "op": "or",
+        "inner": [
+            {
+                "op": "glob",
+                "name": "event.transaction",
+                "value": HEALTH_CHECK_GLOBS,
+                "options": {"ignoreCase": True},
+            }
+        ],
+    },
+    "id": RESERVED_IDS[RuleType.IGNORE_HEALTH_CHECKS_RULE],
+}
+
+
+def _validate_project_config(config: dict[str, Any]) -> None:
+    # Relay uses a BTreeSet for features:
+    if features := config.get("features"):
+        config["features"] = sorted(features)
+    expected = deepcopy(config)
+    # Relay serializes case-insensitive glob patterns lowercased:
+    if generic_filters := expected.get("filterSettings", {}).get("generic"):
+        _lowercase_glob_values(generic_filters)
+    assert normalize_project_config(config) == expected
+
+
+def _lowercase_glob_values(node: object) -> None:
+    if isinstance(node, dict):
+        if node.get("op") == "glob":
+            node["value"] = [value.lower() for value in node["value"]]
+        for child in node.values():
+            _lowercase_glob_values(child)
+    elif isinstance(node, list):
+        for child in node:
+            _lowercase_glob_values(child)
+
+
+@django_db_all
+@cell_silo_test
+def test_get_project_config_non_visible(default_project: Project) -> None:
+    keys = ProjectKey.objects.filter(project=default_project)
+    default_project.update(status=ObjectStatus.PENDING_DELETION)
+    cfg = get_project_config(default_project, project_keys=keys)
+    assert cfg.to_dict() == {"disabled": True}
+
+
+@django_db_all
+@cell_silo_test
+def test_get_project_config(default_project: Project, insta_snapshot: InstaSnapshotter) -> None:
     # We could use the default_project fixture here, but we would like to avoid 1) hitting the db 2) creating a mock
     default_project.update_option("sentry:relay_pii_config", PII_CONFIG)
     default_project.organization.update_option("sentry:relay_pii_config", PII_CONFIG)
     keys = ProjectKey.objects.filter(project=default_project)
 
-    cfg = get_project_config(default_project, full_config=full, project_keys=keys)
-    cfg = cfg.to_dict()
+    project_cfg = get_project_config(default_project, project_keys=keys)
+    cfg = project_cfg.to_dict()
+
+    _validate_project_config(cfg["config"])
 
     # Remove keys that change everytime
     cfg.pop("lastChange")
@@ -51,46 +151,1471 @@ def test_get_project_config(default_project, insta_snapshot, full):
     insta_snapshot(cfg)
 
 
-@pytest.mark.django_db
+SOME_EXCEPTION = RuntimeError("foo")
+
+
+@django_db_all
+@cell_silo_test
+@mock.patch("sentry.relay.config.generate_rules", side_effect=SOME_EXCEPTION)
+@mock.patch("sentry.relay.config.experimental.logger")
+def test_get_experimental_config_dyn_sampling(
+    mock_logger: MagicMock, _: MagicMock, default_project: Project
+) -> None:
+    keys = ProjectKey.objects.filter(project=default_project)
+    with Feature({"organizations:dynamic-sampling": True}):
+        # Does not raise:
+        cfg = get_project_config(default_project, project_keys=keys)
+    # Check that the "sampling" key is missing from config. It used to be called
+    # "dynamicSampling", so we also test for that:
+    subconfig = cfg.to_dict()["config"]
+    assert "dynamicSampling" not in subconfig and "sampling" not in subconfig
+    assert mock_logger.exception.call_args == mock.call(ANY)
+
+
+@django_db_all
+@cell_silo_test
 @pytest.mark.parametrize("has_custom_filters", [False, True])
-def test_project_config_uses_filter_features(default_project, insta_snapshot, has_custom_filters):
+@pytest.mark.parametrize("has_blacklisted_ips", [False, True])
+@pytest.mark.parametrize("has_generic_ip_filter", [False, True])
+def test_project_config_uses_filter_features(
+    default_project: Project,
+    has_custom_filters: bool,
+    has_blacklisted_ips: bool,
+    has_generic_ip_filter: bool,
+) -> None:
+    log_messages = ["some log"]
+    trace_metric_names = ["some metric"]
     error_messages = ["some_error"]
     releases = ["1.2.3", "4.5.6"]
+    # A range, because Relay normalizes a bare address to `/32` inside the generic
+    # filter, which the round-trip check below would flag.
+    blacklisted_ips = ["112.69.248.0/24"]
+    default_project.update_option("sentry:log_messages", log_messages)
+    default_project.update_option("sentry:trace_metric_names", trace_metric_names)
     default_project.update_option("sentry:error_messages", error_messages)
     default_project.update_option("sentry:releases", releases)
+    default_project.update_option("filters:react-hydration-errors", "0")
+    default_project.update_option("filters:chunk-load-error", "0")
+    default_project.update_option("filters:custom-error", "0")
 
-    with Feature({"projects:custom-inbound-filters": has_custom_filters}):
-        cfg = get_project_config(default_project, full_config=True)
-        cfg = cfg.to_dict()
-        cfg_error_messages = get_path(cfg, "config", "filterSettings", "errorMessages")
-        cfg_releases = get_path(cfg, "config", "filterSettings", "releases")
+    if has_blacklisted_ips:
+        default_project.update_option("sentry:blacklisted_ips", blacklisted_ips)
 
-        if has_custom_filters:
-            assert {"patterns": error_messages} == cfg_error_messages
-            assert {"releases": releases} == cfg_releases
-        else:
-            assert cfg_releases is None
-            assert cfg_error_messages is None
+    with Feature(
+        {
+            "projects:custom-inbound-filters": has_custom_filters,
+            "organizations:ourlogs-ingestion": True,
+            "organizations:tracemetrics-ingestion": True,
+            "organizations:inbound-filters-generic-ip-filter": has_generic_ip_filter,
+        }
+    ):
+        project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    cfg_generic = get_path(cfg, "config", "filterSettings", "generic", "filters") or []
+    cfg_error_messages = get_path(cfg, "config", "filterSettings", "errorMessages")
+    cfg_releases = get_path(cfg, "config", "filterSettings", "releases")
+    cfg_client_ips = get_path(cfg, "config", "filterSettings", "clientIps")
+    # The generic IP filter keeps the native filter's outcome reason as its id.
+    ip_generic_filter = {
+        "id": "ip-address",
+        "isEnabled": True,
+        "condition": {"op": "cidr", "name": "envelope.client_ip", "value": blacklisted_ips},
+    }
+
+    if has_custom_filters:
+        assert {"patterns": error_messages} == cfg_error_messages
+        assert {"releases": releases} == cfg_releases
+        assert {
+            "id": "log-message",
+            "isEnabled": True,
+            "condition": {
+                "op": "glob",
+                "name": "log.body",
+                "value": ["some log"],
+            },
+        } in cfg_generic
+        assert {
+            "id": "trace-metric-name",
+            "isEnabled": True,
+            "condition": {
+                "op": "glob",
+                "name": "trace_metric.name",
+                "value": ["some metric"],
+            },
+        } in cfg_generic
+    else:
+        assert cfg_releases is None
+        assert cfg_error_messages is None
+        assert [f for f in cfg_generic if f["id"] != "ip-address"] == []
+
+    if has_blacklisted_ips and has_generic_ip_filter:
+        assert cfg_client_ips is None
+        assert cfg_generic[0] == ip_generic_filter
+    elif has_blacklisted_ips:
+        assert {"blacklistedIps": blacklisted_ips} == cfg_client_ips
+        assert ip_generic_filter not in cfg_generic
+    else:
+        assert cfg_client_ips is None
+        assert ip_generic_filter not in cfg_generic
 
 
-@pytest.mark.django_db
-@pytest.mark.parametrize("has_dyn_sampling", [False, True])
-@pytest.mark.parametrize("full_config", [False, True])
-def test_project_config_uses_filters_and_sampling_feature(
-    default_project, insta_snapshot, dyn_sampling_data, has_dyn_sampling, full_config
-):
+@django_db_all
+@cell_silo_test
+@pytest.mark.parametrize("has_custom_filters", [False, True])
+@pytest.mark.parametrize("has_inbound_filters_v2", [False, True])
+def test_project_config_custom_inbound_filters_v2(
+    default_project: Project,
+    factories: Factories,
+    has_custom_filters: bool,
+    has_inbound_filters_v2: bool,
+) -> None:
+    active_filter = factories.create_project_custom_inbound_filter(
+        default_project,
+        name="Block old releases",
+        conditions=[{"type": "release", "value": ["1.2.3"]}],
+    )
+    factories.create_project_custom_inbound_filter(
+        default_project,
+        name="Disabled filter",
+        active=False,
+        conditions=[{"type": "release", "value": ["4.5.6"]}],
+    )
+
+    with Feature(
+        {
+            "projects:custom-inbound-filters": has_custom_filters,
+            "organizations:inbound-filters-v2": has_inbound_filters_v2,
+        }
+    ):
+        project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    cfg_generic = get_path(cfg, "config", "filterSettings", "generic", "filters") or []
+    custom_filters = [f for f in cfg_generic if f["id"].startswith(CUSTOM_INBOUND_FILTER_ID_PREFIX)]
+
+    if has_custom_filters and has_inbound_filters_v2:
+        assert custom_filters == [
+            {
+                "id": f"{CUSTOM_INBOUND_FILTER_ID_PREFIX}{active_filter.id}",
+                "isEnabled": True,
+                "condition": {"op": "glob", "name": "event.release", "value": ["1.2.3"]},
+            }
+        ]
+    else:
+        assert custom_filters == []
+
+
+@django_db_all
+@cell_silo_test
+@pytest.mark.parametrize("option_enabled", [True, False])
+def test_project_config_json_expansion(default_project: MagicMock, option_enabled: bool) -> None:
+    default_project.update_option("sentry:relay_automatic_json_expansion", option_enabled)
+
+    project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    exposed_features = get_path(cfg, "config", "features") or []
+
+    assert ("projects:relay-automatic-json-expansion" in exposed_features) == option_enabled
+
+
+@django_db_all
+@cell_silo_test
+@mock.patch("sentry.relay.config.EXPOSABLE_FEATURES", ["organizations:profiling"])
+def test_project_config_exposed_features(default_project: MagicMock) -> None:
+    with Feature({"organizations:profiling": True}):
+        project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    cfg_features = get_path(cfg, "config", "features")
+    assert cfg_features == ["organizations:profiling"]
+
+
+@django_db_all
+@cell_silo_test
+@mock.patch("sentry.relay.config.EXPOSABLE_FEATURES", ["badprefix:custom-inbound-filters"])
+def test_project_config_exposed_features_raise_exc(default_project: MagicMock) -> None:
+    with Feature({"projects:custom-inbound-filters": True}):
+        with pytest.raises(RuntimeError) as exc_info:
+            get_project_config(default_project)
+        assert (
+            str(exc_info.value)
+            == "EXPOSABLE_FEATURES must start with 'organizations:' or 'projects:'"
+        )
+
+
+@django_db_all
+@cell_silo_test
+@patch("sentry.dynamic_sampling.rules.biases.boost_latest_releases_bias.apply_dynamic_factor")
+@freeze_time("2022-10-21 18:50:25.000000+00:00")
+def test_project_config_with_all_biases_enabled(
+    eval_dynamic_factor_lr: MagicMock, default_project: Project, default_team: Team
+) -> None:
     """
-    Tests that dynamic sampling information is retrieved for both "full config" and "restricted config"
-    but only when the organization has "organizations:filter-and-sampling" feature enabled.
+    Tests that dynamic sampling information return correct uniform rules
     """
-    default_project.update_option("sentry:dynamic_sampling", dyn_sampling_data())
+    eval_dynamic_factor_lr.return_value = 1.5
 
-    with Feature({"organizations:filters-and-sampling": has_dyn_sampling}):
-        cfg = get_project_config(default_project, full_config=full_config)
-        cfg = cfg.to_dict()
-        dynamic_sampling = get_path(cfg, "config", "dynamicSampling")
+    redis_client = get_redis_client_for_ds()
+    ts = time.time()
 
-        if has_dyn_sampling:
-            assert dynamic_sampling == dyn_sampling_data()
+    # We enable all biases for this project.
+    default_project.update_option(
+        "sentry:dynamic_sampling_biases",
+        [
+            {"id": "boostEnvironments", "active": True},
+            {"id": "ignoreHealthChecks", "active": True},
+            {"id": "boostLatestRelease", "active": True},
+        ],
+    )
+    default_project.add_team(default_team)
+    # We have to create the project and organization in the past, since we boost new orgs and projects to 100%
+    # automatically.
+    old_date = datetime.now(tz=timezone.utc) - timedelta(minutes=NEW_MODEL_THRESHOLD_IN_MINUTES + 1)
+    default_project.organization.date_added = old_date
+    default_project.date_added = old_date
+    store_per_org_project_sample_rate(default_project, 0.1)
+
+    # We create a team key transaction.
+    TeamKeyTransaction.objects.create(
+        organization=default_project.organization,
+        transaction="/foo",
+        project_team=ProjectTeam.objects.get(project=default_project, team=default_team),
+    )
+
+    release_ids = []
+    for release_version in ("1.0", "2.0", "3.0"):
+        release = Factories.create_release(
+            project=default_project,
+            version=release_version,
+        )
+        release_ids.append(release.id)
+
+    # We mark the first release (1.0) as expired.
+    time_to_adoption = Platform(default_project.platform).time_to_adoption
+    boosted_releases = [(release_ids[0], ts - time_to_adoption * 2)]
+    for release_id in release_ids[1:]:
+        boosted_releases.append((release_id, ts))
+
+    for release_id, timestamp in boosted_releases:
+        redis_client.hset(
+            f"ds::p:{default_project.id}:boosted_releases",
+            f"ds::r:{release_id}:e:prod",
+            timestamp,
+        )
+
+    # Set factor
+    default_factor = 0.5
+    set_adjusted_factor(default_project.organization.id, default_factor)
+
+    with Feature(
+        {
+            "organizations:dynamic-sampling": True,
+        }
+    ):
+        with patch(
+            "sentry.dynamic_sampling.rules.base.quotas.backend.get_blended_sample_rate",
+            return_value=0.1,
+        ):
+            project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    dynamic_sampling = get_path(cfg, "config", "sampling")
+    assert dynamic_sampling == {
+        "version": 2,
+        "rules": [
+            {
+                "samplingValue": {"type": "sampleRate", "value": 0.1 / 3},
+                "type": "trace",
+                "condition": {
+                    "op": "or",
+                    "inner": [
+                        {
+                            "op": "glob",
+                            "name": "trace.transaction",
+                            "value": HEALTH_CHECK_GLOBS,
+                        }
+                    ],
+                },
+                "id": 1002,
+            },
+            {
+                "condition": {
+                    "inner": {
+                        "name": "trace.replay_id",
+                        "op": "eq",
+                        "options": {"ignoreCase": True},
+                        "value": None,
+                    },
+                    "op": "not",
+                },
+                "id": 1005,
+                "samplingValue": {"type": "sampleRate", "value": 1.0},
+                "type": "trace",
+            },
+            {
+                "samplingValue": {"type": "sampleRate", "value": 1.0},
+                "type": "trace",
+                "condition": {
+                    "op": "or",
+                    "inner": [
+                        {
+                            "op": "glob",
+                            "name": "trace.environment",
+                            "value": ENVIRONMENT_GLOBS,
+                        }
+                    ],
+                },
+                "id": 1001,
+            },
+            {
+                "condition": {"inner": [], "op": "and"},
+                "id": 1004,
+                "samplingValue": {"type": "factor", "value": default_factor},
+                "type": "trace",
+            },
+            {
+                "samplingValue": {"type": "factor", "value": 1.5},
+                "type": "trace",
+                "condition": {
+                    "op": "and",
+                    "inner": [
+                        {"op": "eq", "name": "trace.release", "value": ["2.0"]},
+                        {
+                            "op": "eq",
+                            "name": "trace.environment",
+                            "value": "prod",
+                        },
+                    ],
+                },
+                "id": 1500,
+                "timeRange": {
+                    "start": "2022-10-21T18:50:25Z",
+                    "end": "2022-10-21T19:50:25Z",
+                },
+                "decayingFn": {"type": "linear", "decayedValue": 1.0},
+            },
+            {
+                "samplingValue": {"type": "factor", "value": 1.5},
+                "type": "trace",
+                "condition": {
+                    "op": "and",
+                    "inner": [
+                        {"op": "eq", "name": "trace.release", "value": ["3.0"]},
+                        {
+                            "op": "eq",
+                            "name": "trace.environment",
+                            "value": "prod",
+                        },
+                    ],
+                },
+                "id": 1501,
+                "timeRange": {
+                    "start": "2022-10-21T18:50:25Z",
+                    "end": "2022-10-21T19:50:25Z",
+                },
+                "decayingFn": {"type": "linear", "decayedValue": 1.0},
+            },
+            {
+                "samplingValue": {"type": "sampleRate", "value": 0.1},
+                "type": "trace",
+                "condition": {"op": "and", "inner": []},
+                "id": 1000,
+            },
+        ],
+    }
+
+
+@django_db_all
+@cell_silo_test
+@patch("sentry.dynamic_sampling.rules.biases.boost_latest_releases_bias.apply_dynamic_factor")
+@freeze_time("2022-10-21 18:50:25.000000+00:00")
+def test_project_config_with_trace_health_checks_enabled(
+    eval_dynamic_factor_lr: MagicMock, default_project: Project, default_team: Team
+) -> None:
+    eval_dynamic_factor_lr.return_value = 1.5
+
+    default_project.update_option(
+        "sentry:dynamic_sampling_biases",
+        [
+            {"id": "boostEnvironments", "active": False},
+            {"id": "ignoreHealthChecks", "active": True},
+            {"id": "boostLatestRelease", "active": False},
+            {"id": "boostKeyTransactions", "active": False},
+            {"id": "boostLowVolumeTransactions", "active": False},
+            {"id": "boostReplayId", "active": False},
+        ],
+    )
+    default_project.add_team(default_team)
+    old_date = datetime.now(tz=timezone.utc) - timedelta(minutes=NEW_MODEL_THRESHOLD_IN_MINUTES + 1)
+    default_project.organization.date_added = old_date
+    default_project.date_added = old_date
+    store_per_org_project_sample_rate(default_project, 0.1)
+
+    with Feature(
+        {
+            "organizations:dynamic-sampling": True,
+        }
+    ):
+        with patch(
+            "sentry.dynamic_sampling.rules.base.quotas.backend.get_blended_sample_rate",
+            return_value=0.1,
+        ):
+            project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    dynamic_sampling = get_path(cfg, "config", "sampling")
+    assert dynamic_sampling == {
+        "version": 2,
+        "rules": [
+            {
+                "samplingValue": {"type": "sampleRate", "value": 0.1 / 3},
+                "type": "trace",
+                "condition": {
+                    "op": "or",
+                    "inner": [
+                        {
+                            "op": "glob",
+                            "name": "trace.transaction",
+                            "value": HEALTH_CHECK_GLOBS,
+                        }
+                    ],
+                },
+                "id": 1002,
+            },
+            {
+                "samplingValue": {"type": "sampleRate", "value": 0.1},
+                "type": "trace",
+                "condition": {"op": "and", "inner": []},
+                "id": 1000,
+            },
+        ],
+    }
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_with_breakdown(default_project: Project) -> None:
+    breakdowns = {
+        "span_ops": {
+            "type": "spanOperations",
+            "matches": ["http", "db", "browser", "resource", "ui"],
+        }
+    }
+    default_project.update_option("sentry:breakdowns", breakdowns)
+    project_cfg = get_project_config(default_project)
+
+    cfg = project_cfg.to_dict()
+    _validate_project_config(cfg["config"])
+    assert cfg["config"]["breakdownsV2"] == breakdowns
+
+
+@django_db_all
+@cell_silo_test
+@pytest.mark.parametrize("abnormal_mechanism_rollout", (0, 1))
+def test_project_config_with_organizations_metrics_extraction(
+    default_project: Project,
+    set_sentry_option: Callable[[str, object], AbstractContextManager[None]],
+    abnormal_mechanism_rollout: int,
+) -> None:
+    with set_sentry_option(
+        "sentry-metrics.releasehealth.abnormal-mechanism-extraction-rate",
+        abnormal_mechanism_rollout,
+    ):
+        project_cfg = get_project_config(default_project)
+
+        cfg = project_cfg.to_dict()
+        _validate_project_config(cfg["config"])
+        session_metrics = get_path(cfg, "config", "sessionMetrics")
+        assert session_metrics == {
+            "version": 2 if abnormal_mechanism_rollout else 1,
+        }
+
+
+@pytest.mark.parametrize("num_clusterer_runs", [9, 10])
+@django_db_all
+def test_txnames_ready(default_project: Project, num_clusterer_runs: int) -> None:
+    with mock.patch(
+        "sentry.relay.config.get_clusterer_meta",
+        return_value={"runs": num_clusterer_runs},
+    ):
+        config = get_project_config(default_project).to_dict()["config"]
+    _validate_project_config(config)
+    if num_clusterer_runs == 9:
+        assert "txNameReady" not in config
+    elif num_clusterer_runs == 10:
+        assert config["txNameReady"] is True
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_setattr(default_project: Project) -> None:
+    project_cfg = ProjectConfig(default_project)
+    with pytest.raises(Exception) as exc_info:
+        project_cfg.foo = "bar"
+    assert str(exc_info.value) == "Trying to change read only ProjectConfig object"
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_getattr(default_project: Project) -> None:
+    project_cfg = ProjectConfig(default_project, foo="bar")
+    assert project_cfg.foo == "bar"
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_str(default_project: Project) -> None:
+    project_cfg = ProjectConfig(default_project, foo="bar")
+    assert str(project_cfg) == '{"foo":"bar"}'
+
+    with mock.patch.object(ProjectConfig, "to_dict") as fake_to_dict:
+        fake_to_dict.side_effect = ValueError("bad data")
+        project_cfg1 = ProjectConfig(default_project)
+        assert str(project_cfg1) == "Content Error:bad data"
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_repr(default_project: Project) -> None:
+    project_cfg = ProjectConfig(default_project, foo="bar")
+    assert repr(project_cfg) == '(ProjectConfig){"foo":"bar"}'
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_to_json_string(default_project: Project) -> None:
+    project_cfg = ProjectConfig(default_project, foo="bar")
+    assert project_cfg.to_json_string() == '{"foo":"bar"}'
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_get_at_path(default_project: Project) -> None:
+    project_cfg = ProjectConfig(default_project, a=1, b="The b", foo="bar")
+    assert project_cfg.get_at_path("b") == "The b"
+    assert project_cfg.get_at_path("bb") is None
+    assert project_cfg.get_at_path("b", "c") is None
+    assert project_cfg.get_at_path() == project_cfg
+
+
+@django_db_all
+@pytest.mark.parametrize(
+    "health_check_set",
+    [True, False],
+    ids=["healthcheck set", "healthcheck not set"],
+)
+def test_healthcheck_filter(default_project: Project, health_check_set: bool) -> None:
+    """
+    Tests that the project config properly returns healthcheck filters when the
+    user has enabled healthcheck filters.
+    """
+
+    default_project.update_option("filters:filtered-transaction", "1" if health_check_set else "0")
+    config = get_project_config(default_project).to_dict()["config"]
+
+    _validate_project_config(config)
+    filter_settings = get_path(config, "filterSettings")
+    config_has_health_check = "ignoreTransactions" in filter_settings
+    assert config_has_health_check == health_check_set
+    if health_check_set:
+        health_check_config = filter_settings["ignoreTransactions"]
+        # healthcheck is enabled
+        assert health_check_config["isEnabled"]
+        # we have some patterns
+        assert len(health_check_config["patterns"]) > 1
+
+
+@django_db_all
+def test_desktop_performance_calculate_score(default_project: Project) -> None:
+    config = get_project_config(default_project).to_dict()["config"]
+
+    # Set a version field that is returned even though it's optional.
+    for profile in config["performanceScore"]["profiles"]:
+        profile["version"] = "1"
+
+    _validate_project_config(config)
+    performance_score = config["performanceScore"]["profiles"]
+    assert performance_score[0] == {
+        "name": "Chrome",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 900,
+                "p50": 1600,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.3,
+                "p10": 1200,
+                "p50": 2400,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.15,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": True,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.1,
+                "p10": 200,
+                "p50": 400,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Chrome",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Chrome",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[1] == {
+        "name": "Firefox",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 900.0,
+                "p50": 1600.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.3,
+                "p10": 1200.0,
+                "p50": 2400.0,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.0,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": False,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.1,
+                "p10": 200.0,
+                "p50": 400.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Firefox",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Firefox",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[2] == {
+        "name": "Safari",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 900.0,
+                "p50": 1600.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.0,
+                "p10": 1200.0,
+                "p50": 2400.0,
+                "optional": False,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.0,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": False,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.1,
+                "p10": 200.0,
+                "p50": 400.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Safari",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Safari",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[3] == {
+        "name": "Edge",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 900,
+                "p50": 1600,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.3,
+                "p10": 1200,
+                "p50": 2400,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.15,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": True,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.1,
+                "p10": 200,
+                "p50": 400,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Edge",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Edge",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[4] == {
+        "name": "Opera",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 900,
+                "p50": 1600,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.3,
+                "p10": 1200,
+                "p50": 2400,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.15,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": True,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.1,
+                "p10": 200,
+                "p50": 400,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Opera",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Opera",
+                },
+            ],
+        },
+        "version": "1",
+    }
+
+    assert performance_score[5] == {
+        "name": "Chrome INP",
+        "scoreComponents": [
+            {
+                "measurement": "inp",
+                "weight": 1.0,
+                "p10": 200,
+                "p50": 500,
+                "optional": False,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Chrome",
+                },
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Google Chrome",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Chrome",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Google Chrome",
+                },
+            ],
+        },
+        "version": "1",
+    }
+
+    assert performance_score[6] == {
+        "name": "Edge INP",
+        "scoreComponents": [
+            {
+                "measurement": "inp",
+                "weight": 1.0,
+                "p10": 200.0,
+                "p50": 500.0,
+                "optional": False,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Edge",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Edge",
+                },
+            ],
+        },
+        "version": "1",
+    }
+
+    assert performance_score[7] == {
+        "name": "Opera INP",
+        "scoreComponents": [
+            {
+                "measurement": "inp",
+                "weight": 1.0,
+                "p10": 200.0,
+                "p50": 500.0,
+                "optional": False,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Opera",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Opera",
+                },
+            ],
+        },
+        "version": "1",
+    }
+
+
+@django_db_all
+def test_mobile_performance_calculate_score(default_project: Project) -> None:
+    config = get_project_config(default_project).to_dict()["config"]
+
+    # Set a version field that is returned even though it's optional.
+    for profile in config["performanceScore"]["profiles"]:
+        profile["version"] = "1"
+
+    _validate_project_config(config)
+    performance_score = config["performanceScore"]["profiles"]
+
+    assert performance_score[8] == {
+        "name": "Chrome Mobile",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 1800.0,
+                "p50": 3000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.30,
+                "p10": 2500.0,
+                "p50": 4000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.15,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": True,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.10,
+                "p10": 800.0,
+                "p50": 1800.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Chrome Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Chrome Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[9] == {
+        "name": "Firefox Mobile",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 1800.0,
+                "p50": 3000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.30,
+                "p10": 2500.0,
+                "p50": 4000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.0,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": False,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.10,
+                "p10": 800.0,
+                "p50": 1800.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Firefox Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Firefox Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[10] == {
+        "name": "Safari Mobile",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 1800.0,
+                "p50": 3000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.0,
+                "p10": 2500.0,
+                "p50": 4000.0,
+                "optional": False,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.0,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": False,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.10,
+                "p10": 800.0,
+                "p50": 1800.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Mobile Safari",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Mobile Safari",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[11] == {
+        "name": "Edge Mobile",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 1800.0,
+                "p50": 3000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.30,
+                "p10": 2500.0,
+                "p50": 4000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.15,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": True,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.10,
+                "p10": 800.0,
+                "p50": 1800.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Edge Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Edge Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+
+    assert performance_score[12] == {
+        "name": "Opera Mobile",
+        "scoreComponents": [
+            {
+                "measurement": "fcp",
+                "weight": 0.15,
+                "p10": 1800.0,
+                "p50": 3000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "lcp",
+                "weight": 0.30,
+                "p10": 2500.0,
+                "p50": 4000.0,
+                "optional": True,
+            },
+            {
+                "measurement": "cls",
+                "weight": 0.15,
+                "p10": 0.1,
+                "p50": 0.25,
+                "optional": True,
+            },
+            {
+                "measurement": "ttfb",
+                "weight": 0.10,
+                "p10": 800.0,
+                "p50": 1800.0,
+                "optional": True,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Opera Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Opera Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[13] == {
+        "name": "Chrome Mobile INP",
+        "scoreComponents": [
+            {
+                "measurement": "inp",
+                "weight": 1.0,
+                "p10": 200.0,
+                "p50": 500.0,
+                "optional": False,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Chrome Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Chrome Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[14] == {
+        "name": "Edge Mobile INP",
+        "scoreComponents": [
+            {
+                "measurement": "inp",
+                "weight": 1.0,
+                "p10": 200.0,
+                "p50": 500.0,
+                "optional": False,
+            },
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Edge Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Edge Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+    assert performance_score[15] == {
+        "name": "Opera Mobile INP",
+        "scoreComponents": [
+            {
+                "measurement": "inp",
+                "weight": 1.0,
+                "p10": 200.0,
+                "p50": 500.0,
+                "optional": False,
+            }
+        ],
+        "condition": {
+            "op": "or",
+            "inner": [
+                {
+                    "op": "eq",
+                    "name": "event.contexts.browser.name",
+                    "value": "Opera Mobile",
+                },
+                {
+                    "op": "eq",
+                    "name": "span.attributes.browser.name.value",
+                    "value": "Opera Mobile",
+                },
+            ],
+        },
+        "version": "1",
+    }
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_with_generic_filters(default_project: Project) -> None:
+    config = get_project_config(default_project).to_dict()
+    _validate_project_config(config["config"])
+
+    assert config["config"]["filterSettings"]["generic"]["filters"]
+
+
+@django_db_all
+@cell_silo_test
+@mock.patch("sentry.relay.config.get_transaction_names_config")
+def test_project_config_with_transaction_name_clustering_disabled(
+    mock_get_transaction_name_config: MagicMock, default_project: Project
+) -> None:
+    mock_get_transaction_name_config.return_value = [
+        TransactionNameRule(
+            pattern="dummy_rule",
+            expiry="2999-05-26T00:00:00Z",
+            redaction={"method": "replace", "substitution": "*"},
+        )
+    ]
+
+    # clustering is enabled (by default)
+    config = get_project_config(default_project).to_dict()
+    mock_get_transaction_name_config.assert_called_once()
+    _validate_project_config(config["config"])
+    assert "txNameRules" in config["config"]
+
+    # clustering is disabled (via explicit option)
+    with Feature({"projects:transaction-name-clustering-disabled": True}):
+        config = get_project_config(default_project).to_dict()
+        _validate_project_config(config["config"])
+        assert "txNameRules" not in config["config"]
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_trusted_relay_settings_enabled(default_project: Project) -> None:
+    default_project.organization.update_option(
+        "sentry:ingest-through-trusted-relays-only", "enabled"
+    )
+
+    config = get_project_config(default_project).to_dict()
+
+    trusted_relay_settings = config["config"].get("trustedRelaySettings")
+    assert trusted_relay_settings is not None
+    assert trusted_relay_settings["verifySignature"] == "enabled"
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_trusted_relay_settings_disabled(default_project: Project) -> None:
+    default_project.organization.update_option(
+        "sentry:ingest-through-trusted-relays-only", "disabled"
+    )
+
+    config = get_project_config(default_project).to_dict()
+
+    # "disabled" is the default — Relay treats absent and disabled as equivalent,
+    # so we don't write the key at all.
+    assert config["config"].get("trustedRelaySettings") is None
+
+
+@django_db_all
+@cell_silo_test
+@pytest.mark.parametrize("trimming_configs", [{}, {"span": {"maxSize": 17}}])
+def test_project_config_trimming(
+    default_project: Project, trimming_configs: dict[str, object]
+) -> None:
+    with patch.object(
+        quotas.backend,
+        "get_trimming_configs",
+        return_value=trimming_configs,
+    ):
+        project_cfg = get_project_config(default_project)
+
+        cfg = project_cfg.to_dict()["config"]
+
+        if trimming_configs:
+            assert cfg["trimming"] == {"span": {"maxSize": 17}}
         else:
-            assert dynamic_sampling is None
+            assert "trimming" not in cfg
+
+        _validate_project_config(cfg)
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_skips_the_row_of_a_legacy_list(default_project: Project) -> None:
+    default_project.update_option("sentry:log_messages", ["*DEBUG*"])
+    Factories.create_project_custom_inbound_filter(
+        default_project,
+        data_type="log",
+        conditions=[{"type": "log_message", "value": ["*DEBUG*"]}],
+        legacy_filter=LegacyFilter.LOG_MESSAGE,
+    )
+    mine = Factories.create_project_custom_inbound_filter(
+        default_project,
+        data_type="all",
+        conditions=[{"type": "release", "value": ["2.*"]}],
+    )
+
+    with Feature(
+        {
+            "projects:custom-inbound-filters": True,
+            "organizations:ourlogs-ingestion": True,
+            "organizations:inbound-filters-v2": True,
+        }
+    ):
+        cfg = get_project_config(default_project).to_dict()
+
+    _validate_project_config(cfg["config"])
+    generic_ids = [f["id"] for f in get_path(cfg, "config", "filterSettings", "generic", "filters")]
+    assert generic_ids.count("log-message") == 1
+    assert [i for i in generic_ids if i.startswith(CUSTOM_INBOUND_FILTER_ID_PREFIX)] == [
+        f"{CUSTOM_INBOUND_FILTER_ID_PREFIX}{mine.id}"
+    ]
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_serves_release_comparisons(default_project: Project) -> None:
+    comparison = Factories.create_project_custom_inbound_filter(
+        default_project,
+        data_type="all",
+        conditions=[{"type": "release", "operator": "lt", "value": ["2.0.0"]}],
+    )
+    text = Factories.create_project_custom_inbound_filter(
+        default_project,
+        data_type="all",
+        conditions=[{"type": "release", "operator": "starts_with", "value": ["1."]}],
+    )
+
+    with Feature(
+        {
+            "projects:custom-inbound-filters": True,
+            "organizations:inbound-filters-v2": True,
+        }
+    ):
+        cfg = get_project_config(default_project).to_dict()
+
+    _validate_project_config(cfg["config"])
+    generic_ids = [f["id"] for f in get_path(cfg, "config", "filterSettings", "generic", "filters")]
+    custom_ids = [i for i in generic_ids if i.startswith(CUSTOM_INBOUND_FILTER_ID_PREFIX)]
+    assert custom_ids == [f"{CUSTOM_INBOUND_FILTER_ID_PREFIX}{f.id}" for f in (comparison, text)]
+
+
+@django_db_all
+@cell_silo_test
+def test_project_config_reads_a_legacy_list_at_v2_from_its_row(
+    default_project: Project, factories: Factories
+) -> None:
+    default_project.update_option("sentry:releases", ["stale"])
+    default_project.update_option("sentry:error_messages", ["stale"])
+    default_project.update_option("sentry:log_messages", ["stale"])
+    default_project.update_option("sentry:trace_metric_names", ["some metric"])
+    factories.create_project_custom_inbound_filter(
+        default_project,
+        data_type="all",
+        conditions=[{"type": "release", "value": ["1.*"]}],
+        legacy_filter=LegacyFilter.RELEASE_VERSION,
+    )
+    factories.create_project_custom_inbound_filter(
+        default_project,
+        active=False,
+        data_type="error",
+        conditions=[{"type": "error_message", "value": ["TypeError*"]}],
+        legacy_filter=LegacyFilter.ERROR_MESSAGE,
+    )
+
+    with Feature(
+        {
+            "projects:custom-inbound-filters": True,
+            "organizations:inbound-filters-v2": True,
+            "organizations:ourlogs-ingestion": True,
+            "organizations:tracemetrics-ingestion": True,
+        }
+    ):
+        cfg = get_project_config(default_project).to_dict()
+
+    filter_settings = cfg["config"]["filterSettings"]
+    assert filter_settings["releases"] == {"releases": ["1.*"]}
+    # A row the user switched off applies nothing, and a list without a row is empty
+    # whatever its option still holds.
+    assert "errorMessages" not in filter_settings
+    generic_ids = [f["id"] for f in filter_settings["generic"]["filters"]]
+    assert "log-message" not in generic_ids
+    assert "trace-metric-name" not in generic_ids

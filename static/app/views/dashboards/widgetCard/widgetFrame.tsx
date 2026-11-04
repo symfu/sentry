@@ -1,0 +1,219 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+import {IconCopy} from '@sentry/icons/copy';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+import {IconExpand} from '@sentry/icons/expand';
+import {IconWarning} from '@sentry/icons/warning';
+
+import {Badge} from '@sentry/scraps/badge';
+import {Button, LinkButton} from '@sentry/scraps/button';
+import {DropdownMenu, type MenuItemProps} from '@sentry/scraps/dropdownMenu';
+import {Container} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {t} from 'sentry/locale';
+import type {StateProps} from 'sentry/views/dashboards/widgets/common/types';
+import {Widget} from 'sentry/views/dashboards/widgets/widget/widget';
+import type {WidgetDescriptionProps} from 'sentry/views/dashboards/widgets/widget/widgetDescription';
+
+import {TooltipIconTrigger} from './tooltipIconTrigger';
+import {WarningsList} from './warningsList';
+
+interface WidgetFrameProps extends StateProps, WidgetDescriptionProps {
+  actions?: MenuItemProps[];
+  actionsDisabled?: boolean;
+  actionsMessage?: string;
+  badgeProps?: string | string[];
+  borderless?: boolean;
+  children?: React.ReactNode;
+  noVisualizationPadding?: boolean;
+  onCopyUrlClick?: () => void;
+  onFullScreenViewClick?: () => void | Promise<void>;
+  revealTooltip?: 'always' | 'hover';
+  title?: string;
+  warnings?: React.ReactNode[];
+}
+
+export function WidgetFrame(props: WidgetFrameProps) {
+  const {error} = props;
+
+  // The error state has its own set of available actions
+  const actions =
+    (error
+      ? props.onRetry
+        ? [
+            {
+              key: 'retry',
+              label: t('Retry'),
+              onAction: props.onRetry,
+            },
+          ]
+        : props.actions
+      : props.actions) ?? [];
+
+  const shouldShowFullScreenViewButton =
+    Boolean(props.onFullScreenViewClick) && !props.error;
+
+  const shouldShowCopyUrlButton = Boolean(props.onCopyUrlClick) && !props.error;
+
+  const shouldShowActions = actions && actions.length > 0;
+  const hasDisabledActionsMessage = Boolean(
+    props.actionsDisabled && props.actionsMessage
+  );
+
+  return (
+    <Widget
+      ariaLabel="Widget panel"
+      borderless={props.borderless}
+      Title={
+        <Fragment>
+          {props.warnings && props.warnings.length > 0 && (
+            <Tooltip title={<WarningsList warnings={props.warnings} />}>
+              <TooltipIconTrigger aria-label={t('Widget warnings')}>
+                <IconWarning variant="warning" />
+              </TooltipIconTrigger>
+            </Tooltip>
+          )}
+
+          <Widget.WidgetTitle title={props.title} />
+
+          {props.badgeProps &&
+            (Array.isArray(props.badgeProps) ? props.badgeProps : [props.badgeProps]).map(
+              (currentBadgeProps, i) => (
+                <WidgetBadge key={i} variant="muted">
+                  {currentBadgeProps}
+                </WidgetBadge>
+              )
+            )}
+        </Fragment>
+      }
+      revealActions={props.revealTooltip === 'always' ? 'always' : 'hover'}
+      Actions={
+        <Fragment>
+          {props.description && (
+            // Ideally we'd use `QuestionTooltip` but we need to firstly paint the icon dark, give it 100% opacity, and remove hover behaviour.
+            <Widget.WidgetDescription
+              title={props.title}
+              description={props.description}
+              revealTooltip={props.revealTooltip ?? 'hover'}
+            />
+          )}
+
+          {shouldShowActions && (
+            <TitleActionsWrapper
+              disabled={Boolean(props.actionsDisabled)}
+              disabledMessage={props.actionsMessage ?? ''}
+            >
+              {actions.length === 1 ? (
+                actions[0]!.to ? (
+                  <LinkButton
+                    size="xs"
+                    disabled={props.actionsDisabled}
+                    onClick={e => {
+                      e.stopPropagation();
+                      actions[0]!.onAction?.();
+                    }}
+                    to={actions[0]!.to}
+                  >
+                    {actions[0]!.label}
+                  </LinkButton>
+                ) : (
+                  <Button
+                    size="xs"
+                    disabled={props.actionsDisabled}
+                    onClick={e => {
+                      e.stopPropagation();
+                      actions[0]!.onAction?.();
+                    }}
+                  >
+                    {actions[0]!.label}
+                  </Button>
+                )
+              ) : null}
+
+              {actions.length > 1 ? (
+                <DropdownMenu
+                  items={actions}
+                  isDisabled={props.actionsDisabled}
+                  trigger={triggerProps => (
+                    <OverlayTrigger.IconButton
+                      {...triggerProps}
+                      aria-label={t('Widget actions')}
+                      size="xs"
+                      variant="transparent"
+                      icon={<IconEllipsis direction="down" size="sm" />}
+                      tooltipProps={{
+                        title: hasDisabledActionsMessage
+                          ? undefined
+                          : t('Widget actions'),
+                      }}
+                    />
+                  )}
+                  position="bottom-end"
+                />
+              ) : null}
+            </TitleActionsWrapper>
+          )}
+
+          {shouldShowCopyUrlButton && (
+            <Tooltip title={t('Copy Widget URL')}>
+              <Button
+                size="xs"
+                aria-label={t('Copy Widget URL')}
+                variant="transparent"
+                icon={<IconCopy />}
+                onClick={e => {
+                  e.stopPropagation();
+                  props.onCopyUrlClick?.();
+                }}
+              />
+            </Tooltip>
+          )}
+
+          {shouldShowFullScreenViewButton && (
+            <Button
+              size="xs"
+              aria-label={t('Open Full-Screen View')}
+              tooltipProps={{title: t('Open Full-Screen View')}}
+              variant="transparent"
+              icon={<IconExpand />}
+              onClick={e => {
+                e.stopPropagation();
+                props.onFullScreenViewClick?.();
+              }}
+            />
+          )}
+        </Fragment>
+      }
+      Visualization={
+        props.error ? (
+          <Container position="absolute" inset={0}>
+            <Widget.WidgetError error={error} />
+          </Container>
+        ) : (
+          props.children
+        )
+      }
+      noVisualizationPadding={props.noVisualizationPadding}
+    />
+  );
+}
+
+interface TitleActionsProps {
+  children: React.ReactNode;
+  disabled: boolean;
+  disabledMessage: string;
+}
+
+const WidgetBadge = styled(Badge)`
+  flex-shrink: 0;
+`;
+
+function TitleActionsWrapper({disabled, disabledMessage, children}: TitleActionsProps) {
+  if (!disabled || !disabledMessage) {
+    return children;
+  }
+
+  return <Tooltip title={disabledMessage}>{children}</Tooltip>;
+}

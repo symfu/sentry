@@ -1,0 +1,255 @@
+import {useCallback, useMemo, useState, type ComponentProps} from 'react';
+import styled from '@emotion/styled';
+import {IconSearch} from '@sentry/icons/search';
+import {parseAsString, useQueryState, useQueryStates} from 'nuqs';
+
+import NoAlertsImage from 'sentry-images/features/alerts-not-found.svg';
+
+import {LinkButton} from '@sentry/scraps/button';
+import {Flex} from '@sentry/scraps/layout';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+import {Heading, Text} from '@sentry/scraps/text';
+
+import {getNextSort} from 'sentry/components/tables/getNextSort';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {SelectAllHeaderCheckbox} from 'sentry/components/workflowEngine/ui/selectAllHeaderCheckbox';
+import {t} from 'sentry/locale';
+import type {Automation} from 'sentry/types/workflowEngine/automations';
+import type {Sort} from 'sentry/utils/discover/fields';
+import {parseAsSort} from 'sentry/utils/url/parseAsSort';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {
+  AutomationsTableActions,
+  AutomationsTableActionsBanner,
+} from 'sentry/views/automations/components/automationListTable/actions';
+import {
+  AutomationListRow,
+  AutomationListRowSkeleton,
+} from 'sentry/views/automations/components/automationListTable/row';
+import {AUTOMATION_LIST_PAGE_LIMIT} from 'sentry/views/automations/constants';
+import {hasOrganizationAutomationWriteAccess} from 'sentry/views/automations/utils/permissions';
+import {makeMonitorBasePathname} from 'sentry/views/detectors/pathnames';
+
+type AutomationListTableProps = {
+  allResultsVisible: boolean;
+  automations: Automation[];
+  isError: boolean;
+  isPending: boolean;
+  isSuccess: boolean;
+  queryCount: string;
+  sort: Sort | undefined;
+};
+
+function LoadingSkeletons() {
+  return Array.from({length: AUTOMATION_LIST_PAGE_LIMIT}).map((_, index) => (
+    <AutomationListRowSkeleton key={index} />
+  ));
+}
+
+const sortQueryParsers = {sort: parseAsSort, cursor: parseAsString};
+
+function HeaderCell({
+  children,
+  sortKey,
+  sort,
+  ...props
+}: {
+  children: React.ReactNode;
+  sort: Sort | undefined;
+  className?: string;
+  sortKey?: string;
+} & Omit<ComponentProps<typeof SimpleTable.HeaderCell>, 'sort'>) {
+  const [, setSortQuery] = useQueryStates(sortQueryParsers);
+  const handleSort = () => {
+    if (!sortKey) {
+      return;
+    }
+    setSortQuery(
+      {sort: getNextSort(sortKey, sort ?? undefined, 'asc'), cursor: null},
+      {history: 'push'}
+    );
+  };
+
+  return (
+    <SimpleTable.HeaderCell
+      {...props}
+      sort={sort && sortKey === sort?.field ? sort.kind : undefined}
+      handleSortClick={sortKey ? handleSort : undefined}
+    >
+      {children}
+    </SimpleTable.HeaderCell>
+  );
+}
+
+export function AutomationListTable({
+  automations,
+  isPending,
+  isError,
+  isSuccess,
+  sort,
+  queryCount,
+  allResultsVisible,
+}: AutomationListTableProps) {
+  const organization = useOrganization();
+  const canEditAutomations = hasOrganizationAutomationWriteAccess(organization);
+  const [query] = useQueryState('query', parseAsString);
+  const [selected, setSelectedIds] = useState(new Set<string>());
+  const [allInQuerySelected, setAllInQuerySelected] = useState(false);
+
+  // Selecting every match only holds while something is selected, so emptying the
+  // selection has to clear it too.
+  const setSelected = useCallback((ids: Set<string>) => {
+    setSelectedIds(ids);
+    if (ids.size === 0) {
+      setAllInQuerySelected(false);
+    }
+  }, []);
+
+  const togglePageSelected = (pageSelected: boolean) => {
+    const newSelected = new Set<string>();
+    if (pageSelected) {
+      automations.forEach(automation => newSelected.add(automation.id));
+    }
+    setSelected(newSelected);
+  };
+  const automationIds = new Set(automations.map(automation => automation.id));
+  const pageSelected =
+    !isPending &&
+    automationIds.size !== 0 &&
+    automationIds.difference(selected).size === 0;
+  const anySelected = selected.size > 0;
+
+  const canEnable = useMemo(
+    () =>
+      automations.some(automation => selected.has(automation.id) && !automation.enabled),
+    [automations, selected]
+  );
+  const canDisable = useMemo(
+    () =>
+      automations.some(automation => selected.has(automation.id) && automation.enabled),
+    [automations, selected]
+  );
+
+  const handleSelect = useCallback(
+    (id: string) => {
+      const newSelected = new Set(selected);
+      if (newSelected.has(id)) {
+        newSelected.delete(id);
+      } else {
+        newSelected.add(id);
+      }
+      setSelected(newSelected);
+    },
+    [selected, setSelected]
+  );
+
+  return (
+    <AutomationsSimpleTable
+      columns={AUTOMATION_COLUMNS}
+      header={
+        !canEditAutomations || selected.size === 0 ? (
+          <SimpleTable.HeaderRow key="header">
+            <HeaderCell sort={sort} sortKey="name">
+              <Flex gap="md" align="center">
+                {canEditAutomations && (
+                  <SelectAllHeaderCheckbox
+                    checked={pageSelected || (anySelected ? 'indeterminate' : false)}
+                    onChange={checked => togglePageSelected(checked)}
+                  />
+                )}
+                <span>{t('Name')}</span>
+              </Flex>
+            </HeaderCell>
+            <HeaderCell sort={sort} sortKey="lastTriggered">
+              {t('Last Triggered')}
+            </HeaderCell>
+            <HeaderCell sort={sort} sortKey="actions">
+              {t('Actions')}
+            </HeaderCell>
+            <HeaderCell sort={sort}>{t('Projects')}</HeaderCell>
+            <HeaderCell sort={sort} sortKey="connectedDetectors">
+              {t('Monitors')}
+            </HeaderCell>
+          </SimpleTable.HeaderRow>
+        ) : (
+          <AutomationsTableActions
+            key="actions"
+            selected={selected}
+            pageSelected={pageSelected}
+            togglePageSelected={togglePageSelected}
+            queryCount={queryCount}
+            allInQuerySelected={allInQuerySelected}
+            setAllInQuerySelected={setAllInQuerySelected}
+            canEnable={canEnable}
+            canDisable={canDisable}
+          />
+        )
+      }
+    >
+      {selected.size > 0 && (
+        <AutomationsTableActionsBanner
+          selected={selected}
+          pageSelected={pageSelected}
+          allResultsVisible={allResultsVisible}
+          queryCount={queryCount}
+          allInQuerySelected={allInQuerySelected}
+          setAllInQuerySelected={setAllInQuerySelected}
+        />
+      )}
+      {isSuccess && automations.length === 0 && (
+        <SimpleTable.Empty>
+          <StyledFlex gap="xl" direction="column" align="center">
+            <img src={NoAlertsImage} />
+            <Heading as="h3">{t('No alerts found.')}</Heading>
+            <Text align="center" variant="muted">
+              {t('Try out that same query on the Monitors page.')}
+            </Text>
+
+            <LinkButton
+              icon={<IconSearch />}
+              variant="primary"
+              to={{
+                pathname: makeMonitorBasePathname(organization.slug),
+                query: {query},
+              }}
+            >
+              {t('Search Monitors')}
+            </LinkButton>
+          </StyledFlex>
+        </SimpleTable.Empty>
+      )}
+      {isError && <SimpleTable.Error message={t('Error loading alerts')} />}
+      {isPending && <LoadingSkeletons />}
+      {isSuccess &&
+        automations.map(automation => (
+          <AutomationListRow
+            key={automation.id}
+            automation={automation}
+            canEdit={canEditAutomations}
+            selected={selected.has(automation.id)}
+            onSelect={handleSelect}
+          />
+        ))}
+    </AutomationsSimpleTable>
+  );
+}
+
+const StyledFlex = styled(Flex)`
+  padding: ${p => p.theme.size.sm};
+`;
+
+const AUTOMATION_COLUMNS: TableColumnConfig[] = [
+  {key: 'name', width: {zero: '1fr', sm: '2.5fr', '4xl': 'minmax(0, 3fr)'}},
+  {
+    key: 'last-triggered',
+    visible: {'3xl': true},
+    width: 'minmax(160px, 1fr)',
+  },
+  {key: 'action', visible: {xl: true}, width: '1fr'},
+  {key: 'projects', visible: {sm: true}, width: '1fr'},
+  {key: 'connected-monitors', visible: {'4xl': true}, width: '1fr'},
+];
+
+const AutomationsSimpleTable = styled(SimpleTable)`
+  margin-bottom: ${p => p.theme.space.xl};
+`;

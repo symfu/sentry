@@ -1,0 +1,85 @@
+import type {ReactElement} from 'react';
+
+import type {Scope} from 'sentry/types/core';
+import type {Organization} from 'sentry/types/organization';
+import type {Project} from 'sentry/types/project';
+
+export type NavigationProps = {
+  access?: Set<Scope>;
+  features?: Set<string>;
+  id?: string;
+  isSelfHosted?: boolean;
+  organization?: Organization;
+  project?: Project;
+};
+
+export type NavigationGroupProps = NavigationProps & NavigationSection;
+
+export type NavigationItem = {
+  /**
+   * The path of the navigation link
+   */
+  path: string;
+  /**
+   * The title of the link. This is what will be rendered in the navigation
+   * panel.
+   */
+  title: string;
+  /**
+   * Returns the text of the badge to render next to the navigation.
+   */
+  badge?: (opts: NavigationGroupProps) => string | number | null | ReactElement;
+  /**
+   * The description of the settings section. This will be used in search.
+   */
+  description?: string;
+  /**
+   * Icon shown next to the page in the command palette.
+   */
+  icon?: ReactElement;
+  /**
+   * A string identifier for the navigation item. May be used in hooks to
+   * augment navigation items.
+   */
+  id?: string;
+  /**
+   * Is this the index settings page for this navigation config.
+   */
+  index?: boolean;
+  /**
+   * Additional search keywords for this item (e.g. aliases or common abbreviations).
+   */
+  keywords?: string[];
+  /**
+   * Should clicking on the sidebar generate an analytics event
+   */
+  recordAnalytics?: boolean;
+  /**
+   * Should the navigation item be displayed?
+   */
+  show?: boolean | ((opts: NavigationGroupProps) => boolean);
+};
+
+export type NavigationSection = {
+  /**
+   * Unique identifier for the navigation section, used to save collapsed state
+   */
+  id: string;
+  items: NavigationItem[];
+  /**
+   * Heading of the navigation section
+   */
+  name: string;
+};
+
+/**
+ * Settings metadata a route can declare on its `handle`.
+ */
+export type SettingsRouteHandle = {
+  /**
+   * Where to go when the user picks a different project while on this route.
+   * Drops entity-specific params (e.g. `:keyId`) so the destination exists for
+   * every project. Shared by the sidebar project selector and breadcrumbs.
+   */
+  settingsProjectSwitch?: {switchTo: string};
+};

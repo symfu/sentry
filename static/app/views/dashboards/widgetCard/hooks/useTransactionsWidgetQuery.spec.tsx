@@ -1,0 +1,158 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {PageFiltersFixture} from 'sentry-fixture/pageFilters';
+import {WidgetFixture} from 'sentry-fixture/widget';
+
+import {renderHookWithProviders, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import {DiscoverDatasets} from 'sentry/utils/discover/types';
+import {DisplayType} from 'sentry/views/dashboards/types';
+
+import {
+  useTransactionsSeriesQuery,
+  useTransactionsTableQuery,
+} from './useTransactionsWidgetQuery';
+
+jest.mock('sentry/views/dashboards/utils/widgetQueryQueue', () => ({
+  useWidgetQueryQueue: () => ({queue: null}),
+}));
+
+describe('useTransactionsSeriesQuery', () => {
+  const organization = OrganizationFixture();
+  const pageFilters = PageFiltersFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(pageFilters);
+  });
+
+  it('makes a request to the events-stats endpoint', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-stats/',
+      body: {
+        data: [],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useTransactionsSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-stats/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            yAxis: ['count()'],
+            dataset: DiscoverDatasets.SPANS,
+          }),
+        })
+      );
+    });
+  });
+
+  it('excludes the Other series for grouped widgets with multiple aggregates', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: '',
+          fields: [],
+          aggregates: ['count()', 'p95()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-stats/',
+      body: {},
+    });
+
+    renderHookWithProviders(() =>
+      useTransactionsSeriesQuery({widget, organization, pageFilters, enabled: true})
+    );
+
+    await waitFor(() =>
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-stats/',
+        expect.objectContaining({query: expect.objectContaining({excludeOther: '1'})})
+      )
+    );
+  });
+});
+
+describe('useTransactionsTableQuery', () => {
+  const organization = OrganizationFixture();
+  const pageFilters = PageFiltersFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(pageFilters);
+  });
+
+  it('makes a request to the events endpoint', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useTransactionsTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            dataset: 'spans',
+          }),
+        })
+      );
+    });
+  });
+});

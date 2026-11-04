@@ -1,62 +1,77 @@
-from sentry import http, options, features
+from __future__ import annotations
 
-from sentry.identity.oauth2 import OAuth2Provider, OAuth2LoginView, OAuth2CallbackView
+from collections.abc import Mapping
+from typing import Any, cast
+
+from django.core.exceptions import PermissionDenied
+from requests import Response
+
+from sentry import http, options
+from sentry.http import safe_urlopen
+from sentry.identity.oauth2 import OAuth2CallbackView, OAuth2LoginView, OAuth2Provider
+from sentry.identity.pipeline import IdentityPipeline
+from sentry.identity.services.identity.model import RpcIdentity
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.pipeline.views.base import PipelineView
+from sentry.users.models.identity import Identity
 from sentry.utils.http import absolute_uri
 
 
-def get_user_info(access_token):
-    session = http.build_session()
-    resp = session.get(
-        "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=1.0",
-        headers={"Accept": "application/json", "Authorization": "bearer %s" % access_token},
-    )
-    resp.raise_for_status()
-    user = resp.json()
-    user["uuid"] = user["id"]
+def get_user_info(access_token: str) -> dict[str, object]:
+    with http.build_session() as session:
+        resp = session.get(
+            "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=1.0",
+            headers={"Accept": "application/json", "Authorization": f"bearer {access_token}"},
+        )
+        resp.raise_for_status()
 
-    resp = session.get(
-        "https://app.vssps.visualstudio.com/_apis/connectionData/",
-        headers={"Accept": "application/json", "Authorization": "bearer %s" % access_token},
-    )
-    resp.raise_for_status()
-    # NOTE (from Microsoft PM):
-    # The "descriptor" is the universal identifier for a given user and is consistent across
-    # all VSTS accounts (organizations). The "id" field for the same user can be different for
-    # the same user in different places, so the "descriptor" is the best identifier for a user.
-    # This is returned in most/all of the VSTS REST APIs at this point (except for the
-    # profiles/me API above). To get the current user's descriptor, we call the "connection data"
-    # REST API (this assumes we are authenticating with an access token issued to the user).
-    # We will also see descriptors returned for every user in the "Get users" (Graph) REST API.
-    user["id"] = resp.json()["authenticatedUser"]["subjectDescriptor"]
+        payload = resp.json()
+        user: dict[str, object] = payload
+        user["uuid"] = user["id"]
+
+        resp = session.get(
+            "https://app.vssps.visualstudio.com/_apis/connectionData/",
+            headers={"Accept": "application/json", "Authorization": f"bearer {access_token}"},
+        )
+        resp.raise_for_status()
+
+        # NOTE (from Microsoft PM):
+        # The "descriptor" is the universal identifier for a given user and is consistent across
+        # all VSTS accounts (organizations). The "id" field for the same user can be different for
+        # the same user in different places, so the "descriptor" is the best identifier for a user.
+        # This is returned in most/all of the VSTS REST APIs at this point (except for the
+        # profiles/me API above). To get the current user's descriptor, we call the "connection data"
+        # REST API (this assumes we are authenticating with an access token issued to the user).
+        # We will also see descriptors returned for every user in the "Get users" (Graph) REST API.
+        connection_data = resp.json()
+        user["id"] = connection_data["authenticatedUser"]["subjectDescriptor"]
 
     return user
 
 
 class VSTSIdentityProvider(OAuth2Provider):
-    key = "vsts"
+    """Legacy VSTS OAuth identity provider (pre-Azure AD v2.0).
+
+    Still used for token refresh on old identities. New logins and
+    integrations should use VSTSNewIdentityProvider.
+    """
+
+    key = IntegrationProviderSlug.AZURE_DEVOPS.value
     name = "Azure DevOps"
 
     oauth_access_token_url = "https://app.vssps.visualstudio.com/oauth2/token"
     oauth_authorize_url = "https://app.vssps.visualstudio.com/oauth2/authorize"
 
-    @property
-    def use_limited_scopes(self):
-        return use_limited_scopes(self.pipeline)
-
-    def get_oauth_client_id(self):
-        if self.use_limited_scopes:
-            return options.get("vsts-limited.client-id")
+    def get_oauth_client_id(self) -> str:
         return options.get("vsts.client-id")
 
-    def get_oauth_client_secret(self):
-        if self.use_limited_scopes:
-            return options.get("vsts-limited.client-secret")
+    def get_oauth_client_secret(self) -> str:
         return options.get("vsts.client-secret")
 
-    def get_refresh_token_url(self):
+    def get_refresh_token_url(self) -> str:
         return self.oauth_access_token_url
 
-    def get_pipeline_views(self):
+    def get_pipeline_views(self) -> list[PipelineView[IdentityPipeline]]:
         return [
             OAuth2LoginView(
                 authorize_url=self.oauth_authorize_url,
@@ -70,11 +85,12 @@ class VSTSIdentityProvider(OAuth2Provider):
             ),
         ]
 
-    def get_refresh_token_headers(self):
+    def get_refresh_token_headers(self) -> dict[str, str]:
         return {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": "1654"}
 
-    def get_refresh_token_params(self, refresh_token, *args, **kwargs):
-        identity = kwargs.get("identity")
+    def get_refresh_token_params(
+        self, refresh_token: str, identity: Identity | RpcIdentity, **kwargs: Any
+    ) -> dict[str, str | None]:
         client_secret = options.get("vsts.client-secret")
 
         # The token refresh flow does not operate within a pipeline in the same way
@@ -84,6 +100,11 @@ class VSTSIdentityProvider(OAuth2Provider):
         # If "vso.code" is missing from the identity.scopes, we know that we installed
         # using the "vsts-limited.client-secret" and therefore should use that to refresh
         # the token.
+
+        # TODO(ecosystem): We should not use scopes to determine which client_secret to use
+        assert isinstance(identity, Identity), (
+            "Legacy VSTS identity provider only supports Identity"
+        )
         if "vso.code" not in identity.scopes:
             client_secret = options.get("vsts-limited.client-secret")
 
@@ -98,48 +119,135 @@ class VSTSIdentityProvider(OAuth2Provider):
             "redirect_uri": absolute_uri(oauth_redirect_url),
         }
 
-    def build_identity(self, data):
-        data = data["data"]
-        user = get_user_info(data["access_token"])
+    def build_identity(self, data: Mapping[str, object]) -> Mapping[str, object]:
+        identity_data = cast(Mapping[str, object], data["data"])
+        access_token = identity_data.get("access_token")
+        if not access_token:
+            raise PermissionDenied()
+        user = get_user_info(cast(str, access_token))
 
         return {
-            "type": "vsts",
+            "type": IntegrationProviderSlug.AZURE_DEVOPS.value,
             "id": user["id"],
             "email": user["emailAddress"],
-            "email_verified": True,
             "name": user["displayName"],
             "scopes": sorted(self.oauth_scopes),
-            "data": self.get_oauth_data(data),
+            "data": self.get_oauth_data(identity_data),
         }
 
 
 class VSTSOAuth2CallbackView(OAuth2CallbackView):
-    def exchange_token(self, request, pipeline, code):
-        from sentry.http import safe_urlopen, safe_urlread
-        from sentry.utils.http import absolute_uri
-        from urllib.parse import parse_qsl
-        from sentry.utils import json
+    def get_access_token(self, pipeline: IdentityPipeline, code: str) -> Response:
+        data = {
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": self.client_secret,
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": code,
+            "redirect_uri": pipeline.config.get("redirect_url"),
+        }
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": "1322",
+        }
+        return safe_urlopen(self.access_token_url, data=data, headers=headers)
 
-        req = safe_urlopen(
-            url=self.access_token_url,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Content-Length": "1322"},
-            data={
-                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                "client_assertion": self.client_secret,
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": code,
-                "redirect_uri": absolute_uri(pipeline.redirect_url()),
-            },
+
+class VSTSNewIdentityProvider(OAuth2Provider):
+    """Active VSTS identity provider using Azure AD v2.0 OAuth.
+
+    Handles all new logins and integrations. Old identities created under
+    VSTSIdentityProvider are migrated via MigratingIdentityId.
+    """
+
+    key = "vsts_new"
+    name = "Azure DevOps"
+
+    oauth_access_token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    oauth_authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+
+    # Using a new option
+    def get_oauth_client_id(self) -> str:
+        return options.get("vsts_new.client-id")
+
+    def get_oauth_client_secret(self) -> str:
+        return options.get("vsts_new.client-secret")
+
+    def get_refresh_token_url(self) -> str:
+        return self.oauth_access_token_url
+
+    def get_pipeline_views(self) -> list[PipelineView[IdentityPipeline]]:
+        return [
+            # made a new view to override `get_authorize_params` for the new params needed for the oauth
+            VSTSOAuth2LoginView(
+                authorize_url=self.oauth_authorize_url,
+                client_id=self.get_oauth_client_id(),
+                scope=" ".join(self.get_oauth_scopes()),
+            ),
+            VSTSNewOAuth2CallbackView(
+                access_token_url=self.oauth_access_token_url,
+                client_id=self.get_oauth_client_id(),
+                client_secret=self.get_oauth_client_secret(),
+            ),
+        ]
+
+    def get_refresh_token_headers(self) -> dict[str, str]:
+        return {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": "1654"}
+
+    def get_refresh_token_params(
+        self, refresh_token: str, identity: Identity | RpcIdentity, **kwargs: Any
+    ) -> dict[str, str | None]:
+        oauth_redirect_url = kwargs.get("redirect_url")
+        if oauth_redirect_url is None:
+            raise ValueError("VSTS requires oauth redirect url when refreshing identity")
+
+        return {
+            "grant_type": "refresh_token",
+            "client_id": self.get_oauth_client_id(),
+            "client_secret": self.get_oauth_client_secret(),
+            "refresh_token": refresh_token,
+        }
+
+    def build_identity(self, data: Mapping[str, object]) -> Mapping[str, object]:
+        identity_data = cast(Mapping[str, object], data["data"])
+        access_token = identity_data.get("access_token")
+        if not access_token:
+            raise PermissionDenied()
+        user = get_user_info(cast(str, access_token))
+
+        return {
+            "type": IntegrationProviderSlug.AZURE_DEVOPS.value,
+            "id": user["id"],
+            "email": user["emailAddress"],
+            "name": user["displayName"],
+            "scopes": sorted(self.oauth_scopes),
+            "data": self.get_oauth_data(identity_data),
+        }
+
+
+class VSTSOAuth2LoginView(OAuth2LoginView):
+    def get_authorize_params(self, state: str, redirect_uri: str) -> dict[str, str | int | None]:
+        params = {
+            "client_id": self.client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "response_mode": "query",
+            "scope": self.get_scope(),
+            "state": state,
+        }
+
+        if options.get("vsts.consent-prompt"):
+            params["prompt"] = "consent"
+
+        return params
+
+
+class VSTSNewOAuth2CallbackView(OAuth2CallbackView):
+    def get_access_token(self, pipeline: IdentityPipeline, code: str) -> Response:
+        data = self.get_token_params(
+            code=code, redirect_uri=absolute_uri(pipeline.config.get("redirect_url"))
         )
-        body = safe_urlread(req)
-        if req.headers["Content-Type"].startswith("application/x-www-form-urlencoded"):
-            return dict(parse_qsl(body))
-        return json.loads(body)
-
-
-def use_limited_scopes(pipeline):
-    return features.has(
-        "organizations:integrations-vsts-limited-scopes",
-        pipeline.organization,
-        actor=pipeline.request.user,
-    )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": "1322",
+        }
+        return safe_urlopen(self.access_token_url, data=data, headers=headers)

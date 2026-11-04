@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping, Sequence
+from typing import Literal, NotRequired, TypedDict
+
+from sentry.integrations.client import ApiClient
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.on_call.metrics import OnCallInteractionType
+from sentry.integrations.opsgenie.metrics import record_event, record_lifecycle_termination_level
+from sentry.integrations.services.integration.model import RpcIntegration
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.integrations.utils.feature_flags import EventFeatureFlag, get_event_feature_flags
+from sentry.models.group import Group
+from sentry.notifications.types import NotificationOrigin
+from sentry.notifications.utils.links import create_link_to_workflow
+from sentry.services.eventstore.models import Event, GroupEvent
+from sentry.shared_integrations.exceptions import ApiError
+from sentry.shared_integrations.response.base import BaseApiResponse
+
+OPSGENIE_API_VERSION = "v2"
+# Defaults to P3 if null, but we can be explicit - https://docs.opsgenie.com/docs/alert-api
+OPSGENIE_DEFAULT_PRIORITY = "P3"
+
+OpsgeniePriority = Literal["P1", "P2", "P3", "P4", "P5"]
+
+
+class _IssueAlertPayload(TypedDict):
+    message: str | None
+    source: str
+    priority: OpsgeniePriority | None
+    details: dict[str, object]
+    tags: list[str]
+    alias: NotRequired[str]
+    entity: NotRequired[str]
+
+
+logger = logging.getLogger("sentry.integrations.opsgenie")
+
+# Opsgenie/JSM caps the total size of `details`, so keep the flags entry bounded.
+MAX_FEATURE_FLAGS_DETAIL_LENGTH = 4000
+
+
+def format_feature_flags_detail(flags: Sequence[EventFeatureFlag]) -> str | None:
+    """
+    Format feature flags as a single Opsgenie/JSM `details` value, e.g.
+    "new-checkout: true, dark-mode: false", truncated to fit the details limit.
+    """
+    if not flags:
+        return None
+
+    detail = ", ".join(f"{f.flag}: {f.result}" for f in flags)
+    if len(detail) > MAX_FEATURE_FLAGS_DETAIL_LENGTH:
+        detail = detail[: MAX_FEATURE_FLAGS_DETAIL_LENGTH - 3] + "..."
+    return detail
+
+
+class OpsgenieClient(ApiClient):
+    integration_name = IntegrationProviderSlug.OPSGENIE.value
+
+    def __init__(self, integration: RpcIntegration | Integration, integration_key: str) -> None:
+        self.integration = integration
+        self.base_url = f"{self.metadata['base_url']}{OPSGENIE_API_VERSION}"
+        self.integration_key = integration_key
+        super().__init__(integration_id=self.integration.id)
+
+    @property
+    def metadata(self) -> Mapping[str, object]:
+        return self.integration.metadata
+
+    def _get_auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"GenieKey {self.integration_key}"}
+
+    def get_alerts(self, limit: int | None = 1) -> object | None:
+        path = f"/alerts?limit={limit}"
+        return self.get(path=path, headers=self._get_auth_headers())
+
+    def _get_workflow_links(
+        self, group: Group, rules: Sequence[NotificationOrigin]
+    ) -> list[tuple[str, str]]:
+        """
+        Returns (label, url) pairs for each rule that carries a workflow id.
+        """
+        organization = group.project.organization
+        links = []
+        for rule in rules:
+            workflow_id = rule.workflow_id
+            if workflow_id is None:
+                # Test notifications have no backing workflow, so nothing to link to.
+                if not rule.is_test_notification():
+                    logger.warning(
+                        "opsgenie.issue_alert.missing_workflow_id",
+                        extra={
+                            "legacy_rule_id": rule.legacy_rule_id,
+                            "group_id": group.id,
+                            "project_id": group.project_id,
+                            "organization_id": organization.id,
+                        },
+                    )
+                continue
+            links.append(
+                (
+                    rule.label,
+                    organization.absolute_url(
+                        create_link_to_workflow(organization.slug, str(workflow_id))
+                    ),
+                )
+            )
+        return links
+
+    def build_issue_alert_payload(
+        self,
+        data: Event | GroupEvent,
+        rules: Sequence[NotificationOrigin],
+        event: Event | GroupEvent,
+        group: Group | None,
+        priority: OpsgeniePriority | None = "P3",
+        notification_uuid: str | None = None,
+    ) -> _IssueAlertPayload:
+        feature_flags = format_feature_flags_detail(get_event_feature_flags(event))
+        feature_flags_context = {"Feature Flags": feature_flags} if feature_flags else {}
+
+        payload: _IssueAlertPayload = {
+            "message": event.message or event.title,
+            "source": "Sentry",
+            "priority": priority,
+            "details": {
+                "Triggering Rules": ", ".join([rule.label for rule in rules]),
+                "Release": data.release,
+                **feature_flags_context,
+            },
+            "tags": [f"{str(x).replace(',', '')}:{str(y).replace(',', '')}" for x, y in event.tags],
+        }
+        if group:
+            payload["alias"] = f"sentry: {group.id}"
+            payload["entity"] = group.culprit if group.culprit else ""
+            group_params = {"referrer": IntegrationProviderSlug.OPSGENIE.value}
+            if notification_uuid:
+                group_params["notification_uuid"] = notification_uuid
+
+            workflow_links = self._get_workflow_links(group, rules)
+            rule_workflow_context = {}
+            if workflow_links:
+                rule_workflow_context = {
+                    "Triggering Workflows": ", ".join(label for label, _ in workflow_links),
+                    "Triggering Workflow URLs": "\n".join(url for _, url in workflow_links),
+                }
+
+            payload["details"] = {
+                "Sentry ID": str(group.id),
+                "Sentry Group": getattr(group, "title", group.message).encode("utf-8"),
+                "Project ID": group.project.slug,
+                "Project Name": group.project.name,
+                "Logger": group.logger,
+                "Level": group.get_level_display(),
+                "Issue URL": group.get_absolute_url(params=group_params),
+                "Release": data.release,
+                **rule_workflow_context,
+                **feature_flags_context,
+            }
+        return payload
+
+    def send_notification(self, data: Mapping[str, object]) -> BaseApiResponse:
+        headers = self._get_auth_headers()
+        with record_event(OnCallInteractionType.CREATE).capture() as lifecycle:
+            try:
+                return self.post("/alerts", data=data, headers=headers)
+            except ApiError as e:
+                record_lifecycle_termination_level(lifecycle=lifecycle, error=e)
+                raise
+
+    # TODO(iamrajjoshi): We need to delete this method during notification platform
+    def send_metric_alert_notification(self, data: Mapping[str, object]) -> BaseApiResponse:
+        headers = self._get_auth_headers()
+
+        # If closing an alert (when Sentry alert was resolved)
+        if data.get("identifier"):
+            alias = data["identifier"]
+            with record_event(OnCallInteractionType.RESOLVE).capture() as lifecycle:
+                try:
+                    return self.post(
+                        f"/alerts/{alias}/close",
+                        data={},
+                        params={"identifierType": "alias"},
+                        headers=headers,
+                    )
+                except ApiError as e:
+                    record_lifecycle_termination_level(lifecycle=lifecycle, error=e)
+                    raise
+
+        # Creating a metric alert
+        with record_event(OnCallInteractionType.CREATE).capture() as lifecycle:
+            try:
+                return self.post("/alerts", data=data, headers=headers)
+            except ApiError as e:
+                record_lifecycle_termination_level(lifecycle=lifecycle, error=e)
+                raise

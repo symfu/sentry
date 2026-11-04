@@ -1,0 +1,170 @@
+from collections.abc import Mapping
+from typing import Any
+from unittest.mock import Mock, patch
+
+import pytest
+from django.test import override_settings
+from urllib3.response import HTTPResponse
+
+from sentry.models.organization import Organization
+from sentry.seer.oneshot import call_seer_oneshot, run_oneshot
+from sentry.seer.run_questions import QUESTIONS, get_run_questions
+from sentry.seer.signed_seer_api import MissingViewerContextError
+from sentry.testutils.cases import TestCase
+from sentry.viewer_context import (
+    Actor,
+    ActorType,
+    ViewerContext,
+    get_viewer_context,
+    viewer_context_scope,
+)
+
+
+class CallSeerOneShotTest(TestCase):
+    @override_settings(SEER_API_SHARED_SECRET="viewer-context-test-secret")
+    @patch("sentry.seer.signed_seer_api.metrics.incr")
+    @patch("sentry.seer.signed_seer_api.seer_autofix_default_connection_pool.urlopen")
+    def test_rejects_legacy_context_without_an_ambient_context(
+        self, mock_urlopen: Mock, mock_metrics_incr: Mock
+    ) -> None:
+        mock_urlopen.return_value = HTTPResponse(b'{"result":{"answer":"ok"}}', status=200)
+
+        with pytest.raises(MissingViewerContextError):
+            run_oneshot("test", {}, self.organization)
+
+        mock_urlopen.assert_not_called()
+        mock_metrics_incr.assert_any_call(
+            "seer.viewer_context_resolution",
+            tags={
+                "outcome": "contextvar_missing",
+                "endpoint": "/v1/automation/oneshot/run",
+            },
+        )
+        assert get_viewer_context() is None
+
+    def test_does_not_establish_ambient_context_from_legacy_metadata(self) -> None:
+        observed_contexts: list[ViewerContext | None] = []
+        observed_request_contexts: list[Mapping[str, int]] = []
+        response = Mock(status=200, data=b'{"result": {}}')
+
+        def make_request(*args: Any, **kwargs: Any) -> Mock:
+            observed_contexts.append(get_viewer_context())
+            observed_request_contexts.append(kwargs["viewer_context"])
+            return response
+
+        call_seer_oneshot(
+            make_request,
+            {"oneshot_id": "test", "payload": {}},
+            self.organization,
+            error_metric="seer.oneshot.error",
+            user_id=self.user.id,
+        )
+
+        assert observed_contexts == [None]
+        assert observed_request_contexts == [
+            {
+                "organization_id": self.organization.id,
+                "user_id": self.user.id,
+            }
+        ]
+        assert get_viewer_context() is None
+
+    def test_preserves_existing_viewer_context(self) -> None:
+        existing_context = ViewerContext(
+            actor=Actor(type=ActorType.USER, actor_id=self.user.id),
+            organization_id=self.organization.id,
+            project_id=self.project.id,
+        )
+        observed_contexts: list[ViewerContext | None] = []
+
+        def make_request(*args: Any, **kwargs: Any) -> Mock:
+            observed_contexts.append(get_viewer_context())
+            return Mock(status=200, data=b'{"result": {}}')
+
+        with viewer_context_scope(existing_context):
+            call_seer_oneshot(
+                make_request,
+                {"oneshot_id": "test", "payload": {}},
+                self.organization,
+                error_metric="seer.oneshot.error",
+                user_id=self.user.id,
+            )
+
+        assert observed_contexts == [existing_context]
+
+
+class GetRunQuestionsTest(TestCase):
+    def _answer_for(self, run_id: int, question: str) -> str:
+        return f"run {run_id} answer to: {question}"
+
+    def _fake_oneshot(
+        self,
+        oneshot_id: str,
+        payload: Mapping[str, Any],
+        organization: Organization,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        return {"answer": self._answer_for(payload["run_id"], payload["question"])}
+
+    def test_answers_every_question_in_order(self) -> None:
+        with patch(
+            "sentry.seer.run_questions.run_oneshot", side_effect=self._fake_oneshot
+        ) as mock_run:
+            result = get_run_questions([123], self.organization)
+
+        answers = result[123]
+        assert [q["key"] for q in answers] == [q.key for q in QUESTIONS]
+        assert [q["question"] for q in answers] == [q.question for q in QUESTIONS]
+        assert [q["answer"] for q in answers] == [
+            self._answer_for(123, q.question) for q in QUESTIONS
+        ]
+        assert mock_run.call_count == len(QUESTIONS)
+
+    def test_answers_multiple_runs_in_parallel(self) -> None:
+        with patch(
+            "sentry.seer.run_questions.run_oneshot", side_effect=self._fake_oneshot
+        ) as mock_run:
+            result = get_run_questions([1, 2, 3], self.organization)
+
+        assert set(result) == {1, 2, 3}
+        for run_id in (1, 2, 3):
+            assert [q["answer"] for q in result[run_id]] == [
+                self._answer_for(run_id, q.question) for q in QUESTIONS
+            ]
+        # One one-shot per (run, question) pair.
+        assert mock_run.call_count == 3 * len(QUESTIONS)
+
+    def test_duplicate_run_ids_answered_once(self) -> None:
+        with patch(
+            "sentry.seer.run_questions.run_oneshot", side_effect=self._fake_oneshot
+        ) as mock_run:
+            result = get_run_questions([7, 7, 7], self.organization)
+
+        assert set(result) == {7}
+        assert [q["answer"] for q in result[7]] == [
+            self._answer_for(7, q.question) for q in QUESTIONS
+        ]
+        # A repeated run is answered only once, not once per occurrence.
+        assert mock_run.call_count == len(QUESTIONS)
+
+    def test_empty_run_ids_returns_empty(self) -> None:
+        with patch("sentry.seer.run_questions.run_oneshot") as mock_run:
+            result = get_run_questions([], self.organization)
+
+        assert result == {}
+        assert mock_run.call_count == 0
+
+    def test_best_effort_on_api_error(self) -> None:
+        with patch(
+            "sentry.seer.run_questions.run_oneshot",
+            side_effect=Exception("boom"),
+        ):
+            result = get_run_questions([789], self.organization)
+
+        assert [q["answer"] for q in result[789]] == ["" for _ in QUESTIONS]
+
+    def test_best_effort_on_empty_result(self) -> None:
+        with patch("sentry.seer.run_questions.run_oneshot", return_value={}):
+            result = get_run_questions([1011], self.organization)
+
+        assert [q["answer"] for q in result[1011]] == ["" for _ in QUESTIONS]

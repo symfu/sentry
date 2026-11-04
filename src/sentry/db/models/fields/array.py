@@ -1,14 +1,31 @@
+"""DO NOT USE ME. USE django.contrib.postgres.fields.array.ArrayField
+
+I am only here for migration compatibility
+"""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Iterable
+from typing import Any
+
 from django.db import models
+from django.db.backends.base.base import BaseDatabaseWrapper
 
 from sentry.db.models.utils import Creator
 from sentry.utils import json
-from sentry.utils.compat import map
 
 
 # Adapted from django-pgfields
 # https://github.com/lukesneeringer/django-pgfields/blob/master/django_pg/models/fields/array.py
-class ArrayField(models.Field):
-    def __init__(self, of=models.TextField, **kwargs):
+class ArrayField(models.Field[object, object]):
+    of: models.Field[object, object]
+
+    def __init__(
+        self,
+        of: type[models.Field[object, object]] | models.Field[object, object] = models.TextField,
+        **kwargs: Any,
+    ):
         # Arrays in PostgreSQL are arrays of a particular type.
         # Save the subtype in our field class.
         if isinstance(of, type):
@@ -22,23 +39,49 @@ class ArrayField(models.Field):
 
         super().__init__(**kwargs)
 
-    def contribute_to_class(self, cls, name):
+    def contribute_to_class(
+        self, cls: type[models.Model], name: str, private_only: bool = False
+    ) -> None:
         """
         Add a descriptor for backwards compatibility
         with previous Django behavior.
         """
-        super().contribute_to_class(cls, name)
+        super().contribute_to_class(cls, name, private_only=private_only)
         setattr(cls, name, Creator(self))
 
-    def db_type(self, connection):
+    def db_type(self, connection: BaseDatabaseWrapper) -> str:
         return f"{self.of.db_type(connection)}[]"
 
-    def get_internal_type(self):
+    def get_internal_type(self) -> str:
         return "TextField"
 
-    def to_python(self, value):
+    def get_prep_value(self, value: Iterable[object]) -> list[object]:
+        """Iterate over each item in the array, and run it
+        through the `get_prep_value` of this array's type.
+        """
+        # If no valid value was given, return an empty list.
+        if not value:
+            return []
+
+        # Appropriately coerce each individual value within
+        # our array.
+        return [self.of.get_prep_value(item) for item in value]
+
+    def to_python(self, value: Any) -> list[object]:
         if not value:
             value = []
         if isinstance(value, str):
-            value = json.loads(value)
-        return map(self.of.to_python, value)
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                # This is to accommodate the erroneous exports pre 21.4.0
+                # See getsentry/sentry#23843 for more details
+                try:
+                    value = ast.literal_eval(value)
+                except ValueError:
+                    # this handles old database values using postgresql array format
+                    # see https://sentry.sentry.io/issues/4524783782/
+                    assert value[0] == "{" and value[-1] == "}", "Unexpected ArrayField format"
+                    assert "\\" not in value, "Unexpected ArrayField format"
+                    value = value[1:-1].split(",")
+        return [self.of.to_python(x) for x in value]

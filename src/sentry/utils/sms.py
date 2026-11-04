@@ -1,32 +1,86 @@
 import logging
-import requests
-
 from urllib.parse import quote
+
+import requests
+from django.conf import settings
 
 from sentry import options
 
 logger = logging.getLogger(__name__)
 
 
-def sms_available():
-    return bool(options.get("sms.twilio-account"))
+class InvalidPhoneNumber(Exception):
+    def __str__(self) -> str:
+        return "InvalidPhoneNumber"
 
 
-def send_sms(body, to, from_=None):
+def validate_phone_number(phone_number: str) -> bool:
+    # Imported here so web workers do not load the phonenumbers metadata at boot.
+    import phonenumbers
+
+    try:
+        p = phonenumbers.parse(phone_number, "US")
+    except phonenumbers.NumberParseException:
+        return False
+
+    return phonenumbers.is_valid_number(p) and phonenumbers.is_possible_number(p)
+
+
+def phone_number_as_e164(num: str) -> str:
+    """Validate and return the phone number in E.164 format.
+
+    If no country code is provided, defaults to assuming the US, "+1".
+
+    :param num: the number in string format can start with +43 (or other country codes)
+    :type num: str
+
+    :return: validated phone number in E.164 format
+    :rtype: str
+    """
+    import phonenumbers
+
+    if validate_phone_number(num):
+        p = phonenumbers.parse(num, "US")
+        return phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.E164)
+    else:
+        raise InvalidPhoneNumber
+
+
+def sms_available() -> bool:
+    backend = options.get("sms.backend")
+    return (backend == "console" and settings.DEBUG) or (
+        backend == "twilio" and bool(options.get("sms.twilio-account"))
+    )
+
+
+def send_sms(body: str, to: str, from_: str | None = None) -> bool:
+    phone_number = phone_number_as_e164(to)
+    backend = options.get("sms.backend")
+
+    if backend == "console":
+        if not settings.DEBUG:
+            raise RuntimeError("Console SMS backend is only available in debug mode.")
+
+        logger.info("sms.console", extra={"phone_number": phone_number, "body": body})
+        return True
+    if backend != "twilio":
+        raise RuntimeError(f"Unknown SMS backend: {backend}")
+
     account = options.get("sms.twilio-account")
     if not account:
         raise RuntimeError("SMS backend is not configured.")
     if account[:2] != "AC":
         account = "AC" + account
     url = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json" % quote(account)
+
     rv = requests.post(
         url,
         auth=(account, options.get("sms.twilio-token")),
-        data={"To": to, "From": options.get("sms.twilio-number"), "Body": body},
+        data={"To": phone_number, "From": options.get("sms.twilio-number"), "Body": body},
     )
     if not rv.ok:
-        logging.exception(
-            "Failed to send text message to %s: (%s) %s", to, rv.status_code, rv.content
+        logging.error(
+            "Failed to send text message to %s: (%s) %s", phone_number, rv.status_code, rv.content
         )
         return False
     return True

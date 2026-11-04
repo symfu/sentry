@@ -1,0 +1,246 @@
+import {Fragment, useEffect, useMemo, useRef} from 'react';
+import styled from '@emotion/styled';
+import {IconChat} from '@sentry/icons/chat';
+import {IconFire} from '@sentry/icons/fire';
+import {IconSpan} from '@sentry/icons/span';
+import {IconTag} from '@sentry/icons/tag';
+
+import {InfoTip} from '@sentry/scraps/info';
+
+import {AnalyticsArea} from 'sentry/components/analyticsArea';
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import {ContextCard} from 'sentry/components/events/contexts/contextCard';
+import {getOrderedContextItems} from 'sentry/components/events/contexts/contextItems';
+import {EventTagsTree} from 'sentry/components/events/eventTags/eventTagsTree';
+import {
+  TracePreview,
+  TracePreviewFullTraceButton,
+} from 'sentry/components/events/interfaces/performance/tracePreview';
+import {eventHasSyntheticTrace} from 'sentry/components/events/interfaces/performance/utils';
+import {CrashReportSection} from 'sentry/components/feedback/feedbackItem/crashReportSection';
+import {FeedbackActivitySection} from 'sentry/components/feedback/feedbackItem/feedbackActivitySection';
+import {FeedbackItemHeader} from 'sentry/components/feedback/feedbackItem/feedbackItemHeader';
+import {FeedbackItemSection} from 'sentry/components/feedback/feedbackItem/feedbackItemSection';
+import {FeedbackReplay} from 'sentry/components/feedback/feedbackItem/feedbackReplay';
+import {FeedbackUrl} from 'sentry/components/feedback/feedbackItem/feedbackUrl';
+import {MessageSection} from 'sentry/components/feedback/feedbackItem/messageSection';
+import {MessageTitle} from 'sentry/components/feedback/feedbackItem/messageTitle';
+import {PanelItem} from 'sentry/components/panels/panelItem';
+import {KeyValueTableCardGrid} from 'sentry/components/tables/keyValueTable';
+import {t} from 'sentry/locale';
+import type {Event} from 'sentry/types/event';
+import type {Group} from 'sentry/types/group';
+import type {Project} from 'sentry/types/project';
+import type {FeedbackIssue} from 'sentry/utils/feedback/types';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {GroupIdProvider} from 'sentry/views/issueDetails/groupIdContext';
+
+interface Props {
+  eventData: Event | undefined;
+  feedbackItem: FeedbackIssue;
+  onBackToList?: () => void;
+}
+
+export function FeedbackItem({feedbackItem, eventData, onBackToList}: Props) {
+  const organization = useOrganization();
+  const crashReportId = eventData?.contexts?.feedback?.associated_event_id;
+  const hasTracePreview =
+    !!eventData?.contexts.trace?.trace_id && !eventHasSyntheticTrace(eventData);
+
+  const overflowRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    setTimeout(() => {
+      overflowRef.current?.scrollTo({
+        top: 0,
+        behavior: 'smooth',
+      });
+    }, 100);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [feedbackItem.id, overflowRef]);
+
+  const tagsWithoutAi = useMemo(
+    () => eventData?.tags.filter(tag => !tag.key.startsWith('ai_categorization.')) ?? [],
+    [eventData?.tags]
+  );
+
+  return (
+    <Fragment>
+      <AnalyticsArea name="details">
+        <FeedbackItemHeader
+          eventData={eventData}
+          feedbackItem={feedbackItem}
+          onBackToList={onBackToList}
+        />
+        <OverflowPanelItem ref={overflowRef}>
+          <FeedbackItemSection sectionKey="message">
+            <MessageTitle eventData={eventData} feedbackItem={feedbackItem} />
+            <MessageSection eventData={eventData} feedbackItem={feedbackItem} />
+          </FeedbackItemSection>
+
+          <FeedbackUrl eventData={eventData} feedbackItem={feedbackItem} />
+
+          {crashReportId && feedbackItem.project ? (
+            <FeedbackItemSection
+              collapsible
+              icon={<IconFire size="xs" />}
+              sectionKey="crash-report"
+              title={t('Linked Error')}
+            >
+              <ErrorBoundary mini>
+                <CrashReportSection
+                  organization={organization}
+                  crashReportId={crashReportId}
+                  projectSlug={feedbackItem.project.slug}
+                />
+              </ErrorBoundary>
+            </FeedbackItemSection>
+          ) : null}
+
+          <FeedbackReplay
+            eventData={eventData}
+            feedbackItem={feedbackItem}
+            organization={organization}
+          />
+
+          {eventData && hasTracePreview ? (
+            <FeedbackItemSection
+              actions={
+                <TracePreviewFullTraceButton
+                  event={eventData}
+                  organization={organization}
+                  source="feedback"
+                />
+              }
+              collapsible
+              icon={<IconSpan size="xs" />}
+              sectionKey="trace"
+              title={t('Trace Preview')}
+            >
+              <ErrorBoundary mini>
+                <TracePreview
+                  event={eventData}
+                  organization={organization}
+                  source="feedback"
+                />
+              </ErrorBoundary>
+            </FeedbackItemSection>
+          ) : null}
+
+          {eventData && feedbackItem.project ? (
+            <FeedbackItemSection
+              collapsible
+              icon={<IconTag size="xs" />}
+              sectionKey="tags"
+              title={t('Tags')}
+            >
+              <EventTagsTree
+                event={eventData}
+                projectSlug={feedbackItem.project.slug}
+                tags={tagsWithoutAi}
+              />
+            </FeedbackItemSection>
+          ) : null}
+
+          {eventData ? (
+            <FeedbackItemSection
+              collapsible
+              icon={<IconTag size="xs" />}
+              sectionKey="context"
+              title={t('Context')}
+            >
+              <FeedbackItemContexts
+                eventData={eventData}
+                project={feedbackItem.project}
+              />
+            </FeedbackItemSection>
+          ) : null}
+
+          {feedbackItem.project ? (
+            <FeedbackItemSection
+              collapsible
+              icon={<IconChat size="xs" />}
+              sectionKey="activity"
+              title={
+                <Fragment>
+                  {t('Internal Activity')}
+                  <InfoTip
+                    size="xs"
+                    title={t(
+                      'Use this section to post comments that are visible only to your organization. It will also automatically update when someone resolves or assigns the feedback.'
+                    )}
+                  />
+                </Fragment>
+              }
+            >
+              <GroupIdProvider groupId={feedbackItem.id}>
+                <FeedbackActivitySection
+                  feedbackItem={feedbackItem as unknown as Group}
+                />
+              </GroupIdProvider>
+            </FeedbackItemSection>
+          ) : null}
+        </OverflowPanelItem>
+      </AnalyticsArea>
+    </Fragment>
+  );
+}
+
+function FeedbackItemContexts({
+  eventData,
+  project,
+}: {
+  eventData: Event;
+  project: undefined | Project;
+}) {
+  const evidenceObject = Object.fromEntries(
+    eventData.occurrence?.evidenceDisplay?.map(({name, value}) => {
+      return [name, value];
+    }) ?? []
+  );
+  const eventDataWithSpamContext: Event = {
+    ...eventData,
+    contexts: {
+      ...eventData.contexts,
+      feedback: {
+        ...eventData.contexts?.feedback,
+        'auto_spam.detection_enabled': evidenceObject.spam_detection_enabled,
+        ...(evidenceObject.spam_detection_enabled
+          ? {'auto_spam.is_spam': evidenceObject.is_spam}
+          : {}),
+      },
+    },
+  };
+
+  const cards = getOrderedContextItems(eventDataWithSpamContext).map(
+    ({alias, type, value: contextValue}) => (
+      <ContextCard
+        key={alias}
+        type={type}
+        alias={alias}
+        value={contextValue}
+        event={eventDataWithSpamContext}
+        project={project}
+      />
+    )
+  );
+
+  if (!cards.length) {
+    return null;
+  }
+
+  return (
+    <ErrorBoundary mini message={t('There was a problem loading event context.')}>
+      <KeyValueTableCardGrid>{cards}</KeyValueTableCardGrid>
+    </ErrorBoundary>
+  );
+}
+
+const OverflowPanelItem = styled(PanelItem)`
+  overflow: auto;
+  overscroll-behavior: contain;
+
+  flex-direction: column;
+  flex-grow: 1;
+  gap: ${p => p.theme.space.xl};
+  padding: ${p => p.theme.space.xl};
+`;

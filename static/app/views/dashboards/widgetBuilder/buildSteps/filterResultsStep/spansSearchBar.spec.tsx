@@ -1,0 +1,161 @@
+import {WidgetQueryFixture} from 'sentry-fixture/widgetQuery';
+
+import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {WildcardOperators} from 'sentry/components/searchSyntax/parser';
+import type {TagValue} from 'sentry/types/group';
+import {SpansSearchBar} from 'sentry/views/dashboards/widgetBuilder/buildSteps/filterResultsStep/spansSearchBar';
+
+// The endpoint seems to just return these fields, but the original TagValue type
+// has extra fields related to user information that we don't seem to need.
+interface MockedTagValue extends Pick<
+  TagValue,
+  'key' | 'value' | 'name' | 'count' | 'firstSeen' | 'lastSeen'
+> {}
+
+function mockSpanTags({
+  type,
+  mockedTags,
+}: {
+  mockedTags: Array<{key: string; name: string}>;
+  type: 'string' | 'number' | 'boolean';
+}) {
+  MockApiClient.addMockResponse({
+    url: '/organizations/org-slug/trace-items/attributes/',
+    body: mockedTags,
+    match: [
+      function (_url: string, options: Record<string, any>) {
+        return options.query.attributeType === type;
+      },
+    ],
+  });
+}
+
+function mockSpanTagValues({
+  type,
+  tagKey,
+  mockedValues,
+}: {
+  mockedValues: MockedTagValue[];
+  tagKey: string;
+  type: 'string' | 'number';
+}) {
+  MockApiClient.addMockResponse({
+    url: `/organizations/org-slug/trace-items/attributes/${tagKey}/values/`,
+    body: mockedValues,
+    match: [
+      function (_url: string, options: Record<string, any>) {
+        return options.query.attributeType === type;
+      },
+    ],
+  });
+}
+
+describe('SpansSearchBar', () => {
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/recent-searches/',
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/recent-searches/',
+      body: [],
+      method: 'POST',
+    });
+
+    mockSpanTags({type: 'string', mockedTags: []});
+    mockSpanTagValues({type: 'string', tagKey: 'span.op', mockedValues: []});
+
+    mockSpanTags({type: 'number', mockedTags: []});
+    mockSpanTagValues({type: 'number', tagKey: 'span.op', mockedValues: []});
+
+    mockSpanTags({type: 'boolean', mockedTags: []});
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      body: [],
+    });
+  });
+
+  it('renders the initial query conditions', async () => {
+    mockSpanTags({type: 'string', mockedTags: [{key: 'span.op', name: 'span.op'}]});
+    mockSpanTagValues({
+      type: 'string',
+      tagKey: 'span.op',
+      mockedValues: [
+        {
+          key: 'span.op',
+          value: 'function',
+          name: 'function',
+          count: 1,
+          firstSeen: '2024-01-01',
+          lastSeen: '2024-01-01',
+        },
+      ],
+    });
+
+    render(
+      <SpansSearchBar
+        widgetQuery={WidgetQueryFixture({conditions: 'span.op:function'})}
+        onSearch={jest.fn()}
+        onClose={jest.fn()}
+      />
+    );
+
+    await screen.findByLabelText('span.op:function');
+  });
+
+  it.isKnownFlake('calls onSearch with the correct query', async () => {
+    const onSearch = jest.fn();
+
+    render(
+      <SpansSearchBar
+        widgetQuery={WidgetQueryFixture({conditions: ''})}
+        onSearch={onSearch}
+        onClose={jest.fn()}
+      />
+    );
+
+    const searchInput = await screen.findByRole('combobox', {
+      name: 'Add a search term',
+    });
+    await userEvent.click(searchInput);
+    await userEvent.type(searchInput, 'span.op:', {delay: null});
+    await userEvent.keyboard('function', {delay: null});
+    await userEvent.keyboard('{enter}', {delay: null});
+
+    await waitFor(() => {
+      expect(onSearch).toHaveBeenCalledWith(
+        `span.op:${WildcardOperators.CONTAINS}function`,
+        expect.anything()
+      );
+    });
+  });
+
+  it.isKnownFlake('triggers onClose when the query changes', async () => {
+    const onClose = jest.fn();
+
+    render(
+      <SpansSearchBar
+        widgetQuery={WidgetQueryFixture({conditions: ''})}
+        onSearch={jest.fn()}
+        onClose={onClose}
+      />
+    );
+
+    const searchInput = await screen.findByRole('combobox', {
+      name: 'Add a search term',
+    });
+    await userEvent.click(searchInput);
+    await userEvent.type(searchInput, 'span.op:', {delay: null});
+    await userEvent.keyboard('{enter}', {delay: null});
+    await screen.findByRole('row', {name: /span\.op/});
+    await userEvent.keyboard('function', {delay: null});
+    await userEvent.keyboard('{enter}', {delay: null});
+
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+  });
+});

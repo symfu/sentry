@@ -1,5 +1,8 @@
 __all__ = ("Spans", "Span")
 
+from collections.abc import Iterator
+from typing import Any, Self
+
 from sentry.interfaces.base import Interface
 
 SPAN_KEYS = (
@@ -40,10 +43,11 @@ class Span(Interface):
     """
 
     @classmethod
-    def to_python(cls, data):
+    def to_python(cls, data: dict[str, Any]) -> Self | None:
         for key in SPAN_KEYS:
             data.setdefault(key, None)
-        return cls(**data)
+
+        return super().to_python(data)
 
 
 class Spans(Interface):
@@ -56,12 +60,12 @@ class Spans(Interface):
     path = "spans"
 
     @classmethod
-    def to_python(cls, data):
-        spans = [Span.to_python(span) for span in data]
-        return cls(spans=spans)
+    def to_python(cls, data: list[Any]) -> Self | None:
+        spans = [Span.to_python(span) for span in data if span is not None]
+        return super().to_python({"spans": spans})
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Span]:
         return iter(self.spans)
 
-    def to_json(self):
+    def to_json(self) -> list[Any]:
         return [span.to_json() for span in self]

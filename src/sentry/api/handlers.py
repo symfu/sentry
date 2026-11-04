@@ -1,13 +1,55 @@
-from rest_framework.views import exception_handler
+import sentry_sdk
 from rest_framework.exceptions import Throttled
+from rest_framework.response import Response
+from rest_framework.views import exception_handler
 
+from sentry.search.events.constants import RATE_LIMIT_ERROR_MESSAGE
+from sentry.types.ratelimit import SnubaRateLimitMeta
 from sentry.utils.snuba import RateLimitExceeded
+from sentry.utils.snuba_rpc import SnubaRPCRateLimitExceeded
 
 
-def custom_exception_handler(exc, context):
+def custom_exception_handler(exc: Exception, context: dict[str, object]) -> Response | None:
     if isinstance(exc, RateLimitExceeded):
-        # If Snuba throws a RateLimitExceeded then it'll likely be available
-        # after another second.
-        exc = Throttled(wait=1)
+        context_request = context.get("request")
+        request = getattr(context_request, "_request", None)
 
-    return exception_handler(exc, context)
+        # Set rate limiting attributes on the underlying request object so access log middleware can log them
+        if request is not None:
+            request.will_be_rate_limited = True
+            request.snuba_rate_limit_metadata = SnubaRateLimitMeta(
+                policy=exc.policy,
+                quota_unit=exc.quota_unit,
+                storage_key=exc.storage_key,
+                quota_used=exc.quota_used,
+                rejection_threshold=exc.rejection_threshold,
+                throttle_threshold=exc.throttle_threshold,
+            )
+
+        # capture the rate limited exception so we can see it in Sentry
+        with sentry_sdk.new_scope() as scope:
+            scope.fingerprint = ["snuba-api-rate-limit-exceeded"]
+            sentry_sdk.capture_exception(
+                exc,
+                level="warning",
+            )
+        # let the client know that they've been rate limited with details
+        exc = Throttled(detail=RATE_LIMIT_ERROR_MESSAGE)
+
+    if isinstance(exc, SnubaRPCRateLimitExceeded):
+        # capture the rate limited exception so we can see it in Sentry
+        with sentry_sdk.new_scope() as scope:
+            scope.fingerprint = ["snuba-rpc-rate-limit-exceeded"]
+            sentry_sdk.capture_exception(
+                exc,
+                level="warning",
+            )
+        exc = Throttled(detail=RATE_LIMIT_ERROR_MESSAGE)
+
+    response = exception_handler(exc, context)
+
+    # RFC 6750 Section 3: Add WWW-Authenticate header if exception defines one
+    if response is not None and hasattr(exc, "auth_header"):
+        response["WWW-Authenticate"] = exc.auth_header
+
+    return response

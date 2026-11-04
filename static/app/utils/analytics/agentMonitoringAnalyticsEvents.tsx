@@ -1,0 +1,23 @@
+export type AgentMonitoringEventParameters = {
+  'agent-monitoring.copy-llm-prompt-click': Record<string, unknown>;
+  'agent-monitoring.page-filter-change': {
+    filter: 'project' | 'environment' | 'date' | 'agent' | 'search';
+  };
+  'agent-monitoring.trace.rendered': Record<string, unknown>;
+  'agent-monitoring.trace.span-select': Record<string, unknown>;
+  'agent-monitoring.trace.view-full-trace-click': Record<string, unknown>;
+  'agent-monitoring.view-ai-trace-click': Record<string, unknown>;
+};
+
+export const agentMonitoringEventMap: Record<
+  keyof AgentMonitoringEventParameters,
+  string
+> = {
+  'agent-monitoring.copy-llm-prompt-click': 'Agent Monitoring: Copy LLM Prompt Click',
+  'agent-monitoring.page-filter-change': 'Agent Monitoring: Page Filter Change',
+  'agent-monitoring.trace.rendered': 'Agent Monitoring: Trace Rendered',
+  'agent-monitoring.trace.span-select': 'Agent Monitoring: Trace Span Select',
+  'agent-monitoring.trace.view-full-trace-click':
+    'Agent Monitoring: Trace View Full Trace Click',
+  'agent-monitoring.view-ai-trace-click': 'Agent Monitoring: View AI Trace Clicked',
+};

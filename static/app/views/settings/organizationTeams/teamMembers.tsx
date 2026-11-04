@@ -1,0 +1,420 @@
+import {Fragment, useMemo, useState} from 'react';
+import {IconUser} from '@sentry/icons/user';
+import {useDebouncedValue} from '@tanstack/react-pacer';
+import {
+  keepPreviousData,
+  useQuery,
+  useMutation,
+  useQueryClient,
+} from '@tanstack/react-query';
+
+import {UserAvatar} from '@sentry/scraps/avatar';
+import {
+  CompactSelect,
+  MenuComponents,
+  type SelectOption,
+} from '@sentry/scraps/compactSelect';
+import {Flex} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Pagination} from '@sentry/scraps/pagination';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+
+import {addErrorMessage, addSuccessMessage} from 'sentry/actionCreators/indicator';
+import {
+  openInviteMembersModal,
+  openTeamAccessRequestModal,
+} from 'sentry/actionCreators/modal';
+import {joinTeamPromise, leaveTeamPromise} from 'sentry/actionCreators/teams';
+import {hasEveryAccess} from 'sentry/components/acl/access';
+import {EmptyMessage} from 'sentry/components/emptyMessage';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {TeamRoleColumnLabel} from 'sentry/components/teamRoleUtils';
+import {t} from 'sentry/locale';
+import type {Member, Organization, Team, TeamMember} from 'sentry/types/organization';
+import {apiOptions, selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {useApi} from 'sentry/utils/useApi';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useUser} from 'sentry/utils/useUser';
+import {BreadcrumbTitle} from 'sentry/views/settings/components/settingsBreadcrumb/breadcrumbTitle';
+import {TextBlock} from 'sentry/views/settings/components/text/textBlock';
+import {useTeamDetailsOutlet} from 'sentry/views/settings/organizationTeams/teamDetails';
+import {TeamMembersRow} from 'sentry/views/settings/organizationTeams/teamMembersRow';
+import {ProjectPermissionAlert} from 'sentry/views/settings/project/projectPermissionAlert';
+
+import {getButtonHelpText} from './utils';
+
+const COLUMNS: TableColumnConfig[] = [
+  {key: 'member', width: {zero: 'minmax(200px, 1fr)', sm: 'minmax(150px, 1fr)'}},
+  {key: 'teamRole', width: {zero: 160, md: 200}},
+  {key: 'actions', width: 'max-content'},
+];
+
+function getTeamMembersApiOptions({
+  organization,
+  teamId,
+  location,
+}: {
+  location: ReturnType<typeof useLocation>;
+  organization: Organization;
+  teamId: string;
+}) {
+  return apiOptions.as<TeamMember[]>()(
+    '/teams/$organizationIdOrSlug/$teamIdOrSlug/members/',
+    {
+      path: {organizationIdOrSlug: organization.slug, teamIdOrSlug: teamId},
+      query: {
+        cursor: location.query.cursor,
+        query: location.query.query,
+      },
+      staleTime: 30_000,
+    }
+  );
+}
+
+function AddMemberDropdown({
+  teamMembers,
+  organization,
+  team,
+  teamId,
+  disabled,
+  isTeamAdmin,
+  onAddMember,
+}: {
+  disabled: boolean;
+  isTeamAdmin: boolean;
+  onAddMember: (variables: {orgMember: TeamMember}) => void;
+  organization: Organization;
+  team: Team;
+  teamId: string;
+  teamMembers: TeamMember[];
+}) {
+  const [memberQuery, setMemberQuery] = useState('');
+  const [debouncedMemberQuery] = useDebouncedValue(memberQuery, {wait: 50});
+  const {data: orgMembers = [], isFetching: isOrgMembersFetching} = useQuery({
+    ...apiOptions.as<Member[]>()('/organizations/$organizationIdOrSlug/members/', {
+      path: {organizationIdOrSlug: organization.slug},
+      query: debouncedMemberQuery ? {query: debouncedMemberQuery} : undefined,
+      staleTime: 30_000,
+    }),
+    placeholderData: keepPreviousData,
+  });
+
+  // members can add other members to a team if the `Open Membership` setting is enabled
+  // otherwise, `org:write` or `team:admin` permissions are required
+  const hasOpenMembership = !!organization?.openMembership;
+  const canAddMembers = hasOpenMembership || isTeamAdmin;
+
+  const isDropdownDisabled = disabled || team.flags['idp:provisioned'];
+
+  const addTeamMember = (selection: SelectOption<string>) => {
+    const orgMember = orgMembers.find(member => member.id === selection.value);
+    if (orgMember === undefined) {
+      return;
+    }
+
+    // Reset members list after adding member to team
+    setMemberQuery('');
+    onAddMember({orgMember});
+  };
+
+  const items = useMemo(() => {
+    const existingMembers = new Set(teamMembers.map(member => member.id));
+    return (orgMembers || [])
+      .filter(m => !existingMembers.has(m.id))
+      .map<SelectOption<string>>(m => ({
+        textValue: `${m.name} ${m.email}`,
+        value: m.id,
+        leadingItems: (
+          <UserAvatar
+            user={{
+              id: m.user?.id ?? m.id,
+              name: m.user?.name ?? m.name,
+              email: m.user?.email ?? m.email,
+              avatar: m.user?.avatar ?? undefined,
+              avatarUrl: m.user?.avatarUrl ?? undefined,
+              type: 'user',
+            }}
+            title={m.user?.name ?? m.name ?? m.user?.email ?? m.email}
+            size={16}
+            className="avatar"
+          />
+        ),
+        label: m.name || m.email,
+        hideCheck: true,
+      }));
+  }, [teamMembers, orgMembers]);
+
+  return (
+    <CompactSelect
+      size="xs"
+      strategy="fixed"
+      menuWidth={250}
+      options={items}
+      onClose={() => setMemberQuery('')}
+      value={undefined}
+      onChange={
+        canAddMembers
+          ? addTeamMember
+          : selection =>
+              openTeamAccessRequestModal({
+                teamId,
+                orgId: organization.slug,
+                memberId: selection.value,
+              })
+      }
+      menuFooter={({closeOverlay}) => (
+        <MenuComponents.CTAButton
+          onClick={() => {
+            closeOverlay();
+            openInviteMembersModal({source: 'teams'});
+          }}
+          data-test-id="invite-member"
+        >
+          {t('Invite Member')}
+        </MenuComponents.CTAButton>
+      )}
+      data-test-id="add-member-menu"
+      disabled={isDropdownDisabled}
+      menuTitle={t('Members')}
+      trigger={triggerProps => (
+        <OverlayTrigger.Button {...triggerProps}>{t('Add Member')}</OverlayTrigger.Button>
+      )}
+      search={{
+        placeholder: t('Search Members'),
+        filter: false,
+        /**
+         * We perform an API request to support orgs with > 100 members (since that's the max API returns)
+         */
+        onChange: setMemberQuery,
+      }}
+      emptyMessage={t('No members')}
+      loading={isOrgMembersFetching}
+    />
+  );
+}
+
+export default function TeamMembers() {
+  const user = useUser();
+  const api = useApi({persistInFlight: true});
+  const queryClient = useQueryClient();
+  const organization = useOrganization();
+  const location = useLocation();
+  const {team} = useTeamDetailsOutlet();
+
+  const {
+    data: teamMembersResp,
+    isError: isTeamMembersError,
+    isLoading: isTeamMembersLoading,
+    refetch: refetchTeamMembers,
+  } = useQuery({
+    ...getTeamMembersApiOptions({organization, teamId: team.slug, location}),
+    select: selectJsonWithHeaders,
+  });
+  const teamMembers = teamMembersResp?.json ?? [];
+
+  const teamMembersPageLinks = teamMembersResp?.headers.Link;
+
+  const hasOrgWriteAccess = hasEveryAccess(['org:write'], {organization, team});
+  const hasTeamAdminAccess = hasEveryAccess(['team:admin'], {organization, team});
+  const isTeamAdmin = hasOrgWriteAccess || hasTeamAdminAccess;
+
+  const {mutate: handleRemoveTeamMember} = useMutation({
+    mutationFn: ({memberId}: {memberId: string}) => {
+      return leaveTeamPromise(api, {
+        orgId: organization.slug,
+        teamId: team.slug,
+        memberId,
+      });
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.setQueryData(
+        getTeamMembersApiOptions({organization, teamId: team.slug, location}).queryKey,
+        existingData => {
+          if (!existingData) {
+            return existingData;
+          }
+          return {
+            ...existingData,
+            json: existingData.json.filter(member => member.id !== variables.memberId),
+          };
+        }
+      );
+      addSuccessMessage(t('Successfully removed member from team.'));
+    },
+    onError: () => {
+      addErrorMessage(
+        t('There was an error while trying to remove a member from the team.')
+      );
+    },
+  });
+
+  const {mutate: updateTeamMemberRole} = useMutation({
+    mutationFn: ({memberId, newRole}: {memberId: string; newRole: string}) => {
+      return api.requestPromise(
+        getApiUrl(
+          '/organizations/$organizationIdOrSlug/members/$memberId/teams/$teamIdOrSlug/',
+          {
+            path: {
+              organizationIdOrSlug: organization.slug,
+              memberId,
+              teamIdOrSlug: team.slug,
+            },
+          }
+        ),
+        {
+          method: 'PUT',
+          data: {teamRole: newRole},
+        }
+      );
+    },
+    onSuccess: (_data, variables) => {
+      addSuccessMessage(t('Successfully changed role for team member.'));
+      queryClient.setQueryData(
+        getTeamMembersApiOptions({organization, teamId: team.slug, location}).queryKey,
+        existingData => {
+          if (!existingData) {
+            return existingData;
+          }
+
+          return {
+            ...existingData,
+            json: existingData.json.map(member => {
+              if (member.id === variables.memberId) {
+                return {
+                  ...member,
+                  teamRole: variables.newRole,
+                };
+              }
+
+              return member;
+            }),
+          };
+        }
+      );
+    },
+    onError: () => {
+      addErrorMessage(
+        t('There was an error while trying to change the roles for a team member.')
+      );
+    },
+  });
+
+  const {mutate: handleAddTeamMember} = useMutation({
+    mutationFn: ({orgMember}: {orgMember: TeamMember}) => {
+      return joinTeamPromise(api, {
+        orgId: organization.slug,
+        teamId: team.slug,
+        memberId: orgMember.id,
+      });
+    },
+    onSuccess: (_data, {orgMember}) => {
+      queryClient.setQueryData(
+        getTeamMembersApiOptions({organization, teamId: team.slug, location}).queryKey,
+        existingData => {
+          if (!existingData) {
+            return existingData;
+          }
+          return {
+            ...existingData,
+            json: existingData.json.concat([orgMember]),
+          };
+        }
+      );
+      addSuccessMessage(t('Successfully added member to team.'));
+    },
+    onError: () => {
+      addErrorMessage(t('Unable to add team member.'));
+    },
+  });
+
+  const renderPageTextBlock = () => {
+    const {openMembership} = organization;
+    const isIdpProvisioned = team.flags['idp:provisioned'];
+
+    if (isIdpProvisioned) {
+      return getButtonHelpText(isIdpProvisioned);
+    }
+
+    return openMembership
+      ? t(
+          '"Open Membership" is enabled for the organization. Anyone can add members for this team.'
+        )
+      : t(
+          '"Open Membership" is disabled for the organization. Org Owner/Manager/Admin, or Team Admins can add members for this team.'
+        );
+  };
+
+  const renderMembers = () => {
+    if (isTeamMembersError) {
+      return <SimpleTable.Error onRetry={refetchTeamMembers} />;
+    }
+    if (isTeamMembersLoading) {
+      return <SimpleTable.Loading />;
+    }
+    if (teamMembers.length) {
+      return teamMembers.map(member => {
+        return (
+          <TeamMembersRow
+            key={member.id}
+            hasWriteAccess={isTeamAdmin}
+            organization={organization}
+            team={team}
+            member={member}
+            user={user}
+            removeMember={handleRemoveTeamMember}
+            updateMemberRole={updateTeamMemberRole}
+          />
+        );
+      });
+    }
+    return (
+      <SimpleTable.Empty>
+        <EmptyMessage icon={<IconUser />} size="lg">
+          {t('This team has no members')}
+        </EmptyMessage>
+      </SimpleTable.Empty>
+    );
+  };
+
+  return (
+    <Fragment>
+      <BreadcrumbTitle title={t('Members')} />
+      <TextBlock>{renderPageTextBlock()}</TextBlock>
+
+      <ProjectPermissionAlert
+        access={organization.openMembership ? ['org:read'] : ['team:write']}
+        team={team}
+      />
+
+      <SimpleTable
+        aria-label={t('Members')}
+        columns={COLUMNS}
+        scrollable
+        header={
+          <SimpleTable.HeaderRow>
+            <SimpleTable.HeaderCell>{t('Members')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell>
+              <TeamRoleColumnLabel />
+            </SimpleTable.HeaderCell>
+            <Flex as="th" role="columnheader" align="center" justify="end" padding="0 xl">
+              <AddMemberDropdown
+                teamMembers={teamMembers}
+                organization={organization}
+                team={team}
+                teamId={team.slug}
+                disabled={isTeamMembersError}
+                isTeamAdmin={isTeamAdmin}
+                onAddMember={handleAddTeamMember}
+              />
+            </Flex>
+          </SimpleTable.HeaderRow>
+        }
+      >
+        {renderMembers()}
+      </SimpleTable>
+      <Pagination pageLinks={teamMembersPageLinks} />
+    </Fragment>
+  );
+}

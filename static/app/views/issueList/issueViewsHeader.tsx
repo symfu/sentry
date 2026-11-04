@@ -1,0 +1,259 @@
+import {Fragment, type ReactNode} from 'react';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+import {IconPause} from '@sentry/icons/pause';
+import {IconPlay} from '@sentry/icons/play';
+import {IconStar} from '@sentry/icons/star';
+import {useQueryClient} from '@tanstack/react-query';
+
+import {FeatureBadge, type FeatureBadgeProps} from '@sentry/scraps/badge';
+import {Button} from '@sentry/scraps/button';
+import {DropdownMenu} from '@sentry/scraps/dropdownMenu';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+
+import {DisableInDemoMode} from 'sentry/components/acl/demoModeDisabled';
+import {t} from 'sentry/locale';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useParams} from 'sentry/utils/useParams';
+import {useUser} from 'sentry/utils/useUser';
+import {EditableIssueViewHeader} from 'sentry/views/issueList/editableIssueViewHeader';
+import {useSelectedGroupSearchView} from 'sentry/views/issueList/issueViews/useSelectedGroupSeachView';
+import {
+  canEditIssueView,
+  confirmDeleteIssueView,
+} from 'sentry/views/issueList/issueViews/utils';
+import {useDeleteGroupSearchView} from 'sentry/views/issueList/mutations/useDeleteGroupSearchView';
+import {useUpdateGroupSearchViewStarred} from 'sentry/views/issueList/mutations/useUpdateGroupSearchViewStarred';
+import {groupSearchViewApiOptions} from 'sentry/views/issueList/queries/groupSearchView';
+import {useHasIssueViews} from 'sentry/views/navigation/secondary/sections/issues/issueViews/useHasIssueViews';
+import {TopBar} from 'sentry/views/navigation/topBar';
+
+type IssueViewsHeaderProps = {
+  onRealtimeChange: (active: boolean) => void;
+  realtimeActive: boolean;
+  title: string;
+  badge?: FeatureBadgeProps['type'];
+  description?: ReactNode;
+  headerActions?: ReactNode;
+};
+
+function PageTitle({
+  title,
+  description,
+  badge,
+}: Pick<IssueViewsHeaderProps, 'title' | 'description' | 'badge'>) {
+  const organization = useOrganization();
+  const {data: groupSearchView} = useSelectedGroupSearchView();
+  const user = useUser();
+  const hasIssueViews = useHasIssueViews();
+
+  if (
+    groupSearchView &&
+    hasIssueViews &&
+    canEditIssueView({groupSearchView, user, organization})
+  ) {
+    return <EditableIssueViewHeader view={groupSearchView} />;
+  }
+
+  if (groupSearchView) {
+    return (
+      <TopBar.Slot
+        name="breadcrumbs"
+        title={{type: 'page-title', label: groupSearchView?.name ?? title}}
+      />
+    );
+  }
+
+  return (
+    <TopBar.Slot
+      name="breadcrumbs"
+      title={{
+        type: 'page-title',
+        label: title,
+        labelTooltip: description,
+        trailingActions: badge
+          ? {type: 'badge', element: <FeatureBadge type={badge} />}
+          : undefined,
+      }}
+    />
+  );
+}
+
+function IssueViewStarButton() {
+  const organization = useOrganization();
+  const user = useUser();
+  const queryClient = useQueryClient();
+
+  const {data: groupSearchView} = useSelectedGroupSearchView();
+  const starViewLabel = groupSearchView?.starred ? t('Unstar view') : t('Star view');
+  const {mutate: mutateViewStarred} = useUpdateGroupSearchViewStarred({
+    onMutate: variables => {
+      const viewKey = groupSearchViewApiOptions({
+        orgSlug: organization.slug,
+        id: variables.id,
+      }).queryKey;
+      queryClient.setQueryData(viewKey, prevData =>
+        prevData
+          ? {...prevData, json: {...prevData.json, starred: variables.starred}}
+          : prevData
+      );
+    },
+    onError: (_error, variables) => {
+      const viewKey = groupSearchViewApiOptions({
+        orgSlug: organization.slug,
+        id: variables.id,
+      }).queryKey;
+      queryClient.setQueryData(viewKey, prevData =>
+        prevData
+          ? {...prevData, json: {...prevData.json, starred: !variables.starred}}
+          : prevData
+      );
+    },
+  });
+
+  if (!groupSearchView) {
+    return null;
+  }
+
+  return (
+    <Button
+      onClick={() => {
+        mutateViewStarred(
+          {
+            id: groupSearchView.id,
+            starred: !groupSearchView?.starred,
+            view: groupSearchView,
+          },
+          {
+            onSuccess: () => {
+              trackAnalytics('issue_views.star_view', {
+                organization,
+                ownership:
+                  user?.id === groupSearchView.createdBy?.id
+                    ? 'personal'
+                    : 'organization',
+                starred: !groupSearchView?.starred,
+                surface: 'issue-view-details',
+              });
+            },
+          }
+        );
+      }}
+      tooltipProps={{title: starViewLabel}}
+      aria-label={starViewLabel}
+      icon={
+        <IconStar
+          isSolid={groupSearchView?.starred}
+          variant={groupSearchView?.starred ? 'warning' : 'muted'}
+        />
+      }
+      size="sm"
+    />
+  );
+}
+
+function IssueViewEditMenu() {
+  const organization = useOrganization();
+  const {data: groupSearchView} = useSelectedGroupSearchView();
+  const user = useUser();
+  const {mutateAsync: deleteIssueView} = useDeleteGroupSearchView();
+  const navigate = useNavigate();
+  const moreOptionsLabel = t('More issue view options');
+
+  if (!groupSearchView) {
+    return null;
+  }
+
+  const canDeleteView = canEditIssueView({groupSearchView, organization, user});
+
+  return (
+    <DropdownMenu
+      items={[
+        {
+          key: 'delete',
+          label: t('Delete View'),
+          priority: 'danger',
+          disabled: !canDeleteView,
+          details: canDeleteView
+            ? undefined
+            : t('You do not have permission to delete this view.'),
+          onAction: () => {
+            confirmDeleteIssueView({
+              handleDelete: () =>
+                deleteIssueView(
+                  {id: groupSearchView.id},
+                  {
+                    onSuccess: () => {
+                      navigate(
+                        normalizeUrl(`/organizations/${organization.slug}/issues/`)
+                      );
+                      trackAnalytics('issue_views.delete_view', {
+                        organization,
+                        ownership:
+                          user?.id === groupSearchView.createdBy?.id
+                            ? 'personal'
+                            : 'organization',
+                        surface: 'issue-view-details',
+                      });
+                    },
+                  }
+                ),
+              groupSearchView,
+            });
+          },
+        },
+      ]}
+      trigger={props => (
+        <OverlayTrigger.IconButton
+          size="sm"
+          {...props}
+          tooltipProps={{title: moreOptionsLabel}}
+          icon={<IconEllipsis />}
+          aria-label={moreOptionsLabel}
+        />
+      )}
+      position="bottom-end"
+      minMenuWidth={160}
+    />
+  );
+}
+
+export function IssueViewsHeader({
+  title,
+  badge,
+  description,
+  realtimeActive,
+  onRealtimeChange,
+  headerActions,
+}: IssueViewsHeaderProps) {
+  const {viewId} = useParams<{viewId?: string}>();
+
+  const realtimeLabel = realtimeActive
+    ? t('Pause real-time updates')
+    : t('Enable real-time updates');
+  const realtimeButton = viewId ? null : (
+    <DisableInDemoMode>
+      <Button
+        size="sm"
+        tooltipProps={{title: realtimeLabel}}
+        aria-label={realtimeLabel}
+        icon={realtimeActive ? <IconPause /> : <IconPlay />}
+        onClick={() => onRealtimeChange(!realtimeActive)}
+      />
+    </DisableInDemoMode>
+  );
+
+  return (
+    <Fragment>
+      <PageTitle title={title} description={description} badge={badge} />
+      <TopBar.Slot name="actions">
+        {headerActions}
+        {realtimeButton}
+        <IssueViewStarButton />
+        <IssueViewEditMenu />
+      </TopBar.Slot>
+    </Fragment>
+  );
+}

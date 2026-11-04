@@ -1,0 +1,319 @@
+import {GroupFixture} from 'sentry-fixture/group';
+import {MemberFixture} from 'sentry-fixture/member';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {ProjectFixture} from 'sentry-fixture/project';
+import {TeamFixture} from 'sentry-fixture/team';
+import {UserFixture} from 'sentry-fixture/user';
+
+import {
+  render,
+  screen,
+  userEvent,
+  waitFor,
+  within,
+} from 'sentry-test/reactTestingLibrary';
+
+import {GroupStore} from 'sentry/stores/groupStore';
+import {TeamStore} from 'sentry/stores/teamStore';
+
+import {GroupList} from './groupList';
+
+describe('GroupList', () => {
+  const organization = OrganizationFixture();
+  const group = GroupFixture();
+  const membersUrl = `/organizations/${organization.slug}/users/`;
+  const issuesUrl = `/organizations/${organization.slug}/issues/`;
+  const defaultQueryParams = {query: '', sort: 'new', limit: '50'};
+  const initialRouterConfig = {
+    location: {
+      pathname: `/organizations/${organization.slug}/issues/`,
+      query: defaultQueryParams,
+    },
+    route: '/organizations/:orgId/issues/',
+  };
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    GroupStore.reset();
+
+    MockApiClient.addMockResponse({url: membersUrl, body: [MemberFixture()]});
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/members/`,
+      body: [MemberFixture()],
+    });
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      body: [group],
+    });
+  });
+
+  afterEach(() => {
+    GroupStore.reset();
+    TeamStore.reset();
+  });
+
+  it('renders the group list', async () => {
+    render(<GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />, {
+      organization,
+      initialRouterConfig,
+    });
+
+    expect(await screen.findByText('RequestError')).toBeInTheDocument();
+    expect(screen.getByText(group.shortId)).toBeInTheDocument();
+    expect(screen.getByText(group.culprit)).toBeInTheDocument();
+    // Event count
+    expect(screen.getByText('327K')).toBeInTheDocument();
+    // Users
+    expect(screen.getByText('35K')).toBeInTheDocument();
+  });
+
+  it('renders a header for each column of the rows', async () => {
+    render(
+      <GroupList
+        numPlaceholderRows={1}
+        queryParams={defaultQueryParams}
+        withColumns={['firstSeen', 'lastSeen', 'event', 'priority', 'assigneeAvatar']}
+      />,
+      {organization, initialRouterConfig}
+    );
+
+    await screen.findByText(group.shortId);
+    const row = screen.getByTestId('group');
+
+    expect(screen.getAllByRole('columnheader').map(header => header.textContent)).toEqual(
+      ['Issue', 'Last Seen', 'Age', 'Graph', 'Events', 'Priority', 'Assignee']
+    );
+    expect(within(row).getAllByRole('cell')).toHaveLength(7);
+  });
+
+  it('renders empty state when no groups are returned', async () => {
+    MockApiClient.addMockResponse({url: membersUrl, body: []});
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      body: [],
+    });
+
+    render(<GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />, {
+      organization,
+      initialRouterConfig,
+    });
+
+    expect(
+      await screen.findByText("There don't seem to be any events fitting the query.")
+    ).toBeInTheDocument();
+  });
+
+  it('explains a boolean query without asking the endpoint', async () => {
+    const issuesRequest = MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      body: [],
+    });
+
+    render(
+      <GroupList
+        numPlaceholderRows={1}
+        queryParams={{...defaultQueryParams, query: 'foo OR bar'}}
+      />,
+      {
+        organization,
+        initialRouterConfig: {
+          ...initialRouterConfig,
+          location: {
+            ...initialRouterConfig.location,
+            query: {...defaultQueryParams, query: 'foo OR bar'},
+          },
+        },
+      }
+    );
+
+    expect(await screen.findByTestId('loading-error')).toBeInTheDocument();
+    expect(
+      screen.getByText('Search queries with AND or OR are not supported.')
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', {name: 'Retry'})).not.toBeInTheDocument();
+    expect(issuesRequest).not.toHaveBeenCalled();
+  });
+
+  it('offers no retry for a client error the endpoint already rejected', async () => {
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      statusCode: 400,
+      body: {detail: 'Invalid query'},
+    });
+
+    render(<GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />, {
+      organization,
+      initialRouterConfig,
+    });
+
+    expect(await screen.findByTestId('loading-error')).toBeInTheDocument();
+    expect(screen.getByText('Invalid query')).toBeInTheDocument();
+    expect(screen.queryByRole('button', {name: 'Retry'})).not.toBeInTheDocument();
+  });
+
+  it('falls back to generic copy when the response carries no detail', async () => {
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      statusCode: 400,
+      body: {},
+    });
+
+    render(<GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />, {
+      organization,
+      initialRouterConfig,
+    });
+
+    expect(await screen.findByTestId('loading-error')).toBeInTheDocument();
+    expect(screen.getByText('There was an error loading data.')).toBeInTheDocument();
+  });
+
+  it('offers a retry for a server error that could land differently', async () => {
+    const issuesRequest = MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      statusCode: 500,
+      body: {detail: 'Internal error'},
+    });
+
+    render(<GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />, {
+      organization,
+      initialRouterConfig,
+    });
+
+    expect(await screen.findByTestId('loading-error')).toBeInTheDocument();
+
+    const retry = await screen.findByRole('button', {name: 'Retry'});
+    const callsBeforeRetry = issuesRequest.mock.calls.length;
+    await userEvent.click(retry);
+
+    await waitFor(() =>
+      expect(issuesRequest.mock.calls.length).toBeGreaterThan(callsBeforeRetry)
+    );
+  });
+
+  it('invokes onFetchSuccess with correct arguments', async () => {
+    const onFetchSuccess = jest.fn();
+    MockApiClient.addMockResponse({url: membersUrl, body: []});
+    const linkHeader = '<https://sentry.io/?cursor=next>; rel="next"';
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      body: [group],
+      headers: {Link: linkHeader},
+    });
+
+    render(
+      <GroupList
+        numPlaceholderRows={1}
+        queryParams={defaultQueryParams}
+        onFetchSuccess={onFetchSuccess}
+      />,
+      {
+        organization,
+        initialRouterConfig,
+      }
+    );
+
+    expect(await screen.findByText('RequestError')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(onFetchSuccess).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: false,
+          errorData: null,
+          groups: [group],
+          loading: false,
+          pageLinks: linkHeader,
+          memberList: new Map(),
+        }),
+        expect.any(Function)
+      )
+    );
+  });
+
+  it('renders pagination and navigates on next click', async () => {
+    const pageLinks =
+      '<https://sentry.io/?cursor=prev:0:0>; rel="previous"; results="false"; cursor="prev:0:0", ' +
+      '<https://sentry.io/?cursor=next:0:0>; rel="next"; results="true"; cursor="next:0:0"';
+
+    MockApiClient.addMockResponse({url: membersUrl, body: []});
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      body: [GroupFixture()],
+      headers: {Link: pageLinks},
+    });
+
+    const {router} = render(
+      <GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />,
+      {
+        organization,
+        initialRouterConfig,
+      }
+    );
+
+    expect(await screen.findByTestId('pagination')).toBeInTheDocument();
+    const prev = screen.getByRole('button', {name: 'Previous'});
+    const next = screen.getByRole('button', {name: 'Next'});
+    expect(prev).toBeDisabled();
+    expect(next).toBeEnabled();
+
+    await userEvent.click(next);
+
+    await waitFor(() => {
+      expect(router.location.query.cursor).toBe('next:0:0');
+    });
+
+    expect(router.location.query.page).toBe('1');
+  });
+
+  it('updates the assignee when changed', async () => {
+    const user = UserFixture({id: '2', name: 'Jane Doe', email: 'jane@example.com'});
+    const team = TeamFixture({id: '1', slug: 'cool-team'});
+    const project = ProjectFixture({teams: [team]});
+    const groupWithProject = GroupFixture({project, assignedTo: null});
+
+    TeamStore.loadInitialData([team]);
+
+    MockApiClient.addMockResponse({url: membersUrl, body: [MemberFixture({user})]});
+    MockApiClient.addMockResponse({
+      url: issuesUrl,
+      method: 'GET',
+      body: [groupWithProject],
+    });
+
+    const assignMock = MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/issues/${groupWithProject.id}/`,
+      method: 'PUT',
+      body: {...groupWithProject, assignedTo: {...user, type: 'user'}},
+    });
+
+    render(<GroupList numPlaceholderRows={1} queryParams={defaultQueryParams} />, {
+      organization,
+      initialRouterConfig,
+    });
+
+    expect(await screen.findByText('RequestError')).toBeInTheDocument();
+
+    // Open the assignee dropdown and select a user
+    await userEvent.click(
+      await screen.findByRole('button', {name: 'Modify issue assignee'})
+    );
+    await userEvent.click(await screen.findByRole('option', {name: /Jane Doe/}));
+
+    // Should make the API call and display the new assignee
+    await waitFor(() => {
+      expect(assignMock).toHaveBeenCalledWith(
+        `/organizations/${organization.slug}/issues/${groupWithProject.id}/`,
+        expect.objectContaining({
+          data: {assignedTo: 'user:2', assignedBy: 'assignee_selector'},
+        })
+      );
+    });
+    expect(await screen.findByTestId('assigned-avatar')).toBeInTheDocument();
+  });
+});

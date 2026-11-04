@@ -1,19 +1,23 @@
+from sentry.backup.scopes import RelocationScope
 from sentry.db.models import (
+    BoundedBigIntegerField,
     BoundedPositiveIntegerField,
     FlexibleForeignKey,
     Model,
+    cell_silo_model,
     sane_repr,
 )
 
 
+@cell_silo_model
 class ReleaseCommit(Model):
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Excluded
 
-    organization_id = BoundedPositiveIntegerField(db_index=True)
+    organization_id = BoundedBigIntegerField(db_index=True)
     # DEPRECATED
-    project_id = BoundedPositiveIntegerField(null=True)
+    project_id = BoundedBigIntegerField(null=True)
     release = FlexibleForeignKey("sentry.Release")
-    commit = FlexibleForeignKey("sentry.Commit")
+    commit = FlexibleForeignKey("sentry.Commit", db_constraint=False)
     order = BoundedPositiveIntegerField()
 
     class Meta:

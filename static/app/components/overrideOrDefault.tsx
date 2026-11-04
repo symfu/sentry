@@ -1,0 +1,59 @@
+import type {ComponentProps} from 'react';
+
+import {getOverride} from 'sentry/overrideRegistry';
+import type {OverrideName, Overrides} from 'sentry/types/overrides';
+
+interface Params<H extends OverrideName> {
+  /**
+   * The name of the override as listed in overrideRegistry.registerOverride(overrideName, callback)
+   */
+  overrideName: H;
+  /**
+   * Component that will be shown if no hook is available
+   */
+  defaultComponent?: ReturnType<Overrides[H]> | (() => ReturnType<Overrides[H]>);
+}
+
+/**
+ * Use this instead of the usual ternary operator when using getsentry overrides.
+ * So in lieu of:
+ *
+ *  getOverride('component:org-auth-view')?.() ?? OrganizationAuth
+ *
+ * do this instead:
+ *
+ *   const OverriddenOrganizationAuth = OverrideOrDefault({
+ *     overrideName:'component:org-auth-view',
+ *     defaultComponent: OrganizationAuth,
+ *   })
+ *
+ * Note, you will need to register the override in gsApp/registerOverrides.tsx and
+ * add the type to sentry/types/overrides.tsx.
+ */
+export function OverrideOrDefault<H extends OverrideName>({
+  overrideName,
+  defaultComponent,
+}: Params<H>): React.FunctionComponent<ComponentProps<ReturnType<Overrides[H]>>> {
+  type Props = ComponentProps<ReturnType<Overrides[H]>>;
+
+  // Defining the props here is unnecessary and slow for typescript
+  function getDefaultComponent(): React.ComponentType<any> | undefined {
+    return defaultComponent;
+  }
+
+  function OverrideOrDefaultComponent(props: Props) {
+    // Defining the props here is unnecessary and slow for typescript
+    const OverrideComponent: React.ComponentType<any> =
+      getOverride(overrideName)?.() ?? getDefaultComponent();
+
+    if (!OverrideComponent) {
+      return null;
+    }
+    // oxlint-disable-next-line react/static-components
+    return <OverrideComponent {...props} />;
+  }
+
+  OverrideOrDefaultComponent.displayName = `OverrideOrDefaultComponent(${overrideName})`;
+
+  return OverrideOrDefaultComponent;
+}

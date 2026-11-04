@@ -1,131 +1,70 @@
+from __future__ import annotations
+
 import itertools
-from functools import reduce, partial
-from operator import or_
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, cast
 
-from django.db.models import Q
-
-from sentry.models import Release, Project, ProjectStatus, EventUser
-from sentry.utils.dates import to_timestamp
-from sentry.utils.geo import geo_by_addr as _geo_by_addr
-
-HEALTH_ID_KEY = "_health_id"
+if TYPE_CHECKING:
+    from sentry.auth.principal import RequestPrincipal
+    from sentry.models.organization import Organization
+    from sentry.utils.snuba import SnubaTSResult
 
 
-def make_health_id(lookup, value):
-    # Convert a lookup and value into
-    # a string that can be used back in a request query.
-    return f"{lookup.name}:{lookup.encoder(value)}"
+class StatsTimeSeriesResult(TypedDict):
+    """Permissive, byte-faithful shape of a single serialized timeseries as
+    emitted by ``SnubaTSResultSerializer.serialize()`` and
+    ``OrganizationEventsEndpointBase.get_event_stats_data()``.
+
+    Only ``data`` is always present; every other key appears conditionally
+    (axis/top-N/comparison/on-demand/metrics paths), so all are ``NotRequired``.
+    Inner structures (``data`` buckets, ``meta``) are heterogeneous and left
+    loose on purpose — documenting every variant is out of scope. This describes
+    the existing payload; it does not constrain or change it.
+    """
+
+    data: list[Any]
+    meta: NotRequired[dict[str, Any]]
+    order: NotRequired[float]
+    isMetricsData: NotRequired[bool]
+    isMetricsExtractedData: NotRequired[bool]
+    confidence: NotRequired[list[Any]]
+    totals: NotRequired[dict[str, Any]]
+    comparisonCount: NotRequired[float]
+    start: NotRequired[int]
+    end: NotRequired[int]
 
 
-def serialize_releases(organization, item_list, user, lookup):
-    return {
-        (r.version,): {
-            HEALTH_ID_KEY: make_health_id(lookup, [r.version]),
-            "value": {"id": r.id, "version": r.version},
-        }
-        for r in Release.objects.filter(
-            organization=organization, version__in={i[0] for i in item_list}
-        )
-    }
+class TimeSeriesLookup(Protocol):
+    columns: Sequence[str]
+    name: str
+
+    def serializer(
+        self,
+        organization: Organization | None,
+        item_list: list[tuple[object, ...]],
+        user: RequestPrincipal | None,
+    ) -> Mapping[tuple[object, ...], object]: ...
 
 
-def geo_by_addr(ip):
-    try:
-        geo = _geo_by_addr(ip)
-    except Exception:
-        geo = None
-
-    if not geo:
-        return
-
-    rv = {}
-    for k in "country_code", "city", "region":
-        d = geo.get(k)
-        if isinstance(d, bytes):
-            d = d.decode("ISO-8859-1")
-        rv[k] = d
-
-    return rv
-
-
-def serialize_eventusers(organization, item_list, user, lookup):
-    if not item_list:
-        return {}
-
-    # We have no reliable way to map the tag value format
-    # back into real EventUser rows. EventUser is only unique
-    # per-project, and this is an organization aggregate.
-    # This means a single value maps to multiple rows.
-    filters = reduce(
-        or_,
-        [Q(hash=EventUser.hash_from_tag(tag), project_id=project) for tag, project in item_list],
-    )
-
-    eu_by_key = {(eu.tag_value, eu.project_id): eu for eu in EventUser.objects.filter(filters)}
-
-    projects = serialize_projects(organization, {i[1] for i in item_list}, user)
-
-    rv = {}
-    for tag, project in item_list:
-        eu = eu_by_key.get((tag, project))
-        if eu is None:
-            attr, value = tag.split(":", 1)
-            eu = EventUser(project_id=project, **{EventUser.attr_from_keyword(attr): value})
-        rv[(tag, project)] = {
-            HEALTH_ID_KEY: make_health_id(lookup, [eu.tag_value, eu.project_id]),
-            "value": {
-                "id": str(eu.id) if eu.id else None,
-                "project": projects.get(eu.project_id),
-                "hash": eu.hash,
-                "tagValue": eu.tag_value,
-                "identifier": eu.ident,
-                "username": eu.username,
-                "email": eu.email,
-                "ipAddress": eu.ip_address,
-                "dateCreated": eu.date_added,
-                "label": eu.get_label(),
-                "name": eu.get_display_name(),
-                "geo": geo_by_addr(eu.ip_address),
-            },
-        }
-    return rv
-
-
-def encoder_eventuser(value):
-    # EventUser needs to be encoded as a
-    # project_id, value tuple.
-    tag_value, project_id = value
-    return "%d:%s" % (project_id, tag_value)
-
-
-def serialize_projects(organization, item_list, user):
-    return {
-        id: {"id": id, "slug": slug}
-        for id, slug in Project.objects.filter(
-            id__in=item_list, organization=organization, status=ProjectStatus.VISIBLE
-        ).values_list("id", "slug")
-    }
-
-
-def serialize_noop(organization, item_list, user, lookup):
-    return {i: {HEALTH_ID_KEY: make_health_id(lookup, [i[0]]), "value": i[0]} for i in item_list}
-
-
-def encoder_noop(row):
-    if not row:
-        return None
-    return row[0]
-
-
-def value_from_row(row, tagkey):
+def value_from_row(row: Mapping[str, object], tagkey: Sequence[str]) -> tuple[object, ...]:
     return tuple(row[k] for k in tagkey)
 
 
-def zerofill(data, start, end, rollup):
+def zerofill(
+    data: Sequence[tuple[float, object]],
+    start: datetime,
+    end: datetime,
+    rollup: int,
+    allow_partial_buckets: bool = False,
+    fill_default: object = None,
+) -> list[tuple[float, object]]:
+    if fill_default is None:
+        fill_default = []
     rv = []
-    end = int(to_timestamp(end))
-    rollup_start = (int(to_timestamp(start)) // rollup) * rollup
-    rollup_end = (end // rollup) * rollup
+    end_seconds = int(end.timestamp())
+    rollup_start = (int(start.timestamp()) // rollup) * rollup
+    rollup_end = (end_seconds // rollup) * rollup
 
     # Fudge the end value when we're only getting a single window.
     # This ensure that we get both values for a single large window that
@@ -146,184 +85,116 @@ def zerofill(data, start, end, rollup):
         except IndexError:
             pass
 
-        rv.append((key, []))
+        rv.append((key, fill_default))
     # Add any remaining rows that are not aligned to the rollup and are lower than the
     # end date.
     if i < len(data):
-        rv.extend(row for row in data[i:] if row[0] < end)
+        end_timestamp = end_seconds if allow_partial_buckets else rollup_end
+        rv.extend(row for row in data[i:] if row[0] < end_timestamp)
 
     return rv
 
 
-class SnubaLookup:
-    """
-    A SnubaLookup consists of all of the attributes needed to facilitate making
-    a query for a column in Snuba. This covers which columns are selected, the extra conditions
-    that need to be applied, how values are serialized in/out of Snuba, etc.
-    """
+def calculate_time_frame(start: datetime, end: datetime, rollup: int) -> dict[str, int]:
+    rollup_start = (int(start.timestamp()) // rollup) * rollup
+    rollup_end = (int(end.timestamp()) // rollup) * rollup
+    if rollup_end - rollup_start == rollup:
+        rollup_end += 1
+    return {"start": rollup_start, "end": rollup_end}
 
-    __slots__ = (
-        "name",
-        "tagkey",
-        "columns",
-        "selected_columns",
-        "conditions",
-        "serializer",
-        "encoder",
-        "filter_key",
-    )
-    __registry = {}
+
+class SnubaTSResultSerializer:
+    """
+    Serializer for time-series Snuba data.
+    """
 
     def __init__(
         self,
-        name,
-        tagkey=None,
-        extra=None,
-        selected_columns=None,
-        conditions=None,
-        serializer=serialize_noop,
-        encoder=encoder_noop,
-        filter_key=None,
-    ):
-        cls = type(self)
-        assert name not in cls.__registry
-        self.name = name
-        self.tagkey = tagkey or name
-        self.columns = [self.tagkey] + list(extra or [])
-        self.serializer = partial(serializer, lookup=self)
-        self.encoder = encoder
-        self.conditions = conditions or [[self.tagkey, "IS NOT NULL", None]]
-        self.selected_columns = selected_columns or []
-        self.filter_key = filter_key or self.tagkey
-        cls.__registry[name] = self
-
-    @classmethod
-    def get(cls, name):
-        return cls.__registry[name]
-
-
-SnubaLookup(
-    "user",
-    "tags[sentry:user]",
-    ["project_id"],
-    serializer=serialize_eventusers,
-    encoder=encoder_eventuser,
-    # User is a complex query and can't be treated as a single value.
-    # And EventUser is a tuple of project_id and the tag value. So we need
-    # to make sure we always keep them together and query them as a single unit.
-    filter_key=("concat", (("toString", ("project_id",)), "':'", "tags[sentry:user]")),
-)
-SnubaLookup("release", "tags[sentry:release]", serializer=serialize_releases)
-# error.type is special in that in ClickHouse, it's an array. But we need
-# to make sure that we don't do any queries across a NULL value or an empty array
-# so we must filter them out explicitly. We also are choosing to explicitly take the
-# first element of the exception_stacks array as the "primary" error type for the event.
-# This is slightly inaccurate due to the fact that a single error may have multiple
-# errors.
-SnubaLookup(
-    "error.type",
-    "error_type",
-    selected_columns=[
-        ("ifNull", ("arrayElement", ("exception_stacks.type", 1), "''"), "error_type")
-    ],
-    conditions=[[("notEmpty", ("exception_stacks.type",)), "=", 1], [("error_type", "!=", "")]],
-)
-# Similar to error.type, we need to also guard against NULL types, but for this case,
-# the NULL type is actually significant for us, which means "unknown". So we want
-# to also retain and capture this.
-SnubaLookup(
-    "error.handled",
-    "error_handled",
-    selected_columns=[("arrayElement", ("exception_stacks.mechanism_handled", 1), "error_handled")],
-    conditions=[[("notEmpty", ("exception_stacks.mechanism_handled",)), "=", 1]],
-)
-
-# Simple tags don't need any special treatment
-for _tag in ("transaction", "os", "os.name", "browser", "browser.name", "device", "device.family"):
-    SnubaLookup(_tag, "tags[%s]" % _tag)
-
-
-class BaseSnubaSerializer:
-    def __init__(self, organization, lookup, user):
+        organization: Organization | None,
+        lookup: TimeSeriesLookup | None,
+        user: RequestPrincipal | None,
+    ) -> None:
         self.organization = organization
         self.lookup = lookup
         self.user = user
 
-    def get_attrs(self, item_list):
+    def get_attrs(
+        self, item_list: list[tuple[object, ...]]
+    ) -> Mapping[tuple[object, ...], object] | list[tuple[object, ...]]:
         if self.lookup is None:
             return item_list
 
         return self.lookup.serializer(self.organization, item_list, self.user)
 
-
-class SnubaResultSerializer(BaseSnubaSerializer):
-    """
-    Serializer for the top values Snuba results.
-    """
-
-    def serialize(self, result):
-        counts_by_value = {
-            value_from_row(r, self.lookup.columns): r["count"] for r in result.previous["data"]
-        }
-        projects = serialize_projects(
-            self.organization,
-            {p for r in result.current["data"] for p in r.get("top_projects", [])},
-            self.user,
-        )
-        attrs = self.get_attrs(
-            [value_from_row(r, self.lookup.columns) for r in result.current["data"]]
-        )
-
-        data = []
-        for r in result.current["data"]:
-            value = value_from_row(r, self.lookup.columns)
-            row = {
-                "count": r["count"],
-                "lastCount": counts_by_value.get(value, 0),
-                self.lookup.name: attrs.get(value),
-            }
-            if "top_projects" in r:
-                row["topProjects"] = [projects[p] for p in r["top_projects"]]
-            if "total_projects" in r:
-                row["totalProjects"] = r["total_projects"]
-
-            data.append(row)
-
-        return {
-            "data": data,
-            "totals": {
-                "count": result.current["totals"]["count"],
-                "lastCount": result.previous["totals"]["count"],
-            },
-        }
-
-
-class SnubaTSResultSerializer(BaseSnubaSerializer):
-    """
-    Serializer for time-series Snuba data.
-    """
-
-    def serialize(self, result, column="count", order=None):
+    def serialize(
+        self,
+        result: SnubaTSResult,
+        column: str = "count",
+        order: int | None = None,
+        allow_partial_buckets: bool = False,
+        zerofill_results: bool = True,
+        extra_columns: Sequence[str] | None = None,
+        confidence_column: str = "count",
+    ) -> dict[str, Any]:
         data = [
             (key, list(group))
             for key, group in itertools.groupby(result.data["data"], key=lambda r: r["time"])
         ]
+        attrs: Mapping[tuple[object, ...], object] = {}
         if self.lookup:
-            attrs = self.get_attrs(
-                [value_from_row(r, self.lookup.columns) for _, v in data for r in v]
+            attrs = cast(
+                Mapping[tuple[object, ...], object],
+                self.get_attrs(
+                    [value_from_row(r, self.lookup.columns) for _, v in data for r in v]
+                ),
             )
         rv = []
         for k, v in data:
             row = []
             for r in v:
                 item = {"count": r.get(column, 0)}
+                if extra_columns is not None:
+                    for extra_column in extra_columns:
+                        item[extra_column] = r.get(extra_column, 0)
                 if self.lookup:
                     value = value_from_row(r, self.lookup.columns)
                     item[self.lookup.name] = (attrs.get(value),)
                 row.append(item)
             rv.append((k, row))
 
-        res = {"data": zerofill(rv, result.start, result.end, result.rollup)}
+        res: StatsTimeSeriesResult = {
+            "data": (
+                zerofill(
+                    rv,
+                    result.start,
+                    result.end,
+                    result.rollup,
+                    allow_partial_buckets=allow_partial_buckets,
+                )
+                if zerofill_results
+                else rv
+            )
+        }
+
+        confidence_values = []
+        # TODO: remove this once frontend starts using `accuracy` in `meta`
+        if "processed_timeseries" in result.data:
+            for key, group in itertools.groupby(
+                result.data["processed_timeseries"].confidence, key=lambda r: r["time"]
+            ):
+                result_row = []
+                for confidence_row in group:
+                    item = {confidence_column: confidence_row.get(column, None)}
+                    if extra_columns is not None:
+                        for extra_column in extra_columns:
+                            item[extra_column] = confidence_row.get(extra_column, 0)
+                    if self.lookup:
+                        value = value_from_row(confidence_row, self.lookup.columns)
+                        item[self.lookup.name] = (attrs.get(value),)
+                    result_row.append(item)
+                confidence_values.append((key, result_row))
+            # confidence only comes from the RPC which already helps us zerofill by returning all buckets
+            res["confidence"] = confidence_values
 
         if result.data.get("totals"):
             res["totals"] = {"count": result.data["totals"][column]}
@@ -332,5 +203,11 @@ class SnubaTSResultSerializer(BaseSnubaSerializer):
             res["order"] = order
         elif "order" in result.data:
             res["order"] = result.data["order"]
+        res["isMetricsData"] = result.data.get("isMetricsData", False)
 
-        return res
+        if hasattr(result, "start") and hasattr(result, "end"):
+            timeframe = calculate_time_frame(result.start, result.end, result.rollup)
+            res["start"] = timeframe["start"]
+            res["end"] = timeframe["end"]
+
+        return dict(res)

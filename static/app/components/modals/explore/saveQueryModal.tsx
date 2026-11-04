@@ -1,0 +1,179 @@
+import {Fragment, useState} from 'react';
+import styled from '@emotion/styled';
+import * as Sentry from '@sentry/react';
+
+import {Button} from '@sentry/scraps/button';
+import {Input} from '@sentry/scraps/input';
+import {Container, Flex} from '@sentry/scraps/layout';
+import {Switch} from '@sentry/scraps/switch';
+
+import {
+  addErrorMessage,
+  addLoadingMessage,
+  addSuccessMessage,
+} from 'sentry/actionCreators/indicator';
+import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+import {t} from 'sentry/locale';
+import type {Organization} from 'sentry/types/organization';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {defined} from 'sentry/utils/defined';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useSetQueryParamsSavedQuery} from 'sentry/views/explore/queryParams/context';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+
+export type SaveQueryModalProps = {
+  organization: Organization;
+  saveQuery: (variables: {name: string; starred?: boolean}) => Promise<{id: string}>;
+  traceItemDataset: TraceItemDataset;
+  name?: string;
+  showMessage?: boolean;
+  source?: 'toolbar' | 'table' | 'conversations' | 'explorer' | 'errors';
+};
+
+type Props = ModalRenderProps & SaveQueryModalProps;
+
+function SaveQueryModal({
+  Header,
+  Body,
+  Footer,
+  closeModal,
+  saveQuery,
+  name: initialName,
+  source,
+  traceItemDataset,
+  showMessage = true,
+}: Props) {
+  const organization = useOrganization();
+
+  const [name, setName] = useState(initialName ?? '');
+  const [isSaving, setIsSaving] = useState(false);
+  const [starred, setStarred] = useState(true);
+
+  const setQueryParamsSavedQuery = useSetQueryParamsSavedQuery();
+
+  const onSave = async () => {
+    try {
+      setIsSaving(true);
+      addLoadingMessage(t('Saving query...'));
+      const {id} = await saveQuery({
+        name,
+        starred: initialName === undefined ? starred : undefined,
+      });
+      if (initialName === undefined && source !== 'errors') {
+        setQueryParamsSavedQuery(id, name);
+      }
+      if (showMessage) {
+        addSuccessMessage(t('Query saved successfully'));
+      }
+      if (defined(source)) {
+        if (source === 'conversations') {
+          trackAnalytics('conversations.save_query_modal', {
+            action: 'submit',
+            save_type: initialName === undefined ? 'save_new_query' : 'rename_query',
+            ui_source: 'table',
+            organization,
+          });
+        } else if (source === 'errors') {
+          trackAnalytics('errors.save_query_modal', {
+            action: 'submit',
+            save_type: initialName === undefined ? 'save_new_query' : 'rename_query',
+            ui_source: source,
+            organization,
+          });
+        } else if (traceItemDataset === TraceItemDataset.LOGS) {
+          trackAnalytics('logs.save_query_modal', {
+            action: 'submit',
+            save_type: initialName === undefined ? 'save_new_query' : 'rename_query',
+            ui_source: source,
+            organization,
+          });
+        } else if (traceItemDataset === TraceItemDataset.SPANS) {
+          trackAnalytics('trace_explorer.save_query_modal', {
+            action: 'submit',
+            save_type: initialName === undefined ? 'save_new_query' : 'rename_query',
+            ui_source: source,
+            organization,
+          });
+        }
+      }
+      closeModal();
+    } catch (error) {
+      if (showMessage) {
+        addErrorMessage(t('Failed to save query'));
+      }
+      Sentry.captureException(error);
+      // oxlint-disable-next-line react/todo
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <Fragment>
+      <Header closeButton>
+        <h4>{defined(initialName) ? t('Rename Query') : t('New Query')}</h4>
+      </Header>
+      <Body>
+        <Container marginBottom="xl">
+          <SectionHeader>{t('Name')}</SectionHeader>
+          <Input
+            autoFocus
+            placeholder={
+              defined(initialName)
+                ? t('Enter a name for your query')
+                : t('Enter a name for your new query')
+            }
+            onChange={e => setName(e.target.value)}
+            value={name}
+            title={
+              defined(initialName)
+                ? t('Enter a name for your query')
+                : t('Enter a name for your new query')
+            }
+          />
+        </Container>
+        {initialName === undefined && (
+          <StarredWrapper>
+            <Switch
+              checked={starred}
+              onChange={() => {
+                setStarred(!starred);
+              }}
+              title={t('Starred')}
+            />
+            <SectionHeader>{t('Starred')}</SectionHeader>
+          </StarredWrapper>
+        )}
+      </Body>
+
+      <Footer>
+        <Flex gap="lg" justify="end">
+          <Button onClick={closeModal} disabled={isSaving}>
+            {t('Cancel')}
+          </Button>
+          <Button onClick={onSave} disabled={!name || isSaving} variant="primary">
+            {defined(initialName) ? t('Save Changes') : t('Create a New Query')}
+          </Button>
+        </Flex>
+      </Footer>
+    </Fragment>
+  );
+}
+
+export default SaveQueryModal;
+
+const StarredWrapper = styled('div')`
+  display: flex;
+  flex-direction: row;
+  gap: ${p => p.theme.space.md};
+  align-items: center;
+
+  > h6 {
+    margin-bottom: 0;
+  }
+`;
+
+const SectionHeader = styled('h6')`
+  font-size: ${p => p.theme.form.md.fontSize};
+  margin-bottom: ${p => p.theme.space.xs};
+`;

@@ -1,20 +1,19 @@
-import types
+from types import SimpleNamespace
 
+from django.http import HttpRequest, HttpResponse
 from django.views.generic import View
 
-from sentry.models import Repository
-from sentry.plugins.providers.dummy import DummyRepositoryProvider
+from sentry.models.repository import Repository
+from sentry.web.frontend.base import internal_cell_silo_view
 
 from .mail import MailPreview
 
 
+@internal_cell_silo_view
 class DebugUnableToDeleteRepository(View):
-    def get(self, request):
-        def mock_get_provider(self):
-            return DummyRepositoryProvider("dummy")
-
-        repo = Repository(name="getsentry/sentry", provider="dummy")
-        repo.get_provider = types.MethodType(mock_get_provider, repo)
+    def get(self, request: HttpRequest) -> HttpResponse:
+        repo = Repository(name="getsentry/sentry", provider="integrations:example")
+        setattr(repo, "get_provider", lambda: SimpleNamespace(name="Example"))
 
         email = repo.generate_delete_fail_email("An internal server error occurred")
         return MailPreview(

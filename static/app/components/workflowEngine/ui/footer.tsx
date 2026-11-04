@@ -1,0 +1,34 @@
+import {useRef} from 'react';
+import styled from '@emotion/styled';
+
+import {useIsStuck} from 'sentry/utils/useIsStuck';
+
+const StickyFooterBase = styled('div')`
+  position: sticky;
+  margin-top: auto;
+  bottom: 0;
+  right: 0;
+  width: 100%;
+  padding: ${p => `${p.theme.space.xl} ${p.theme.space.xl}`};
+  background: ${p => p.theme.tokens.background.primary};
+  border-top: 1px solid ${p => p.theme.colors.gray200};
+  box-shadow: none;
+  justify-content: flex-end;
+  gap: ${p => p.theme.space.lg};
+  z-index: ${p => p.theme.zIndex.initial};
+
+  &[data-stuck] {
+    /* TODO(design-engineering): Replace with a directional shadow token when one exists */
+    box-shadow:
+      0px -4px 0px 2px ${p => p.theme.tokens.elevation.high},
+      0px -1px 0px 1px ${p => p.theme.tokens.elevation.high};
+  }
+`;
+
+export function StickyFooter(props: React.ComponentProps<'div'>) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Use a bottom-focused rootMargin so the hook reports stuck when pinned at bottom.
+  const isStuck = useIsStuck(ref, {position: 'bottom'});
+  const stuckProps = isStuck ? {'data-stuck': ''} : {};
+  return <StickyFooterBase ref={ref} {...stuckProps} {...props} />;
+}

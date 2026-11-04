@@ -1,0 +1,134 @@
+# Frontend Development Guide
+
+> For critical commands and testing rules, see the "Command Execution Guide" section in `/AGENTS.md` in the repository root.
+
+## Frontend Tech Stack
+
+- **Language**: TypeScript
+- **Framework**: React 19
+- **Build Tool**: Rsbuild (powered by Rspack)
+- **Package management**: pnpm
+- **State Management**: Reflux, React Query (TanStack Query)
+- **Styling**: Emotion (CSS-in-JS), Less
+- **Testing**: Jest, React Testing Library
+
+## Important Files and Directories
+
+- `package.json`: Node.js dependencies and scripts
+- `rsbuild.config.ts`: Frontend build configuration
+- `tsconfig.json`: TypeScript configuration
+- `oxlint.config.ts`: Oxlint configuration
+- `oxlint.base.ts`: Shared Oxlint rules used by root and package configs
+- `stylelint.config.js`: CSS/styling linting
+- `stylelint.base.js`: Shared Stylelint rules used by root and package configs
+- **Components**: `static/app/components/{component}/`
+- **Views**: `static/app/views/{area}/{page}.tsx`
+- **Stores**: `static/app/stores/{store}Store.tsx`
+- **Actions**: `static/app/actionCreators/{resource}.tsx`
+- **Utils**: `static/app/utils/{utility}.tsx`
+- **Types**: `static/app/types/{area}.tsx`
+- **API Client**: `static/app/api.tsx`
+
+### Routing
+
+- Routes defined in `static/app/router/routes.tsx`
+- Builds, tests, and typechecks use React Router V8.
+- Import router APIs and types from `react-router`, and `RouterProvider` from
+  `react-router/dom`. Use Sentry's Nuqs adapter from `sentry/router/nuqsAdapter`.
+- Keep using Sentry's routing helpers where required. Use Sentry's
+  `reactRouterBrowserTracingIntegration` and `wrapCreateBrowserRouter`.
+- Lazy load route components when possible
+
+### Frontend API Calls
+
+Use `apiOptions` with `useQuery` from TanStack Query; **never** use the deprecated `useApiQuery`/`getApiQueryData`/`setApiQueryData`. `staleTime` is required. For the full guide (conditional fetching, no call-site generics, response headers/pagination) → use the **`frontend-data-fetching`** skill.
+
+## General Frontend Rules
+
+1. NO new Reflux stores
+2. NO class components
+3. NO CSS files (use [core components](./app/components/core/) or Emotion in edge cases)
+4. ALWAYS use TypeScript
+5. ALWAYS colocate tests
+6. Lazy load routes: `React.lazy(() => import('...'))`
+
+`Menu` from `@sentry/scraps/menu` is an internal presentation primitive for shared controls. In product UI, use `DropdownMenu` for actions, `CompactSelect` for choices, or the form system's `field.Select` for form fields. Use `Menu` directly only when implementing those shared controls.
+
+## Linting
+
+Icons and Scraps own their lint configs and run native Oxlint and Stylelint. Root lint commands and prek route selected files to their owning packages. For file-scoped CSS checks, the root invokes Stylelint directly in each package to avoid its full-scan glob. Use `pnpm run lint:suppressions` at the root for suppression maintenance across all workspaces.
+
+Incubator rules show as warnings in editors but fail `pnpm run lint:js`, prek, and CI. Each workspace's `oxlint-suppressions.json` uses project-relative paths and caps existing debt per file and rule. Missing or empty files mean empty budgets. Successful fixes lower counts automatically. Run `pnpm run lint:suppressions --help` for the suppression maintenance flags (`--prune`, `--enroll`, `--backlog`).
+
+## Refs
+
+**NEVER read from or write to a ref (`ref.current`) during render.** This breaks the rules of React — render must be pure, and refs are mutable state that React does not track. Reading a ref during render can return stale values across concurrent renders; writing one is a side effect that makes render impure.
+
+- Read and write `ref.current` **only** inside effects (`useEffect`, `useLayoutEffect`) or event handlers/callbacks — never in the render body.
+- If you need a value during render, derive it as a `const` from props/state, or lift it into `useState`/`useMemo`. Reach for a ref only for values that must persist across renders **without** triggering one (DOM nodes, timers, previous-value tracking read later in an effect).
+
+```tsx
+// ❌ Reading/writing a ref during render
+function Component({value}: Props) {
+  renderCountRef.current += 1; // side effect during render
+  const previous = prevValueRef.current; // stale under concurrent rendering
+  prevValueRef.current = value; // write during render
+  return <div>{previous}</div>;
+}
+
+// ✅ Mutate refs in effects; derive render values
+function Component({value}: Props) {
+  const prevValueRef = useRef(value);
+  useEffect(() => {
+    prevValueRef.current = value; // write in an effect
+  }, [value]);
+  return <div>{value}</div>;
+}
+```
+
+## UI Patterns
+
+- When implementing advanced copy to clipboard functionality like markdown or JSON, avoid using separate buttons to copy different formats and prefer using sentry/components/copyAsDropdown and provide the different format options.
+
+## Design System
+
+Use core primitives from `@sentry/scraps` instead of hand-rolling styled components for layout and typography. **For the full prop/token reference and worked examples, use the `design-system` skill.**
+
+- **Layout**: use `Flex`, `Grid`, `Stack`, `Container` — never styled `display: flex/grid`.
+- **Typography**: use `Text` and `Heading` — never raw `<p>`, `<span>`, `<div>`, or `<h1>`–`<h6>`.
+- Prefer component props over the `style` attribute; use `gap`/padding over `margin`.
+- Use container responsive props (e.g. `{xs: 'column', md: 'row'}`) instead of styled media queries. Do not add viewport `screen:` keys; preserve existing viewport behavior with a lint suppression when a container query would change it.
+- Do not add layout `@media` or `@container` queries to Emotion styles, including tests. Use responsive primitive props. `@media` is allowed for modal sizing in `modalCss`, viewport sizing or placement in the core drawer shell, and non-layout features such as reduced motion, hover, pointer, and color scheme.
+- Split layout from typography — compose `Flex`/`Grid` with `Text`/`Heading`; don't couple them in one styled component.
+- Prefer `InfoTip`/`InfoText` over a raw `Tooltip`.
+- Add `*.stories.mdx` stories for new components.
+- Use [core components](./app/components/core/) whenever available; reserve Emotion for genuine edge cases.
+
+### Other core components
+
+- **Avatars**: use `<UserAvatar/>`/`<TeamAvatar/>`/`<ProjectAvatar/>`/etc. from `static/app/components/core/avatar` (and `<AvatarList>` for lists) — never raw `<img>`.
+- **Disclosure**: use the core `<Disclosure>` component — don't hand-roll expand/collapse.
+- **Icons**: import SVG icons from explicit `@sentry/icons` subpaths (for example, `@sentry/icons/add`). Keep SvgIcon-based icons in `static/packages/icons/src`; keep app asset wrappers in `static/app/icons`. The icons package must not depend on scraps or app code. Never inline SVGs. Optimize with svgo/svgomg.
+- **Images**: import via the `sentry-images` alias (webpack loader); keep them in `static/app/images`, never reference by static path.
+
+For worked examples of all of the above, use the **`design-system`** skill.
+
+## React Testing
+
+`test-ci` runs each workspace with its scoped Jest config, with up to two workspaces in parallel. File arguments select tests across workspaces. App, lint, and test-support suites share the global CI test list and load balancing. Standalone packages run once on shard 0 in CI. New small standalone suites can use `runOnFirstShard` from `scripts/jestSingleShard.js`; larger suites can use the shared scoped config. Balance reports are written per workspace under `.artifacts/jest-balance/` and merged by CI.
+
+`pnpm test` uses one Jest watcher for app, lint, and test-support tests. `pnpm test-all` runs all workspace test scripts once with watch mode disabled.
+
+Writing or editing frontend tests (`*.spec.tsx`, RTL, `MockApiClient`, routing/network tests) → use the **`react-testing`** skill for the full guide (query priority, no hook mocking, fixtures, async assertions, mocking network requests).
+
+## Sentry SDK Instrumentation
+
+Before inventing a key for `Sentry.setTag`/`setContext`, or a span's `setAttribute`, check whether OTel or Sentry already has a standard name for it in `@sentry/conventions`. Reuse existing names so the same attribute remains queryable across producers such as SDKs and Relay.
+
+Find attribute name constants in `@sentry/conventions/attributes/search`, where they are prefixed with `SEARCH_`. Use `span.setAttribute` to attach the value with the existing convention name:
+
+```tsx
+import {SEARCH_USER_AGENT__ORIGINAL} from '@sentry/conventions/attributes/search';
+
+span.setAttribute(SEARCH_USER_AGENT__ORIGINAL, navigator.userAgent);
+```

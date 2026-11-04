@@ -1,46 +1,28 @@
-from django.core.urlresolvers import reverse
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.silo import control_silo_test
 
-from sentry.testutils import APITestCase
 
-
+@control_silo_test
 class OrganizationApiKeyIndex(APITestCase):
-    def test_org_admin_can_access(self):
-        self.login_as(user=self.user)
+    endpoint = "sentry-api-0-organization-api-key-index"
 
-        organization = self.create_organization(name="foo", owner=self.user)
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(self.user)
 
-        path = reverse("sentry-api-0-organization-api-key-index", args=[organization.slug])
+    def test_org_admin_can_access(self) -> None:
+        self.get_success_response(self.organization.slug)
 
-        resp = self.client.get(path)
-
-        assert resp.status_code == 200
-
-    def test_member_no_access(self):
-        self.login_as(user=self.user)
-        organization = self.create_organization(name="foo", owner=self.user)
-
+    def test_member_no_access(self) -> None:
         user = self.create_user("bar@example.com")
-        self.create_member(organization=organization, user=user, role="member")
-
-        path = reverse("sentry-api-0-organization-api-key-index", args=[organization.slug])
+        self.create_member(organization=self.organization, user=user, role="member")
 
         self.login_as(user)
+        self.get_error_response(self.organization.slug, status_code=403)
 
-        resp = self.client.get(path)
-
-        assert resp.status_code == 403
-
-    def test_superuser_can_access(self):
-        self.login_as(user=self.user)
-        organization = self.create_organization(name="foo", owner=self.user)
-
+    def test_superuser_can_access(self) -> None:
         admin_user = self.create_user("admin@example.com", is_superuser=True)
-        self.create_member(organization=organization, user=admin_user, role="admin")
-
-        path = reverse("sentry-api-0-organization-api-key-index", args=[organization.slug])
+        self.create_member(organization=self.organization, user=admin_user, role="admin")
 
         self.login_as(admin_user, superuser=True)
-
-        resp = self.client.get(path)
-
-        assert resp.status_code == 200
+        self.get_success_response(self.organization.slug)

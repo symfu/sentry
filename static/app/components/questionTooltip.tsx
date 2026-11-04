@@ -1,0 +1,65 @@
+import styled from '@emotion/styled';
+import {IconInfo} from '@sentry/icons/info';
+import {IconQuestion} from '@sentry/icons/question';
+import {SvgIcon, type SVGIconProps} from '@sentry/icons/svgIcon';
+
+import type {TooltipProps} from '@sentry/scraps/tooltip';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+interface QuestionProps extends Partial<
+  Pick<
+    TooltipProps,
+    'containerDisplayMode' | 'maxWidth' | 'position' | 'skipWrapper' | 'delay'
+  >
+> {
+  /**
+   * Sets the size of the icon.
+   *
+   * Remember to keep the size relative to the text or content it is near.
+   */
+  size: NonNullable<SVGIconProps['size']>;
+  /**
+   * The message to show in the question icons tooltip.
+   */
+  title: React.ReactNode;
+  className?: string;
+  icon?: 'question' | 'info';
+}
+
+/**
+ * @deprecated Prefer `InfoTip` from `@sentry/scraps/info` for new usages.
+ */
+export function QuestionTooltip({
+  title,
+  size,
+  className,
+  icon = 'question',
+  ...tooltipProps
+}: QuestionProps) {
+  return (
+    <QuestionIconContainer size={size} className={className}>
+      <Tooltip skipWrapper title={title} {...tooltipProps}>
+        {icon === 'info' ? (
+          <IconInfo size={size} variant="muted" data-test-id="more-information" />
+        ) : (
+          <IconQuestion size={size} variant="muted" data-test-id="more-information" />
+        )}
+      </Tooltip>
+    </QuestionIconContainer>
+  );
+}
+
+const QuestionIconContainer = styled('span')<Pick<QuestionProps, 'size' | 'className'>>`
+  display: inline-block;
+  height: ${p => SvgIcon.ICON_SIZES[p.size]};
+  line-height: ${p => SvgIcon.ICON_SIZES[p.size]};
+
+  & svg {
+    transition: 120ms opacity;
+    opacity: 0.6;
+
+    &:hover {
+      opacity: 1;
+    }
+  }
+`;

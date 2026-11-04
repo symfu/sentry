@@ -1,49 +1,24 @@
 import os
+import warnings
+
 import click
 
-DEFAULT_SETTINGS_MODULE = "sentry.conf.server"
+from sentry.runner import importer
+from sentry.runner.boot_gc import frozen_after_boot
+
 DEFAULT_SETTINGS_CONF = "config.yml"
 DEFAULT_SETTINGS_OVERRIDE = "sentry.conf.py"
 
 
-def generate_secret_key():
-    from django.utils.crypto import get_random_string
-
-    chars = "abcdefghijklmnopqrstuvwxyz0123456789!@#%^&*(-_=+)"
-    return get_random_string(50, chars)
-
-
-def load_config_template(path, version="default"):
-    from pkg_resources import resource_string
-
-    return resource_string("sentry", f"data/config/{path}.{version}").decode("utf8")
-
-
-def generate_settings(dev=False):
-    """
-    This command is run when ``default_path`` doesn't exist, or ``init`` is
-    run and returns a string representing the default data to put into their
-    settings file.
-    """
-    context = {
-        "secret_key": generate_secret_key(),
-        "debug_flag": dev,
-        "mail.backend": "console" if dev else "smtp",
-    }
-
-    py = load_config_template(DEFAULT_SETTINGS_OVERRIDE, "default") % context
-    yaml = load_config_template(DEFAULT_SETTINGS_CONF, "default") % context
-    return py, yaml
-
-
-def get_sentry_conf():
+def get_sentry_conf() -> str:
     """
     Fetch the SENTRY_CONF value, either from the click context
     if available, or SENTRY_CONF environment variable.
     """
     try:
         ctx = click.get_current_context()
-        return ctx.obj["config"]
+        config = ctx.obj["config"]
+        return config
     except (RuntimeError, KeyError, TypeError):
         try:
             return os.environ["SENTRY_CONF"]
@@ -51,17 +26,20 @@ def get_sentry_conf():
             return "~/.sentry"
 
 
-def discover_configs():
+def discover_configs(directory: str | None = None) -> tuple[str, str, str | None]:
     """
     Discover the locations of three configuration components:
      * Config directory (~/.sentry)
      * Optional python config file (~/.sentry/sentry.conf.py)
      * Optional yaml config (~/.sentry/config.yml)
     """
-    try:
-        config = os.environ["SENTRY_CONF"]
-    except KeyError:
-        config = "~/.sentry"
+    if directory is not None:
+        config = directory
+    else:
+        try:
+            config = os.environ["SENTRY_CONF"]
+        except KeyError:
+            config = "~/.sentry"
 
     config = os.path.expanduser(config)
 
@@ -77,7 +55,9 @@ def discover_configs():
     )
 
 
-def configure(ctx, py, yaml, skip_service_validation=False):
+def configure(
+    ctx: click.Context | None, py: str, yaml: str | None, skip_service_validation: bool = False
+) -> None:
     """
     Given the two different config files, set up the environment.
 
@@ -87,19 +67,19 @@ def configure(ctx, py, yaml, skip_service_validation=False):
     if __installed:
         return
 
-    import warnings
+    # This creates most of the long-lived objects a process accumulates during
+    # boot. See sentry.runner.boot_gc for why GC is paused while it runs and
+    # the heap frozen after it.
+    with frozen_after_boot("configure"):
+        _configure(ctx, py, yaml, skip_service_validation)
+        __installed = True
 
+
+def _configure(
+    ctx: click.Context | None, py: str, yaml: str | None, skip_service_validation: bool
+) -> None:
     # Make sure that our warnings are always displayed.
     warnings.filterwarnings("default", "", Warning, r"^sentry")
-
-    # This should be kept in-sync with sentry.utils.pytest.sentry,
-    # and pytest warningfilters in pyproject.toml.
-    # See pyproject.toml for explanations.
-    from django.utils.deprecation import RemovedInDjango20Warning, RemovedInDjango21Warning
-
-    warnings.filterwarnings(action="ignore", category=RemovedInDjango20Warning)
-    warnings.filterwarnings(action="ignore", category=RemovedInDjango21Warning)
-    warnings.filterwarnings(action="ignore", category=DeprecationWarning)
 
     # Add in additional mimetypes that are useful for our static files
     # which aren't common in default system registries
@@ -114,10 +94,9 @@ def configure(ctx, py, yaml, skip_service_validation=False):
         ("application/x-font-ttf", "ttc"),
         ("font/opentype", "otf"),
         ("image/svg+xml", "svg"),
+        ("text/plain", "log"),
     ):
         mimetypes.add_type(type, "." + ext)
-
-    from .importer import install
 
     if yaml is None:
         # `yaml` will be None when SENTRY_CONF is pointed
@@ -137,15 +116,9 @@ def configure(ctx, py, yaml, skip_service_validation=False):
             )
         raise ValueError("Configuration file does not exist at '%s'" % click.format_filename(yaml))
 
-    # Add autoreload for config.yml file if needed
-    if yaml is not None and os.path.exists(yaml):
-        from sentry.utils.uwsgi import reload_on_change
+    importer.SENTRY_CONF_PY = py
 
-        reload_on_change(yaml)
-
-    os.environ["DJANGO_SETTINGS_MODULE"] = "sentry_config"
-
-    install("sentry_config", py, DEFAULT_SETTINGS_MODULE)
+    os.environ["DJANGO_SETTINGS_MODULE"] = "sentry.runner.default_settings"
 
     from django.conf import settings
 
@@ -160,7 +133,9 @@ def configure(ctx, py, yaml, skip_service_validation=False):
         skip_service_validation=skip_service_validation,
     )
 
-    __installed = True
+    if os.environ.get("OPENAPIGENERATE", False):
+        # see https://drf-spectacular.readthedocs.io/en/latest/customization.html#step-5-extensions
+        from sentry.apidocs import extensions  # NOQA
 
 
 __installed = False

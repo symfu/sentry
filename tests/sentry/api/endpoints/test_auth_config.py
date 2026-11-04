@@ -1,15 +1,25 @@
+from time import time
+from unittest.mock import patch
+
 import pytest
 from django.conf import settings
 from django.test.utils import override_settings
 
 from sentry import newsletter
-from sentry.testutils import APITestCase
+from sentry.auth.authenticators.totp import TotpInterface
+from sentry.newsletter.dummy import DummyNewsletter
+from sentry.receivers import create_default_projects
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.silo import assume_test_silo_mode, control_silo_test
+from sentry.web.frontend.auth_login import additional_context
 
 
+@control_silo_test
 class AuthConfigEndpointTest(APITestCase):
     path = "/api/0/auth/config/"
 
-    def test_logged_in(self):
+    def test_logged_in(self) -> None:
         user = self.create_user("foo@example.com")
         self.login_as(user)
         response = self.client.get(self.path)
@@ -17,7 +27,7 @@ class AuthConfigEndpointTest(APITestCase):
         assert response.status_code == 200
         assert response.data["nextUri"] == "/organizations/new/"
 
-    def test_logged_in_active_org(self):
+    def test_logged_in_active_org(self) -> None:
         user = self.create_user("foo@example.com")
         self.create_organization(owner=user, slug="ricks-org")
         self.login_as(user)
@@ -26,42 +36,171 @@ class AuthConfigEndpointTest(APITestCase):
         assert response.status_code == 200
         assert response.data["nextUri"] == "/organizations/ricks-org/issues/"
 
-    @override_settings(SENTRY_SINGLE_ORGANIZATION=True)
-    def test_single_org(self):
+    def test_logged_in_preserves_next(self) -> None:
+        user = self.create_user("foo@example.com")
+        self.login_as(user)
+        self.session["_next"] = "/_admin/"
+        self.save_session()
+
         response = self.client.get(self.path)
 
         assert response.status_code == 200
-        assert response.data["nextUri"] == "/auth/login/sentry/"
+        assert response.data["nextUri"] == "/_admin/"
+        assert self.client.session["_next"] == "/_admin/"
 
-    def test_superuser_is_not_redirected(self):
+        response = self.client.get(self.path, {"next": "/settings/account/"})
+
+        assert response.data["nextUri"] == "/settings/account/"
+        assert self.client.session["_next"] == "/_admin/"
+
+    @override_settings(SENTRY_SINGLE_ORGANIZATION=True)
+    @assume_test_silo_mode(SiloMode.MONOLITH)  # Single org IS monolith mode
+    def test_single_org(self) -> None:
+        create_default_projects()
+        response = self.client.get(self.path)
+
+        assert response.status_code == 200
+        assert response.data == {
+            "canRegister": False,
+            "hasNewsletter": False,
+            "pendingMfa": None,
+            "serverHostname": "testserver",
+            "singleOrganizationSlug": "sentry",
+        }
+
+    @override_settings(SENTRY_SINGLE_ORGANIZATION=True)
+    @assume_test_silo_mode(SiloMode.MONOLITH)
+    def test_authenticated_single_org(self) -> None:
+        create_default_projects()
+        self.login_as(self.create_user("user@example.com"))
+
+        response = self.client.get(self.path)
+
+        assert response.status_code == 200
+        assert set(response.data) == {"nextUri"}
+
+    def test_superuser_is_not_redirected(self) -> None:
         user = self.create_user("foo@example.com", is_superuser=True)
         self.login_as(user)
         response = self.client.get(self.path)
 
         assert response.status_code == 200
-        assert "nextUri" not in response.data
+        assert response.data["nextUri"] == "/organizations/new/"
 
-    def test_unauthenticated(self):
+    def test_unauthenticated(self) -> None:
         response = self.client.get(self.path)
 
         assert response.status_code == 200
-        assert not response.data["canRegister"]
-        assert not response.data["hasNewsletter"]
-        assert response.data["serverHostname"] == "testserver"
+        assert response.data == {
+            "canRegister": False,
+            "hasNewsletter": False,
+            "pendingMfa": None,
+            "serverHostname": "testserver",
+        }
+
+    def test_pending_mfa_login(self) -> None:
+        TotpInterface().enroll(self.user)
+        self.client.get(self.path, {"next": "/settings/account/"})
+        login_response = self.client.post(
+            "/api/0/auth/login/",
+            data={"username": self.user.username, "password": "admin"},
+        )
+
+        response = self.client.get(self.path)
+
+        assert login_response.status_code == 202
+        assert response.status_code == 200
+        assert response.data == {
+            "canRegister": False,
+            "hasNewsletter": False,
+            "pendingMfa": {
+                "mfaRequired": True,
+                "mfaMethods": [{"id": "totp"}],
+            },
+            "serverHostname": "testserver",
+        }
+        assert self.client.session["_pending_2fa"][0] == self.user.id
+        assert self.client.session["_next"] == "/settings/account/"
+
+    def test_pending_mfa_for_authenticated_user(self) -> None:
+        TotpInterface().enroll(self.user)
+        self.login_as(self.user)
+        pending_2fa = [self.user.id, time()]
+        self.session["_pending_2fa"] = pending_2fa
+        self.save_session()
+
+        response = self.client.get(self.path)
+
+        assert response.status_code == 200
+        assert response.data["pendingMfa"] == {
+            "mfaRequired": True,
+            "mfaMethods": [{"id": "totp"}],
+        }
+        assert self.client.session["_pending_2fa"] == pending_2fa
+
+    def test_pending_mfa_consumes_session_expired_warning(self) -> None:
+        TotpInterface().enroll(self.user)
+        self.client.get(self.path)
+        self.client.post(
+            "/api/0/auth/login/",
+            data={"username": self.user.username, "password": "admin"},
+        )
+        self.client.cookies["session_expired"] = "1"
+
+        response = self.client.get(self.path)
+
+        assert response.data["warning"] == "Your session has expired."
+        assert response.cookies["session_expired"]["max-age"] == 0
+        assert response.data["pendingMfa"] == {
+            "mfaRequired": True,
+            "mfaMethods": [{"id": "totp"}],
+        }
+
+    def test_login_banner(self) -> None:
+        banner = "Banner message [Learn more](https://example.com)."
+        with patch.object(
+            additional_context,
+            "_callbacks",
+            {lambda request: {"login_banner_markdown": banner}},
+        ):
+            response = self.client.get(self.path)
+
+        assert response.data["loginBannerMarkdown"] == banner
+        assert "login_banner_markdown" not in response.data
+
+    def test_additional_context_keys_are_camelized(self) -> None:
+        with patch.object(
+            additional_context,
+            "_callbacks",
+            {
+                lambda request: {
+                    "github_login_link": "/identity/login/github/",
+                    "google_login_link": "/identity/login/google/",
+                    "vsts_login_link": "/identity/login/vsts/",
+                }
+            },
+        ):
+            response = self.client.get(self.path)
+
+        assert response.data["githubLoginLink"] == "/identity/login/github/"
+        assert response.data["googleLoginLink"] == "/identity/login/google/"
+        assert response.data["vstsLoginLink"] == "/identity/login/vsts/"
+        assert "github_login_link" not in response.data
+        assert "google_login_link" not in response.data
+        assert "vsts_login_link" not in response.data
 
     @pytest.mark.skipif(
         settings.SENTRY_NEWSLETTER != "sentry.newsletter.dummy.DummyNewsletter",
         reason="Requires DummyNewsletter.",
     )
-    def test_has_newsletter(self):
-        newsletter.backend.enable()
-        response = self.client.get(self.path)
-        newsletter.backend.disable()
+    def test_has_newsletter(self) -> None:
+        with newsletter.backend.test_only__downcast_to(DummyNewsletter).enable():
+            response = self.client.get(self.path)
 
         assert response.status_code == 200
         assert response.data["hasNewsletter"]
 
-    def test_can_register(self):
+    def test_can_register(self) -> None:
         with self.options({"auth.allow-registration": True}):
             with self.feature("auth:register"):
                 response = self.client.get(self.path)
@@ -69,7 +208,7 @@ class AuthConfigEndpointTest(APITestCase):
         assert response.status_code == 200
         assert response.data["canRegister"]
 
-    def test_session_expired(self):
+    def test_session_expired(self) -> None:
         self.client.cookies["session_expired"] = "1"
         response = self.client.get(self.path)
 

@@ -1,0 +1,85 @@
+from typing import TypedDict
+
+from rest_framework import serializers
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry import analytics
+from sentry.analytics.events.onboarding_continuation_sent import OnboardingContinuationSent
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases.organization import OrganizationEndpoint, OrganizationPermission
+from sentry.api.serializers.rest_framework.base import CamelSnakeSerializer
+from sentry.auth.principal import require_user
+from sentry.models.organization import Organization
+from sentry.users.models.user import User
+from sentry.utils.email import MessageBuilder
+from sentry.utils.strings import oxfordize_list
+
+
+class OnboardingContinuationSerializer(CamelSnakeSerializer[dict[str, list[str]]]):
+    platforms = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+    )
+
+
+class RequestBuilderArgs(TypedDict):
+    subject: str
+    type: str
+    context: dict[str, object]
+    template: str
+    html_template: str
+
+
+def get_request_builder_args(
+    user: User, organization: Organization, platforms: list[str]
+) -> RequestBuilderArgs:
+    num_platforms = len(platforms)
+    context = {
+        "recipient_name": user.get_display_name(),
+        "onboarding_link": organization.absolute_url(
+            f"/onboarding/{organization.slug}/", query="referrer=onboarding_continuation-email"
+        ),
+        "organization_name": organization.name,
+        "num_platforms": num_platforms,
+        "platforms": oxfordize_list(platforms),
+    }
+    return {
+        "subject": "Finish Onboarding",
+        "type": "organization.onboarding-continuation-email",
+        "context": context,
+        "template": "sentry/emails/onboarding-continuation.txt",
+        "html_template": "sentry/emails/onboarding-continuation.html",
+    }
+
+
+class OnboardingContinuationPermission(OrganizationPermission):
+    scope_map = {"POST": ["org:read", "org:write", "org:admin"]}
+
+
+@cell_silo_endpoint
+class OrganizationOnboardingContinuationEmail(OrganizationEndpoint):
+    publish_status = {
+        "POST": ApiPublishStatus.PRIVATE,
+    }
+    owner = ApiOwner.VALUE_DISCOVERY
+    permission_classes = (OnboardingContinuationPermission,)
+
+    def post(self, request: Request, organization: Organization) -> Response:
+        serializer = OnboardingContinuationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return self.respond(serializer.errors, status=400)
+        user = require_user(request)
+        msg = MessageBuilder(
+            **get_request_builder_args(user, organization, serializer.validated_data["platforms"])
+        )
+        msg.send_async([user.email])
+        analytics.record(
+            OnboardingContinuationSent(
+                organization_id=organization.id,
+                user_id=user.id,
+                providers="email",
+            )
+        )
+        return self.respond(status=202)

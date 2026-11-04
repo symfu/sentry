@@ -1,0 +1,91 @@
+import {IssueStreamDetectorFixture} from 'sentry-fixture/detectors';
+
+import {initializeOrg} from 'sentry-test/initializeOrg';
+import {render, screen, userEvent, within} from 'sentry-test/reactTestingLibrary';
+
+import {Form} from 'sentry/components/forms/form';
+import {EnvironmentSelector} from 'sentry/components/workflowEngine/form/environmentSelector';
+import {ProjectsStore} from 'sentry/stores/projectsStore';
+
+describe('EnvironmentSelector', () => {
+  it('renders & handles selection', async () => {
+    const {projects} = initializeOrg({
+      projects: [
+        {id: '1', slug: 'project-1', environments: ['prod', 'staging'], isMember: true},
+        {id: '2', slug: 'project-2', environments: ['prod', 'stage'], isMember: false},
+      ],
+    });
+    ProjectsStore.loadInitialData(projects);
+
+    render(
+      <Form initialData={{environment: '', allProjects: true}}>
+        <EnvironmentSelector />
+      </Form>
+    );
+
+    // Open list
+    await userEvent.click(screen.getByRole('button', {name: 'All Environments'}));
+
+    // Get groups
+    const allEnvironments = screen.getByRole('group', {
+      name: 'All Environments',
+    });
+    const userProjectEnvironments = screen.getByRole('group', {
+      name: 'Environments in My Projects',
+    });
+    const otherProjectEnvironments = screen.getByRole('group', {
+      name: 'Other Environments',
+    });
+
+    // Environments are correctly grouped
+    expect(
+      within(allEnvironments).getByRole('option', {name: 'All Environments'})
+    ).toBeInTheDocument();
+    expect(
+      within(userProjectEnvironments).getByRole('option', {name: 'prod'})
+    ).toBeInTheDocument();
+    expect(
+      within(userProjectEnvironments).getByRole('option', {name: 'staging'})
+    ).toBeInTheDocument();
+    expect(
+      within(otherProjectEnvironments).getByRole('option', {name: 'stage'})
+    ).toBeInTheDocument();
+    // "prod" should not be shown twice
+    expect(
+      within(otherProjectEnvironments).queryByRole('option', {name: 'prod'})
+    ).not.toBeInTheDocument();
+
+    // Select "prod"
+    await userEvent.click(screen.getByRole('option', {name: 'prod'}));
+
+    // Trigger label is updated
+    expect(screen.getByRole('button', {name: 'prod'})).toBeInTheDocument();
+  });
+
+  it('shows a saved environment absent from the connected projects', async () => {
+    const {projects} = initializeOrg({
+      projects: [
+        {id: '1', slug: 'project-1', environments: ['prod'], isMember: true},
+        {id: '2', slug: 'project-2', environments: ['staging'], isMember: false},
+      ],
+    });
+    ProjectsStore.loadInitialData(projects);
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/detectors/',
+      body: [IssueStreamDetectorFixture({id: '10', projectId: '2'})],
+    });
+    render(
+      <Form initialData={{detectorIds: ['10'], environment: 'configured'}}>
+        <EnvironmentSelector />
+      </Form>
+    );
+
+    await userEvent.click(screen.getByRole('button', {name: 'configured'}));
+
+    expect(await screen.findByRole('option', {name: 'staging'})).toBeInTheDocument();
+    expect(
+      screen.getByRole('option', {name: 'configured', selected: true})
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('option', {name: 'prod'})).not.toBeInTheDocument();
+  });
+});

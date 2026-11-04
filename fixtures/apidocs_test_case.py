@@ -1,0 +1,60 @@
+import functools
+import os
+
+import orjson
+from django.conf import settings
+from django.http import HttpRequest
+from openapi_core.contrib.django import DjangoOpenAPIRequest, DjangoOpenAPIResponse
+from openapi_core.spec import Spec
+from openapi_core.validation.response.validators import V30ResponseDataValidator
+from rest_framework.response import Response
+
+from sentry.services.eventstore.models import Event
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.helpers.datetime import before_now
+from sentry.testutils.skips import requires_snuba
+
+
+@functools.cache
+def _load_schema() -> Spec:
+    # Spec.from_dict validates the whole multi-MB document (~2s), so share one
+    # Spec per process instead of rebuilding it for every test instance.
+    path = os.path.join(os.path.dirname(__file__), "../tests/apidocs/openapi-derefed.json")
+    with open(path, "rb") as json_file:
+        data = orjson.loads(json_file.read())
+    data["servers"][0]["url"] = settings.SENTRY_OPTIONS["system.url-prefix"]
+    del data["components"]
+    return Spec.from_dict(data)
+
+
+@requires_snuba
+class APIDocsTestCase(APITestCase):
+    @property
+    def cached_schema(self) -> Spec:
+        return _load_schema()
+
+    def validate_schema(self, request: HttpRequest, response: Response) -> None:
+        assert 200 <= response.status_code < 300, response.status_code
+
+        if isinstance(response.data, list):
+            assert len(response.data) > 0, "Cannot validate an empty list"
+
+        response["Content-Type"] = "application/json"
+        V30ResponseDataValidator(self.cached_schema).validate(
+            DjangoOpenAPIRequest(request),
+            DjangoOpenAPIResponse(response),  # type: ignore[arg-type]  # Werkzeug 3.1 Headers vs Mapping
+        )
+
+    def create_event(self, name: str, **kwargs: object) -> Event:
+        # Somewhat sane default data.
+        data: dict[str, object] = {
+            "event_id": (name * 32)[:32],
+            "fingerprint": ["1"],
+            "sdk": {"version": "5.17.0", "name": "sentry.javascript.browser"},
+            "timestamp": before_now(seconds=1).isoformat(),
+            "user": {"id": self.user.id, "email": self.user.email},
+            "release": name,
+        }
+        data.update(kwargs)
+
+        return self.store_event(data=data, project_id=self.project.id)

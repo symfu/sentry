@@ -1,9 +1,18 @@
 {
   "get": {
     "tags": ["Events"],
-    "description": "Returns details for given tag key related to an issue.",
+    "description": "Returns details for given tag key related to an issue. \n\nWhen [paginated](/api/pagination) can return at most 1000 values.",
     "operationId": "List a Tag's Values Related to an Issue",
     "parameters": [
+      {
+        "name": "organization_id_or_slug",
+        "in": "path",
+        "description": "The ID or slug of the organization the event belongs to.",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       {
         "name": "issue_id",
         "in": "path",

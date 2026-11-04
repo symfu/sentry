@@ -1,0 +1,1204 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {PageFiltersFixture} from 'sentry-fixture/pageFilters';
+import {TimeSeriesFixture} from 'sentry-fixture/timeSeries';
+import {WidgetFixture} from 'sentry-fixture/widget';
+
+import {renderHookWithProviders, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import {DurationUnit} from 'sentry/utils/discover/fields';
+import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+
+import {useSpansSeriesQuery, useSpansTableQuery} from './useSpansWidgetQuery';
+
+jest.mock('sentry/views/dashboards/utils/widgetQueryQueue', () => ({
+  useWidgetQueryQueue: () => ({queue: null}),
+}));
+
+describe('useSpansSeriesQuery', () => {
+  const organization = OrganizationFixture();
+  const pageFilters = PageFiltersFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(pageFilters);
+  });
+
+  it('formats Date objects in query parameters', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const startDate = new Date('2026-01-14T00:00:00.000Z');
+    const endDate = new Date('2026-01-21T00:00:00.000Z');
+
+    const pageFiltersWithDates = PageFiltersFixture({
+      datetime: {
+        start: startDate,
+        end: endDate,
+        period: null,
+        utc: true,
+      },
+    });
+
+    PageFiltersStore.onInitializeUrlState(pageFiltersWithDates);
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters: pageFiltersWithDates,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            start: '2026-01-14T00:00:00',
+            end: '2026-01-21T00:00:00',
+          }),
+        })
+      );
+    });
+  });
+
+  it('excludes the Other series for grouped widgets with multiple aggregates', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: '',
+          fields: [],
+          aggregates: ['count()', 'avg(span.duration)'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: []},
+    });
+
+    renderHookWithProviders(() =>
+      useSpansSeriesQuery({widget, organization, pageFilters, enabled: true})
+    );
+
+    await waitFor(() =>
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({query: expect.objectContaining({excludeOther: '1'})})
+      )
+    );
+  });
+
+  it('applies dashboard filters correctly', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: 'transaction.duration:>100',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        dashboardFilters: {
+          release: ['1.0.0'],
+        },
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            query: expect.stringContaining('release:"1.0.0"'),
+          }),
+        })
+      );
+    });
+  });
+
+  it('handles multiple widget queries', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'query1',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+        {
+          name: 'query2',
+          fields: ['avg(transaction.duration)'],
+          aggregates: ['avg(transaction.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest1 = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          const yAxis = Array.isArray(options.query.yAxis)
+            ? options.query.yAxis[0]
+            : options.query.yAxis;
+          return yAxis === 'count()';
+        },
+      ],
+    });
+
+    const mockRequest2 = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'avg(transaction.duration)'})]},
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          const yAxis = Array.isArray(options.query.yAxis)
+            ? options.query.yAxis[0]
+            : options.query.yAxis;
+          return yAxis === 'avg(transaction.duration)';
+        },
+      ],
+    });
+
+    renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest1).toHaveBeenCalled();
+    });
+    expect(mockRequest2).toHaveBeenCalled();
+  });
+
+  it('returns loading state while fetching', () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    expect(result.current.loading).toBe(true);
+  });
+
+  it('handles API errors', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {
+        detail: 'Internal server error',
+      },
+      statusCode: 500,
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.errorMessage).toBeDefined();
+    });
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('skips the request when every aggregate has an invalid _if filter', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'test',
+          fields: ['avg_if(``,span.duration)'],
+          aggregates: ['avg_if(``,span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: []},
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.errorMessage).toBe('Invalid series filter');
+    });
+    expect(result.current.loading).toBe(false);
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
+  it('keeps series results dense when skipping only some invalid _if queries', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'invalid',
+          fields: ['avg_if(``,span.duration)'],
+          aggregates: ['avg_if(``,span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+        {
+          name: 'valid',
+          fields: ['avg(span.duration)'],
+          aggregates: ['avg(span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    expect(result.current.rawData).toHaveLength(1);
+    expect(result.current.rawData.every(Boolean)).toBe(true);
+    expect(result.current.timeseriesResults).toBeDefined();
+    expect(result.current.timeseriesResults!.length).toBeGreaterThan(0);
+    expect(result.current.timeseriesResults!.every(Boolean)).toBe(true);
+  });
+
+  it('keeps rawData referentially stable across rerenders when skipping queries', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'invalid',
+          fields: ['avg_if(``,span.duration)'],
+          aggregates: ['avg_if(``,span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+        {
+          name: 'valid',
+          fields: ['avg(span.duration)'],
+          aggregates: ['avg(span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    const initialProps = {
+      widget,
+      organization,
+      pageFilters,
+      enabled: true,
+    };
+    const {result, rerender} = renderHookWithProviders(useSpansSeriesQuery, {
+      initialProps,
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const {rawData} = result.current;
+    expect(rawData).toHaveLength(1);
+
+    rerender({...initialProps, widget: {...widget}});
+
+    expect(result.current.rawData).toBe(rawData);
+  });
+
+  it('filters invalid _if aggregates out of a mixed series request', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'test',
+          fields: ['avg(span.duration)', 'avg_if(``,span.duration)'],
+          aggregates: ['avg(span.duration)', 'avg_if(``,span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalled();
+    });
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events-timeseries/',
+      expect.objectContaining({
+        query: expect.objectContaining({
+          yAxis: ['avg(span.duration)'],
+        }),
+      })
+    );
+  });
+
+  it('reads series types and units from the response', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'test',
+          fields: ['avg_if(``,span.duration)', 'p95(span.duration)'],
+          aggregates: ['avg_if(``,span.duration)', 'p95(span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+          fieldAliases: ['Stripped', 'P95'],
+          fieldMeta: [
+            {valueType: 'integer', valueUnit: null},
+            {valueType: 'duration', valueUnit: DurationUnit.MILLISECOND},
+          ],
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {
+        timeSeries: [
+          TimeSeriesFixture({
+            yAxis: 'p95(span.duration)',
+            meta: {
+              valueType: 'duration',
+              valueUnit: DurationUnit.MILLISECOND,
+              interval: 1000,
+            },
+          }),
+        ],
+      },
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.timeseriesResults).toHaveLength(1);
+    expect(result.current.timeseriesResults![0]!.timeSeries.meta).toEqual(
+      expect.objectContaining({
+        valueType: 'duration',
+        valueUnit: DurationUnit.MILLISECOND,
+      })
+    );
+  });
+
+  it('retargets orderby when it pointed at a stripped invalid _if aggregate', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TOP_N,
+      widgetType: WidgetType.SPANS,
+      limit: 5,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'avg(span.duration)', 'avg_if(``,span.duration)'],
+          aggregates: ['avg(span.duration)', 'avg_if(``,span.duration)'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '-avg_if(``,span.duration)',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalled();
+    });
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events-timeseries/',
+      expect.objectContaining({
+        query: expect.objectContaining({
+          sort: '-avg(span.duration)',
+          field: expect.not.arrayContaining(['avg_if(``,span.duration)']),
+        }),
+      })
+    );
+  });
+
+  it('returns the transformed series', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: '',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events-timeseries/',
+      expect.objectContaining({
+        query: expect.objectContaining({yAxis: ['count()'], dataset: 'spans'}),
+      })
+    );
+    expect(result.current.timeseriesResults?.map(({seriesName}) => seriesName)).toEqual([
+      'count()',
+    ]);
+  });
+});
+
+describe('useSpansTableQuery', () => {
+  const organization = OrganizationFixture();
+  const pageFilters = PageFiltersFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(pageFilters);
+  });
+
+  it('formats Date objects in query parameters', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const startDate = new Date('2026-01-14T00:00:00.000Z');
+    const endDate = new Date('2026-01-21T00:00:00.000Z');
+
+    const pageFiltersWithDates = PageFiltersFixture({
+      datetime: {
+        start: startDate,
+        end: endDate,
+        period: null,
+        utc: true,
+      },
+    });
+
+    PageFiltersStore.onInitializeUrlState(pageFiltersWithDates);
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters: pageFiltersWithDates,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            start: '2026-01-14T00:00:00.000',
+            end: '2026-01-21T00:00:00.000',
+          }),
+        })
+      );
+    });
+  });
+
+  it('includes starred segment query key in query key', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+  });
+
+  it('applies dashboard filters correctly', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: 'transaction.duration:>100',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        dashboardFilters: {
+          release: ['1.0.0'],
+        },
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            query: expect.stringContaining('release:"1.0.0"'),
+          }),
+        })
+      );
+    });
+  });
+
+  it('handles pagination parameters', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        limit: 50,
+        cursor: 'test-cursor',
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            per_page: 50,
+            cursor: 'test-cursor',
+          }),
+        })
+      );
+    });
+  });
+
+  it('returns loading state while fetching', () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    expect(result.current.loading).toBe(true);
+  });
+
+  it('handles API errors', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        detail: 'Internal server error',
+      },
+      statusCode: 500,
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.errorMessage).toBeDefined();
+    });
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('automatically sorts by is_starred_transaction when field is present', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'is_starred_transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction', 'is_starred_transaction'],
+          conditions: '',
+          orderby: '-count()',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [
+          {transaction: '/api/starred', is_starred_transaction: true, 'count()': 100},
+          {transaction: '/api/normal', is_starred_transaction: false, 'count()': 200},
+        ],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            sort: ['-is_starred_transaction', '-count()'],
+          }),
+        })
+      );
+    });
+  });
+
+  it('does not add starred sort when already sorted by starred', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'is_starred_transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '-is_starred_transaction',
+        },
+      ],
+    });
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            sort: ['-is_starred_transaction'],
+          }),
+        })
+      );
+    });
+  });
+
+  it('does not add starred sort when field is not present', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '-count()',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            sort: ['-count()'],
+          }),
+        })
+      );
+    });
+  });
+
+  it('passes categorical bar limit as per_page', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.CATEGORICAL_BAR,
+      limit: 15,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'count()'],
+          aggregates: ['count()'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'count()': 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        limit: 15,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            per_page: 15,
+          }),
+        })
+      );
+    });
+  });
+
+  it('skips the table request when every aggregate has an invalid _if filter', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'test',
+          fields: ['avg_if(``,span.duration)'],
+          aggregates: ['avg_if(``,span.duration)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {data: []},
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.errorMessage).toBe('Invalid series filter');
+    });
+    expect(result.current.loading).toBe(false);
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
+  it('filters invalid _if aggregates out of a mixed table request', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'avg(span.duration)', 'avg_if(``,span.duration)'],
+          aggregates: ['avg(span.duration)', 'avg_if(``,span.duration)'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '-avg_if(``,span.duration)',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'avg(span.duration)': 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalled();
+    });
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events/',
+      expect.objectContaining({
+        query: expect.objectContaining({
+          field: ['transaction', 'avg(span.duration)'],
+          sort: ['-avg(span.duration)'],
+        }),
+      })
+    );
+  });
+
+  it('keeps fieldMeta aligned when a stripped _if aggregate was not last', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      widgetType: WidgetType.SPANS,
+      queries: [
+        {
+          name: 'test',
+          fields: ['transaction', 'avg_if(``,span.duration)', 'p95(span.duration)'],
+          aggregates: ['avg_if(``,span.duration)', 'p95(span.duration)'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+          fieldAliases: ['', 'Stripped', 'P95'],
+          fieldMeta: [
+            null,
+            {valueType: 'integer', valueUnit: null},
+            {valueType: 'duration', valueUnit: DurationUnit.MILLISECOND},
+          ],
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{transaction: '/api/test', 'p95(span.duration)': 100}],
+        meta: {
+          fields: {
+            transaction: 'string',
+            'p95(span.duration)': 'number',
+          },
+          units: {
+            transaction: null,
+            'p95(span.duration)': null,
+          },
+        },
+      },
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useSpansTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.tableResults?.[0]?.meta?.units?.['p95(span.duration)']).toBe(
+      DurationUnit.MILLISECOND
+    );
+    expect(result.current.tableResults?.[0]?.meta?.fields?.['p95(span.duration)']).toBe(
+      'duration'
+    );
+    expect(
+      result.current.tableResults?.[0]?.meta?.units?.['avg_if(``,span.duration)']
+    ).toBeUndefined();
+  });
+});

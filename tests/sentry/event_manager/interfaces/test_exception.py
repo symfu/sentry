@@ -1,33 +1,45 @@
+from typing import Any
+
 import pytest
 
-from sentry import eventstore
-from sentry.interfaces.exception import Exception
-from sentry.stacktraces.processing import normalize_stacktraces_for_grouping
 from sentry.event_manager import EventManager
+from sentry.interfaces.exception import Exception
+from sentry.services import eventstore
+from sentry.stacktraces.processing import normalize_stacktraces_for_grouping
+from sentry.testutils.pytest.fixtures import InstaSnapshotter
+from tests.sentry.event_manager.interfaces import CustomSnapshotter as CustomSnapshotterBase
+
+SnapshotInput = dict[str, Any]
+CustomSnapshotter = CustomSnapshotterBase[SnapshotInput]
 
 
 @pytest.fixture
-def make_exception_snapshot(insta_snapshot):
-    def inner(data):
-        mgr = EventManager(data={"exception": data})
+def make_exception_snapshot(insta_snapshot: InstaSnapshotter) -> CustomSnapshotter:
+    def inner(data: SnapshotInput) -> None:
+        mgr = EventManager(data={"exception": data}, remove_other=False)
         mgr.normalize()
-        evt = eventstore.create_event(data=mgr.get_data())
+        evt = eventstore.backend.create_event(project_id=1, data=mgr.get_data())
 
         interface = evt.interfaces.get("exception")
+        assert interface is not None
 
-        insta_snapshot(
-            {
-                "errors": evt.data.get("errors"),
-                "to_json": interface and interface.to_json(),
-                "get_api_context": interface and interface.get_api_context(),
-                "to_string": interface and interface.to_string(evt),
-            }
-        )
+        snapshot_values = {
+            "errors": evt.data.get("errors"),
+            "to_json": interface and interface.to_json(),
+            "get_api_context": interface and interface.get_api_context(),
+            "to_string": interface and interface.to_string(evt),
+        }
+
+        tags = sorted(interface.iter_tags())
+        if len(tags) > 0:
+            snapshot_values["tags"] = tags
+
+        insta_snapshot(snapshot_values)
 
     return inner
 
 
-def test_basic(make_exception_snapshot):
+def test_basic(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(
             values=[
@@ -52,21 +64,21 @@ def test_basic(make_exception_snapshot):
     )
 
 
-def test_args_as_keyword_args(make_exception_snapshot):
+def test_args_as_keyword_args(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(values=[{"type": "ValueError", "value": "hello world", "module": "foo.bar"}])
     )
 
 
-def test_args_as_old_style(make_exception_snapshot):
+def test_args_as_old_style(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot({"type": "ValueError", "value": "hello world", "module": "foo.bar"})
 
 
-def test_non_string_value_with_no_type(make_exception_snapshot):
+def test_non_string_value_with_no_type(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot({"value": {"foo": "bar"}})
 
 
-def test_context_with_mixed_frames(make_exception_snapshot):
+def test_context_with_mixed_frames(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(
             values=[
@@ -91,7 +103,7 @@ def test_context_with_mixed_frames(make_exception_snapshot):
     )
 
 
-def test_context_with_symbols(make_exception_snapshot):
+def test_context_with_symbols(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(
             values=[
@@ -116,7 +128,7 @@ def test_context_with_symbols(make_exception_snapshot):
     )
 
 
-def test_context_with_only_system_frames(make_exception_snapshot):
+def test_context_with_only_system_frames(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(
             values=[
@@ -141,7 +153,7 @@ def test_context_with_only_system_frames(make_exception_snapshot):
     )
 
 
-def test_context_with_only_app_frames(make_exception_snapshot):
+def test_context_with_only_app_frames(make_exception_snapshot: CustomSnapshotter) -> None:
     values = [
         {
             "type": "ValueError",
@@ -161,7 +173,7 @@ def test_context_with_only_app_frames(make_exception_snapshot):
     make_exception_snapshot(exc)
 
 
-def test_context_with_raw_stacks(make_exception_snapshot):
+def test_context_with_raw_values(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(
             values=[
@@ -169,6 +181,9 @@ def test_context_with_raw_stacks(make_exception_snapshot):
                     "type": "ValueError",
                     "value": "hello world",
                     "module": "foobar",
+                    "raw_value": "hello world raw",
+                    "raw_module": "foobar raw",
+                    "raw_type": "ValueError raw",
                     "raw_stacktrace": {
                         "frames": [
                             {
@@ -195,7 +210,7 @@ def test_context_with_raw_stacks(make_exception_snapshot):
     )
 
 
-def test_context_with_mechanism(make_exception_snapshot):
+def test_context_with_mechanism(make_exception_snapshot: CustomSnapshotter) -> None:
     make_exception_snapshot(
         dict(
             values=[
@@ -206,17 +221,128 @@ def test_context_with_mechanism(make_exception_snapshot):
                     "stacktrace": {
                         "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
                     },
-                    "mechanism": {"type": "generic"},
+                    "mechanism": {
+                        "type": "generic",
+                        "source": "__context__",
+                        "exception_id": 0,
+                    },
                 }
             ]
         )
     )
 
 
-def test_iteration():
+def test_context_with_two_exceptions_having_mechanism(
+    make_exception_snapshot: CustomSnapshotter,
+) -> None:
+    make_exception_snapshot(
+        dict(
+            values=[
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
+                    },
+                    "mechanism": {
+                        "type": "chained",
+                        "handled": True,
+                        "source": "__context__",
+                        "exception_id": 1,
+                        "parent_id": 0,
+                    },
+                },
+                {
+                    "type": "ValueError",
+                    "value": "hello world",
+                    "module": "foo.bar",
+                    "stacktrace": {
+                        "frames": [{"filename": "foo/baz.py", "lineno": 1, "in_app": True}]
+                    },
+                    "mechanism": {
+                        "type": "generic",
+                        "handled": False,
+                        "source": "__context__",
+                        "is_exception_group": True,
+                        "exception_id": 0,
+                    },
+                },
+            ]
+        )
+    )
+
+
+def test_iteration() -> None:
     inst = Exception.to_python({"values": [None, {"type": "ValueError"}, None]})
+    assert inst is not None
 
     assert len(inst) == 1
-    assert inst[0].type == "ValueError"
+    first = inst.exceptions()[0]
+    assert first is not None
+    assert first.type == "ValueError"
     for exc in inst:
+        assert exc is not None
         assert exc.type == "ValueError"
+
+
+def test_get_api_meta_with_non_numeric_keys() -> None:
+    # Create exception with multiple values to test various index keys
+    inst = Exception.to_python(
+        {
+            "values": [
+                {"type": "ValueError"},
+                {"type": "TypeError"},
+                {"type": "RuntimeError"},
+                {"type": "KeyError"},
+                {"type": "IndexError"},
+                {"type": "AttributeError"},
+                {"type": "ZeroDivisionError"},
+                {"type": "ImportError"},
+                {"type": "NameError"},
+                {"type": "SyntaxError"},
+                {"type": "OSError"},
+                {"type": "IOError"},
+            ]
+        }
+    )
+
+    assert inst is not None
+
+    # Test mix of valid single-digit, multi-digit, and invalid keys
+    meta: dict[str, dict[str, dict[str, object]]] = {
+        "values": {
+            "0": {},  # valid single-digit
+            "": {},  # invalid: empty string
+            "1": {},  # valid single-digit
+            "invalid": {},  # invalid: non-numeric string
+            "10": {},  # valid multi-digit
+            "11": {},  # valid multi-digit
+            "-1": {},  # invalid: negative number string
+            "3.14": {},  # invalid: float string
+            "9": {},  # valid single-digit
+            "123": {},  # invalid: index out of range but numeric format
+        }
+    }
+
+    result = inst.get_api_meta(meta)
+    assert result is not None
+
+    # Valid single-digit keys should be present
+    assert "0" in result["values"]
+    assert "1" in result["values"]
+    assert "9" in result["values"]
+
+    # Valid multi-digit keys should be present
+    assert "10" in result["values"]
+    assert "11" in result["values"]
+
+    # Invalid keys should be filtered out
+    assert "" not in result["values"]
+    assert "invalid" not in result["values"]
+    assert "-1" not in result["values"]
+    assert "3.14" not in result["values"]
+
+    # Numeric but out-of-range index should still be filtered
+    # (int("123") will work, but self.values[123] will raise IndexError)
+    assert "123" not in result["values"]

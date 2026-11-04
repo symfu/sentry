@@ -1,0 +1,1489 @@
+import {LocationFixture} from 'sentry-fixture/locationFixture';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {ProjectFixture} from 'sentry-fixture/project';
+
+import {
+  act,
+  render,
+  screen,
+  userEvent,
+  waitFor,
+  within,
+} from 'sentry-test/reactTestingLibrary';
+
+import {updateProjects} from 'sentry/components/pageFilters/actions';
+import {ProjectPageFilter} from 'sentry/components/pageFilters/project/projectPageFilter';
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import {OrganizationStore} from 'sentry/stores/organizationStore';
+import {ProjectsStore} from 'sentry/stores/projectsStore';
+
+const organization = OrganizationFixture({features: ['open-membership']});
+const projects = [
+  ProjectFixture({id: '1', slug: 'project-1', isMember: true}),
+  ProjectFixture({id: '2', slug: 'project-2', isMember: true}),
+  ProjectFixture({id: '3', slug: 'project-3', isMember: false}),
+];
+
+const QUICK_SELECT_LABELS = ['All Projects', 'My Projects', 'Favorite Projects'];
+
+function getProjectRows() {
+  return screen
+    .getAllByRole('row')
+    .filter(row => !QUICK_SELECT_LABELS.includes(row.getAttribute('aria-label') ?? ''));
+}
+
+describe('ProjectPageFilter', () => {
+  beforeEach(() => {
+    OrganizationStore.init();
+
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState({
+      projects: [],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    OrganizationStore.onUpdate(organization, {replace: true});
+    ProjectsStore.loadInitialData(projects);
+  });
+
+  afterEach(() => PageFiltersStore.reset());
+
+  it('renders & handles single selection', async () => {
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    // Open menu
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+
+    // Select only project-1
+    await userEvent.click(screen.getByRole('row', {name: 'project-1'}));
+
+    // Trigger label & router is updated
+    expect(screen.getByRole('button', {name: 'project-1'})).toBeInTheDocument();
+    expect(router.location.query).toEqual({project: '1'});
+  });
+
+  it('handles multiple selection', async () => {
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    // Open menu
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+
+    // Deselect project-1 & project-2 by clicking on their checkboxes
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-2'}));
+
+    // Select project-3 by clicking on its checkbox
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-3'}));
+
+    // Click "Apply"
+    await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+
+    // Trigger button & router are updated
+    await waitFor(() => {
+      expect(screen.getByRole('button', {name: 'project-3'})).toBeInTheDocument();
+    });
+    expect(router.location.query).toEqual({project: '3'});
+  });
+
+  it('renders keyboard-accessible trailing items', async () => {
+    const mockApi = MockApiClient.addMockResponse({
+      method: 'PUT',
+      url: `/projects/${organization.slug}/project-1/`,
+    });
+
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    // Open the menu, search input has focus
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText('Search…')).toHaveFocus();
+    });
+
+    // Move focus past the two special items ("All Projects", "My Projects") to project-1
+    await userEvent.keyboard('{ArrowDown}');
+    await userEvent.keyboard('{ArrowDown}');
+    await userEvent.keyboard('{ArrowDown}');
+    const optionOne = screen.getByRole('row', {name: 'project-1'});
+    expect(optionOne).toHaveFocus();
+
+    // Move focus to Option One's "Project Details" link
+    await userEvent.keyboard('{ArrowRight}');
+    await userEvent.keyboard('{ArrowRight}');
+    expect(
+      within(optionOne).getByRole('button', {name: 'Open Project Details'})
+    ).toHaveFocus();
+
+    // Activating the link triggers a route change
+    await userEvent.keyboard('{Enter}');
+
+    expect(router.location.pathname).toBe(
+      '/organizations/org-slug/insights/projects/project-1/'
+    );
+    expect(router.location.query).toEqual({project: '1'});
+
+    // Move focus to "Project Settings" link
+    await userEvent.keyboard('{ArrowRight}');
+    expect(
+      within(optionOne).getByRole('button', {name: 'Open Project Settings'})
+    ).toHaveFocus();
+
+    // Activating the link triggers a route change
+    await userEvent.keyboard('{Enter}');
+    expect(router.location.pathname).toBe(
+      `/settings/${organization.slug}/projects/project-1/`
+    );
+
+    // Move focus to "Bookmark Project" button
+    await userEvent.keyboard('{ArrowRight}');
+    expect(within(optionOne).getByRole('button', {name: 'Bookmark'})).toHaveFocus();
+
+    // Activate the button
+    await userEvent.keyboard('{Enter}');
+    expect(
+      within(optionOne).getByRole('button', {name: 'Remove Bookmark'})
+    ).toHaveAttribute('aria-pressed', 'true');
+    expect(mockApi).toHaveBeenCalledWith(
+      `/projects/${organization.slug}/project-1/`,
+      expect.objectContaining({
+        data: {isBookmarked: true},
+      })
+    );
+
+    MockApiClient.clearMockResponses();
+  });
+
+  it('handles reset', async () => {
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    // Open the menu, select project-1
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+    await userEvent.click(screen.getByRole('row', {name: 'project-1'}));
+    expect(router.location.query).toEqual({project: '1'});
+
+    // Open menu again & click "Reset"
+    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+    await userEvent.click(screen.getByRole('button', {name: 'Reset'}));
+
+    expect(screen.getByRole('button', {name: 'My Projects'})).toBeInTheDocument();
+  });
+
+  it('responds to page filter changes, async e.g. from back button nav', async () => {
+    const navigate = jest.fn();
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    // Confirm initial selection
+    expect(await screen.findByRole('button', {name: 'My Projects'})).toBeInTheDocument();
+
+    // Edit store value
+    act(() =>
+      updateProjects(
+        [2],
+        LocationFixture({pathname: '/organizations/org-slug/issues/', query: {}}),
+        navigate
+      )
+    );
+
+    // <ProjectPageFilter /> is updated
+
+    expect(await screen.findByRole('button', {name: 'project-2'})).toBeInTheDocument();
+  });
+
+  it('keeps selected environments when they are available in the newly selected project', async () => {
+    ProjectsStore.loadInitialData([
+      ProjectFixture({
+        id: '1',
+        slug: 'project-1',
+        isMember: true,
+        environments: ['prod', 'staging'],
+      }),
+      ProjectFixture({
+        id: '2',
+        slug: 'project-2',
+        isMember: true,
+        environments: ['prod'],
+      }),
+    ]);
+    PageFiltersStore.onInitializeUrlState({
+      projects: [2],
+      environments: ['prod'],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: '2', environment: 'prod'},
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'project-2'}));
+    await userEvent.click(screen.getByRole('row', {name: 'project-1'}));
+
+    expect(router.location.query).toEqual({project: '1', environment: 'prod'});
+    expect(PageFiltersStore.getState().selection.environments).toEqual(['prod']);
+  });
+
+  it('removes selected environments when they are not available in the newly selected project', async () => {
+    ProjectsStore.loadInitialData([
+      ProjectFixture({
+        id: '1',
+        slug: 'project-1',
+        isMember: true,
+        environments: ['prod', 'staging'],
+      }),
+      ProjectFixture({
+        id: '2',
+        slug: 'project-2',
+        isMember: true,
+        environments: ['prod'],
+      }),
+    ]);
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: ['prod', 'staging'],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: '1', environment: ['prod', 'staging']},
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+    await userEvent.click(screen.getByRole('row', {name: 'project-2'}));
+
+    expect(router.location.query).toEqual({project: '2', environment: 'prod'});
+    expect(PageFiltersStore.getState().selection.environments).toEqual(['prod']);
+  });
+
+  it('clicking My Projects when All Projects is active selects only non-member projects', async () => {
+    // Start with All Projects active from URL
+    PageFiltersStore.onInitializeUrlState({
+      projects: [-1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '-1'}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
+
+    // Click "My Projects" while All Projects is active
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+
+    // Both sentinels should be unchecked
+    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
+    // Member projects should be unchecked
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+    // Non-member project should be checked
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
+  });
+
+  it('clicking My Projects while All Projects is staged selects only non-member projects', async () => {
+    // Start with a single project selected
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+
+    // Stage All Projects first
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
+
+    // Now click My Projects — should subtract member projects
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+
+    // Both sentinels should be unchecked
+    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
+    // Member projects should be unchecked
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+    // Non-member project should be checked
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
+  });
+
+  it('All Projects toggles all projects on; clicking again deselects everything', async () => {
+    // Start with a single project selected
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+
+    // Click "All Projects" — should check all projects
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
+
+    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
+
+    // Click "All Projects" again — should deselect everything
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
+
+    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
+  });
+
+  it('unchecking all project checkboxes from All Projects leaves everything unchecked', async () => {
+    // Start with All Projects active from URL
+    PageFiltersStore.onInitializeUrlState({
+      projects: [-1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '-1'}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
+
+    // Uncheck every project explicitly
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-2'}));
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-3'}));
+
+    // Sentinels and project checkboxes should all be unchecked in staged state
+    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
+  });
+
+  it('My Projects toggles member projects on; clicking again deselects everything', async () => {
+    // Start with a single project selected
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+
+    // Click "My Projects" — should check member projects only
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
+
+    // Click "My Projects" again — should deselect everything
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+
+    expect(screen.getByRole('checkbox', {name: 'Select All Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
+  });
+
+  it('does not show All Projects separator when My Projects is visible', async () => {
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+
+    const allProjectsRow = screen.getByRole('row', {name: /All Projects/i});
+    expect(
+      within(allProjectsRow).queryByRole('separator', {hidden: true})
+    ).not.toBeInTheDocument();
+  });
+
+  it('hides special project options when search is active', async () => {
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+    await userEvent.type(screen.getByPlaceholderText('Search…'), 'project-1');
+
+    expect(
+      screen.queryByRole('checkbox', {name: 'Select All Projects'})
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('checkbox', {name: 'Select My Projects'})
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeInTheDocument();
+  });
+
+  it('does not show All Projects or My Projects options when only one project exists', async () => {
+    const singleProject = [ProjectFixture({id: '3', slug: 'project-3', isMember: false})];
+    ProjectsStore.loadInitialData(singleProject);
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'No Projects'}));
+
+    expect(
+      screen.queryByRole('checkbox', {name: 'Select All Projects'})
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('checkbox', {name: 'Select My Projects'})
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeInTheDocument();
+  });
+
+  it('shows selection limit warning when all projects are selected explicitly', async () => {
+    const manyProjects = Array.from({length: 52}, (_, index) =>
+      ProjectFixture({
+        id: String(index + 1),
+        slug: `project-${index + 1}`,
+        isMember: true,
+      })
+    );
+    ProjectsStore.loadInitialData(manyProjects);
+
+    PageFiltersStore.onInitializeUrlState({
+      projects: Array.from({length: 51}, (_, index) => index + 1),
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: Array.from({length: 51}, (_, index) => String(index + 1))},
+        },
+      },
+    });
+
+    await userEvent.click(
+      screen.getByRole('button', {name: /project-1, project-2 \+49/i})
+    );
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-52'}));
+
+    expect(
+      screen.getByText(/only up to 50 can be selected at a time/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
+  });
+
+  it('does not show selection limit warning when loaded with All Projects sentinel', async () => {
+    const manyProjects = Array.from({length: 52}, (_, index) =>
+      ProjectFixture({
+        id: String(index + 1),
+        slug: `project-${index + 1}`,
+        isMember: true,
+      })
+    );
+    ProjectsStore.loadInitialData(manyProjects);
+
+    PageFiltersStore.onInitializeUrlState({
+      projects: [-1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: '-1'},
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
+
+    expect(
+      screen.queryByText(/only up to 50 can be selected at a time/i)
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', {name: 'Apply'})).not.toBeInTheDocument();
+  });
+
+  it('keeps All Projects sentinel in URL when opening and closing the menu', async () => {
+    const manyProjects = Array.from({length: 52}, (_, index) =>
+      ProjectFixture({
+        id: String(index + 1),
+        slug: `project-${index + 1}`,
+        isMember: true,
+      })
+    );
+    ProjectsStore.loadInitialData(manyProjects);
+
+    PageFiltersStore.onInitializeUrlState({
+      projects: [-1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: '-1'},
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
+    await userEvent.click(document.body);
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual({project: '-1'});
+    });
+  });
+
+  it('shows selection limit warning when clicking All Projects then unchecking a single project', async () => {
+    // 51 members + 1 non-member = 52 total so the "All Projects" sentinel appears
+    const manyProjects = [
+      ...Array.from({length: 51}, (_, index) =>
+        ProjectFixture({
+          id: String(index + 1),
+          slug: `project-${index + 1}`,
+          isMember: true,
+        })
+      ),
+      ProjectFixture({id: '52', slug: 'project-52', isMember: false}),
+    ];
+    ProjectsStore.loadInitialData(manyProjects);
+
+    // Start with a single project selected
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: '1'},
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+
+    // Click "All Projects" to stage all 52 projects
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
+
+    // Uncheck project-1 — should be unchecked and leave 51 selections, exceeding the limit
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
+
+    expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+    expect(
+      screen.getByText(/only up to 50 can be selected at a time/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
+  });
+
+  it.each([
+    {
+      label: 'My Projects',
+      // 52 members + 1 non-member so the "My Projects" sentinel appears
+      // (requires memberProjectList.length < projects.length)
+      memberCount: 52,
+      nonMemberCount: 1,
+      urlProjects: [] as number[],
+      urlQuery: {} as Record<string, string>,
+      triggerName: 'My Projects',
+    },
+    {
+      label: 'All Projects',
+      // 51 members + 1 non-member so the "All Projects" sentinel appears
+      // (requires nonMemberProjectList.length > 0)
+      memberCount: 51,
+      nonMemberCount: 1,
+      urlProjects: [-1],
+      urlQuery: {project: '-1'},
+      triggerName: 'All Projects',
+    },
+  ])(
+    'shows selection limit warning when $label is active and a single project is unchecked',
+    async ({memberCount, nonMemberCount, urlProjects, urlQuery, triggerName}) => {
+      const manyProjects = [
+        ...Array.from({length: memberCount}, (_, index) =>
+          ProjectFixture({
+            id: String(index + 1),
+            slug: `project-${index + 1}`,
+            isMember: true,
+          })
+        ),
+        ...Array.from({length: nonMemberCount}, (_, index) =>
+          ProjectFixture({
+            id: String(memberCount + index + 1),
+            slug: `project-${memberCount + index + 1}`,
+            isMember: false,
+          })
+        ),
+      ];
+      ProjectsStore.loadInitialData(manyProjects);
+
+      PageFiltersStore.onInitializeUrlState({
+        projects: urlProjects,
+        environments: [],
+        datetime: {start: null, end: null, period: '14d', utc: null},
+      });
+
+      render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: urlQuery},
+        },
+      });
+
+      await userEvent.click(screen.getByRole('button', {name: triggerName}));
+
+      // Unchecking one project leaves memberCount explicit selections, which exceeds the limit of 50
+      await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-1'}));
+
+      expect(
+        screen.getByText(/only up to 50 can be selected at a time/i)
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
+    }
+  );
+
+  it('shows selection limit warning after editing All Projects sentinel selection', async () => {
+    const manyProjects = Array.from({length: 52}, (_, index) =>
+      ProjectFixture({
+        id: String(index + 1),
+        slug: `project-${index + 1}`,
+        isMember: true,
+      })
+    );
+    ProjectsStore.loadInitialData(manyProjects);
+
+    PageFiltersStore.onInitializeUrlState({
+      projects: [-1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/issues/',
+          query: {project: '-1'},
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'All Projects'}));
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-52'}));
+
+    expect(
+      screen.getByText(/only up to 50 can be selected at a time/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Apply'})).toBeDisabled();
+  });
+
+  it('sorts projects with bookmarked appearing before non-bookmarked', async () => {
+    // Set up projects with different bookmark states
+    const projectsWithBookmarks = [
+      ProjectFixture({id: '1', slug: 'selected-project', isMember: true}),
+      ProjectFixture({
+        id: '2',
+        slug: 'bookmarked-project',
+        isMember: true,
+        isBookmarked: true,
+      }),
+      ProjectFixture({id: '3', slug: 'regular-project-a', isMember: true}),
+      ProjectFixture({id: '4', slug: 'regular-project-b', isMember: true}),
+    ];
+
+    ProjectsStore.loadInitialData(projectsWithBookmarks);
+
+    // Set project-1 as selected
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
+      },
+    });
+
+    // Open menu
+    await userEvent.click(screen.getByRole('button', {name: 'selected-project'}));
+
+    const projectRows = getProjectRows();
+
+    // Verify sort order:
+    // 1. Selected project (selected-project)
+    // 2. Bookmarked project (bookmarked-project)
+    // 3. Regular projects (alphabetically)
+    expect(projectRows).toHaveLength(4);
+    expect(within(projectRows[0]!).getByText('selected-project')).toBeInTheDocument();
+    expect(within(projectRows[1]!).getByText('bookmarked-project')).toBeInTheDocument();
+    expect(within(projectRows[2]!).getByText('regular-project-a')).toBeInTheDocument();
+    expect(within(projectRows[3]!).getByText('regular-project-b')).toBeInTheDocument();
+  });
+
+  it('sorts bookmarked non-member projects above unbookmarked member projects', async () => {
+    const projectsWithMixedMembership = [
+      ProjectFixture({id: '1', slug: 'selected-project', isMember: true}),
+      ProjectFixture({id: '2', slug: 'member-project', isMember: true}),
+      ProjectFixture({
+        id: '3',
+        slug: 'bookmarked-non-member',
+        isMember: false,
+        isBookmarked: true,
+      }),
+      ProjectFixture({id: '4', slug: 'non-member-project', isMember: false}),
+    ];
+
+    ProjectsStore.loadInitialData(projectsWithMixedMembership);
+
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
+      },
+    });
+
+    await userEvent.click(screen.getByRole('button', {name: 'selected-project'}));
+
+    const projectRows = getProjectRows();
+
+    expect(within(projectRows[0]!).getByText('selected-project')).toBeInTheDocument();
+    expect(
+      within(projectRows[1]!).getByText('bookmarked-non-member')
+    ).toBeInTheDocument();
+    expect(within(projectRows[2]!).getByText('member-project')).toBeInTheDocument();
+    expect(within(projectRows[3]!).getByText('non-member-project')).toBeInTheDocument();
+  });
+
+  it('maintains stable sort when bookmarking, then applies new sort on menu reopen', async () => {
+    const mockApi = MockApiClient.addMockResponse({
+      method: 'PUT',
+      url: `/projects/${organization.slug}/regular-project-a/`,
+    });
+
+    // Set up projects with one bookmarked project
+    const projectsWithBookmarks = [
+      ProjectFixture({id: '1', slug: 'selected-project', isMember: true}),
+      ProjectFixture({
+        id: '2',
+        slug: 'already-bookmarked',
+        isMember: true,
+        isBookmarked: true,
+      }),
+      ProjectFixture({id: '3', slug: 'regular-project-a', isMember: true}),
+      ProjectFixture({id: '4', slug: 'regular-project-b', isMember: true}),
+    ];
+
+    ProjectsStore.loadInitialData(projectsWithBookmarks);
+
+    // Set project-1 as selected
+    PageFiltersStore.onInitializeUrlState({
+      projects: [1],
+      environments: [],
+      datetime: {start: null, end: null, period: '14d', utc: null},
+    });
+
+    render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {project: '1'}},
+      },
+    });
+
+    // Open menu
+    await userEvent.click(screen.getByRole('button', {name: 'selected-project'}));
+
+    // Let deferred autofocus finish before moving focus by hovering a row.
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText('Search…')).toHaveFocus();
+    });
+
+    let projectRows = getProjectRows();
+    expect(projectRows).toHaveLength(4);
+    expect(within(projectRows[0]!).getByText('selected-project')).toBeInTheDocument();
+    expect(within(projectRows[1]!).getByText('already-bookmarked')).toBeInTheDocument();
+    expect(within(projectRows[2]!).getByText('regular-project-a')).toBeInTheDocument();
+    expect(within(projectRows[3]!).getByText('regular-project-b')).toBeInTheDocument();
+
+    // Bookmark regular-project-a while menu is open
+    const regularProjectARow = screen.getByRole('row', {name: 'regular-project-a'});
+    await userEvent.hover(regularProjectARow);
+    const bookmarkButton = within(regularProjectARow).getByRole('button', {
+      name: 'Bookmark',
+    });
+    await userEvent.click(bookmarkButton);
+
+    // Verify the API was called
+    expect(mockApi).toHaveBeenCalledWith(
+      `/projects/${organization.slug}/regular-project-a/`,
+      expect.objectContaining({
+        data: {isBookmarked: true},
+      })
+    );
+
+    // Verify sort order DOES NOT change while menu is still open (stable sorting)
+    projectRows = getProjectRows();
+
+    expect(within(projectRows[0]!).getByText('selected-project')).toBeInTheDocument();
+    expect(within(projectRows[1]!).getByText('already-bookmarked')).toBeInTheDocument();
+    expect(within(projectRows[2]!).getByText('regular-project-a')).toBeInTheDocument();
+    expect(within(projectRows[3]!).getByText('regular-project-b')).toBeInTheDocument();
+
+    // Close menu by clicking outside
+    await userEvent.click(document.body);
+
+    // Update the project store to reflect the bookmark change
+    act(() => {
+      ProjectsStore.loadInitialData([
+        ProjectFixture({id: '1', slug: 'selected-project', isMember: true}),
+        ProjectFixture({
+          id: '2',
+          slug: 'already-bookmarked',
+          isMember: true,
+          isBookmarked: true,
+        }),
+        ProjectFixture({
+          id: '3',
+          slug: 'regular-project-a',
+          isMember: true,
+          isBookmarked: true,
+        }),
+        ProjectFixture({id: '4', slug: 'regular-project-b', isMember: true}),
+      ]);
+    });
+
+    // Reopen menu
+    await userEvent.click(screen.getByRole('button', {name: 'selected-project'}));
+
+    // Verify new sort order with bookmarked projects grouped together
+    projectRows = getProjectRows();
+    expect(within(projectRows[0]!).getByText('selected-project')).toBeInTheDocument();
+    expect(within(projectRows[1]!).getByText('already-bookmarked')).toBeInTheDocument();
+    expect(within(projectRows[2]!).getByText('regular-project-a')).toBeInTheDocument();
+    expect(within(projectRows[3]!).getByText('regular-project-b')).toBeInTheDocument();
+
+    MockApiClient.clearMockResponses();
+  });
+
+  it('deselecting My Projects does not select All Projects in the URL', async () => {
+    // Start with default empty URL = "My Projects" state
+    const {router} = render(<ProjectPageFilter />, {
+      organization,
+      initialRouterConfig: {
+        location: {pathname: '/organizations/org-slug/issues/', query: {}},
+      },
+    });
+
+    // Open the menu; "My Projects" should be checked
+    await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).toBeChecked();
+
+    // Deselect "My Projects"
+    await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+    expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).not.toBeChecked();
+
+    // Apply the (empty) selection
+    await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+
+    // URL must NOT become project=-1 (All Projects); the user did not select All Projects
+    await waitFor(() => {
+      expect(router.location.query.project).not.toBe('-1');
+    });
+  });
+
+  describe('closed-membership org defaults', () => {
+    let closedOrg: ReturnType<typeof OrganizationFixture>;
+
+    beforeEach(() => {
+      // Org without open-membership; user is a regular member
+      closedOrg = OrganizationFixture({features: [], orgRole: 'member'});
+      OrganizationStore.onUpdate(closedOrg, {replace: true});
+    });
+
+    it('shows My Projects (not All Projects) as the default in closed orgs', async () => {
+      render(<ProjectPageFilter />, {
+        organization: closedOrg,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: {}},
+        },
+      });
+
+      // The trigger button should say "My Projects", not "All Projects"
+      expect(
+        await screen.findByRole('button', {name: 'My Projects'})
+      ).toBeInTheDocument();
+    });
+
+    it('correctly round-trips My Projects selection in closed orgs', async () => {
+      const {router} = render(<ProjectPageFilter />, {
+        organization: closedOrg,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: {}},
+        },
+      });
+
+      // Open menu and confirm My Projects checkbox is checked
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(screen.getByRole('checkbox', {name: 'Select My Projects'})).toBeChecked();
+
+      // Toggle My Projects off and back on to create staged changes, making Apply available
+      await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+      await userEvent.click(screen.getByRole('checkbox', {name: 'Select My Projects'}));
+
+      // Apply My Projects — should use compact [] encoding, not explicit IDs
+      await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+
+      // URL should use the compact [] encoding (no project param), not explicit IDs
+      await waitFor(() => {
+        expect(router.location.query.project).toBeUndefined();
+      });
+    });
+
+    it('selecting All Projects in a closed org writes project=-1 to the URL', async () => {
+      const {router} = render(<ProjectPageFilter />, {
+        organization: closedOrg,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: {}},
+        },
+      });
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await userEvent.click(screen.getByRole('checkbox', {name: 'Select All Projects'}));
+      await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+
+      await waitFor(() => {
+        expect(router.location.query.project).toBe('-1');
+      });
+    });
+
+    it('resetting in a closed org navigates to My Projects (no project param)', async () => {
+      PageFiltersStore.onInitializeUrlState({
+        projects: [1],
+        environments: [],
+        datetime: {start: null, end: null, period: '14d', utc: null},
+      });
+
+      const {router} = render(<ProjectPageFilter />, {
+        organization: closedOrg,
+        initialRouterConfig: {
+          location: {
+            pathname: '/organizations/org-slug/issues/',
+            query: {project: '1'},
+          },
+        },
+      });
+
+      // Open menu and click Reset
+      await userEvent.click(screen.getByRole('button', {name: 'project-1'}));
+      await userEvent.click(screen.getByRole('button', {name: 'Reset'}));
+
+      // Reset should land on My Projects (compact [] URL = no project param)
+      await waitFor(() => {
+        expect(router.location.query.project).toBeUndefined();
+      });
+    });
+  });
+
+  describe('single-project org label', () => {
+    it('shows the project name when the org has one member project auto-selected', async () => {
+      const singleProject = ProjectFixture({
+        id: '42',
+        slug: 'only-project',
+        isMember: true,
+      });
+      ProjectsStore.loadInitialData([singleProject]);
+      PageFiltersStore.onInitializeUrlState({
+        projects: [42],
+        environments: [],
+        datetime: {start: null, end: null, period: '14d', utc: null},
+      });
+
+      render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: '/organizations/org-slug/issues/',
+            query: {project: '42'},
+          },
+        },
+      });
+
+      expect(
+        await screen.findByRole('button', {name: 'only-project'})
+      ).toBeInTheDocument();
+    });
+
+    it('shows the project name when the org has one non-member project auto-selected', async () => {
+      const singleProject = ProjectFixture({
+        id: '42',
+        slug: 'only-project',
+        isMember: false,
+      });
+      ProjectsStore.loadInitialData([singleProject]);
+      PageFiltersStore.onInitializeUrlState({
+        projects: [42],
+        environments: [],
+        datetime: {start: null, end: null, period: '14d', utc: null},
+      });
+
+      render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: '/organizations/org-slug/issues/',
+            query: {project: '42'},
+          },
+        },
+      });
+
+      expect(
+        await screen.findByRole('button', {name: 'only-project'})
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe('edge case: user with no member projects', () => {
+    it('shows "All Projects" label when URL has -1 and user has no member projects', async () => {
+      // User has access to projects but is not a member of any
+      const nonMemberProjects = [
+        ProjectFixture({id: '1', slug: 'project-1', isMember: false}),
+        ProjectFixture({id: '2', slug: 'project-2', isMember: false}),
+        ProjectFixture({id: '3', slug: 'project-3', isMember: false}),
+      ];
+      ProjectsStore.loadInitialData(nonMemberProjects);
+
+      // URL has -1 (All Projects sentinel)
+      PageFiltersStore.onInitializeUrlState({
+        projects: [-1],
+        environments: [],
+        datetime: {start: null, end: null, period: '14d', utc: null},
+      });
+
+      render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: '/organizations/org-slug/issues/',
+            query: {project: '-1'},
+          },
+        },
+      });
+
+      // Should display "All Projects", not a count like "3" or enumerated list
+      expect(
+        await screen.findByRole('button', {name: 'All Projects'})
+      ).toBeInTheDocument();
+    });
+
+    it('expands to "All Projects" when empty URL and user has no member projects', async () => {
+      // User has access to projects but is not a member of any
+      const nonMemberProjects = [
+        ProjectFixture({id: '1', slug: 'project-1', isMember: false}),
+        ProjectFixture({id: '2', slug: 'project-2', isMember: false}),
+      ];
+      ProjectsStore.loadInitialData(nonMemberProjects);
+
+      // Empty URL defaults to "My Projects", but user has no member projects
+      // The initializeUrlState logic should set it to ALL_ACCESS_PROJECTS
+      PageFiltersStore.onInitializeUrlState({
+        projects: [-1],
+        environments: [],
+        datetime: {start: null, end: null, period: '14d', utc: null},
+      });
+
+      render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: '/organizations/org-slug/issues/',
+            query: {},
+          },
+        },
+      });
+
+      // Should display "All Projects" since user has no member projects
+      expect(
+        await screen.findByRole('button', {name: 'All Projects'})
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe('favorite projects', () => {
+    const favoriteProjects = [
+      ProjectFixture({id: '1', slug: 'project-1', isMember: true, isBookmarked: true}),
+      ProjectFixture({id: '2', slug: 'project-2', isMember: true}),
+      ProjectFixture({id: '3', slug: 'project-3', isMember: false, isBookmarked: true}),
+      ProjectFixture({id: '4', slug: 'project-4', isMember: false}),
+    ];
+
+    beforeEach(() => {
+      ProjectsStore.loadInitialData(favoriteProjects);
+    });
+
+    it('is hidden when no projects are bookmarked', async () => {
+      ProjectsStore.loadInitialData(projects);
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(
+        screen.queryByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeInTheDocument();
+    });
+
+    it('selects only bookmarked projects and applies them to the URL', async () => {
+      const {router} = render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: {}},
+        },
+      });
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(screen.getByRole('row', {name: /Favorite Projects/})).toHaveTextContent(
+        '(2)'
+      );
+
+      await userEvent.click(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      );
+
+      expect(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).toBeChecked();
+      expect(
+        screen.getByRole('checkbox', {name: 'Select My Projects'})
+      ).not.toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-3'})).toBeChecked();
+
+      await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+
+      await waitFor(() => {
+        expect(router.location.query.project).toEqual(['1', '3']);
+      });
+    });
+
+    it('clicking the Favorite Projects row applies favorites immediately', async () => {
+      const {router} = render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: {}},
+        },
+      });
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await userEvent.click(screen.getByRole('row', {name: 'Favorite Projects'}));
+
+      await waitFor(() => {
+        expect(router.location.query.project).toEqual(['1', '3']);
+      });
+    });
+
+    it('deselecting a project while favorites are staged keeps the other favorites', async () => {
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await userEvent.click(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      );
+      await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-3'}));
+
+      expect(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-1'})).toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
+    });
+
+    it('keeps projects added after selecting favorites', async () => {
+      const {router} = render(<ProjectPageFilter />, {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: '/organizations/org-slug/issues/', query: {}},
+        },
+      });
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await userEvent.click(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      );
+      await userEvent.click(screen.getByRole('checkbox', {name: 'Select project-2'}));
+
+      expect(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-2'})).toBeChecked();
+
+      await userEvent.click(screen.getByRole('button', {name: 'Apply'}));
+
+      await waitFor(() => {
+        expect([router.location.query.project].flat().sort()).toEqual(['1', '2', '3']);
+      });
+    });
+
+    it('is hidden when there are more favorites than the selection limit', async () => {
+      ProjectsStore.loadInitialData(
+        Array.from({length: 51}, (_, index) =>
+          ProjectFixture({
+            id: String(index + 1),
+            slug: `project-${index + 1}`,
+            isMember: true,
+            isBookmarked: true,
+          })
+        ).concat(
+          ProjectFixture({id: '100', slug: 'other', isMember: false}),
+          ProjectFixture({id: '101', slug: 'unstarred', isMember: true})
+        )
+      );
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(
+        screen.queryByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeInTheDocument();
+    });
+
+    it('clicking Favorite Projects again deselects everything', async () => {
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await userEvent.click(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      );
+      await userEvent.click(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      );
+
+      expect(screen.getByRole('checkbox', {name: 'Select project-1'})).not.toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-2'})).not.toBeChecked();
+      expect(screen.getByRole('checkbox', {name: 'Select project-3'})).not.toBeChecked();
+    });
+
+    it('includes projects starred while the menu is open', async () => {
+      MockApiClient.addMockResponse({
+        method: 'PUT',
+        url: `/projects/${organization.slug}/project-2/`,
+        body: {...favoriteProjects[1], isBookmarked: true},
+      });
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText('Search…')).toHaveFocus();
+      });
+
+      const projectRow = screen.getByRole('row', {name: 'project-2'});
+      await userEvent.hover(projectRow);
+      await userEvent.click(within(projectRow).getByRole('button', {name: 'Bookmark'}));
+
+      expect(screen.getByRole('row', {name: /Favorite Projects/})).toHaveTextContent(
+        '(3)'
+      );
+      await userEvent.click(
+        screen.getByRole('checkbox', {name: 'Select Favorite Projects'})
+      );
+      expect(screen.getByRole('checkbox', {name: 'Select project-2'})).toBeChecked();
+    });
+
+    it('drops a star from favorites when the bookmark request fails', async () => {
+      MockApiClient.addMockResponse({
+        method: 'PUT',
+        url: `/projects/${organization.slug}/project-2/`,
+        statusCode: 500,
+      });
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText('Search…')).toHaveFocus();
+      });
+
+      const projectRow = screen.getByRole('row', {name: 'project-2'});
+      await userEvent.hover(projectRow);
+      await userEvent.click(within(projectRow).getByRole('button', {name: 'Bookmark'}));
+
+      await waitFor(() => {
+        expect(screen.getByRole('row', {name: /Favorite Projects/})).toHaveTextContent(
+          '(2)'
+        );
+      });
+    });
+
+    it('is hidden when favorites are the same as My Projects', async () => {
+      ProjectsStore.loadInitialData([
+        ProjectFixture({id: '1', slug: 'project-1', isMember: true, isBookmarked: true}),
+        ProjectFixture({id: '2', slug: 'project-2', isMember: true, isBookmarked: true}),
+        ProjectFixture({id: '3', slug: 'project-3', isMember: false}),
+      ]);
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(
+        screen.getByRole('checkbox', {name: 'Select My Projects'})
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeInTheDocument();
+    });
+
+    it('is hidden when every project is a favorite', async () => {
+      ProjectsStore.loadInitialData([
+        ProjectFixture({id: '1', slug: 'project-1', isMember: true, isBookmarked: true}),
+        ProjectFixture({id: '2', slug: 'project-2', isMember: false, isBookmarked: true}),
+      ]);
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(
+        screen.getByRole('checkbox', {name: 'Select All Projects'})
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeInTheDocument();
+    });
+
+    it('is hidden when search is active', async () => {
+      render(<ProjectPageFilter />, {organization});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      await userEvent.type(screen.getByPlaceholderText('Search…'), 'project-1');
+
+      expect(
+        screen.queryByRole('checkbox', {name: 'Select Favorite Projects'})
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  describe('create project button', () => {
+    it('is shown to members when member project creation is allowed', async () => {
+      const memberOrg = OrganizationFixture({
+        features: ['open-membership'],
+        access: ['org:read', 'team:read', 'project:read'],
+        allowMemberProjectCreation: true,
+      });
+      OrganizationStore.onUpdate(memberOrg, {replace: true});
+
+      render(<ProjectPageFilter />, {organization: memberOrg});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      expect(screen.getByRole('button', {name: 'Create Project'})).toBeInTheDocument();
+    });
+
+    it('is disabled with an explanation when member project creation is not allowed', async () => {
+      const memberOrg = OrganizationFixture({
+        features: ['open-membership'],
+        access: ['org:read', 'team:read', 'project:read'],
+        allowMemberProjectCreation: false,
+      });
+      OrganizationStore.onUpdate(memberOrg, {replace: true});
+
+      render(<ProjectPageFilter />, {organization: memberOrg});
+
+      await userEvent.click(screen.getByRole('button', {name: 'My Projects'}));
+      const createProject = screen.getByRole('button', {name: 'Create Project'});
+      expect(createProject).toHaveAttribute('aria-disabled', 'true');
+
+      await userEvent.hover(createProject);
+      expect(
+        await screen.findByText('Only project or team admins can create projects')
+      ).toBeInTheDocument();
+    });
+  });
+});

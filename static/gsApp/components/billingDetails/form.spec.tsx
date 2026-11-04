@@ -1,0 +1,131 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+
+import {BillingDetailsFixture} from 'getsentry-test/fixtures/billingDetails';
+import {act, render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {BillingDetailsForm} from './form';
+
+describe('BillingDetailsForm', () => {
+  const organization = OrganizationFixture({access: ['org:billing']});
+  const billingDetails = BillingDetailsFixture();
+  const defaultProps = {
+    organization,
+    onSubmitSuccess: jest.fn(),
+    initialData: billingDetails,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.restoreAllMocks();
+    MockApiClient.clearMockResponses();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('returns null for users without org:billing access', () => {
+    const orgWithoutAccess = OrganizationFixture({access: []});
+    const {container} = render(
+      <BillingDetailsForm {...defaultProps} organization={orgWithoutAccess} />
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('hides loading indicator when Stripe loads', async () => {
+    render(<BillingDetailsForm {...defaultProps} />);
+
+    expect(screen.getByTestId('loading-indicator')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByTestId('loading-indicator')).not.toBeInTheDocument();
+    });
+  });
+
+  it('shows billing email field', async () => {
+    render(<BillingDetailsForm {...defaultProps} />);
+
+    await screen.findByRole('textbox', {name: 'Billing email'});
+  });
+
+  it('shows warning when Stripe hooks return null', async () => {
+    jest.useFakeTimers();
+
+    const stripeImport = await import('@stripe/react-stripe-js');
+    jest.spyOn(stripeImport, 'useStripe').mockReturnValue(null);
+    jest.spyOn(stripeImport, 'useElements').mockReturnValue(null);
+
+    render(<BillingDetailsForm {...defaultProps} />);
+
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(10000);
+    });
+
+    expect(
+      screen.getByText(
+        /To add or update your business address, you may need to disable any ad or tracker blocking extensions/
+      )
+    ).toBeInTheDocument();
+
+    jest.restoreAllMocks();
+  });
+
+  it('disables submit button during loading', async () => {
+    render(<BillingDetailsForm {...defaultProps} />);
+
+    const submitButton = screen.getByRole('button', {name: 'Save Changes'});
+    expect(submitButton).toBeDisabled();
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('loading-indicator')).not.toBeInTheDocument();
+    });
+    expect(submitButton).toBeEnabled();
+  });
+
+  it('shows tax number field when country has sales tax', async () => {
+    const detailsWithTax = BillingDetailsFixture({
+      countryCode: 'GB',
+      taxNumber: '123456789',
+    });
+
+    render(<BillingDetailsForm {...defaultProps} initialData={detailsWithTax} />);
+
+    await screen.findByRole('textbox', {name: /VAT Number/i});
+  });
+
+  it('renders and handles cancel when provided', async () => {
+    const onCancel = jest.fn();
+    render(<BillingDetailsForm {...defaultProps} onCancel={onCancel} />);
+
+    const cancelButton = screen.getByRole('button', {name: 'Cancel'});
+    expect(screen.getByRole('button', {name: 'Save Changes'})).toBeInTheDocument();
+
+    await userEvent.click(cancelButton);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears a stale region on save for countries without region choices', async () => {
+    const detailsWithStaleRegion = BillingDetailsFixture({
+      countryCode: 'HU',
+      region: 'CA',
+    });
+    const updateMock = MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/billing-details/`,
+      method: 'PUT',
+      body: detailsWithStaleRegion,
+    });
+
+    render(<BillingDetailsForm {...defaultProps} initialData={detailsWithStaleRegion} />);
+
+    const submitButton = screen.getByRole('button', {name: 'Save Changes'});
+    await waitFor(() => expect(submitButton).toBeEnabled());
+
+    await userEvent.click(submitButton);
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalled());
+    expect(updateMock).toHaveBeenCalledWith(
+      `/customers/${organization.slug}/billing-details/`,
+      expect.objectContaining({data: expect.objectContaining({region: null})})
+    );
+  });
+});

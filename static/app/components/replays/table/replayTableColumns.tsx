@@ -1,0 +1,561 @@
+import type {ReactNode} from 'react';
+import {useMatches} from 'react-router';
+import {useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+import {IconCursorArrow} from '@sentry/icons/cursorArrow';
+import {IconOpen} from '@sentry/icons/open';
+import {IconPlay} from '@sentry/icons/play';
+import type {LocationDescriptor} from 'history';
+import invariant from 'invariant';
+
+import {LinkButton} from '@sentry/scraps/button';
+import {Checkbox} from '@sentry/scraps/checkbox';
+import {InfoText} from '@sentry/scraps/info';
+import {Container, Flex, Stack} from '@sentry/scraps/layout';
+import {ExternalLink, Link} from '@sentry/scraps/link';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {Duration} from 'sentry/components/duration/duration';
+import {useSelectedReplayIndex} from 'sentry/components/replays/queryParams/selectedReplayIndex';
+import {ReplayActivityScore} from 'sentry/components/replays/replayActivityScore';
+import {ReplayBadge} from 'sentry/components/replays/replayBadge';
+import {ReplayErrorCount} from 'sentry/components/replays/replayErrorCount';
+import {ReplayPlatformIcon} from 'sentry/components/replays/replayPlatformIcon';
+import {ReplayPlayPauseButton} from 'sentry/components/replays/replayPlayPauseButton';
+import {NumericDropdownFilter} from 'sentry/components/replays/table/filters/numericDropdownFilter';
+import {OSBrowserDropdownFilter} from 'sentry/components/replays/table/filters/osBrowserDropdownFilter';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {UnreadIndicator} from 'sentry/components/unreadIndicator';
+import {t, tct} from 'sentry/locale';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {spanOperationRelativeBreakdownRenderer} from 'sentry/utils/discover/fieldRenderers';
+import {getRouteStringFromRoutes} from 'sentry/utils/getRouteStringFromRoutes';
+import {ListItemSelectCheckbox} from 'sentry/utils/list/listItemSelectCheckbox';
+import type {ListItemCheckboxState} from 'sentry/utils/list/useListItemCheckboxState';
+import {MIN_DEAD_RAGE_CLICK_SDK} from 'sentry/utils/replays/sdkVersions';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjectFromId} from 'sentry/utils/useProjectFromId';
+import type {
+  ReplayListRecord,
+  ReplayRecordNestedFieldName,
+} from 'sentry/views/explore/replays/types';
+import type {ReplayListRecordWithTx} from 'sentry/views/performance/transactionSummary/transactionReplays/useReplaysWithTxData';
+
+type ListRecord = ReplayListRecord | ReplayListRecordWithTx;
+
+interface HeaderProps {
+  columnIndex: number;
+  listItemCheckboxState: ListItemCheckboxState;
+  replays: ReplayListRecord[];
+}
+
+interface CellProps {
+  columnIndex: number;
+  replay: ListRecord;
+  rowIndex: number;
+  showDropdownFilters: boolean;
+  to: string | LocationDescriptor;
+  className?: string;
+}
+
+export interface ReplayTableColumn {
+  /**
+   * Render the content
+   * Content will be automatically wrapped with `<SimpleTable.RowCell>`
+   */
+  Component: (props: CellProps) => ReactNode;
+
+  /**
+   * Render the header
+   * Header will be automatically wrapped with `<SimpleTable.HeaderCell>`
+   */
+  Header: string | ((props: HeaderProps) => ReactNode);
+
+  /**
+   * If any columns in the table are interactive, we will add an
+   * `<InteractionStateLayer>` to each row.
+   */
+  interactive: boolean;
+
+  /**
+   * The `ReplayListRecord` key to sort by
+   * If `undefined`, the column header will not be clickable.
+   */
+  sortKey: undefined | ReplayRecordNestedFieldName;
+
+  /**
+   * The width of the column
+   * Defaults to `max-content`
+   */
+  width?: string;
+}
+
+export const ReplayActivityColumn: ReplayTableColumn = {
+  Header: () => (
+    <InfoText
+      variant="inherit"
+      title={t(
+        'Activity represents how much user activity happened in a replay. It is determined by the number of errors encountered, duration, and UI events.'
+      )}
+    >
+      {t('Activity')}
+    </InfoText>
+  ),
+  interactive: false,
+  sortKey: 'activity',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    return (
+      <DropdownContainer key="activity">
+        <ReplayActivityScore score={replay?.activity ?? null} />
+        {showDropdownFilters ? (
+          <NumericDropdownFilter type="activity" val={replay?.activity ?? 0} />
+        ) : null}
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayBrowserColumn: ReplayTableColumn = {
+  Header: t('Browser'),
+  interactive: false,
+  sortKey: 'browser.name',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    const {name, version} = replay.browser;
+
+    return (
+      <DropdownContainer key="browser">
+        <ReplayPlatformIcon name={name} version={version}>
+          {showDropdownFilters ? (
+            <OSBrowserDropdownFilter type="browser" name={name} version={version} />
+          ) : null}
+        </ReplayPlatformIcon>
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayCountDeadClicksColumn: ReplayTableColumn = {
+  Header: () => (
+    <InfoText
+      variant="inherit"
+      title={tct(
+        'A dead click is a user click that does not result in any page activity after 7 seconds. Requires SDK version >= [minSDK]. [link:Learn more.]',
+        {
+          minSDK: MIN_DEAD_RAGE_CLICK_SDK.minVersion,
+          link: <ExternalLink href="https://docs.sentry.io/platforms/javascript/" />,
+        }
+      )}
+    >
+      {t('Dead clicks')}
+    </InfoText>
+  ),
+  interactive: false,
+  sortKey: 'count_dead_clicks',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    return (
+      <DropdownContainer key="countDeadClicks">
+        <TabularNumber>
+          {replay.count_dead_clicks ? (
+            <Flex gap="xs">
+              <IconCursorArrow size="sm" variant="warning" />
+              {replay.count_dead_clicks}
+            </Flex>
+          ) : (
+            0
+          )}
+        </TabularNumber>
+        {showDropdownFilters ? (
+          <NumericDropdownFilter
+            type="count_dead_clicks"
+            val={replay.count_dead_clicks ?? 0}
+          />
+        ) : null}
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayCountErrorsColumn: ReplayTableColumn = {
+  Header: () => (
+    <InfoText
+      variant="inherit"
+      title={tct(
+        'The error count only reflects errors generated within the Replay SDK. [inboundFilters:Inbound Filters] may have prevented those errors from being saved. [perfIssue:Performance] and other [replayIssue:error] types may have been added afterwards.',
+        {
+          inboundFilters: (
+            <ExternalLink href="https://docs.sentry.io/concepts/data-management/filtering/" />
+          ),
+          replayIssue: (
+            <ExternalLink href="https://docs.sentry.io/product/issues/issue-details/replay-issues/" />
+          ),
+          perfIssue: (
+            <ExternalLink href="https://docs.sentry.io/product/issues/issue-details/performance-issues/" />
+          ),
+        }
+      )}
+    >
+      {t('Errors')}
+    </InfoText>
+  ),
+  interactive: false,
+  sortKey: 'count_errors',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    return (
+      <DropdownContainer
+        key="countErrors"
+        data-test-id="replay-table-column-count-errors"
+      >
+        <ReplayErrorCount count={replay.count_errors} />
+        {showDropdownFilters ? (
+          <NumericDropdownFilter type="count_errors" val={replay.count_errors ?? 0} />
+        ) : null}
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayCountRageClicksColumn: ReplayTableColumn = {
+  Header: () => (
+    <InfoText
+      variant="inherit"
+      title={tct(
+        'A rage click is 5 or more clicks on a dead element, which exhibits no page activity after 7 seconds. Requires SDK version >= [minSDK]. [link:Learn more.]',
+        {
+          minSDK: MIN_DEAD_RAGE_CLICK_SDK.minVersion,
+          link: <ExternalLink href="https://docs.sentry.io/platforms/javascript/" />,
+        }
+      )}
+    >
+      {t('Rage clicks')}
+    </InfoText>
+  ),
+  interactive: false,
+  sortKey: 'count_rage_clicks',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    return (
+      <DropdownContainer key="countRageClicks">
+        <TabularNumber>
+          {replay.count_rage_clicks ? (
+            <Flex gap="xs">
+              <IconCursorArrow size="sm" variant="danger" />
+              {replay.count_rage_clicks}
+            </Flex>
+          ) : (
+            0
+          )}
+        </TabularNumber>
+        {showDropdownFilters ? (
+          <NumericDropdownFilter
+            type="count_rage_clicks"
+            val={replay.count_rage_clicks ?? 0}
+          />
+        ) : null}
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayDetailsLinkColumn: ReplayTableColumn = {
+  Header: '',
+  interactive: true,
+  sortKey: undefined,
+  Component: ({to}) => {
+    return (
+      <DetailsLink to={to}>
+        <Tooltip title={t('See Full Replay')}>
+          <IconOpen />
+        </Tooltip>
+      </DetailsLink>
+    );
+  },
+};
+
+export const ReplayDurationColumn: ReplayTableColumn = {
+  Header: t('Duration'),
+  interactive: false,
+  sortKey: 'duration',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    invariant(
+      replay.duration,
+      'For TypeScript: replay.duration is implied because replay.is_archived is false'
+    );
+    return (
+      <DropdownContainer key="duration">
+        <Duration duration={[replay.duration.asMilliseconds(), 'ms']} precision="sec" />
+        {showDropdownFilters ? (
+          <NumericDropdownFilter
+            type="duration"
+            val={replay.duration.asSeconds() ?? 0}
+            formatter={(val: number) => `${val}s`}
+          />
+        ) : null}
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayOSColumn: ReplayTableColumn = {
+  Header: t('OS'),
+  interactive: false,
+  sortKey: 'os.name',
+  Component: ({replay, showDropdownFilters}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    const {name, version} = replay.os;
+
+    return (
+      <DropdownContainer key="os">
+        <ReplayPlatformIcon name={name} version={version}>
+          {showDropdownFilters ? (
+            <OSBrowserDropdownFilter type="os" name={name} version={version} />
+          ) : null}
+        </ReplayPlatformIcon>
+      </DropdownContainer>
+    );
+  },
+};
+
+export const ReplayPlayPauseColumn: ReplayTableColumn = {
+  Header: '',
+  interactive: true,
+  sortKey: undefined,
+  Component: ({replay, rowIndex}) => {
+    const location = useLocation();
+    const {index: selectedReplayIndex, select: setSelectedReplayIndex} =
+      useSelectedReplayIndex();
+
+    if (replay.is_archived) {
+      return null;
+    }
+    if (rowIndex === selectedReplayIndex) {
+      return (
+        <PlayPauseButtonContainer>
+          <ReplayPlayPauseButton key="playPause-play" variant="transparent" size="sm" />
+        </PlayPauseButtonContainer>
+      );
+    }
+    return (
+      <PlayPauseButtonContainer onClick={() => setSelectedReplayIndex(rowIndex)}>
+        <LinkButton
+          key="playPause-select"
+          aria-label={t('Play')}
+          data-test-id="replay-table-play-button"
+          icon={<IconPlay />}
+          to={{
+            pathname: location.pathname,
+            query: {...location.query, selected_replay_index: rowIndex},
+          }}
+          variant="secondary"
+          size="sm"
+          tooltipProps={{title: t('Play')}}
+        />
+      </PlayPauseButtonContainer>
+    );
+  },
+};
+
+export const ReplaySelectColumn: ReplayTableColumn = {
+  Header: ({
+    listItemCheckboxState: {
+      deselectAll,
+      isAllSelected,
+      knownIds,
+      selectedIds,
+      toggleSelected,
+    },
+    replays,
+  }) => {
+    return (
+      <CheckboxHeaderContainer>
+        <Checkbox
+          id="replay-table-select-all"
+          checked={isAllSelected}
+          disabled={knownIds.length === 0}
+          onChange={() => {
+            // If the replay is archived, don't include it in the selection
+            const eligibleIds = knownIds.filter(
+              id => !replays.find(r => r.id === id)?.is_archived
+            );
+
+            if (isAllSelected === true || selectedIds.length === eligibleIds.length) {
+              deselectAll();
+            } else {
+              // Make everything visible selected
+              const unselectedIds = eligibleIds.filter(id => !selectedIds.includes(id));
+              toggleSelected(unselectedIds);
+            }
+          }}
+        />
+      </CheckboxHeaderContainer>
+    );
+  },
+  interactive: true,
+  sortKey: undefined,
+  Component: ({replay}) => {
+    if (replay.is_archived) {
+      return null;
+    }
+    return (
+      <CheckboxClickCapture onClick={e => e.stopPropagation()}>
+        <Stack justify="center" align="center" gap="xs" position="relative">
+          <ListItemSelectCheckbox htmlPrefix="replay-table-select" value={replay.id} />
+          {replay.has_viewed ? (
+            <Container width="8px" height="8px" />
+          ) : (
+            <UnreadIndicator />
+          )}
+        </Stack>
+      </CheckboxClickCapture>
+    );
+  },
+};
+
+export const ReplaySessionColumn: ReplayTableColumn = {
+  Header: () => (
+    <InfoText variant="inherit" title={t('By default, replays are sorted by time sent.')}>
+      {t('Replay')}
+    </InfoText>
+  ),
+  interactive: true,
+  sortKey: 'started_at',
+  width: 'minmax(150px, 1fr)',
+  Component: ({replay, to, className}) => {
+    const matches = useMatches();
+    const referrer = getRouteStringFromRoutes({matches});
+
+    const organization = useOrganization();
+    const project = useProjectFromId({project_id: replay.project_id ?? undefined});
+
+    if (replay.is_archived) {
+      return <ReplayBadge replay={replay} />;
+    }
+
+    invariant(
+      replay.started_at,
+      'For TypeScript: replay.started_at is implied because replay.is_archived is false'
+    );
+
+    const trackNavigationEvent = () =>
+      trackAnalytics('replay.list-navigate-to-details', {
+        project_id: project?.id,
+        platform: project?.platform,
+        organization,
+        referrer,
+        referrer_table: 'main',
+      });
+
+    return (
+      <CellLink className={className} to={to} onClick={trackNavigationEvent}>
+        <ReplayBadge replay={replay} />
+      </CellLink>
+    );
+  },
+};
+
+export const ReplaySlowestTransactionColumn: ReplayTableColumn = {
+  Header: t('Slowest Transaction'),
+  interactive: false,
+  sortKey: undefined,
+  Component: ({replay}) => {
+    const location = useLocation();
+    const navigate = useNavigate();
+    const organization = useOrganization();
+    const theme = useTheme();
+
+    if (replay.is_archived) {
+      return null;
+    }
+    const hasTxEvent = 'txEvent' in replay;
+    const txDuration = hasTxEvent ? replay.txEvent?.['transaction.duration'] : undefined;
+    if (!hasTxEvent) {
+      return null;
+    }
+    return (
+      <SpanOperationBreakdown key="slowestTransaction">
+        {txDuration ? <div>{txDuration}ms</div> : null}
+        {spanOperationRelativeBreakdownRenderer(
+          replay.txEvent,
+          {navigate, organization, location, theme},
+          {enableOnClick: false}
+        )}
+      </SpanOperationBreakdown>
+    );
+  },
+};
+
+const DetailsLink = styled(Link)`
+  z-index: 1;
+  margin: -${p => p.theme.space.md};
+  padding: ${p => p.theme.space.md};
+  line-height: 0;
+`;
+
+const DropdownContainer = styled(Flex)`
+  position: relative;
+  flex-direction: column;
+  justify-content: center;
+`;
+
+const TabularNumber = styled('div')`
+  font-variant-numeric: tabular-nums;
+`;
+
+const CellLink = styled(Link)`
+  ${SimpleTable.rowLinkStyle}
+
+  flex-grow: 1;
+`;
+
+const PlayPauseButtonContainer = styled(Flex)`
+  ${SimpleTable.rowLinkStyle}
+
+  z-index: 1; /* Raise above any ReplaySessionColumn in the row */
+  flex-direction: column;
+  justify-content: center;
+`;
+
+const CheckboxHeaderContainer = styled(Flex)`
+  display: flex;
+  position: relative;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: ${p => p.theme.space.md};
+`;
+
+const CheckboxClickCapture = styled('div')`
+  z-index: 1; /* Raise above any ReplaySessionColumn in the row */
+  padding: ${p => p.theme.space.xl};
+  margin: -${p => p.theme.space.xl};
+`;
+
+const SpanOperationBreakdown = styled('div')`
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: ${p => p.theme.space.xs};
+  color: ${p => p.theme.colors.gray800};
+  font-size: ${p => p.theme.font.size.md};
+  text-align: right;
+`;

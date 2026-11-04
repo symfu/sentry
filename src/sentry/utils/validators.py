@@ -1,32 +1,58 @@
-import ipaddress
+import re
 import uuid
+from typing import TypeGuard
 
-from django.utils.encoding import force_text
+from django.utils.encoding import force_str
+
+INVALID_ID_DETAILS = "`{}` must be a valid UUID hex (32-36 characters long, containing only digits, dashes, or a-f characters)"
+
+WILDCARD_NOT_ALLOWED = "Wildcard conditions are not permitted on `{}` field"
+
+INVALID_SPAN_ID = (
+    "`{}` must be a valid 16 character hex (containing only digits, or a-f characters)"
+)
+
+HEXADECIMAL_16_DIGITS = re.compile("^[0-9a-fA-F]{1,16}$")
 
 
-def validate_ip(value, required=True):
-    if not required and not value:
-        return
-
-    # will raise a ValueError
-    ipaddress.ip_network(str(value), strict=False)
-    return value
-
-
-def is_float(var):
+def normalize_event_id(value: object) -> str | None:
     try:
-        float(var)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
-def normalize_event_id(value):
-    try:
-        return uuid.UUID(force_text(value)).hex
+        return uuid.UUID(force_str(value)).hex
     except (TypeError, AttributeError, ValueError):
         return None
 
 
-def is_event_id(value):
+def is_event_id(value: object) -> bool:
     return normalize_event_id(value) is not None
+
+
+def is_event_id_or_list(value: object) -> bool:
+    if isinstance(value, list):
+        return all(is_event_id(item) for item in value)
+    else:
+        return is_event_id(value)
+
+
+def normalize_event_id_strict(value: object) -> object:
+    """Normalize a UUID by stripping dashes. Returns the original value if normalization fails."""
+    result = normalize_event_id(value)
+    return result if result is not None else value
+
+
+def is_span_id(value: object) -> TypeGuard[str]:
+    return bool(HEXADECIMAL_16_DIGITS.search(force_str(value)))
+
+
+def normalize_span_id(value: object) -> str:
+    return force_str(value).lower()
+
+
+def is_span_id_or_list(value: object) -> bool:
+    if isinstance(value, list):
+        return all(is_span_id(item) for item in value)
+    else:
+        return is_span_id(value)
+
+
+def is_empty_string(value: object) -> bool:
+    return force_str(value) == ""

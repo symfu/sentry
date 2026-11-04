@@ -1,0 +1,402 @@
+import copy
+import logging
+from collections.abc import Mapping, MutableMapping
+from time import time
+from typing import Any
+
+import sentry_sdk
+from django.conf import settings
+from sentry_sdk import traces
+from taskbroker_client.constants import CompressionType
+
+from sentry import options
+from sentry.ingest.event_payload import load_event_payload, prepare_submit
+from sentry.killswitches import killswitch_matches_context
+from sentry.lang.native.processing import (
+    get_native_symbolication_functions,
+)
+from sentry.lang.native.symbolicator import (
+    Symbolicator,
+    SymbolicatorFunction,
+    SymbolicatorTaskKind,
+)
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.services.eventstore import processing
+from sentry.services.eventstore.processing.base import Event
+from sentry.silo.base import SiloMode
+from sentry.stacktraces.processing import StacktraceInfo
+from sentry.tasks import store
+from sentry.tasks.base import instrumented_task
+from sentry.taskworker.namespaces import (
+    symbolication_js_tasks,
+    symbolication_jvm_tasks,
+    symbolication_tasks,
+)
+from sentry.utils import metrics
+from sentry.utils.sdk import set_current_event_project
+
+error_logger = logging.getLogger("sentry.errors.events")
+info_logger = logging.getLogger("sentry.symbolication")
+
+
+def get_symbolication_functions(
+    data: Mapping[str, Any], stacktraces: list[StacktraceInfo]
+) -> list[SymbolicatorFunction]:
+    """Returns a list of Symbolicator platforms
+    that apply to this event."""
+
+    from sentry.lang.java.utils import is_jvm_event
+    from sentry.lang.javascript.utils import is_js_event
+
+    functions = []
+
+    if is_jvm_event(data, stacktraces):
+        functions.append(SymbolicatorFunction.jvm)
+    if is_js_event(data, stacktraces):
+        functions.append(SymbolicatorFunction.js)
+
+    functions.extend(get_native_symbolication_functions(data, stacktraces))
+
+    return functions
+
+
+class SymbolicationTimeout(Exception):
+    pass
+
+
+def _do_symbolicate_event(
+    *,
+    task_kind: SymbolicatorTaskKind,
+    cache_key: str | None,
+    start_time: float | None,
+    event_id: str | None,
+    data: Event | None = None,
+    has_attachments: bool = False,
+    symbolicate_functions: list[SymbolicatorFunction] | None = None,
+    unprocessed_pending: bool = False,
+    unprocessed: MutableMapping[str, Any] | None = None,
+) -> None:
+    data = load_event_payload(data, cache_key, processing.event_processing_store)
+
+    if data is None:
+        metrics.incr(
+            "events.failed", tags={"reason": "cache", "stage": "symbolicate"}, skip_internal=False
+        )
+        error_logger.error("symbolicate.failed.empty", extra={"cache_key": cache_key})
+        return
+
+    event_id = str(data["event_id"])
+    project_id = data["project"]
+    has_changed = False
+
+    set_current_event_project(project_id)
+    sentry_sdk.set_tag("event_id", event_id)
+    sentry_sdk.set_attribute("event_id", event_id)
+
+    # Copy before symbolication modifies the payload in place, even if it is skipped.
+    if unprocessed_pending and not options.get("store.reprocessing-force-disable"):
+        unprocessed = copy.deepcopy(data)
+
+    def _continue_to_process_event(was_killswitched: bool = False) -> None:
+        # Go through the remaining symbolication platforms/functions
+        # and submit the next one.
+        if not was_killswitched and symbolicate_functions:
+            next_function = symbolicate_functions.pop(0)
+
+            submit_symbolicate(
+                task_kind=task_kind.with_function(next_function),
+                cache_key=cache_key,
+                event_id=event_id,
+                start_time=start_time,
+                has_attachments=has_attachments,
+                symbolicate_functions=symbolicate_functions,
+                data=data,
+                unprocessed=unprocessed,
+            )
+            return
+        # else:
+        store.submit_process(
+            from_reprocessing=task_kind.is_reprocessing,
+            cache_key=cache_key,
+            event_id=event_id,
+            start_time=start_time,
+            data_has_changed=has_changed,
+            from_symbolicate=True,
+            has_attachments=has_attachments,
+            data=data,
+            unprocessed=unprocessed,
+        )
+
+    symbolication_function = task_kind.function
+    symbolication_function_name = (
+        None
+        if symbolication_function is None
+        else getattr(symbolication_function.function(), "__name__", "none")
+    )
+
+    if symbolication_function is None or killswitch_matches_context(
+        "store.load-shed-symbolicate-event-projects",
+        {
+            "project_id": project_id,
+            "event_id": event_id,
+            "platform": data.get("platform") or "null",
+            "symbolication_function": symbolication_function_name,
+        },
+    ):
+        return _continue_to_process_event(True)
+
+    symbolication_start_time = time()
+
+    project = Project.objects.get_from_cache(id=project_id)
+    # needed for efficient featureflag checks in getsentry
+    # NOTE: The `organization` is used for constructing the symbol sources.
+    with traces.start_span(
+        name="lang.native.symbolicator.organization.get_from_cache",
+        attributes={"sentry.op": "lang.native.symbolicator.organization.get_from_cache"},
+    ):
+        project.set_cached_field_value(
+            "organization", Organization.objects.get_from_cache(id=project.organization_id)
+        )
+
+    def on_symbolicator_request() -> None:
+        duration = time() - symbolication_start_time
+        if duration > settings.SYMBOLICATOR_PROCESS_EVENT_HARD_TIMEOUT:
+            raise SymbolicationTimeout
+        elif duration > settings.SYMBOLICATOR_PROCESS_EVENT_WARN_TIMEOUT:
+            error_logger.warning(
+                "symbolicate.slow",
+                extra={"project_id": project_id, "event_id": event_id},
+            )
+
+    symbolicator = Symbolicator(
+        task_kind=task_kind,
+        on_request=on_symbolicator_request,
+        project=project,
+        event_id=event_id,
+    )
+
+    with (
+        metrics.timer(
+            "tasks.store.symbolicate_event.symbolication",
+            tags={"symbolication_function": symbolication_function_name},
+        ),
+        traces.start_span(
+            name=f"tasks.store.symbolicate_event.{symbolication_function_name}",
+            attributes={
+                "sentry.op": f"tasks.store.symbolicate_event.{symbolication_function_name}"
+            },
+        ) as span,
+    ):
+        try:
+            symbolicated_data = symbolication_function(symbolicator, data)
+            span.set_attribute("symbolicated_data", bool(symbolicated_data))
+
+            if symbolicated_data:
+                data = symbolicated_data
+                has_changed = True
+        except SymbolicationTimeout:
+            metrics.incr(
+                "tasks.store.symbolicate_event.fatal",
+                tags={
+                    "reason": "timeout",
+                    "symbolication_function": symbolication_function_name,
+                },
+            )
+            error_logger.exception(
+                "symbolicate.failed.infinite_retry",
+                extra={"project_id": project_id, "event_id": event_id},
+            )
+            data.setdefault("_metrics", {})["flag.processing.error"] = True
+            data.setdefault("_metrics", {})["flag.processing.fatal"] = True
+            has_changed = True
+        except Exception:
+            metrics.incr(
+                "tasks.store.symbolicate_event.fatal",
+                tags={
+                    "reason": "error",
+                    "symbolication_function": symbolication_function_name,
+                },
+            )
+            error_logger.exception("tasks.store.symbolicate_event.symbolication")
+            data.setdefault("_metrics", {})["flag.processing.error"] = True
+            data.setdefault("_metrics", {})["flag.processing.fatal"] = True
+            has_changed = True
+
+    # We cannot persist canonical types in the cache, so we need to
+    # downgrade this.
+    if not isinstance(data, dict):
+        data = dict(data.items())
+
+    return _continue_to_process_event()
+
+
+# ============ Parameterized tasks below ============
+# We have different *tasks* and associated *queues* for the following permutations:
+# - Event Type (JS vs Native)
+# - Reprocessing (currently not available for JS events)
+
+
+def submit_symbolicate(
+    task_kind: SymbolicatorTaskKind,
+    cache_key: str | None,
+    event_id: str | None,
+    start_time: float | None,
+    has_attachments: bool = False,
+    symbolicate_functions: list[SymbolicatorFunction] | None = None,
+    data: Event | None = None,
+    unprocessed_pending: bool = False,
+    unprocessed: MutableMapping[str, Any] | None = None,
+) -> None:
+    data, cache_key = prepare_submit(data, cache_key, event_id)
+
+    # Because of `mock` usage, we cannot just save a reference to the actual function
+    # into the `TASK_FNS` dict. We actually have to access it at runtime from the global scope
+    # on every invocation. Great stuff!
+    task_fn_name = TASK_FNS.get(task_kind, "symbolicate_event")
+    task_fn = globals()[task_fn_name]
+
+    # Pass symbolicate_functions as strings—apparently we're not allowed to pickle
+    # custom classes.
+    symbolicate_function_names = (
+        None if symbolicate_functions is None else [p.name for p in symbolicate_functions]
+    )
+
+    task_fn.delay(
+        cache_key=cache_key,
+        start_time=start_time,
+        event_id=event_id,
+        has_attachments=has_attachments,
+        symbolicate_functions=symbolicate_function_names,
+        data=data,
+        unprocessed_pending=unprocessed_pending,
+        unprocessed=unprocessed,
+    )
+
+
+SymbolicationTaskFn = Any  # FIXME: it would be nice if `instrumented_task` would be fully typed
+# Maps from the `SymbolicatorTaskKind` to the name of the specific task function in the global scope.
+TASK_FNS: dict[SymbolicatorTaskKind, str] = {}
+
+
+def make_task_fn(name: str, queue: str, task_kind: SymbolicatorTaskKind) -> SymbolicationTaskFn:
+    """
+    Returns a parameterized version of `_do_symbolicate_event` that runs as a task,
+    and can be spawned as one.
+    """
+
+    namespace = {
+        SymbolicatorFunction.js: symbolication_js_tasks,
+        SymbolicatorFunction.jvm: symbolication_jvm_tasks,
+    }.get(task_kind.function, symbolication_tasks)
+
+    @instrumented_task(
+        name=name,
+        namespace=namespace,
+        alias_namespace=symbolication_tasks,
+        processing_deadline_duration=settings.SYMBOLICATOR_PROCESS_EVENT_HARD_TIMEOUT + 30,
+        silo_mode=SiloMode.CELL,
+        compression_type=CompressionType.ZSTD,
+    )
+    def symbolication_fn(
+        cache_key: str | None = None,
+        start_time: float | None = None,
+        event_id: str | None = None,
+        data: Event | None = None,
+        has_attachments: bool = False,
+        symbolicate_functions: list[str] | None = None,
+        unprocessed_pending: bool = False,
+        unprocessed: MutableMapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Handles event symbolication using the external service: symbolicator.
+
+        :param string cache_key: the cache key for the event data
+        :param int start_time: the timestamp when the event was ingested
+        :param string event_id: the event identifier
+        """
+
+        symbolicate_function_values: list[SymbolicatorFunction] | None = None
+        if symbolicate_functions is not None:
+            # Turn symbolicate_functions back into proper enum values
+            symbolicate_function_values = (
+                None
+                if symbolicate_functions is None
+                else [SymbolicatorFunction(p) for p in symbolicate_functions]
+            )
+
+        return _do_symbolicate_event(
+            task_kind=task_kind,
+            cache_key=cache_key,
+            start_time=start_time,
+            event_id=event_id,
+            data=data,
+            has_attachments=has_attachments,
+            symbolicate_functions=symbolicate_function_values,
+            unprocessed_pending=unprocessed_pending,
+            unprocessed=unprocessed,
+        )
+
+    fn_name = name.split(".")[-1]
+    setattr(symbolication_fn, "__name__", fn_name)
+    TASK_FNS[task_kind] = fn_name
+
+    return symbolication_fn
+
+
+# The names of tasks and metrics in this file point to tasks.store instead of tasks.symbolicator
+# for legacy reasons, namely to prevent tasks from dropping older tasks and needing to
+# update metrics tooling (e.g. DataDog). All (as of 19/10/2021) of these tasks were moved
+# out of tasks/store.py, hence the "store" bit of the name.
+#
+# New tasks and metrics are welcome to use the correct naming scheme as they are not
+# burdened by aforementioned legacy concerns.
+
+symbolicate_minidump = make_task_fn(
+    name="sentry.tasks.store.symbolicate_minidump",
+    queue="events.symbolicate_event",
+    task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.minidump, is_reprocessing=False),
+)
+symbolicate_applecrashreport = make_task_fn(
+    name="sentry.tasks.store.symbolicate_applecrashreport",
+    queue="events.symbolicate_event",
+    task_kind=SymbolicatorTaskKind(
+        function=SymbolicatorFunction.applecrashreport, is_reprocessing=False
+    ),
+)
+symbolicate_event = make_task_fn(
+    name="sentry.tasks.store.symbolicate_event",
+    queue="events.symbolicate_event",
+    task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.native, is_reprocessing=False),
+)
+symbolicate_js_event = make_task_fn(
+    name="sentry.tasks.symbolicate_js_event",
+    queue="events.symbolicate_js_event",
+    task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.js, is_reprocessing=False),
+)
+symbolicate_jvm_event = make_task_fn(
+    name="sentry.tasks.symbolicate_jvm_event",
+    queue="events.symbolicate_jvm_event",
+    task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.jvm, is_reprocessing=False),
+)
+
+
+# Reprocessing variants, only for "native" events:
+symbolicate_minidump_from_reprocessing = make_task_fn(
+    name="sentry.tasks.store.symbolicate_minidump_from_reprocessing",
+    queue="events.reprocessing.symbolicate_event",
+    task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.minidump, is_reprocessing=True),
+)
+symbolicate_applecrashreport_from_reprocessing = make_task_fn(
+    name="sentry.tasks.store.symbolicate_applecrashreport_from_reprocessing",
+    queue="events.reprocessing.symbolicate_event",
+    task_kind=SymbolicatorTaskKind(
+        function=SymbolicatorFunction.applecrashreport, is_reprocessing=True
+    ),
+)
+symbolicate_event_from_reprocessing = make_task_fn(
+    name="sentry.tasks.store.symbolicate_event_from_reprocessing",
+    queue="events.reprocessing.symbolicate_event",
+    task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.native, is_reprocessing=True),
+)

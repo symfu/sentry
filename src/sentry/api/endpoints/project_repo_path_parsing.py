@@ -1,101 +1,179 @@
-from rest_framework import status, serializers
+from pathlib import PurePath, PureWindowsPath
+from typing import Any, TypedDict
+from urllib.parse import unquote, urlparse, urlunparse
 
-from sentry import integrations
-from sentry.api.bases.project import ProjectEndpoint
+from drf_spectacular.utils import extend_schema
+from rest_framework import serializers, status
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases.project import ProjectEndpoint, ProjectPermission
 from sentry.api.serializers.rest_framework.base import CamelSnakeSerializer
-from sentry.models import Integration, Repository
-from sentry.utils.compat import filter, map
+from sentry.apidocs.constants import (
+    RESPONSE_BAD_REQUEST,
+    RESPONSE_FORBIDDEN,
+    RESPONSE_NOT_FOUND,
+    RESPONSE_UNAUTHORIZED,
+)
+from sentry.apidocs.parameters import GlobalParams
+from sentry.apidocs.utils import inline_sentry_response_serializer
+from sentry.constants import ObjectStatus
+from sentry.integrations.base import IntegrationFeatures
+from sentry.integrations.manager import default_manager as integrations
+from sentry.integrations.services.integration import RpcIntegration, integration_service
+from sentry.integrations.source_code_management.repository import RepositoryIntegration
+from sentry.integrations.source_code_management.url import url_is_under
+from sentry.issues.auto_source_code_config.code_mapping import find_roots
+from sentry.issues.auto_source_code_config.errors import (
+    UnexpectedPathException,
+    UnsupportedFrameInfo,
+)
+from sentry.issues.auto_source_code_config.frame_info import FrameInfo, create_frame_info
+from sentry.models.project import Project
+from sentry.models.repository import Repository
 
 
-def find_roots(stack_path, source_path):
-    """
-    Returns a tuple containing the stack_root, and the source_root.
-    If there is no overlap, raise an exception since this should not happen
-    """
-    overlap_to_check = stack_path
-    stack_root = ""
-    while overlap_to_check:
-        # see if our path ends with the overlap we want
-        if source_path.endswith(overlap_to_check):
-            # determine the source root by removing the overlap
-            source_root = source_path.rpartition(overlap_to_check)[0]
-            return (stack_root, source_root)
-        # increase the stack root specificity
-        # while decreasing the overlap
-        stack_root += overlap_to_check[0]
-        overlap_to_check = overlap_to_check[1:]
-    # validate_source_url should have ensured the file names match
-    # so if we get here something went wrong and there is a bug
-    raise Exception("Could not find common root from paths")
+class RepoPathParsingResponse(TypedDict):
+    # NOTE: API convention is to return identifiers as strings, but this endpoint has
+    # always returned these as integers. Typed to match the existing behavior.
+    integrationId: int
+    repositoryId: int
+    provider: str
+    stackRoot: str
+    sourceRoot: str
+    defaultBranch: str
 
 
-class PathMappingSerializer(CamelSnakeSerializer):
-    stack_path = serializers.CharField()
-    source_url = serializers.URLField()
+def unquote_source_url_path(source_url: str) -> str:
+    parsed = urlparse(source_url)
+    return urlunparse(parsed._replace(path=unquote(parsed.path)))
 
-    def __init__(self, *args, **kwargs):
+
+class PathMappingSerializer(CamelSnakeSerializer[dict[str, str]]):
+    stack_path = serializers.CharField(
+        help_text="A file path as it appears in a stack trace frame."
+    )
+    source_url = serializers.URLField(
+        help_text="The URL of the same file in the connected source code repository."
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.integration = None
-        self.repo = None
+        self.integration: RpcIntegration | None = None
+        self.repo: Repository | None = None
 
     @property
-    def providers(self):
-        # TODO: use feature flag in the future
-        providers = filter(lambda x: x.has_stacktrace_linking, list(integrations.all()))
-        return map(lambda x: x.key, providers)
+    def providers(self) -> list[str]:
+        return [
+            x.key for x in integrations.all() if x.has_feature(IntegrationFeatures.STACKTRACE_LINK)
+        ]
 
     @property
-    def org_id(self):
-        return self.context["organization_id"]
+    def org_id(self) -> int:
+        org_id = self.context["organization_id"]
+        return org_id
 
-    def validate_source_url(self, source_url):
+    def validate_source_url(self, source_url: str) -> str:
+        # URLs copied from a provider's UI can be percent-encoded, but stack trace
+        # paths are not, so decode before comparing or extracting paths
+        source_url = unquote_source_url_path(source_url)
+
         # first check to see if we are even looking at the same file
         stack_path = self.initial_data["stack_path"]
-        stack_file = stack_path.split("/")[-1]
-        source_file = source_url.split("/")[-1]
+
+        stack_file = PureWindowsPath(stack_path).name
+        source_file = PurePath(urlparse(source_url).path).name
 
         if stack_file != source_file:
             raise serializers.ValidationError(
                 "Source code URL points to a different file than the stack trace"
             )
 
-        def integration_match(integration):
-            return source_url.startswith("https://{}".format(integration.metadata["domain_name"]))
+        def integration_match(integration: RpcIntegration) -> bool:
+            installation = integration.get_installation(self.org_id)
+            # Check if the installation has the source_url_matches method
+            if isinstance(installation, RepositoryIntegration):
+                return installation.source_url_matches(source_url)
+            # Fallback to a basic check if the method doesn't exist
+            return False
 
-        def repo_match(repo):
-            return source_url.startswith(repo.url)
+        def repo_match(repo: Repository) -> bool:
+            return repo.url is not None and url_is_under(source_url, repo.url)
 
         # now find the matching integration
-        integrations = Integration.objects.filter(
-            organizations=self.org_id, provider__in=self.providers
+        integrations = integration_service.get_integrations(
+            organization_id=self.org_id,
+            providers=self.providers,
+            status=ObjectStatus.ACTIVE,
+            org_integration_status=ObjectStatus.ACTIVE,
         )
 
-        matching_integrations = filter(integration_match, integrations)
+        matching_integrations = {
+            integration.id: integration
+            for integration in integrations
+            if integration_match(integration)
+        }
         if not matching_integrations:
             raise serializers.ValidationError("Could not find integration")
 
-        self.integration = matching_integrations[0]
-
-        # now find the matching repo
-        repos = Repository.objects.filter(integration_id=self.integration.id)
-        matching_repos = filter(repo_match, repos)
+        # Several integrations can claim the same link, such as two Bitbucket Cloud
+        # workspaces or a GitLab group and its subgroup, so the repository decides
+        # which integration the link belongs to.
+        repos = Repository.objects.filter(
+            organization_id=self.org_id,
+            integration_id__in=matching_integrations,
+            url__isnull=False,
+        ).order_by("id")
+        matching_repos = list(filter(repo_match, repos))
         if not matching_repos:
             raise serializers.ValidationError("Could not find repo")
 
         # store the repo we found
         self.repo = matching_repos[0]
+        assert self.repo.integration_id is not None
+        self.integration = matching_integrations[self.repo.integration_id]
         return source_url
 
 
-class ProjectRepoPathParsingEndpoint(ProjectEndpoint):
+class ProjectRepoPathParsingEndpointLoosePermission(ProjectPermission):
     """
-    Returns the parameters associated with the RepositoryProjectPathConfig
-    we would create based on a particular stack trace and source code URL.
-    Does validation to make sure we have an integration and repo
-    depending on the source code URL
+    Similar to the code_mappings endpoint, loosen permissions to all users
     """
 
-    def post(self, request, project):
+    scope_map = {
+        "POST": ["org:read", "project:write", "project:admin"],
+    }
+
+
+@extend_schema(tags=["Integrations"])
+@cell_silo_endpoint
+class ProjectRepoPathParsingEndpoint(ProjectEndpoint):
+    publish_status = {
+        "POST": ApiPublishStatus.PRIVATE,
+    }
+    permission_classes = (ProjectRepoPathParsingEndpointLoosePermission,)
+
+    @extend_schema(
+        operation_id="Parse a Repository Path Mapping",
+        parameters=[GlobalParams.ORG_ID_OR_SLUG, GlobalParams.PROJECT_ID_OR_SLUG],
+        request=PathMappingSerializer,
+        responses={
+            200: inline_sentry_response_serializer("RepoPathParsing", RepoPathParsingResponse),
+            400: RESPONSE_BAD_REQUEST,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+    )
+    def post(self, request: Request, project: Project) -> Response[RepoPathParsingResponse]:
+        """
+        Derive the code-mapping parameters (stack root, source root, default branch) that
+        Sentry would create for a given stack trace frame and source code URL.
+
+        Validates that a matching integration and repository exist for the provided URL.
+        """
         serializer = PathMappingSerializer(
             context={"organization_id": project.organization_id},
             data=request.data,
@@ -105,17 +183,36 @@ class ProjectRepoPathParsingEndpoint(ProjectEndpoint):
 
         data = serializer.validated_data
         source_url = data["source_url"]
-        stack_path = data["stack_path"]
+        try:
+            frame_info = get_frame_info_from_request(request)
+        except UnsupportedFrameInfo:
+            return self.respond(
+                {"detail": "Unsupported frame info"}, status=status.HTTP_400_BAD_REQUEST
+            )
 
+        # validated by `serializer.is_valid()`
+        assert serializer.repo is not None
+        assert serializer.integration is not None
         repo = serializer.repo
         integration = serializer.integration
+        installation = integration.get_installation(project.organization_id)
 
-        # strip off the base URL (could be in different formats)
-        rest_url = source_url.replace(f"{repo.url}/-/blob/", "")
-        rest_url = rest_url.replace(f"{repo.url}/blob/", "")
-        branch, _, source_path = rest_url.partition("/")
+        if not isinstance(installation, RepositoryIntegration):
+            return self.respond(
+                {"detail": "Integration does not support repository operations"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        stack_root, source_root = find_roots(stack_path, source_path)
+        branch = installation.extract_branch_from_source_url(repo, source_url)
+        source_path = installation.extract_source_path_from_source_url(repo, source_url)
+
+        try:
+            stack_root, source_root = find_roots(frame_info, source_path)
+        except UnexpectedPathException:
+            return self.respond(
+                {"detail": "Could not determine code mapping from provided paths"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return self.respond(
             {
@@ -127,3 +224,12 @@ class ProjectRepoPathParsingEndpoint(ProjectEndpoint):
                 "defaultBranch": branch,
             }
         )
+
+
+def get_frame_info_from_request(request: Request) -> FrameInfo:
+    frame = {
+        "abs_path": request.data.get("absPath"),
+        "filename": request.data["stackPath"],
+        "module": request.data.get("module"),
+    }
+    return create_frame_info(frame, request.data.get("platform"))

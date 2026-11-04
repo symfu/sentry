@@ -1,0 +1,282 @@
+import styled from '@emotion/styled';
+import {IconChat} from '@sentry/icons/chat';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+
+import {LinkButton} from '@sentry/scraps/button';
+import {Container, Grid} from '@sentry/scraps/layout';
+import {Heading} from '@sentry/scraps/text';
+
+import {addErrorMessage, addSuccessMessage} from 'sentry/actionCreators/indicator';
+import {t, tct, tn} from 'sentry/locale';
+import type {NoteType} from 'sentry/types/alerts';
+import type {Group, GroupActivity, GroupActivityNote} from 'sentry/types/group';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {RequestError} from 'sentry/utils/requestError/requestError';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {ActivityFeed} from 'sentry/views/issueDetails/activitySection/activityFeed';
+import {
+  buildActivityFeedItems,
+  type DisplayedActivityFeedItem,
+} from 'sentry/views/issueDetails/activitySection/activityLineItem/activityFeedItem';
+import {isActivityNote} from 'sentry/views/issueDetails/activitySection/activityLineItem/note';
+import {ActivityNoteInput} from 'sentry/views/issueDetails/activitySection/activityNoteInput';
+import {useMutateActivity} from 'sentry/views/issueDetails/activitySection/useMutateActivity';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+import {SidebarFoldSection} from 'sentry/views/issueDetails/foldSection';
+import {Tab, TabPaths} from 'sentry/views/issueDetails/types';
+import {useGroupDetailsRoute} from 'sentry/views/issueDetails/useGroupDetailsRoute';
+
+interface ActivitySectionProps {
+  group: Group;
+  /**
+   * Activity to render instead of the activity embedded in the group response.
+   */
+  activities?: GroupActivity[];
+  /**
+   * Whether to filter the activity to only show comments.
+   */
+  filterComments?: boolean;
+  /** Prepared feed rows. Defaults to building rows from the issue activity. */
+  items?: DisplayedActivityFeedItem[];
+  minHeight?: number;
+  onActivityChange?: (activity: GroupActivity[]) => void;
+  placeholder?: string;
+  /**
+   * Controls layout and input style.
+   * - `sidebar` (default): fold section, compact input, collapses at 5 items
+   * - `standalone`: full input, no collapse
+   */
+  variant?: 'sidebar' | 'standalone';
+}
+
+export function ActivitySection({
+  group,
+  activities: providedActivities,
+  filterComments,
+  onActivityChange,
+  items,
+  variant = 'sidebar',
+  minHeight = 96,
+  placeholder = t('Add a comment\u2026'),
+}: ActivitySectionProps) {
+  const organization = useOrganization();
+  const {baseUrl} = useGroupDetailsRoute();
+  const location = useLocation();
+  const activities = providedActivities ?? group.activity;
+  const {createComment, deleteComment, updateComment} = useMutateActivity({
+    organization,
+    group,
+  });
+
+  async function handleCreate(data: NoteType) {
+    try {
+      const result = await createComment(data);
+      trackAnalytics('issue_details.comment_created', {organization});
+      addSuccessMessage(t('Comment posted'));
+      onActivityChange?.([result, ...activities]);
+    } catch (error) {
+      const detail =
+        error instanceof RequestError && typeof error.responseJSON?.detail === 'string'
+          ? error.responseJSON.detail
+          : null;
+      addErrorMessage(
+        detail ? tct('Error: [msg]', {msg: detail}) : t('Unable to post comment')
+      );
+      throw error;
+    }
+  }
+
+  async function handleDelete(item: GroupActivityNote) {
+    const commentId = item.commentId;
+    await deleteComment(commentId);
+    trackAnalytics('issue_details.comment_deleted', {organization});
+    addSuccessMessage(t('Comment removed'));
+    onActivityChange?.(
+      activities.filter(
+        activity => !isActivityNote(activity) || activity.commentId !== commentId
+      )
+    );
+  }
+
+  async function handleUpdate(item: GroupActivityNote, data: NoteType) {
+    try {
+      const commentId = item.commentId;
+      const result = await updateComment(commentId, data);
+      trackAnalytics('issue_details.comment_updated', {organization});
+      addSuccessMessage(t('Comment updated'));
+      onActivityChange?.(
+        activities.map(activity =>
+          isActivityNote(activity) && activity.commentId === commentId
+            ? {...activity, data: {...activity.data, ...result.data}}
+            : activity
+        )
+      );
+    } catch (error) {
+      addErrorMessage(t('Unable to update comment'));
+      throw error;
+    }
+  }
+
+  const isStandalone = variant === 'standalone';
+  const activityLink = {
+    pathname: `${baseUrl}${TabPaths[Tab.ACTIVITY]}`,
+    query: {
+      ...location.query,
+      cursor: undefined,
+    },
+  };
+  const commentsLink = {
+    pathname: activityLink.pathname,
+    query: {
+      ...activityLink.query,
+      filter: 'comments',
+    },
+  };
+
+  const displayedActivities =
+    items ??
+    buildActivityFeedItems({
+      activities,
+      filterComments,
+    });
+  const inputVariant = isStandalone ? 'full' : 'compact';
+  const timestampUnitStyle = isStandalone ? undefined : 'short';
+
+  const noteInput = (
+    <ActivityNoteInput
+      storageKey="groupinput:latest"
+      itemKey={group.id}
+      minHeight={minHeight}
+      onSubmit={handleCreate}
+      placeholder={placeholder}
+      variant={inputVariant}
+    />
+  );
+
+  const timeline = (
+    <ActivityFeed
+      group={group}
+      items={displayedActivities}
+      inputVariant={inputVariant}
+      timestampUnitStyle={timestampUnitStyle}
+      onCommentDelete={handleDelete}
+      onCommentUpdate={handleUpdate}
+    />
+  );
+  const shouldCollapseSidebar = displayedActivities.length >= 5;
+  const sidebarVisibleActivities = shouldCollapseSidebar
+    ? displayedActivities.slice(0, 3)
+    : displayedActivities;
+  // Count the events inside status-flapping rollups so the label reflects how much
+  // activity is actually hidden, not how many rows it collapses into.
+  const hiddenActivityCount = shouldCollapseSidebar
+    ? displayedActivities
+        .slice(3)
+        .reduce(
+          (count, item) =>
+            count +
+            (item.type === 'collapsed_status_activities' ? item.activities.length : 1),
+          0
+        )
+    : 0;
+  const sidebarActivityItems = (
+    <ActivityFeed
+      group={group}
+      items={sidebarVisibleActivities}
+      inputVariant={inputVariant}
+      timestampUnitStyle={timestampUnitStyle}
+      onCommentDelete={handleDelete}
+      onCommentUpdate={handleUpdate}
+    >
+      <MoreActivityRow>
+        <MoreActivityIcon>
+          <RotatedEllipsisIcon direction="up" />
+        </MoreActivityIcon>
+        <Container marginTop="xs">
+          <LinkButton
+            aria-label={t('View all activity')}
+            to={activityLink}
+            size="xs"
+            replace
+            preventScrollReset
+            analyticsEventKey="issue_details.activity_expanded"
+            analyticsEventName="Issue Details: Activity Expanded"
+            analyticsParams={{
+              num_activities_hidden: hiddenActivityCount,
+            }}
+          >
+            {hiddenActivityCount > 0
+              ? t('View %s more', hiddenActivityCount)
+              : t('Expand')}
+          </LinkButton>
+        </Container>
+      </MoreActivityRow>
+    </ActivityFeed>
+  );
+
+  if (isStandalone) {
+    return (
+      <Grid gap="xl">
+        {noteInput}
+        {timeline}
+      </Grid>
+    );
+  }
+
+  return (
+    <SidebarFoldSection
+      title={
+        <Heading as="h3" size="md">
+          {t('Activity')}
+        </Heading>
+      }
+      titleTrailingItems={
+        group.numComments > 0 ? (
+          <LinkButton
+            aria-label={tn('View %s comment', 'View %s comments', group.numComments)}
+            icon={<IconChat />}
+            size="zero"
+            variant="transparent"
+            to={commentsLink}
+            replace
+            preventScrollReset
+          >
+            {tn('%s comment', '%s comments', group.numComments)}
+          </LinkButton>
+        ) : null
+      }
+      sectionKey={SectionKey.ACTIVITY}
+    >
+      <Grid gap="lg">
+        {noteInput}
+        {sidebarActivityItems}
+      </Grid>
+    </SidebarFoldSection>
+  );
+}
+
+const RotatedEllipsisIcon = styled(IconEllipsis)`
+  position: relative;
+  left: 1px;
+  transform: rotate(90deg) translate(1px, 1px);
+`;
+
+const MoreActivityRow = styled('div')`
+  position: relative;
+  display: grid;
+  align-items: center;
+  grid-template-columns: 22px minmax(0, 1fr);
+  grid-column-gap: ${p => p.theme.space.md};
+`;
+
+const MoreActivityIcon = styled('div')`
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  min-height: 22px;
+  color: ${p => p.theme.tokens.content.secondary};
+  background: ${p => p.theme.tokens.background.primary};
+`;

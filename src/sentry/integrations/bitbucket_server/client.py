@@ -1,26 +1,47 @@
 import logging
+from collections.abc import Mapping, Sequence
+from typing import Any, NotRequired, TypedDict, cast
+from urllib.parse import parse_qsl
 
 from oauthlib.oauth1 import SIGNATURE_RSA
+from requests import PreparedRequest
 from requests_oauthlib import OAuth1
-from urllib.parse import parse_qsl
+
+from sentry.identity.services.identity.model import RpcIdentity
+from sentry.integrations.bitbucket_server.utils import BitbucketServerAPIPath
 from sentry.integrations.client import ApiClient
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.services.integration.model import RpcIntegration
+from sentry.integrations.source_code_management.repository import RepositoryClient
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.models.repository import Repository
 from sentry.shared_integrations.exceptions import ApiError
+from sentry.shared_integrations.response import MappingApiResponse
 
 logger = logging.getLogger("sentry.integrations.bitbucket_server")
 
 
-class BitbucketServerAPIPath:
-    """
-    project is the short key of the project
-    repo is the fully qualified slug
-    """
+class _ValuesResponse(TypedDict):
+    values: list[Mapping[str, object]]
+    isLastPage: NotRequired[bool]
+    nextPageStart: NotRequired[int]
 
-    repository = "/rest/api/1.0/projects/{project}/repos/{repo}"
-    repositories = "/rest/api/1.0/repos"
-    repository_hook = "/rest/api/1.0/projects/{project}/repos/{repo}/webhooks/{id}"
-    repository_hooks = "/rest/api/1.0/projects/{project}/repos/{repo}/webhooks"
-    repository_commits = "/rest/api/1.0/projects/{project}/repos/{repo}/commits"
-    commit_changes = "/rest/api/1.0/projects/{project}/repos/{repo}/commits/{commit}/changes"
+
+class BitbucketServerWebhookFields(TypedDict):
+    name: str
+    url: str
+    active: bool
+    events: list[str]
+    sslVerificationRequired: NotRequired[bool]
+
+
+class BitbucketServerWebhookData(BitbucketServerWebhookFields):
+    configuration: dict[str, Any]
+
+
+class BitbucketServerWebhookResponse(BitbucketServerWebhookFields):
+    id: int
+    configuration: NotRequired[dict[str, Any]]
 
 
 class BitbucketServerSetupClient(ApiClient):
@@ -33,13 +54,27 @@ class BitbucketServerSetupClient(ApiClient):
     authorize_url = "{}/plugins/servlet/oauth/authorize?oauth_token={}"
     integration_name = "bitbucket_server_setup"
 
-    def __init__(self, base_url, consumer_key, private_key, verify_ssl=True):
+    def __init__(
+        self,
+        base_url: str,
+        consumer_key: str,
+        private_key: str,
+        verify_ssl: bool = True,
+        *,
+        integration_id: int | None = None,
+        logging_context: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(
+            integration_id=integration_id,
+            verify_ssl=verify_ssl,
+            logging_context=logging_context,
+        )
         self.base_url = base_url
         self.consumer_key = consumer_key
         self.private_key = private_key
         self.verify_ssl = verify_ssl
 
-    def get_request_token(self):
+    def get_request_token(self) -> dict[str, str]:
         """
         Step 1 of the oauth flow.
         Get a request token that we can have the user verify.
@@ -48,14 +83,16 @@ class BitbucketServerSetupClient(ApiClient):
         resp = self.post(url, allow_text=True)
         return dict(parse_qsl(resp.text))
 
-    def get_authorize_url(self, request_token):
+    def get_authorize_url(self, request_token: Mapping[str, str]) -> str:
         """
         Step 2 of the oauth flow.
         Get a URL that the user can verify our request token at.
         """
         return self.authorize_url.format(self.base_url, request_token["oauth_token"])
 
-    def get_access_token(self, request_token, verifier):
+    def get_access_token(
+        self, request_token: Mapping[str, str], verifier: str | None
+    ) -> dict[str, str]:
         """
         Step 3 of the oauth flow.
         Use the verifier and request token from step 1 to get an access token.
@@ -70,12 +107,13 @@ class BitbucketServerSetupClient(ApiClient):
             rsa_key=self.private_key,
             signature_method=SIGNATURE_RSA,
             signature_type="auth_header",
+            decoding=None,
         )
         url = self.access_token_url.format(self.base_url)
         resp = self.post(url, auth=auth, allow_text=True)
         return dict(parse_qsl(resp.text))
 
-    def request(self, *args, **kwargs):
+    def request(self, *args: Any, **kwargs: Any) -> Any:
         """
         Add OAuth1 RSA signatures.
         """
@@ -85,11 +123,12 @@ class BitbucketServerSetupClient(ApiClient):
                 rsa_key=self.private_key,
                 signature_method=SIGNATURE_RSA,
                 signature_type="auth_header",
+                decoding=None,
             )
         return self._request(*args, **kwargs)
 
 
-class BitbucketServer(ApiClient):
+class BitbucketServerClient(ApiClient, RepositoryClient):
     """
     Contains the BitBucket Server specifics in order to communicate with bitbucket
 
@@ -98,50 +137,108 @@ class BitbucketServer(ApiClient):
     https://developer.atlassian.com/server/bitbucket/reference/rest-api/
     """
 
-    integration_name = "bitbucket_server"
+    integration_name = IntegrationProviderSlug.BITBUCKET_SERVER.value
 
-    def __init__(self, base_url, credentials, verify_ssl):
-        super().__init__(verify_ssl)
+    def __init__(
+        self,
+        integration: RpcIntegration | Integration,
+        identity: RpcIdentity,
+    ) -> None:
+        self.base_url = integration.metadata["base_url"]
+        self.identity = identity
 
-        self.base_url = base_url
-        self.credentials = credentials
+        super().__init__(
+            verify_ssl=integration.metadata["verify_ssl"],
+            integration_id=integration.id,
+            logging_context=None,
+        )
 
-    def get_repos(self):
-        return self.get(
+    def finalize_request(self, prepared_request: PreparedRequest) -> PreparedRequest:
+        return self.authorize_request(prepared_request=prepared_request)
+
+    def authorize_request(self, prepared_request: PreparedRequest) -> PreparedRequest:
+        """Bitbucket Server authorizes with RSA-signed OAuth1 scheme"""
+        if not self.identity:
+            return prepared_request
+        auth_scheme = OAuth1(
+            client_key=self.identity.data["consumer_key"],
+            rsa_key=self.identity.data["private_key"],
+            resource_owner_key=self.identity.data["access_token"],
+            resource_owner_secret=self.identity.data["access_token_secret"],
+            signature_method=SIGNATURE_RSA,
+            signature_type="auth_header",
+            decoding=None,
+        )
+        prepared_request.prepare_auth(auth=auth_scheme)
+        return prepared_request
+
+    def get_repos(self) -> MappingApiResponse:
+        return self.get_mapping(
             BitbucketServerAPIPath.repositories,
-            auth=self.get_auth(),
             params={"limit": 250, "permission": "REPO_ADMIN"},
         )
 
-    def search_repositories(self, query_string):
-        return self.get(
+    def search_repositories(self, query_string: str) -> MappingApiResponse:
+        return self.get_mapping(
             BitbucketServerAPIPath.repositories,
-            auth=self.get_auth(),
             params={"limit": 250, "permission": "REPO_ADMIN", "name": query_string},
         )
 
-    def get_repo(self, project, repo):
-        return self.get(
+    def get_repo(self, project: str, repo: str) -> dict[str, Any]:
+        return self.get_mapping(
             BitbucketServerAPIPath.repository.format(project=project, repo=repo),
-            auth=self.get_auth(),
         )
 
-    def create_hook(self, project, repo, data):
-        return self.post(
-            BitbucketServerAPIPath.repository_hooks.format(project=project, repo=repo),
-            auth=self.get_auth(),
-            data=data,
+    def create_hook(
+        self, project: str, repo: str, data: BitbucketServerWebhookData
+    ) -> BitbucketServerWebhookResponse:
+        return cast(
+            "BitbucketServerWebhookResponse",
+            self.post_mapping(
+                BitbucketServerAPIPath.repository_hooks.format(project=project, repo=repo),
+                data=data,
+            ),
         )
 
-    def delete_hook(self, project, repo, webhook_id):
-        return self.delete(
+    def get_hook(
+        self, project: str, repo: str, webhook_id: int | str
+    ) -> BitbucketServerWebhookResponse:
+        return cast(
+            "BitbucketServerWebhookResponse",
+            self.get_mapping(
+                BitbucketServerAPIPath.repository_hook.format(
+                    project=project, repo=repo, id=webhook_id
+                ),
+            ),
+        )
+
+    def update_hook(
+        self,
+        project: str,
+        repo: str,
+        webhook_id: int | str,
+        data: BitbucketServerWebhookData,
+    ) -> BitbucketServerWebhookResponse:
+        return cast(
+            "BitbucketServerWebhookResponse",
+            self.put_mapping(
+                BitbucketServerAPIPath.repository_hook.format(
+                    project=project, repo=repo, id=webhook_id
+                ),
+                data=data,
+            ),
+        )
+
+    def delete_hook(self, project: str, repo: str, webhook_id: int | str) -> None:
+        self.delete(
             BitbucketServerAPIPath.repository_hook.format(
                 project=project, repo=repo, id=webhook_id
             ),
-            auth=self.get_auth(),
         )
 
-    def get_commits(self, project, repo, from_hash, to_hash, limit=1000):
+    def get_commits(
+        self, project: str, repo: str, from_hash: str, to_hash: str, limit: int = 1000
+    ) -> Sequence[Mapping[str, object]]:
         logger.info(
             "load.commits",
             extra={
@@ -157,14 +254,21 @@ class BitbucketServer(ApiClient):
             {"limit": limit, "since": from_hash, "until": to_hash, "merges": "exclude"},
         )
 
-    def get_last_commits(self, project, repo, limit=10):
-        return self.get(
-            BitbucketServerAPIPath.repository_commits.format(project=project, repo=repo),
-            auth=self.get_auth(),
-            params={"merges": "exclude", "limit": limit},
-        )["values"]
+    def get_last_commits(
+        self, project: str, repo: str, limit: int = 10
+    ) -> Sequence[Mapping[str, object]]:
+        data = cast(
+            "_ValuesResponse",
+            self.get_mapping(
+                BitbucketServerAPIPath.repository_commits.format(project=project, repo=repo),
+                params={"merges": "exclude", "limit": limit},
+            ),
+        )
+        return data["values"]
 
-    def get_commit_filechanges(self, project, repo, commit, limit=1000):
+    def get_commit_filechanges(
+        self, project: str, repo: str, commit: str, limit: int = 1000
+    ) -> Sequence[Mapping[str, object]]:
         logger.info(
             "load.filechanges",
             extra={
@@ -179,18 +283,10 @@ class BitbucketServer(ApiClient):
             {"limit": limit},
         )
 
-    def get_auth(self):
-        return OAuth1(
-            client_key=self.credentials["consumer_key"],
-            rsa_key=self.credentials["private_key"],
-            resource_owner_key=self.credentials["access_token"],
-            resource_owner_secret=self.credentials["access_token_secret"],
-            signature_method=SIGNATURE_RSA,
-            signature_type="auth_header",
-        )
-
-    def _get_values(self, uri, params, max_pages=1000000):
-        values = []
+    def _get_values(
+        self, uri: str, params: Mapping[str, object], max_pages: int = 1000000
+    ) -> list[Mapping[str, object]]:
+        values: list[Mapping[str, object]] = []
         start = 0
 
         logger.info(
@@ -203,14 +299,14 @@ class BitbucketServer(ApiClient):
         )
 
         for i in range(max_pages):
-            new_params = dict.copy(params)
+            new_params = dict(params)
             new_params["start"] = start
             logger.debug(
                 "Loading values for paginated uri starting from %s",
                 start,
                 extra={"uri": uri, "params": new_params},
             )
-            data = self.get(uri, auth=self.get_auth(), params=new_params)
+            data = cast("_ValuesResponse", self.get_mapping(uri, params=new_params))
             logger.debug(
                 "%s values loaded", len(data["values"]), extra={"uri": uri, "params": new_params}
             )
@@ -223,7 +319,7 @@ class BitbucketServer(ApiClient):
             else:
                 start = data["nextPageStart"]
 
-        logger.warn(
+        logger.warning(
             "load.paginated_uri.max_pages",
             extra={
                 "bitbucket_uri": uri,
@@ -232,3 +328,27 @@ class BitbucketServer(ApiClient):
             },
         )
         return values
+
+    def check_file(self, repo: Repository, path: str, version: str | None) -> object | None:
+        return self.head_cached(
+            path=BitbucketServerAPIPath.build_source(
+                project=repo.config["project"],
+                repo=repo.config["repo"],
+                path=path,
+                sha=version,
+            ),
+        )
+
+    def get_file(
+        self, repo: Repository, path: str, ref: str | None, codeowners: bool = False
+    ) -> str:
+        response = self.get_cached(
+            path=BitbucketServerAPIPath.build_raw(
+                project=repo.config["project"],
+                repo=repo.config["repo"],
+                path=path,
+                sha=ref,
+            ),
+            raw_response=True,
+        )
+        return response.text

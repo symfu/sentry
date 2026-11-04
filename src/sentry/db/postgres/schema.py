@@ -1,0 +1,252 @@
+from collections.abc import Callable
+from types import TracebackType
+from typing import Any, Concatenate, ParamSpec, cast
+
+from django.contrib.postgres.constraints import ExclusionConstraint
+from django.db.backends.postgresql.schema import (
+    DatabaseSchemaEditor as PostgresDatabaseSchemaEditor,
+)
+from django.db.models import Field, Model
+from django.db.models.base import ModelBase
+from django.db.models.constraints import BaseConstraint
+from django_zero_downtime_migrations.backends.postgres.schema import (
+    DatabaseSchemaEditorMixin,
+    PGAccessExclusive,
+    Unsafe,
+    UnsafeOperationException,
+)
+
+unsafe_mapping = {
+    Unsafe.ADD_COLUMN_NOT_NULL: (
+        "Adding {}.{} as a not null column with no default is unsafe. Provide a default using db_default. \n"
+        "More info: https://develop.sentry.dev/api-server/application-domains/database-migrations/#adding-columns-with-a-default"
+    ),
+    Unsafe.ALTER_COLUMN_TYPE: (
+        "Altering the type of column {}.{} in this way is unsafe\n"
+        "More info here: https://develop.sentry.dev/database-migrations/#altering-column-types"
+    ),
+    # TODO: If we use > 3.0 we can add tests to verify this
+    Unsafe.ADD_CONSTRAINT_EXCLUDE: (
+        "Adding an exclusion constraint is unsafe\n"
+        "We don't use these at Sentry currently, bring this up in #discuss-backend"
+    ),
+    Unsafe.ALTER_TABLE_SET_TABLESPACE: (
+        "Changing the tablespace for a table is unsafe\n"
+        "There's probably no reason to do this via a migration. Bring this up in #discuss-backend"
+    ),
+    Unsafe.ALTER_TABLE_RENAME_COLUMN: (
+        "Renaming column {}.{} to {} is unsafe.\n"
+        "More info here: https://develop.sentry.dev/database-migrations/#renaming-columns"
+    ),
+}
+
+
+P = ParamSpec("P")
+
+
+def value_translator(value: object) -> object:
+    if isinstance(value, Field):
+        return value.name
+    if isinstance(value, ModelBase):
+        return value.__name__
+    return value
+
+
+def translate_unsafeoperation_exception(
+    func: Callable[Concatenate[Any, P], None],
+) -> Callable[Concatenate[Any, P], None]:
+    def inner(self: Any, *args: P.args, **kwargs: P.kwargs) -> None:
+        try:
+            func(self, *args, **kwargs)
+        except UnsafeOperationException as e:
+            exc_str = unsafe_mapping.get(str(e))
+            if exc_str is None:
+                raise
+
+            formatted_args = [value_translator(arg) for arg in args]
+
+            raise UnsafeOperationException(exc_str.format(*formatted_args))
+
+    return cast("Callable[Concatenate[Any, P], None]", inner)
+
+
+class MakeBtreeGistSchemaEditor(PostgresDatabaseSchemaEditor):
+    """workaround for https://code.djangoproject.com/ticket/36374"""
+
+    def create_model(self, model: type[Model]) -> None:
+        if any(isinstance(c, ExclusionConstraint) for c in model._meta.constraints):
+            self.execute("CREATE EXTENSION IF NOT EXISTS btree_gist;")
+        super().create_model(model)
+
+    def add_constraint(self, model: type[Model], constraint: BaseConstraint) -> None:
+        if isinstance(constraint, ExclusionConstraint):
+            self.execute("CREATE EXTENSION IF NOT EXISTS btree_gist;")
+        super().add_constraint(model, constraint)
+
+
+class SafePostgresDatabaseSchemaEditor(DatabaseSchemaEditorMixin, PostgresDatabaseSchemaEditor):
+    add_field = translate_unsafeoperation_exception(PostgresDatabaseSchemaEditor.add_field)
+    alter_db_tablespace = translate_unsafeoperation_exception(
+        PostgresDatabaseSchemaEditor.alter_db_tablespace
+    )
+
+    @translate_unsafeoperation_exception
+    def alter_field(
+        self,
+        model: type[Model],
+        old_field: Field[Any, Any],
+        new_field: Field[Any, Any],
+        strict: bool = False,
+    ) -> None:
+        self._check_alter_indexed_column_type(model, old_field, new_field)
+        PostgresDatabaseSchemaEditor.alter_field(self, model, old_field, new_field, strict)
+
+    def _check_alter_indexed_column_type(
+        self, model: type[Model], old_field: Field[Any, Any], new_field: Field[Any, Any]
+    ) -> None:
+        """
+        Block column type changes (including varchar length changes) when the column is
+        part of any index, unique constraint, or primary key. Postgres does not rewrite
+        the table when a varchar length is increased, but the column's statistics get
+        invalidated on every index referencing it. The planner can then fall back to
+        bad plans — e.g. scanning the primary key index — which has caused hard
+        production downtime for us.
+        """
+        old_type = old_field.db_parameters(connection=self.connection)["type"]
+        new_type = new_field.db_parameters(connection=self.connection)["type"]
+        if old_type is None or new_type is None or old_type == new_type:
+            return
+
+        column = old_field.column
+        with self.connection.cursor() as cursor:
+            constraints = self.connection.introspection.get_constraints(
+                cursor, model._meta.db_table
+            )
+        index_names = sorted(
+            name
+            for name, info in constraints.items()
+            if (info["index"] or info["unique"] or info["primary_key"])
+            and column in info["columns"]
+        )
+        if index_names:
+            raise UnsafeOperationException(
+                f"Altering the type of column {model.__name__}.{old_field.name} "
+                f"from `{old_type}` to `{new_type}` is unsafe because the column is "
+                f"part of the following index(es): {', '.join(index_names)}. "
+                f"Changing the column type invalidates Postgres' column statistics, "
+                f"which can cause the planner to pick bad plans and has resulted in hard downtime for us.\n"
+                f"More info: https://develop.sentry.dev/database-migrations/#altering-column-types"
+            )
+
+    # A column made NOT NULL by django-zero-downtime-migrations can still carry its
+    # `<table>_<column>_<hash>_notnull` CHECK constraint: older setups kept the CHECK instead of
+    # running SET NOT NULL, and an interrupted run leaves it behind. `DROP NOT NULL` doesn't
+    # touch that CHECK, so the column would stay NOT NULL in those databases while databases
+    # built from current migrations accept NULLs.
+    _sql_drop_not_null_check = PGAccessExclusive(
+        "ALTER TABLE %(table)s DROP CONSTRAINT IF EXISTS %(name)s"
+    )
+
+    def _alter_column_drop_not_null(
+        self, model: type[Model], new_field: Field[Any, Any]
+    ) -> tuple[str, list[Any]]:
+        self.deferred_sql.append(
+            self._sql_drop_not_null_check
+            % {
+                "table": self.quote_name(model._meta.db_table),
+                "name": self.quote_name(
+                    self._create_index_name(
+                        model._meta.db_table, [new_field.column], suffix="_notnull"
+                    )
+                ),
+            }
+        )
+        return super()._alter_column_drop_not_null(model, new_field)
+
+    def alter_db_table(self, model: type[Model], old_db_table: str, new_db_table: str) -> None:
+        """
+        This didn't work correctly in  django_zero_downtime_migrations, so implementing here. This
+        method is only used to modify table name, so we just need to raise.
+        """
+        raise UnsafeOperationException(
+            f"Renaming table for model {model.__name__} from {old_db_table} to {new_db_table} is unsafe.\n"
+            "More info here: https://develop.sentry.dev/database-migrations/#renaming-tables"
+        )
+
+    def delete_model(self, model: type[Model], is_safe: bool = False) -> None:
+        """
+        It's never safe to delete a model using the standard migration process
+        """
+        if not is_safe:
+            raise UnsafeOperationException(
+                f"Deleting the {model.__name__} model is unsafe.\n"
+                "More info here: https://develop.sentry.dev/database-migrations/#deleting-tables"
+            )
+        super(DatabaseSchemaEditorMixin, self).delete_model(model)
+
+    def remove_field(
+        self, model: type[Model], field: Field[Any, Any], is_safe: bool = False
+    ) -> None:
+        """
+        It's never safe to remove a field using the standard migration process
+        """
+        if not is_safe:
+            raise UnsafeOperationException(
+                f"Removing the {model.__name__}.{field.name} field is unsafe.\n"
+                "More info here: https://develop.sentry.dev/database-migrations/#deleting-columns"
+            )
+        super(DatabaseSchemaEditorMixin, self).remove_field(model, field)
+
+
+class DatabaseSchemaEditorProxy:
+    """
+    Wrapper that allows us to use either the `SafePostgresDatabaseSchemaEditor` or
+    `PostgresDatabaseSchemaEditor`. Can be configured by setting the `safe` property
+    before using to edit the schema. If already in use, attempts to modify `safe` will
+    fail.
+    """
+
+    class AlreadyInUse(Exception):
+        pass
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        self._safe = False
+        self._schema_editor: PostgresDatabaseSchemaEditor | None = None
+
+    @property
+    def safe(self) -> bool:
+        return self._safe
+
+    @safe.setter
+    def safe(self, safe: bool) -> None:
+        if self._schema_editor is not None:
+            raise self.AlreadyInUse("Schema editor already in use, can't set `safe`")
+
+        self._safe = safe
+
+    @property
+    def schema_editor(self) -> PostgresDatabaseSchemaEditor:
+        if self._schema_editor is None:
+            schema_editor_cls = (
+                SafePostgresDatabaseSchemaEditor if self.safe else MakeBtreeGistSchemaEditor
+            )
+            schema_editor = schema_editor_cls(*self.args, **self.kwargs)
+            schema_editor.__enter__()
+            self._schema_editor = schema_editor
+        return self._schema_editor
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.schema_editor, name)
+
+    def __enter__(self) -> "DatabaseSchemaEditorProxy":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.schema_editor.__exit__(exc_type, exc_val, exc_tb)

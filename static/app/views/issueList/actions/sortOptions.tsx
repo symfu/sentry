@@ -1,0 +1,97 @@
+import {IconSort} from '@sentry/icons/sort';
+
+import {CompactSelect} from '@sentry/scraps/compactSelect';
+import {
+  OverlayTrigger,
+  type OverlayTriggerButtonProps,
+} from '@sentry/scraps/overlayTrigger';
+
+import {t} from 'sentry/locale';
+import {
+  FOR_REVIEW_QUERIES,
+  getSortLabel,
+  IssueSortOptions,
+} from 'sentry/views/issueList/utils';
+
+type Props = {
+  onSelect: (sort: string) => void;
+  query: string;
+  sort: string;
+  className?: string;
+  showIcon?: boolean;
+  triggerSize?: OverlayTriggerButtonProps['size'];
+};
+
+function getSortTooltip(key: IssueSortOptions) {
+  switch (key) {
+    case IssueSortOptions.INBOX:
+      return t('When issue was flagged for review.');
+    case IssueSortOptions.NEW:
+      return t('First time the issue occurred.');
+    case IssueSortOptions.TRENDS:
+      return t('Recent issues trending upward.');
+    case IssueSortOptions.FREQ:
+      return t('Number of events.');
+    case IssueSortOptions.USER:
+      return t('Number of users affected.');
+    case IssueSortOptions.RECOMMENDED:
+    case IssueSortOptions.RECOMMENDED_V1:
+    case IssueSortOptions.RECOMMENDED_EXPERIMENTAL:
+      return t('Relevance and impact.');
+    case IssueSortOptions.PROGRESS:
+      return t('Progress toward a fix.');
+    case IssueSortOptions.DATE:
+    default:
+      return t('Last time the issue occurred.');
+  }
+}
+
+export function IssueListSortOptions({
+  className,
+  onSelect,
+  sort,
+  query,
+  triggerSize = 'xs',
+  showIcon = true,
+}: Props) {
+  // The explicit v1/v2 sort values are URL-only escape hatches for pinning one of
+  // the two recommended scorers; the dropdown just shows them as Recommended.
+  const isPinnedRecommended =
+    sort === IssueSortOptions.RECOMMENDED_V1 ||
+    sort === IssueSortOptions.RECOMMENDED_EXPERIMENTAL;
+  const sortKey = isPinnedRecommended
+    ? IssueSortOptions.RECOMMENDED
+    : sort || IssueSortOptions.DATE;
+  const sortKeys = [
+    IssueSortOptions.RECOMMENDED,
+    ...(FOR_REVIEW_QUERIES.includes(query || '') ? [IssueSortOptions.INBOX] : []),
+    IssueSortOptions.DATE,
+    IssueSortOptions.NEW,
+    IssueSortOptions.TRENDS,
+    IssueSortOptions.FREQ,
+    IssueSortOptions.USER,
+  ];
+
+  return (
+    <CompactSelect
+      className={className}
+      onChange={opt => onSelect(opt.value)}
+      options={sortKeys.map(key => ({
+        value: key,
+        label: getSortLabel(key),
+        details: getSortTooltip(key),
+      }))}
+      menuWidth={240}
+      value={sortKey}
+      trigger={triggerProps => (
+        <OverlayTrigger.Button
+          {...triggerProps}
+          size={triggerSize}
+          icon={showIcon && <IconSort />}
+        >
+          {triggerProps.children}
+        </OverlayTrigger.Button>
+      )}
+    />
+  );
+}

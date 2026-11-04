@@ -1,0 +1,79 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+
+import {renderHookWithProviders} from 'sentry-test/reactTestingLibrary';
+
+import {parseFunction} from 'sentry/utils/discover/fields';
+import {useSpanItemAttributes} from 'sentry/views/explore/hooks/useTraceItemAttributes';
+import {useVisualizeFields} from 'sentry/views/explore/hooks/useVisualizeFields';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+
+function useWrapper(yAxis: string) {
+  const {attributes: stringTags} = useSpanItemAttributes({}, 'string');
+  const {attributes: numberTags} = useSpanItemAttributes({}, 'number');
+  const {attributes: booleanTags} = useSpanItemAttributes({}, 'boolean');
+  return useVisualizeFields({
+    numberTags,
+    stringTags,
+    booleanTags,
+    parsedFunction: parseFunction(yAxis) ?? undefined,
+    traceItemType: TraceItemDataset.SPANS,
+  });
+}
+
+describe('useVisualizeFields', () => {
+  const organization = OrganizationFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      body: [],
+    });
+  });
+
+  it('returns numeric fields', () => {
+    const {result} = renderHookWithProviders(() => useWrapper('avg(score.ttfb)'), {
+      organization,
+    });
+
+    expect(result.current.map(field => field.value)).toEqual([
+      'ai.total_cost',
+      'gen_ai.cost.input_tokens',
+      'gen_ai.cost.output_tokens',
+      'gen_ai.cost.total_tokens',
+      'gen_ai.usage.input_tokens',
+      'gen_ai.usage.output_tokens',
+      'gen_ai.usage.total_tokens',
+      'span.duration',
+      'span.self_time',
+      'score.ttfb',
+    ]);
+  });
+
+  it('returns numeric fields for count', () => {
+    const {result} = renderHookWithProviders(() => useWrapper('count(span.duration)'), {
+      organization,
+    });
+
+    expect(result.current.map(field => field.value)).toEqual(['span.duration']);
+  });
+
+  it('returns string fields for count_unique', () => {
+    const {result} = renderHookWithProviders(() => useWrapper('count_unique(foobar)'), {
+      organization,
+    });
+
+    expect(result.current.map(field => field.value)).toEqual(
+      expect.arrayContaining([
+        'foobar',
+        'project',
+        'span.description',
+        'span.op',
+        'timestamp',
+        'trace',
+        'transaction',
+      ])
+    );
+  });
+});

@@ -1,155 +1,193 @@
+from typing import Any
+from unittest.mock import MagicMock, patch
+
 from botocore.exceptions import ClientError
-from django.http import HttpResponse
-from urllib.parse import urlencode
+from django.urls import reverse
 
-from sentry.api.serializers import serialize
-from sentry.integrations.aws_lambda import AwsLambdaIntegrationProvider
-from sentry.integrations.aws_lambda.utils import ALL_AWS_REGIONS
-from sentry.models import (
-    Integration,
-    OrganizationIntegration,
-    ProjectKey,
-)
-from sentry.testutils import IntegrationTestCase
-from sentry.utils.compat import map
-from sentry.utils.compat.mock import patch, ANY, MagicMock
-from sentry.testutils.helpers.faux import Mock
-from sentry.pipeline import PipelineView
-
-
-arn = (
-    "arn:aws:cloudformation:us-east-2:599817902985:stack/"
-    "Sentry-Monitoring-Stack/e42083d0-3e3f-11eb-b66a-0ac9b5db7f30"
-)
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.pipeline import IntegrationPipeline
+from sentry.models.projectkey import ProjectKey
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.silo import assume_test_silo_mode, control_silo_test
 
 account_number = "599817902985"
 region = "us-east-2"
+aws_external_id = "test-external-id-1234"
 
 
-class AwsLambdaIntegrationTest(IntegrationTestCase):
-    provider = AwsLambdaIntegrationProvider
+@control_silo_test
+class AwsLambdaApiPipelineTest(APITestCase):
+    endpoint = "sentry-api-0-organization-pipeline"
+    method = "post"
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
+        self.login_as(self.user)
         self.projectA = self.create_project(organization=self.organization, slug="projA")
         self.projectB = self.create_project(organization=self.organization, slug="projB")
 
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_project_select(self, mock_react_view):
-        resp = self.client.get(self.setup_path)
-        assert resp.status_code == 200
-        serialized_projects = map(lambda x: serialize(x, self.user), [self.projectA, self.projectB])
-        mock_react_view.assert_called_with(
-            ANY, "awsLambdaProjectSelect", {"projects": serialized_projects}
+    def _get_pipeline_url(self) -> str:
+        return reverse(
+            self.endpoint,
+            args=[self.organization.slug, IntegrationPipeline.pipeline_name],
         )
 
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_one_project(self, mock_react_view):
-        self.projectB.delete()
-        resp = self.client.get(self.setup_path)
-        assert resp.status_code == 200
-        mock_react_view.assert_called_with(ANY, "awsLambdaCloudformation", ANY)
-
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_render_cloudformation_view(self, mock_react_view):
-        self.pipeline.state.step_index = 1
-        resp = self.client.get(self.setup_path)
-        assert resp.status_code == 200
-        mock_react_view.assert_called_with(
-            ANY,
-            "awsLambdaCloudformation",
-            {
-                "baseCloudformationUrl": "https://console.aws.amazon.com/cloudformation/home#/stacks/create/review",
-                "templateUrl": "https://example.com/file.json",
-                "stackName": "Sentry-Monitoring-Stack",
-                "regionList": ALL_AWS_REGIONS,
-                "region": None,
-                "accountNumber": None,
-                "error": None,
-                "initialStepNumber": 1,
-                "organization": serialize(self.organization),
-                "awsExternalId": None,
-            },
+    def _initialize_pipeline(self) -> Any:
+        return self.client.post(
+            self._get_pipeline_url(),
+            data={"action": "initialize", "provider": "aws_lambda"},
+            format="json",
         )
 
-    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_set_valid_arn(self, mock_react_view, mock_gen_aws_client):
-        self.pipeline.state.step_index = 1
-        data = {"region": region, "accountNumber": account_number, "awsExternalId": "my-id"}
-        resp = self.client.get(self.setup_path + "?" + urlencode(data))
+    def _advance_step(self, data: dict[str, Any]) -> Any:
+        return self.client.post(self._get_pipeline_url(), data=data, format="json")
+
+    def _get_step_info(self) -> Any:
+        return self.client.get(self._get_pipeline_url())
+
+    def test_initialize_pipeline(self) -> None:
+        resp = self._initialize_pipeline()
         assert resp.status_code == 200
-        mock_react_view.assert_called_with(ANY, "awsLambdaFunctionSelect", ANY)
+        assert resp.data["step"] == "project_select"
+        assert resp.data["stepIndex"] == 0
+        assert resp.data["totalSteps"] == 3
+        assert resp.data["provider"] == "aws_lambda"
+
+    def test_project_select_step_data(self) -> None:
+        self._initialize_pipeline()
+        resp = self._get_step_info()
+        assert resp.status_code == 200
+        assert resp.data["step"] == "project_select"
+        assert resp.data["data"] == {}
+
+    def test_project_select_advance(self) -> None:
+        self._initialize_pipeline()
+        resp = self._advance_step({"projectId": self.projectA.id})
+        assert resp.status_code == 200
+        assert resp.data["status"] == "advance"
+        assert resp.data["step"] == "cloudformation"
+
+    def test_project_select_invalid_project(self) -> None:
+        self._initialize_pipeline()
+        resp = self._advance_step({"projectId": 99999})
+        assert resp.status_code == 400
+        assert resp.data["status"] == "error"
+
+    def test_project_select_missing_project_id(self) -> None:
+        self._initialize_pipeline()
+        resp = self._advance_step({})
+        assert resp.status_code == 400
 
     @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_set_arn_with_error(self, mock_react_view, mock_gen_aws_client):
-        self.pipeline.state.step_index = 1
-        mock_gen_aws_client.side_effect = ClientError({"Error": {}}, "assume_role")
-        data = {"region": region, "accountNumber": account_number, "awsExternalId": "my-id"}
-        resp = self.client.get(self.setup_path + "?" + urlencode(data))
+    def test_cloudformation_step_data(self, mock_gen_aws_client: MagicMock) -> None:
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        resp = self._get_step_info()
         assert resp.status_code == 200
-        mock_react_view.assert_called_with(
-            ANY,
-            "awsLambdaCloudformation",
+        assert resp.data["step"] == "cloudformation"
+        data = resp.data["data"]
+        assert "templateUrl" in data
+        assert "regionList" in data
+        assert data["stackName"] == "Sentry-Monitoring-Stack"
+
+    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
+    def test_cloudformation_advance(self, mock_gen_aws_client: MagicMock) -> None:
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        resp = self._advance_step(
             {
-                "baseCloudformationUrl": "https://console.aws.amazon.com/cloudformation/home#/stacks/create/review",
-                "templateUrl": "https://example.com/file.json",
-                "stackName": "Sentry-Monitoring-Stack",
-                "regionList": ALL_AWS_REGIONS,
-                "region": region,
                 "accountNumber": account_number,
-                "error": "Please validate the Cloudformation stack was created successfully",
-                "initialStepNumber": 1,
-                "organization": serialize(self.organization),
-                "awsExternalId": "my-id",
-            },
+                "region": region,
+                "awsExternalId": aws_external_id,
+            }
         )
+        assert resp.status_code == 200
+        assert resp.data["status"] == "advance"
+        assert resp.data["step"] == "instrumentation"
+
+    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
+    def test_cloudformation_invalid_region(self, mock_gen_aws_client: MagicMock) -> None:
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        resp = self._advance_step(
+            {
+                "accountNumber": account_number,
+                "region": "invalid-region",
+                "awsExternalId": aws_external_id,
+            }
+        )
+        assert resp.status_code == 400
+        assert "region" in resp.data
+
+    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
+    def test_cloudformation_invalid_account_number(self, mock_gen_aws_client: MagicMock) -> None:
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        resp = self._advance_step(
+            {
+                "accountNumber": "bad",
+                "region": region,
+                "awsExternalId": aws_external_id,
+            }
+        )
+        assert resp.status_code == 400
+        assert "accountNumber" in resp.data
+
+    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
+    def test_cloudformation_client_error(self, mock_gen_aws_client: MagicMock) -> None:
+        mock_gen_aws_client.side_effect = ClientError({"Error": {}}, "assume_role")
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        resp = self._advance_step(
+            {
+                "accountNumber": account_number,
+                "region": region,
+                "awsExternalId": aws_external_id,
+            }
+        )
+        assert resp.status_code == 400
+        assert resp.data["status"] == "error"
+        assert "Cloudformation" in resp.data["data"]["detail"]
 
     @patch("sentry.integrations.aws_lambda.integration.get_supported_functions")
     @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_lambda_list(self, mock_react_view, mock_gen_aws_client, mock_get_supported_functions):
+    def test_instrumentation_step_data(
+        self,
+        mock_gen_aws_client: MagicMock,
+        mock_get_supported_functions: MagicMock,
+    ) -> None:
         mock_get_supported_functions.return_value = [
-            {"FunctionName": "lambdaA", "Runtime": "nodejs12.x"},
-            {"FunctionName": "lambdaB", "Runtime": "nodejs10.x"},
-            {"FunctionName": "lambdaC", "Runtime": "python3.6"},
-            {"FunctionName": "lambdaD", "Runtime": "python3.7"},
-            {"FunctionName": "lambdaE", "Runtime": "python3.8"},
-            {"FunctionName": "lambdaD", "Runtime": "python3.9"},
+            {"FunctionName": "lambdaB", "Runtime": "nodejs12.x", "Description": "B func"},
+            {"FunctionName": "lambdaA", "Runtime": "python3.9", "Description": "A func"},
         ]
 
-        aws_external_id = "12-323"
-        self.pipeline.state.step_index = 2
-        self.pipeline.state.data = {
-            "region": region,
-            "accountNumber": account_number,
-            "aws_external_id": aws_external_id,
-            "project_id": self.projectA.id,
-        }
-        resp = self.client.get(self.setup_path)
-        assert resp.status_code == 200
-        mock_react_view.assert_called_with(
-            ANY,
-            "awsLambdaFunctionSelect",
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        self._advance_step(
             {
-                "lambdaFunctions": [
-                    {"FunctionName": "lambdaA", "Runtime": "nodejs12.x"},
-                    {"FunctionName": "lambdaB", "Runtime": "nodejs10.x"},
-                    {"FunctionName": "lambdaC", "Runtime": "python3.6"},
-                    {"FunctionName": "lambdaD", "Runtime": "python3.7"},
-                    {"FunctionName": "lambdaE", "Runtime": "python3.8"},
-                    {"FunctionName": "lambdaD", "Runtime": "python3.9"},
-                ],
-                "initialStepNumber": 3,
-            },
+                "accountNumber": account_number,
+                "region": region,
+                "awsExternalId": aws_external_id,
+            }
         )
+        resp = self._get_step_info()
+        assert resp.status_code == 200
+        assert resp.data["step"] == "instrumentation"
+        functions = resp.data["data"]["functions"]
+        assert len(functions) == 2
+        assert functions[0]["name"] == "lambdaA"
+        assert functions[1]["name"] == "lambdaB"
 
     @patch("sentry.integrations.aws_lambda.integration.get_supported_functions")
     @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    def test_lambda_setup_layer_success(self, mock_gen_aws_client, mock_get_supported_functions):
-        mock_client = Mock()
-        mock_gen_aws_client.return_value = mock_client
+    def test_full_api_pipeline_success(
+        self,
+        mock_gen_aws_client: MagicMock,
+        mock_get_supported_functions: MagicMock,
+    ) -> None:
+        mock_client = mock_gen_aws_client.return_value
         mock_client.update_function_configuration = MagicMock()
         mock_client.describe_account = MagicMock(return_value={"Account": {"Name": "my_name"}})
 
@@ -157,141 +195,55 @@ class AwsLambdaIntegrationTest(IntegrationTestCase):
             {
                 "FunctionName": "lambdaA",
                 "Runtime": "nodejs12.x",
-                "FunctionArn": "arn:aws:lambda:us-east-2:599817902985:function:lambdaA",
-            },
-            {
-                "FunctionName": "lambdaB",
-                "Runtime": "nodejs10.x",
-                "FunctionArn": "arn:aws:lambda:us-east-2:599817902985:function:lambdaB",
+                "FunctionArn": f"arn:aws:lambda:{region}:{account_number}:function:lambdaA",
             },
         ]
 
-        aws_external_id = "12-323"
-        self.pipeline.state.step_index = 2
-        self.pipeline.state.data = {
-            "region": region,
-            "account_number": account_number,
-            "aws_external_id": aws_external_id,
-            "project_id": self.projectA.id,
-        }
+        with assume_test_silo_mode(SiloMode.CELL):
+            project_key = ProjectKey.get_default(project=self.projectA)
+            assert project_key is not None
+            sentry_project_dsn = project_key.get_dsn(public=True)
 
-        sentry_project_dsn = ProjectKey.get_default(project=self.projectA).get_dsn(public=True)
-
-        # TODO: pass in lambdaA=false
-        # having issues with reading json data
-        # request.POST looks like {"lambdaB": "True"}
-        # string instead of boolean
-        resp = self.client.post(
-            self.setup_path,
-            data={"lambdaB": True},
-            format="json",
-            HTTP_ACCEPT="application/json",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-
-        assert resp.status_code == 200
-
-        mock_client.update_function_configuration.assert_called_once_with(
-            FunctionName="lambdaB",
-            Layers=["arn:aws:lambda:us-east-2:1234:layer:my-layer:3"],
-            Environment={
-                "Variables": {
-                    "NODE_OPTIONS": "-r @sentry/serverless/dist/awslambda-auto",
-                    "SENTRY_DSN": sentry_project_dsn,
-                    "SENTRY_TRACES_SAMPLE_RATE": "1.0",
-                }
-            },
-        )
-
-        integration = Integration.objects.get(provider=self.provider.key)
-        assert integration.name == "my_name us-east-2"
-        assert integration.external_id == "599817902985-us-east-2"
-        assert integration.metadata == {
-            "region": region,
-            "account_number": account_number,
-            "aws_external_id": aws_external_id,
-        }
-        assert OrganizationIntegration.objects.filter(
-            integration=integration, organization=self.organization
-        )
-
-    @patch("sentry.integrations.aws_lambda.integration.get_supported_functions")
-    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    def test_python_lambda_setup_layer_success(
-        self, mock_gen_aws_client, mock_get_supported_functions
-    ):
-        mock_client = Mock()
-        mock_gen_aws_client.return_value = mock_client
-        mock_client.update_function_configuration = MagicMock()
-        mock_client.describe_account = MagicMock(return_value={"Account": {"Name": "my_name"}})
-
-        mock_get_supported_functions.return_value = [
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        self._advance_step(
             {
-                "FunctionName": "lambdaA",
-                "Handler": "lambda_handler.test_handler",
-                "Runtime": "python3.6",
-                "FunctionArn": "arn:aws:lambda:us-east-2:599817902985:function:lambdaA",
+                "accountNumber": account_number,
+                "region": region,
+                "awsExternalId": aws_external_id,
             }
-        ]
-
-        aws_external_id = "12-323"
-        self.pipeline.state.step_index = 2
-        self.pipeline.state.data = {
-            "region": region,
-            "account_number": account_number,
-            "aws_external_id": aws_external_id,
-            "project_id": self.projectA.id,
-        }
-
-        sentry_project_dsn = ProjectKey.get_default(project=self.projectA).get_dsn(public=True)
-
-        resp = self.client.post(
-            self.setup_path,
-            data={"lambdaA": True},
-            format="json",
-            HTTP_ACCEPT="application/json",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
-
+        resp = self._advance_step({"enabledFunctions": ["lambdaA"]})
         assert resp.status_code == 200
+        assert resp.data["status"] == "complete"
 
-        mock_client.update_function_configuration.assert_called_once_with(
-            FunctionName="lambdaA",
-            Layers=["arn:aws:lambda:us-east-2:1234:layer:my-python-layer:34"],
-            Environment={
-                "Variables": {
-                    "SENTRY_INITIAL_HANDLER": "lambda_handler.test_handler",
-                    "SENTRY_DSN": sentry_project_dsn,
-                    "SENTRY_TRACES_SAMPLE_RATE": "1.0",
-                }
-            },
-            Handler="sentry_sdk.integrations.init_serverless_sdk.sentry_lambda_handler",
-        )
+        mock_client.update_function_configuration.assert_called_once()
+        call_kwargs = mock_client.update_function_configuration.call_args[1]
+        assert call_kwargs["FunctionName"] == "lambdaA"
+        assert call_kwargs["Environment"]["Variables"]["SENTRY_DSN"] == sentry_project_dsn
 
-        integration = Integration.objects.get(provider=self.provider.key)
-        assert integration.name == "my_name us-east-2"
-        assert integration.external_id == "599817902985-us-east-2"
-        assert integration.metadata == {
-            "region": region,
-            "account_number": account_number,
-            "aws_external_id": aws_external_id,
-        }
+        integration = Integration.objects.get(provider="aws_lambda")
+        assert integration.name == f"my_name {region}"
+        assert integration.external_id == f"{account_number}-{region}"
+        assert integration.metadata["account_number"] == account_number
+        assert integration.metadata["region"] == region
+        assert "aws_external_id" in integration.metadata
         assert OrganizationIntegration.objects.filter(
-            integration=integration, organization=self.organization
-        )
+            integration=integration, organization_id=self.organization.id
+        ).exists()
 
     @patch("sentry.integrations.aws_lambda.integration.get_supported_functions")
     @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_lambda_setup_layer_error(
-        self, mock_react_view, mock_gen_aws_client, mock_get_supported_functions
-    ):
+    def test_instrumentation_with_failures(
+        self,
+        mock_gen_aws_client: MagicMock,
+        mock_get_supported_functions: MagicMock,
+    ) -> None:
         class MockException(Exception):
             pass
 
         bad_layer = "arn:aws:lambda:us-east-2:546545:layer:another-layer:5"
-        mock_client = Mock()
-        mock_gen_aws_client.return_value = mock_client
+        mock_client = mock_gen_aws_client.return_value
         mock_client.update_function_configuration = MagicMock(
             side_effect=Exception(f"Layer version {bad_layer} does not exist")
         )
@@ -303,97 +255,33 @@ class AwsLambdaIntegrationTest(IntegrationTestCase):
             {
                 "FunctionName": "lambdaA",
                 "Runtime": "nodejs12.x",
-                "FunctionArn": "arn:aws:lambda:us-east-2:599817902985:function:lambdaA",
+                "FunctionArn": f"arn:aws:lambda:{region}:{account_number}:function:lambdaA",
             },
+        ]
+
+        self._initialize_pipeline()
+        self._advance_step({"projectId": self.projectA.id})
+        self._advance_step(
             {
-                "FunctionName": "lambdaB",
-                "Runtime": "nodejs10.x",
-                "FunctionArn": "arn:aws:lambda:us-east-2:599817902985:function:lambdaB",
-            },
-        ]
-
-        aws_external_id = "12-323"
-        self.pipeline.state.step_index = 2
-        self.pipeline.state.data = {
-            "region": region,
-            "account_number": account_number,
-            "aws_external_id": aws_external_id,
-            "project_id": self.projectA.id,
-        }
-
-        resp = self.client.post(
-            self.setup_path,
-            {"lambdaB": True},
-            format="json",
-            HTTP_ACCEPT="application/json",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+                "accountNumber": account_number,
+                "region": region,
+                "awsExternalId": aws_external_id,
+            }
         )
 
+        resp = self._advance_step({"enabledFunctions": ["lambdaA"]})
         assert resp.status_code == 200
-        assert not Integration.objects.filter(provider=self.provider.key).exists()
+        assert resp.data["status"] == "stay"
+        assert resp.data["data"]["successCount"] == 0
+        assert len(resp.data["data"]["failures"]) == 1
+        assert resp.data["data"]["failures"][0]["name"] == "lambdaA"
+        assert "another-layer" in resp.data["data"]["failures"][0]["error"]
 
-        failures = [{"name": "lambdaB", "error": "Invalid existing layer another-layer"}]
-
-        mock_react_view.assert_called_with(
-            ANY, "awsLambdaFailureDetails", {"lambdaFunctionFailures": failures, "successCount": 0}
-        )
-
-    @patch("sentry.integrations.aws_lambda.integration.get_supported_functions")
-    @patch("sentry.integrations.aws_lambda.integration.gen_aws_client")
-    @patch.object(PipelineView, "render_react_view", return_value=HttpResponse())
-    def test_lambda_setup_layer_missing_role_error(
-        self, mock_react_view, mock_gen_aws_client, mock_get_supported_functions
-    ):
-        class MockException(Exception):
-            pass
-
-        missing_role_err = (
-            "An error occurred (InvalidParameterValueException) when "
-            "calling the UpdateFunctionConfiguration operation: "
-            "The role defined for the function cannot be "
-            "assumed by Lambda."
-        )
-        mock_client = Mock()
-        mock_gen_aws_client.return_value = mock_client
-        mock_client.update_function_configuration = MagicMock(
-            side_effect=Exception(missing_role_err)
-        )
-        mock_client.describe_account = MagicMock(return_value={"Account": {"Name": "my_name"}})
-        mock_client.exceptions = MagicMock()
-        mock_client.exceptions.ResourceConflictException = MockException
-
-        mock_get_supported_functions.return_value = [
-            {
-                "FunctionName": "lambdaB",
-                "Runtime": "nodejs10.x",
-                "FunctionArn": "arn:aws:lambda:us-east-2:599817902985:function:lambdaB",
-            },
-        ]
-
-        aws_external_id = "12-323"
-        self.pipeline.state.step_index = 2
-        self.pipeline.state.data = {
-            "region": region,
-            "account_number": account_number,
-            "aws_external_id": aws_external_id,
-            "project_id": self.projectA.id,
-        }
-
-        resp = self.client.post(
-            self.setup_path,
-            {"lambdaB": True},
-            format="json",
-            HTTP_ACCEPT="application/json",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-
+        # User retries (or deselects failed functions), pipeline finishes
+        mock_client.update_function_configuration = MagicMock()
+        resp = self._advance_step({"enabledFunctions": ["lambdaA"]})
         assert resp.status_code == 200
-        assert not Integration.objects.filter(provider=self.provider.key).exists()
+        assert resp.data["status"] == "complete"
 
-        failures = [
-            {"name": "lambdaB", "error": "Invalid role associated with the lambda function"}
-        ]
-
-        mock_react_view.assert_called_with(
-            ANY, "awsLambdaFailureDetails", {"lambdaFunctionFailures": failures, "successCount": 0}
-        )
+        integration = Integration.objects.get(provider="aws_lambda")
+        assert integration.external_id == f"{account_number}-{region}"

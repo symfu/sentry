@@ -1,0 +1,326 @@
+import {BroadcastFixture} from 'sentry-fixture/broadcast';
+import {GroupSearchViewFixture} from 'sentry-fixture/groupSearchView';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {UserFixture} from 'sentry-fixture/user';
+
+import {
+  render,
+  renderGlobalModal,
+  screen,
+  userEvent,
+  within,
+  type RouterConfig,
+} from 'sentry-test/reactTestingLibrary';
+import {mockMatchMedia} from 'sentry-test/utils';
+
+import {ConfigStore} from 'sentry/stores/configStore';
+import {Navigation} from 'sentry/views/navigation';
+import {PrimaryNavigationContextProvider} from 'sentry/views/navigation/primaryNavigationContext';
+
+const ALL_AVAILABLE_FEATURES = [
+  'insight-modules',
+  'discover',
+  'discover-basic',
+  'discover-query',
+  'dashboards-basic',
+  'dashboards-edit',
+  'session-replay-ui',
+  'ourlogs-enabled',
+  'performance-view',
+  'profiling',
+  'visibility-explore-view',
+];
+
+function navigationContext({
+  organization,
+  initialRouterConfig,
+}: {
+  initialRouterConfig?: RouterConfig;
+  organization?: Parameters<typeof OrganizationFixture>[0];
+} = {}) {
+  return {
+    organization: OrganizationFixture({
+      features: ALL_AVAILABLE_FEATURES,
+      ...organization,
+    }),
+    initialRouterConfig: {
+      location: {pathname: '/organizations/org-slug/issues/'},
+      ...initialRouterConfig,
+    },
+  };
+}
+
+function setupMocks() {
+  localStorage.clear();
+  sessionStorage.clear();
+  MockApiClient.clearMockResponses();
+
+  // MobileNavigation requires a #main element to manage inert/overflow attributes
+  const mainEl = document.createElement('div');
+  mainEl.id = 'main';
+  document.body.appendChild(mainEl);
+
+  ConfigStore.set('user', UserFixture());
+  ConfigStore.set('customerDomain', null);
+
+  MockApiClient.addMockResponse({
+    url: '/organizations/org-slug/broadcasts/',
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: '/assistant/',
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: '/organizations/org-slug/group-search-views/starred/',
+    body: [GroupSearchViewFixture({name: 'Starred View 1'})],
+  });
+  MockApiClient.addMockResponse({
+    url: '/organizations/org-slug/issues-count/',
+    body: {},
+  });
+  MockApiClient.addMockResponse({
+    url: '/organizations/org-slug/explore/all-queries/',
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: '/organizations/org-slug/dashboards/',
+    body: [],
+  });
+
+  // Simulate a mobile viewport — matchMedia returns true for the mobile breakpoint query
+  mockMatchMedia(true);
+}
+
+describe('mobile navigation', () => {
+  beforeEach(setupMocks);
+
+  afterEach(() => {
+    document.getElementById('main')?.remove();
+  });
+
+  describe('settings v3', () => {
+    const settingsV3 = {features: [...ALL_AVAILABLE_FEATURES, 'settings-v3']};
+
+    it('uses the settings scope rail', async () => {
+      const {router} = render(
+        <PrimaryNavigationContextProvider>
+          <Navigation />
+        </PrimaryNavigationContextProvider>,
+        navigationContext({
+          organization: settingsV3,
+          initialRouterConfig: {location: {pathname: '/settings/org-slug/'}},
+        })
+      );
+
+      await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+      expect(screen.getByRole('link', {name: 'Org'})).toHaveAttribute(
+        'aria-current',
+        'location'
+      );
+      expect(screen.queryByRole('link', {name: 'Issues'})).not.toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('link', {name: 'Account'}));
+      expect(router.location.pathname).toBe('/settings/account/');
+      expect(screen.getByRole('link', {name: 'Account'})).toHaveAttribute(
+        'aria-current',
+        'location'
+      );
+      expect(screen.getByRole('link', {name: 'General'})).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('button', {name: 'Collapse'}));
+      expect(
+        screen.queryByRole('navigation', {name: 'Primary Navigation'})
+      ).not.toBeInTheDocument();
+    });
+
+    it('returns to the page settings was entered from through the menu', async () => {
+      const {router} = render(
+        <PrimaryNavigationContextProvider>
+          <Navigation />
+        </PrimaryNavigationContextProvider>,
+        navigationContext({organization: settingsV3})
+      );
+
+      await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+      await userEvent.click(screen.getByRole('link', {name: 'Explore'}));
+      await userEvent.click(
+        screen.getByRole('button', {name: 'Toggle organization menu'})
+      );
+      await userEvent.click(await screen.findByRole('menuitemradio', {name: 'Settings'}));
+      // The Explore tap above must not leave its secondary navigation behind
+      expect(screen.getByText('Org Settings')).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('button', {name: 'Back to app'}));
+      expect(router.location.pathname).toMatch(/^\/organizations\/org-slug\/explore\//);
+      expect(screen.queryByText('Org Settings')).not.toBeInTheDocument();
+    });
+  });
+
+  it('navigates account settings without an organization', async () => {
+    document.getElementById('main')?.remove();
+
+    const {router} = render(
+      <PrimaryNavigationContextProvider>
+        <Navigation />
+      </PrimaryNavigationContextProvider>,
+      {
+        organization: null,
+        initialRouterConfig: {location: {pathname: '/settings/account/details/'}},
+      }
+    );
+
+    expect(
+      screen.queryByRole('button', {name: 'Command Palette'})
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+
+    const secondaryNav = screen.getByRole('navigation', {name: 'Secondary Navigation'});
+    expect(within(secondaryNav).getAllByRole('link')).toHaveLength(10);
+    await userEvent.click(within(secondaryNav).getByRole('link', {name: 'Security'}));
+    expect(router.location.pathname).toBe('/settings/account/security/');
+
+    await userEvent.click(screen.getByRole('button', {name: 'Close main menu'}));
+    expect(
+      screen.queryByRole('navigation', {name: 'Secondary Navigation'})
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+    await userEvent.click(screen.getByRole('link', {name: 'Email Addresses'}));
+    expect(router.location.pathname).toBe('/settings/account/emails/');
+  });
+
+  describe('accessibility', () => {
+    it('does not render a skip link', () => {
+      render(
+        <PrimaryNavigationContextProvider>
+          <Navigation />
+        </PrimaryNavigationContextProvider>,
+        navigationContext()
+      );
+      expect(
+        screen.queryByRole('link', {name: 'Skip to main content'})
+      ).not.toBeInTheDocument();
+    });
+
+    it('primary navigation marks exactly one link as active for the current route', async () => {
+      render(
+        <PrimaryNavigationContextProvider>
+          <Navigation />
+        </PrimaryNavigationContextProvider>,
+        navigationContext()
+      );
+
+      await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+
+      const primaryNav = screen.getByRole('navigation', {name: 'Primary Navigation'});
+      const links = within(primaryNav).getAllByRole('link');
+      const activeLinks = links.filter(
+        l => l.getAttribute('aria-current') === 'location'
+      );
+
+      expect(activeLinks).toHaveLength(1);
+      links.forEach(link => {
+        expect(link).not.toHaveAttribute('aria-selected');
+      });
+    });
+
+    it('secondary navigation marks exactly one link as active for the current route', async () => {
+      render(
+        <PrimaryNavigationContextProvider>
+          <Navigation />
+        </PrimaryNavigationContextProvider>,
+        navigationContext()
+      );
+
+      await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+
+      const secondaryNav = screen.getByRole('navigation', {name: 'Secondary Navigation'});
+      await within(secondaryNav).findByRole('link', {name: /Starred View 1/});
+
+      const links = within(secondaryNav).getAllByRole('link');
+      const activeLinks = links.filter(l => l.getAttribute('aria-current') === 'page');
+
+      expect(activeLinks).toHaveLength(1);
+      links.forEach(link => {
+        expect(link).not.toHaveAttribute('aria-selected');
+      });
+    });
+  });
+
+  it('keeps nav open when interacting with org dropdown overlay', async () => {
+    const pageFrameContext = navigationContext({
+      organization: {features: ALL_AVAILABLE_FEATURES},
+    });
+
+    render(
+      <PrimaryNavigationContextProvider>
+        <Navigation />
+      </PrimaryNavigationContextProvider>,
+      pageFrameContext
+    );
+
+    await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+    expect(
+      screen.getByRole('navigation', {name: 'Primary Navigation'})
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', {name: 'Toggle organization menu'}));
+
+    // The org dropdown menu is portaled to document.body, so clicking it
+    // triggers click-outside on the nav panel. The nav should stay open.
+    await userEvent.click(
+      await screen.findByRole('menuitemradio', {name: 'Organization Settings'})
+    );
+
+    expect(
+      screen.getByRole('navigation', {name: 'Primary Navigation'})
+    ).toBeInTheDocument();
+  });
+
+  it("moves the Command Palette into the mobile row and What's New into the Help menu", async () => {
+    const context = navigationContext();
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/broadcasts/',
+      body: [BroadcastFixture({title: 'Mobile Broadcast', hasSeen: true})],
+    });
+
+    render(
+      <PrimaryNavigationContextProvider>
+        <Navigation />
+      </PrimaryNavigationContextProvider>,
+      context
+    );
+    renderGlobalModal({organization: context.organization});
+
+    const mobileHeader = within(screen.getByRole('banner'));
+    expect(
+      mobileHeader.getByRole('button', {name: 'Command Palette'})
+    ).toBeInTheDocument();
+    expect(mobileHeader.getByRole('button', {name: 'Help'})).toBeInTheDocument();
+    expect(screen.queryByRole('button', {name: "What's New"})).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', {name: 'Help'}));
+    await userEvent.click(screen.getByRole('menuitemradio', {name: "What's New"}));
+
+    expect(await screen.findByText('Mobile Broadcast')).toBeInTheDocument();
+  });
+
+  describe('secondary nav route inference', () => {
+    it('opens secondary navigation by default when on a sub-view', async () => {
+      render(
+        <PrimaryNavigationContextProvider>
+          <Navigation />
+        </PrimaryNavigationContextProvider>,
+        navigationContext()
+      );
+
+      await userEvent.click(screen.getByRole('button', {name: 'Open main menu'}));
+
+      expect(
+        screen.getByRole('navigation', {name: 'Secondary Navigation'})
+      ).toBeInTheDocument();
+    });
+  });
+});

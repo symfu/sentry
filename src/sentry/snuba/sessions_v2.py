@@ -1,12 +1,25 @@
-from datetime import datetime, timedelta
-import itertools
-import math
-import pytz
+from __future__ import annotations
 
-from sentry.api.event_search import get_filter
+import logging
+import math
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Protocol, cast
+
+from django.http import QueryDict
+from snuba_sdk import BooleanCondition, Column, Condition, Function
+
 from sentry.api.utils import get_date_range_from_params
-from sentry.utils.dates import parse_stats_period, to_timestamp, to_datetime
-from sentry.utils.snuba import Dataset, raw_query, resolve_condition
+from sentry.exceptions import InvalidParams
+from sentry.release_health.base import AllowedResolution
+from sentry.search.events.builder.sessions import SessionsV2QueryBuilder
+from sentry.search.events.types import QueryBuilderConfig
+from sentry.snuba.dataset import Dataset
+from sentry.snuba.metrics.utils import to_intervals
+from sentry.utils.dates import parse_stats_period
+
+logger = logging.getLogger(__name__)
+
 
 """
 The new Sessions API defines a "metrics"-like interface which is can be used in
@@ -78,63 +91,112 @@ Is then "exploded" into something like:
 """
 
 
+class _Field(Protocol):
+    def extract_from_row(
+        self, row: Mapping[str, Any] | None, group: Mapping[str, str]
+    ) -> float | None: ...
+    def get_snuba_columns(self, raw_groupby: Sequence[str]) -> list[str]: ...
+
+
+def _number(row: Mapping[str, object], key: str) -> float:
+    return cast(float, row[key])
+
+
 class SessionsField:
-    def get_snuba_columns(self, raw_groupby):
+    def get_snuba_columns(self, raw_groupby: Sequence[str]) -> list[str]:
         if "session.status" in raw_groupby:
-            return ["sessions", "sessions_abnormal", "sessions_crashed", "sessions_errored"]
+            return [
+                "sessions",
+                "sessions_abnormal",
+                "sessions_crashed",
+                "sessions_errored",
+                "sessions_unhandled",
+            ]
         return ["sessions"]
 
-    def extract_from_row(self, row, group):
+    def extract_from_row(
+        self, row: Mapping[str, Any] | None, group: Mapping[str, str]
+    ) -> float | None:
         if row is None:
             return 0
         status = group.get("session.status")
         if status is None:
-            return row["sessions"]
+            return _number(row, "sessions")
         if status == "healthy":
-            return row["sessions"] - row["sessions_errored"]
+            healthy_sessions = (
+                _number(row, "sessions")
+                - _number(row, "sessions_errored")
+                - _number(row, "sessions_unhandled")
+            )
+            return max(healthy_sessions, 0)
         if status == "abnormal":
-            return row["sessions_abnormal"]
+            return _number(row, "sessions_abnormal")
+        if status == "unhandled":
+            return _number(row, "sessions_unhandled")
         if status == "crashed":
-            return row["sessions_crashed"]
+            return _number(row, "sessions_crashed")
         if status == "errored":
-            return row["sessions_errored"]
+            errored_sessions = (
+                _number(row, "sessions_errored")
+                - _number(row, "sessions_unhandled")
+                - _number(row, "sessions_crashed")
+                - _number(row, "sessions_abnormal")
+            )
+            return max(errored_sessions, 0)
         return 0
 
 
 class UsersField:
-    def get_snuba_columns(self, raw_groupby):
+    def get_snuba_columns(self, raw_groupby: Sequence[str]) -> list[str]:
         if "session.status" in raw_groupby:
-            return ["users", "users_abnormal", "users_crashed", "users_errored"]
+            return ["users", "users_abnormal", "users_crashed", "users_errored", "users_unhandled"]
         return ["users"]
 
-    def extract_from_row(self, row, group):
+    def extract_from_row(
+        self, row: Mapping[str, Any] | None, group: Mapping[str, str]
+    ) -> float | None:
         if row is None:
             return 0
         status = group.get("session.status")
         if status is None:
-            return row["users"]
+            return _number(row, "users")
         if status == "healthy":
-            return row["users"] - row["users_errored"]
+            healthy_users = (
+                _number(row, "users")
+                - _number(row, "users_errored")
+                - _number(row, "users_unhandled")
+            )
+            return max(healthy_users, 0)
         if status == "abnormal":
-            return row["users_abnormal"]
+            return _number(row, "users_abnormal")
+        if status == "unhandled":
+            return _number(row, "users_unhandled")
         if status == "crashed":
-            return row["users_crashed"]
+            return _number(row, "users_crashed")
         if status == "errored":
-            return row["users_errored"]
+            errored_users = (
+                _number(row, "users_errored")
+                - _number(row, "users_crashed")
+                - _number(row, "users_abnormal")
+                - _number(row, "users_unhandled")
+            )
+            return max(errored_users, 0)
         return 0
 
 
-def finite_or_none(val):
-    if not math.isfinite(val):
+def finite_or_none(val: float | None) -> float | None:
+    if isinstance(val, (int, float)) and not math.isfinite(val):
         return None
     return val
 
 
 class DurationAverageField:
-    def get_snuba_columns(self, raw_groupby):
+    def get_snuba_columns(self, raw_groupby: Sequence[str]) -> list[str]:
         return ["duration_avg"]
 
-    def extract_from_row(self, row, group):
+    def extract_from_row(
+        self, row: Mapping[str, Any] | None, group: Mapping[str, str]
+    ) -> float | None:
         if row is None:
             return None
         status = group.get("session.status")
@@ -144,13 +206,15 @@ class DurationAverageField:
 
 
 class DurationQuantileField:
-    def __init__(self, quantile_index):
+    def __init__(self, quantile_index: int) -> None:
         self.quantile_index = quantile_index
 
-    def get_snuba_columns(self, raw_groupby):
+    def get_snuba_columns(self, raw_groupby: Sequence[str]) -> list[str]:
         return ["duration_quantiles"]
 
-    def extract_from_row(self, row, group):
+    def extract_from_row(
+        self, row: Mapping[str, Any] | None, group: Mapping[str, str]
+    ) -> float | None:
         if row is None:
             return None
         status = group.get("session.status")
@@ -159,7 +223,7 @@ class DurationQuantileField:
         return None
 
 
-COLUMN_MAP = {
+COLUMN_MAP: dict[str, _Field] = {
     "sum(session)": SessionsField(),
     "count_unique(user)": UsersField(),
     "avg(session.duration)": DurationAverageField(),
@@ -172,51 +236,56 @@ COLUMN_MAP = {
 }
 
 
+class _GroupBy(Protocol):
+    def get_snuba_columns(self) -> list[str]: ...
+    def get_snuba_groupby(self) -> list[str]: ...
+    def get_keys_for_row(self, row: Mapping[str, Any]) -> list[tuple[str, str]]: ...
+
+
 class SimpleGroupBy:
-    def __init__(self, row_name, name=None):
+    def __init__(self, row_name: str, name: str | None = None):
         self.row_name = row_name
         self.name = name or row_name
 
-    def get_snuba_columns(self):
+    def get_snuba_columns(self) -> list[str]:
         return [self.row_name]
 
-    def get_snuba_groupby(self):
+    def get_snuba_groupby(self) -> list[str]:
         return [self.row_name]
 
-    def get_keys_for_row(self, row):
-        return [(self.name, row[self.row_name])]
+    def get_keys_for_row(self, row: Mapping[str, Any]) -> list[tuple[str, str]]:
+        return [(self.name, cast("str", row[self.row_name]))]
 
 
 class SessionStatusGroupBy:
-    def get_snuba_columns(self):
+    def get_snuba_columns(self) -> list[str]:
         return []
 
-    def get_snuba_groupby(self):
+    def get_snuba_groupby(self) -> list[str]:
         return []
 
-    def get_keys_for_row(self, row):
-        return [("session.status", key) for key in ["healthy", "abnormal", "crashed", "errored"]]
+    def get_keys_for_row(self, row: Mapping[str, Any]) -> list[tuple[str, str]]:
+        return [
+            ("session.status", key)
+            for key in ["healthy", "abnormal", "crashed", "errored", "unhandled"]
+        ]
 
 
 # NOTE: in the future we might add new `user_agent` and `os` fields
 
-GROUPBY_MAP = {
+GROUPBY_MAP: dict[str, _GroupBy] = {
     "project": SimpleGroupBy("project_id", "project"),
     "environment": SimpleGroupBy("environment"),
     "release": SimpleGroupBy("release"),
     "session.status": SessionStatusGroupBy(),
 }
 
-CONDITION_COLUMNS = ["project", "environment", "release"]
-
-
-def resolve_column(col):
-    if col in CONDITION_COLUMNS:
-        return col
-    raise InvalidField(f'Invalid query field: "{col}"')
-
 
 class InvalidField(Exception):
+    pass
+
+
+class ZeroIntervalsException(Exception):
     pass
 
 
@@ -227,35 +296,64 @@ class QueryDefinition:
     `fields` and `groupby` definitions as [`ColumnDefinition`] objects.
     """
 
-    # XXX: Do *not* enable `allow_minute_resolution` yet outside of unit tests!
-    def __init__(self, query, params, allow_minute_resolution=False):
+    def __init__(
+        self,
+        query: QueryDict,
+        params: Mapping[str, Any],
+        limit: int | None = 0,
+        offset: int | None = 0,
+    ) -> None:
         self.query = query.get("query", "")
-        raw_fields = query.getlist("field", [])
-        raw_groupby = query.getlist("groupBy", [])
+        self.raw_fields = raw_fields = query.getlist("field", [])
+        self.raw_groupby = raw_groupby = query.getlist("groupBy", [])
+        self.raw_orderby = query.getlist("orderBy")  # only respected by metrics implementation
+        self.limit = limit
+        self.offset = offset
 
         if len(raw_fields) == 0:
             raise InvalidField('Request is missing a "field"')
 
-        self.fields = {}
+        self.fields: dict[str, _Field] = {}
         for key in raw_fields:
             if key not in COLUMN_MAP:
+                from sentry.release_health.metrics_sessions_v2 import FIELD_MAP
+
+                if key in FIELD_MAP:
+                    # HACK : Do not raise an error for metrics-only fields,
+                    # Simply ignore them instead.
+                    #
+                    # It is important to note that this ignore can lead to the
+                    # self.primary_column not being initialized.
+                    continue
+
                 raise InvalidField(f'Invalid field: "{key}"')
+
             self.fields[key] = COLUMN_MAP[key]
 
-        self.groupby = []
+        self.groupby: list[_GroupBy] = []
         for key in raw_groupby:
             if key not in GROUPBY_MAP:
                 raise InvalidField(f'Invalid groupBy: "{key}"')
+
             self.groupby.append(GROUPBY_MAP[key])
 
-        start, end, rollup = _get_constrained_date_range(query, allow_minute_resolution)
+        start, end, rollup = get_constrained_date_range(
+            query,
+            allowed_resolution=AllowedResolution.ten_seconds,
+        )
         self.rollup = rollup
         self.start = start
         self.end = end
 
+        self.params = params
+
         query_columns = set()
-        for field in self.fields.values():
-            query_columns.update(field.get_snuba_columns(raw_groupby))
+        for i, (field_name, field) in enumerate(self.fields.items()):
+            columns = field.get_snuba_columns(raw_groupby)
+            if i == 0 or field_name == "sum(session)":  # Prefer first, but sum(session) always wins
+                self.primary_column = columns[0]  # Will be used in order by
+            query_columns.update(columns)
+
         for groupby in self.groupby:
             query_columns.update(groupby.get_snuba_columns())
         self.query_columns = list(query_columns)
@@ -265,37 +363,101 @@ class QueryDefinition:
             query_groupby.update(groupby.get_snuba_groupby())
         self.query_groupby = list(query_groupby)
 
-        # the `params` are:
-        # project_id, organization_id, environment;
-        # also: start, end; but we got those ourselves.
-        snuba_filter = get_filter(self.query, params)
+    def to_query_builder_dict(self, orderby: list[str] | None = None) -> dict[str, Any]:
+        num_intervals = len(get_timestamps(self))
+        if num_intervals == 0:
+            raise ZeroIntervalsException
 
-        # this makes sure that literals in complex queries are properly quoted,
-        # and unknown fields are raised as errors
-        conditions = [resolve_condition(c, resolve_column) for c in snuba_filter.conditions]
+        max_groups = SNUBA_LIMIT // num_intervals
 
-        self.aggregations = snuba_filter.aggregations
-        self.conditions = conditions
-        self.filter_keys = snuba_filter.filter_keys
+        query_builder_dict = {
+            "dataset": Dataset.Sessions,
+            "params": {
+                **self.params,
+                "start": self.start,
+                "end": self.end,
+            },
+            "selected_columns": self.query_columns,
+            "groupby_columns": self.query_groupby,
+            "query": self.query,
+            "orderby": orderby,
+            "limit": max_groups,
+            "granularity": self.rollup,
+            "config": QueryBuilderConfig(auto_aggregations=True),
+            "extra_filter_allowlist_fields": ["session.status"],
+        }
+        return query_builder_dict
+
+    def get_filter_conditions(self) -> list[Any]:
+        """
+        Returns filter conditions for the query to be used for metrics queries, and hence excluding timestamp and
+        organization id condition that are later added by the metrics layer.
+        """
+        conditions = SessionsV2QueryBuilder(**self.to_query_builder_dict()).where
+        filter_conditions = []
+        for condition in conditions:
+            self._check_supported_condition(condition)
+
+            # Exclude sessions "started" timestamp condition and org_id condition, as it is not needed for metrics
+            # queries.
+            if (
+                isinstance(condition, Condition)
+                and isinstance(condition.lhs, Column)
+                and condition.lhs.name in ["started", "org_id"]
+            ):
+                continue
+            filter_conditions.append(condition)
+
+        return filter_conditions
+
+    @classmethod
+    def _check_supported_condition(cls, condition: Any) -> None:
+        if isinstance(condition, BooleanCondition):
+            for nested_condition in condition.conditions:
+                cls._check_supported_condition(nested_condition)
+        elif isinstance(condition, Condition):
+            if isinstance(condition.lhs, Function):
+                # Since we moved to metrics backed sessions, we don't allow wildcard search anymore. The reason for this
+                # is that we don't store tag values as strings in the database, this makes wildcard match on the
+                # db impossible. The solution would be to lift it out at the application level, but it will impact
+                # performance.
+                if condition.lhs.function == "match":
+                    raise InvalidField("Invalid condition: wildcard search is not supported")
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({repr(self.__dict__)})"
 
 
-MAX_POINTS = 1000
+MAX_POINTS = 1000  # max. points in time
 ONE_DAY = timedelta(days=1).total_seconds()
 ONE_HOUR = timedelta(hours=1).total_seconds()
 ONE_MINUTE = timedelta(minutes=1).total_seconds()
 
+#: We know that a limit of 1000 is too low for some UI use cases, e.g.
+#: https://sentry.io/organizations/sentry/projects/sentry/?project=1&statsPeriod=14d
+#: (2 * 14d * 24h * 4 statuses = 2688 groups).
+#: At the same time, there is no justification from UI perspective to increase
+#: the limit to the absolute maximum of 10000 (see https://github.com/getsentry/snuba/blob/69862db3ad224b48810ac1bb3001e4c446bf0aff/snuba/query/snql/parser.py#L908-L909).
+#: -> Let's go with 5000, so we can still serve the 50 releases over 90d that are used here:
+#: https://github.com/getsentry/sentry/blob/d6ed7c12844b70edb6a93b4f33d3e60e8516105a/static/app/views/releases/list/releasesAdoptionChart.tsx#L91-L96
+SNUBA_LIMIT = 5000
 
-class InvalidParams(Exception):
-    pass
+
+def get_now() -> datetime:
+    """Wrapper function to make it mockable in unit tests"""
+    return datetime.now(tz=timezone.utc)
 
 
-def _get_constrained_date_range(params, allow_minute_resolution=False):
-    interval = parse_stats_period(params.get("interval", "1h"))
-    interval = int(3600 if interval is None else interval.total_seconds())
+def get_constrained_date_range(
+    params: Mapping[str, Any],
+    allowed_resolution: AllowedResolution = AllowedResolution.one_hour,
+    max_points: int = MAX_POINTS,
+) -> tuple[datetime, datetime, int]:
+    interval_td = parse_stats_period(params.get("interval", "1h"))
+    interval = int(3600 if interval_td is None else interval_td.total_seconds())
 
-    smallest_interval = ONE_MINUTE if allow_minute_resolution else ONE_HOUR
+    smallest_interval, interval_str = allowed_resolution.value
     if interval % smallest_interval != 0 or interval < smallest_interval:
-        interval_str = "one minute" if allow_minute_resolution else "one hour"
         raise InvalidParams(
             f"The interval has to be a multiple of the minimum interval of {interval_str}."
         )
@@ -306,202 +468,36 @@ def _get_constrained_date_range(params, allow_minute_resolution=False):
     if ONE_DAY % interval != 0:
         raise InvalidParams("The interval should divide one day without a remainder.")
 
-    using_minute_resolution = interval % ONE_HOUR != 0
-
     start, end = get_date_range_from_params(params)
+    now = get_now()
 
-    # if `end` is explicitly given, we add a second to it, so it is treated as
-    # inclusive. the rounding logic down below will take care of the rest.
-    if params.get("end"):
-        end += timedelta(seconds=1)
+    if start > now:
+        start = now
 
-    date_range = end - start
-    # round the range up to a multiple of the interval.
-    # the minimum is 1h so the "totals" will not go out of sync, as they will
-    # use the materialized storage due to no grouping on the `started` column.
-    rounding_interval = int(math.ceil(interval / ONE_HOUR) * ONE_HOUR)
-    date_range = timedelta(
-        seconds=int(rounding_interval * math.ceil(date_range.total_seconds() / rounding_interval))
-    )
+    adjusted_start, adjusted_end, _num_intervals = to_intervals(start, end, interval)
 
-    if using_minute_resolution:
-        if date_range.total_seconds() > 6 * ONE_HOUR:
-            raise InvalidParams(
-                "The time-range when using one-minute resolution intervals is restricted to 6 hours."
-            )
-        if (datetime.now(tz=pytz.utc) - start).total_seconds() > 30 * ONE_DAY:
-            raise InvalidParams(
-                "The time-range when using one-minute resolution intervals is restricted to the last 30 days."
-            )
+    date_range = adjusted_end - adjusted_start
 
-    if date_range.total_seconds() / interval > MAX_POINTS:
+    if date_range.total_seconds() / interval > max_points:
         raise InvalidParams(
             "Your interval and date range would create too many results. "
             "Use a larger interval, or a smaller date range."
         )
 
-    end_ts = int(rounding_interval * math.ceil(to_timestamp(end) / rounding_interval))
-    end = to_datetime(end_ts)
-    # when expanding the rounding interval, we would adjust the end time too far
-    # to the future, in which case the start time would not actually contain our
-    # desired date range. adjust for this by extend the time by another interval.
-    # for example, when "45m" means the range from 08:49:00-09:34:00, our rounding
-    # has to go from 08:00:00 to 10:00:00.
-    if rounding_interval > interval and (end - date_range) > start:
-        date_range += timedelta(seconds=rounding_interval)
-    start = end - date_range
-
-    return start, end, interval
+    return adjusted_start, adjusted_end, interval
 
 
-TS_COL = "bucketed_started"
+def isoformat_z(date: datetime) -> str:
+    return datetime.fromtimestamp(int(date.timestamp())).isoformat() + "Z"
 
 
-def run_sessions_query(query):
-    """
-    Runs the `query` as defined by [`QueryDefinition`] two times, once for the
-    `totals` and again for the actual time-series data grouped by the requested
-    interval.
-    """
-    result_totals = raw_query(
-        dataset=Dataset.Sessions,
-        selected_columns=query.query_columns,
-        groupby=query.query_groupby,
-        aggregations=query.aggregations,
-        conditions=query.conditions,
-        filter_keys=query.filter_keys,
-        start=query.start,
-        end=query.end,
-        rollup=query.rollup,
-        referrer="sessions.totals",
-    )
-
-    result_timeseries = raw_query(
-        dataset=Dataset.Sessions,
-        selected_columns=[TS_COL] + query.query_columns,
-        groupby=[TS_COL] + query.query_groupby,
-        aggregations=query.aggregations,
-        conditions=query.conditions,
-        filter_keys=query.filter_keys,
-        start=query.start,
-        end=query.end,
-        rollup=query.rollup,
-        referrer="sessions.timeseries",
-    )
-
-    return result_totals["data"], result_timeseries["data"]
-
-
-def massage_sessions_result(query, result_totals, result_timeseries):
-    """
-    Post-processes the query result.
-
-    Given the `query` as defined by [`QueryDefinition`] and its totals and
-    timeseries results from snuba, groups and transforms the result into the
-    expected format.
-
-    For example:
-    ```json
-    {
-      "intervals": [
-        "2020-12-16T00:00:00Z",
-        "2020-12-16T12:00:00Z",
-        "2020-12-17T00:00:00Z"
-      ],
-      "groups": [
-        {
-          "by": { "release": "99b8edc5a3bb49d01d16426d7bb9c511ec41f81e" },
-          "series": { "sum(session)": [0, 1, 0] },
-          "totals": { "sum(session)": 1 }
-        },
-        {
-          "by": { "release": "test-example-release" },
-          "series": { "sum(session)": [0, 10, 20] },
-          "totals": { "sum(session)": 30 }
-        }
-      ]
-    }
-    ```
-    """
-    timestamps = _get_timestamps(query)
-
-    total_groups = _split_rows_groupby(result_totals, query.groupby)
-    timeseries_groups = _split_rows_groupby(result_timeseries, query.groupby)
-
-    def make_timeseries(rows, group):
-        for row in rows:
-            row[TS_COL] = row[TS_COL][:19] + "Z"
-
-        rows.sort(key=lambda row: row[TS_COL])
-        fields = [(name, field, list()) for name, field in query.fields.items()]
-        group_index = 0
-
-        while group_index < len(rows):
-            row = rows[group_index]
-            if row[TS_COL] < timestamps[0]:
-                group_index += 1
-            else:
-                break
-
-        for ts in timestamps:
-            row = rows[group_index] if group_index < len(rows) else None
-            if row is not None and row[TS_COL] == ts:
-                group_index += 1
-            else:
-                row = None
-
-            for (name, field, series) in fields:
-                series.append(field.extract_from_row(row, group))
-
-        return {name: series for (name, field, series) in fields}
-
-    def make_totals(totals, group):
-        return {
-            name: field.extract_from_row(totals[0], group) for name, field in query.fields.items()
-        }
-
-    groups = []
-    keys = set(total_groups.keys()) | set(timeseries_groups.keys())
-    for key in keys:
-        by = dict(key)
-
-        group = {
-            "by": by,
-            "totals": make_totals(total_groups.get(key, [None]), by),
-            "series": make_timeseries(timeseries_groups.get(key, []), by),
-        }
-
-        groups.append(group)
-
-    return {
-        "query": query.query,
-        "intervals": timestamps,
-        "groups": groups,
-    }
-
-
-def _get_timestamps(query):
+def get_timestamps(query: QueryDefinition) -> list[str]:
     """
     Generates a list of timestamps according to `query`.
     The timestamps are returned as ISO strings for now.
     """
     rollup = query.rollup
-    start = int(to_timestamp(query.start))
-    end = int(to_timestamp(query.end))
-    return [datetime.utcfromtimestamp(ts).isoformat() + "Z" for ts in range(start, end, rollup)]
+    start = int(query.start.timestamp())
+    end = int(query.end.timestamp())
 
-
-def _split_rows_groupby(rows, groupby):
-    groups = {}
-    for row in rows:
-        key_parts = (group.get_keys_for_row(row) for group in groupby)
-        keys = itertools.product(*key_parts)
-
-        for key in keys:
-            key = frozenset(key)
-
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(row)
-
-    return groups
+    return [datetime.fromtimestamp(ts).isoformat() + "Z" for ts in range(start, end, rollup)]

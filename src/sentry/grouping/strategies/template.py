@@ -1,20 +1,41 @@
-from sentry.grouping.component import GroupingComponent
-from sentry.grouping.strategies.base import strategy, produces_variants
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from sentry.grouping.component import (
+    ContextLineGroupingComponent,
+    FilenameGroupingComponent,
+    TemplateGroupingComponent,
+)
+from sentry.grouping.strategies.base import (
+    ComponentsByVariant,
+    produces_variants,
+    strategy,
+)
+from sentry.interfaces.template import Template
+
+if TYPE_CHECKING:
+    from sentry.grouping.context import GroupingContext
+    from sentry.services.eventstore.models import BaseEvent
 
 
-@strategy(id="template:v1", interfaces=["template"], score=1100)
+@strategy(ids=["template:v1"], interface=Template, score=1100)
 @produces_variants(["default"])
-def template_v1(template, context, **meta):
-    filename_component = GroupingComponent(id="filename")
-    if template.filename is not None:
-        filename_component.update(values=[template.filename])
+def template_v1(
+    interface: Template, event: BaseEvent, context: GroupingContext, **kwargs: Any
+) -> ComponentsByVariant[Any]:
+    variant_name = context["variant_name"]
 
-    context_line_component = GroupingComponent(id="context-line")
-    if template.context_line is not None:
-        context_line_component.update(values=[template.context_line])
+    filename_component = FilenameGroupingComponent()
+    if interface.filename is not None:
+        filename_component.update(values=[interface.filename])
+
+    context_line_component = ContextLineGroupingComponent()
+    if interface.context_line is not None:
+        context_line_component.update(values=[interface.context_line])
 
     return {
-        context["variant"]: GroupingComponent(
-            id="template", values=[filename_component, context_line_component]
+        variant_name: TemplateGroupingComponent(
+            values=[filename_component, context_line_component],
         )
     }

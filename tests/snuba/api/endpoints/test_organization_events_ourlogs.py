@@ -1,0 +1,1464 @@
+import math
+from datetime import datetime, timedelta, timezone
+from unittest.mock import ANY, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+from django.test import override_settings
+from sentry_protos.snuba.v1.trace_item_pb2 import AnyValue, ArrayValue
+
+from sentry.conf.types.sentry_config import SentryMode
+from sentry.constants import DataCategory
+from sentry.search.eap import constants
+from sentry.testutils.cases import OutcomesSnubaTest
+from sentry.testutils.helpers import parse_link_header
+from sentry.testutils.helpers.datetime import before_now
+from sentry.utils.cursors import Cursor
+from sentry.utils.outcomes import Outcome
+from sentry.utils.snuba_rpc import table_rpc
+from tests.snuba.api.endpoints.test_organization_events import OrganizationEventsEndpointTestBase
+
+
+class OrganizationEventsOurLogsEndpointTest(OrganizationEventsEndpointTestBase, OutcomesSnubaTest):
+    dataset = "logs"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.features = {
+            "organizations:ourlogs-enabled": True,
+        }
+
+    @pytest.mark.querybuilder
+    def test_simple(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "foo"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["id", "log.body"],
+                "query": "",
+                "orderby": "-log.body",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        meta = response.data["meta"]
+        assert len(data) == 2
+        assert data == [
+            {
+                "id": logs[0].item_id.hex(),
+                "log.body": "foo",
+            },
+            {
+                "id": logs[1].item_id.hex(),
+                "log.body": "bar",
+            },
+        ]
+        assert meta["dataset"] == self.dataset
+
+    def test_no_requested_fields(self) -> None:
+        response = self.do_request(
+            {
+                "query": "",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 400, response.content
+        assert response.data["detail"] == "No columns selected"
+
+    @pytest.mark.querybuilder
+    def test_timestamp_order(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "foo"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.ten_mins_ago + timedelta(microseconds=1),
+            ),
+            self.create_ourlog(
+                {"body": "baz"},
+                timestamp=self.ten_mins_ago + timedelta(microseconds=2),
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body", "timestamp"],
+                "query": "",
+                "orderby": "timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        meta = response.data["meta"]
+        assert len(data) == len(logs)
+
+        for log, source in zip(data, logs):
+            assert log["log.body"] == source.attributes["sentry.body"].string_value
+            assert "tags[sentry.timestamp_precise,number]" not in log
+            assert constants.TIMESTAMP_PRECISE_ALIAS in log
+            assert constants.TIMESTAMP_ALIAS in log
+            ts = datetime.fromisoformat(log["timestamp"])
+            assert ts.tzinfo == timezone.utc
+            timestamp_from_nanos = (
+                source.attributes["sentry.observed_timestamp_nanos"].int_value / 1_000_000_000
+            )
+            assert ts.timestamp() == pytest.approx(timestamp_from_nanos, abs=5), "timestamp"
+
+        assert meta["dataset"] == self.dataset
+
+    def test_free_text_wildcard_filter(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "foo"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "foo",
+                "orderby": "log.body",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        meta = response.data["meta"]
+        assert len(data) == 1
+        assert data[0]["log.body"] == "foo"
+
+        assert meta["dataset"] == self.dataset
+
+    def test_invalid_wildcard_filter(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "foo"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "message:*wild\\",
+                "orderby": "log.body",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 400, response.content
+        assert "Search terms cannot end with an escape character" in response.data["detail"]
+
+    def test_regex_filter(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "ERROR [42] disk full"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "WARN [7] disk filling up"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "message://^ERROR \\[\\d+\\]//",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [log["log.body"] for log in response.data["data"]] == ["ERROR [42] disk full"]
+
+    def test_regex_filter_negated(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "ERROR [42] disk full"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "WARN [7] disk filling up"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "!message://^ERROR \\[\\d+\\]//",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [log["log.body"] for log in response.data["data"]] == ["WARN [7] disk filling up"]
+
+    def test_regex_filter_on_an_attribute(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "first"},
+                attributes={"release": "1.2.3"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "second"},
+                attributes={"release": "nightly"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "tags[release,string]://^\\d+\\.\\d+//",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [log["log.body"] for log in response.data["data"]] == ["first"]
+
+    def test_regex_filter_on_an_array_attribute(self) -> None:
+        """Snuba applies OP_REGEXP to the string elements of a string array, so the array
+        membership form matches when any element does."""
+        logs = [
+            self.create_ourlog(
+                {"body": "first"},
+                attributes={
+                    "log_tags": {
+                        "array_value": ArrayValue(
+                            values=[
+                                AnyValue(string_value="alpha-01"),
+                                AnyValue(string_value="beta"),
+                            ]
+                        )
+                    }
+                },
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "second"},
+                attributes={
+                    "log_tags": {"array_value": ArrayValue(values=[AnyValue(string_value="gamma")])}
+                },
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "tags[log_tags[*],array]://^alpha-\\d+$//",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [log["log.body"] for log in response.data["data"]] == ["first"]
+
+    def test_regex_filter_case_insensitive(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "Error: disk full"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "0 problems"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "message://^[A-Z]RROR\\D+//",
+                "caseInsensitive": "1",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [log["log.body"] for log in response.data["data"]] == ["Error: disk full"]
+
+    def test_regex_filter_rejects_an_invalid_pattern(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "query": "message://[a-//",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            },
+        )
+
+        assert response.status_code == 400, response.content
+        assert "Invalid regex" in response.data["detail"]
+
+    def test_pagination(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "foo"},
+                timestamp=self.eleven_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "baz"},
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["log.body", "timestamp"],
+                "query": "",
+                "cursor": Cursor(0, 2, False, False),
+                "per_page": 2,
+                "orderby": "timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        assert len(data) == 1
+        assert data[0]["log.body"] == "baz"
+
+    @pytest.mark.xfail(
+        reason="Failing because of https://github.com/getsentry/eap-planning/issues/238"
+    )
+    def test_project_slug_field(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.ten_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["project"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        meta = response.data["meta"]
+        assert len(data) == 1
+        assert data[0]["project"] == self.project.slug
+
+        assert meta["dataset"] == self.dataset
+
+    def test_trace_id_list_filter(self) -> None:
+        trace_id_1 = "1" * 32
+        trace_id_2 = "2" * 32
+        logs = [
+            self.create_ourlog(
+                {"body": "foo", "trace_id": trace_id_1},
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "bar", "trace_id": trace_id_2},
+                timestamp=self.ten_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["message", "trace"],
+                "query": f"trace:[{trace_id_1},{trace_id_2}]",
+                "orderby": "message",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        meta = response.data["meta"]
+        assert len(data) == 2
+        assert data == [
+            {"message": "bar", "trace": trace_id_2},
+            {"message": "foo", "trace": trace_id_1},
+        ]
+        assert meta["dataset"] == self.dataset
+
+    def test_has_trace_filter(self) -> None:
+        trace_id = "1" * 32
+        logs = [
+            self.create_ourlog(
+                {"body": "foo", "trace_id": trace_id},
+                timestamp=self.ten_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["message", "trace"],
+                "query": "has:trace",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"message": "foo", "trace": trace_id}]
+
+    def test_filter_timestamp(self) -> None:
+        one_day_ago = before_now(days=1).replace(microsecond=0)
+        three_days_ago = before_now(days=3).replace(microsecond=0)
+
+        log1 = self.create_ourlog(
+            {"body": "foo"},
+            timestamp=one_day_ago,
+        )
+        log2 = self.create_ourlog(
+            {"body": "bar"},
+            timestamp=three_days_ago,
+        )
+        self.store_eap_items([log1, log2])
+
+        request = {
+            "field": ["message"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+        }
+
+        response = self.do_request(
+            {
+                **request,
+                "query": "timestamp:-2d",
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"message": "foo"}]
+
+        timestamp = before_now(days=2).isoformat()
+        timestamp = timestamp.split("T", 2)[0]
+
+        response = self.do_request(
+            {
+                **request,
+                "query": f"timestamp:>{timestamp}",
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"message": "foo"}]
+
+        response = self.do_request(
+            {
+                **request,
+                "query": f"timestamp:<{timestamp}",
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"message": "bar"}]
+
+    def test_count_meta_type_is_integer(self) -> None:
+        one_day_ago = before_now(days=1).replace(microsecond=0)
+
+        log1 = self.create_ourlog(
+            {"body": "foo"},
+            timestamp=one_day_ago,
+        )
+        self.store_eap_items([log1])
+
+        request = {
+            "field": ["message", "count()"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+        }
+
+        response = self.do_request(
+            {
+                **request,
+                "query": "timestamp:-2d",
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"message": "foo", "count()": 1}]
+        assert response.data["meta"]["fields"]["count()"] == "integer"
+
+    def test_payload_bytes_meta_type_is_byte(self) -> None:
+        one_day_ago = before_now(days=1).replace(microsecond=0)
+
+        log1 = self.create_ourlog(
+            {"body": "foo"},
+            attributes={"sentry.payload_size_bytes": 1234567},
+            timestamp=one_day_ago,
+        )
+        self.store_eap_items([log1])
+
+        request = {
+            "field": ["message", "payload_size"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+        }
+
+        response = self.do_request(
+            {
+                **request,
+                "query": "message:foo payload_size:1234567",
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"message": "foo", "payload_size": 1234567}]
+        assert response.data["meta"]["fields"]["payload_size"] == "size"
+        assert response.data["meta"]["units"]["payload_size"] == "byte"
+
+    def test_pagelimit(self) -> None:
+        log = self.create_ourlog(
+            {"body": "test"},
+            timestamp=self.ten_mins_ago,
+        )
+        self.store_eap_items([log])
+
+        response = self.do_request(
+            {
+                "field": ["message"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "per_page": 9999,
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert len(response.data["data"]) == 1
+        assert response.data["data"][0]["message"] == "test"
+
+        response = self.do_request(
+            {
+                "field": ["message"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "per_page": 10000,
+            }
+        )
+        assert response.status_code == 400
+        assert response.data["detail"] == "Invalid per_page value. Must be between 1 and 9999."
+
+    def test_truncate_param(self) -> None:
+        long_body = "a" * 100
+        log = self.create_ourlog(
+            {"body": long_body},
+            timestamp=self.ten_mins_ago,
+        )
+        self.store_eap_items([log])
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "truncate": 64,
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"][0]["log.body"] == "a" * 64 + "..."
+
+    def test_truncate_param_invalid_type(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "truncate": "notanumber",
+            }
+        )
+        assert response.status_code == 400
+        assert response.data["detail"] == "truncate must be a positive integer >= 64"
+
+    def test_truncate_param_zero_value(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "truncate": 0,
+            }
+        )
+        assert response.status_code == 400
+        assert response.data["detail"] == "truncate must be a positive integer >= 64"
+
+    def test_truncate_param_small_value(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["log.body"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "truncate": 63,
+            }
+        )
+        assert response.status_code == 400
+        assert response.data["detail"] == "truncate must be a positive integer >= 64"
+
+    def test_homepage_query(self) -> None:
+        """This query matches the one made on the logs homepage so that we can be sure everything is working at least
+        for the initial load"""
+        logs = [
+            self.create_ourlog(
+                {"body": "foo"},
+                attributes={
+                    "sentry.observed_timestamp_nanos": str(
+                        self.ten_mins_ago.timestamp() * 1_000_000_000
+                    )
+                },
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "bar"},
+                attributes={
+                    "sentry.observed_timestamp_nanos": str(
+                        self.nine_mins_ago.timestamp() * 1_000_000_000
+                    ),
+                },
+                timestamp=self.nine_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "cursor": "",
+                "dataset": "logs",
+                "field": [
+                    "sentry.item_id",
+                    "project.id",
+                    "trace",
+                    "severity_number",
+                    "severity",
+                    "timestamp",
+                    "observed_timestamp",
+                    "message",
+                ],
+                "per_page": 1000,
+                "project": self.project.id,
+                "query": "",
+                "referrer": "api.explore.logs-table",
+                "sort": "-timestamp",
+                "statsPeriod": "14d",
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        meta = response.data["meta"]
+        assert len(data) == 2
+        for result, source in zip(data, reversed(logs)):
+            assert result == {
+                "sentry.item_id": source.item_id.hex(),
+                "project.id": self.project.id,
+                "trace": source.trace_id,
+                "severity_number": source.attributes["sentry.severity_number"].int_value,
+                "severity": source.attributes["sentry.severity_text"].string_value,
+                "timestamp": datetime.fromtimestamp(source.timestamp.seconds)
+                .replace(tzinfo=timezone.utc)
+                .isoformat(),
+                constants.TIMESTAMP_PRECISE_ALIAS: pytest.approx(
+                    source.attributes["sentry.timestamp_precise"].int_value
+                ),
+                "observed_timestamp": source.attributes[
+                    "sentry.observed_timestamp_nanos"
+                ].string_value,
+                "message": source.attributes["sentry.body"].string_value,
+            }
+        assert meta["dataset"] == self.dataset
+
+    def test_timestamp_precise_preserves_full_nanosecond_value(self) -> None:
+        base = before_now(minutes=10).replace(microsecond=0)
+        precise_nanos = int(base.timestamp()) * 1_000_000_000 + 123_456_789
+        log = self.create_ourlog(
+            {"body": "foo"},
+            attributes={"sentry.timestamp_precise": precise_nanos},
+            timestamp=base,
+        )
+        self.store_eap_items([log])
+
+        response = self.do_request(
+            {
+                "field": ["message", "timestamp_precise"],
+                "query": "",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        assert len(data) == 1
+        assert data[0]["timestamp_precise"] == precise_nanos
+        assert response.data["meta"]["fields"]["timestamp_precise"] == "number"
+
+    def test_strip_sentry_prefix_from_message_parameter(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "User {username} logged in from {ip}"},
+                attributes={
+                    "sentry.message.parameter.username": "alice",
+                    "sentry.message.parameter.ip": "192.168.1.1",
+                },
+                timestamp=self.ten_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "User {username} logged out"},
+                attributes={"sentry.message.parameter.username": "bob"},
+                timestamp=self.nine_mins_ago,
+            ),
+            self.create_ourlog(
+                {"body": "Item {0} was purchased by {1}"},
+                attributes={
+                    "sentry.message.parameter.0": "laptop",
+                    "sentry.message.parameter.1": "charlie",
+                },
+                timestamp=self.nine_mins_ago - timedelta(minutes=1),
+            ),
+            self.create_ourlog(
+                {"body": "Item {0} of {1}"},
+                attributes={
+                    "sentry.message.parameter.0": 5,
+                    "sentry.message.parameter.1": 10,
+                },
+                timestamp=self.nine_mins_ago - timedelta(minutes=1),
+            ),
+        ]
+
+        self.store_eap_items(logs)
+
+        response = self.do_request(
+            {
+                "field": [
+                    "timestamp",
+                    "message",
+                    "message.parameter.username",
+                    "message.parameter.ip",
+                ],
+                "query": 'message.parameter.username:"alice"',
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        assert len(data) == 1
+        assert data[0]["message"] == "User {username} logged in from {ip}"
+        assert data[0]["message.parameter.username"] == "alice"
+        assert data[0]["message.parameter.ip"] == "192.168.1.1"
+
+        response = self.do_request(
+            {
+                "field": [
+                    "timestamp",
+                    "message",
+                    "message.parameter.0",
+                    "message.parameter.1",
+                ],
+                "query": 'message.parameter.0:"laptop"',
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        assert len(data) == 1
+        assert data[0]["message"] == "Item {0} was purchased by {1}"
+        assert data[0]["message.parameter.0"] == "laptop"
+        assert data[0]["message.parameter.1"] == "charlie"
+
+        response = self.do_request(
+            {
+                "field": [
+                    "timestamp",
+                    "message",
+                    "tags[message.parameter.0,number]",
+                    "tags[message.parameter.1,number]",
+                ],
+                "query": "tags[message.parameter.0,number]:>0",
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        assert len(data) == 1
+        assert data[0]["message"] == "Item {0} of {1}"
+        assert data[0]["tags[message.parameter.0,number]"] == 5
+        assert data[0]["tags[message.parameter.1,number]"] == 10
+
+        response = self.do_request(
+            {
+                "field": ["timestamp", "message", "message.parameter.username"],
+                "query": 'message.parameter.username:["alice", "bob"]',
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        data = response.data["data"]
+        assert len(data) == 2
+        assert data[0]["message.parameter.username"] == "bob"
+        assert data[1]["message.parameter.username"] == "alice"
+
+    def test_high_accuracy_flex_time_filter_trace(self) -> None:
+        trace_id = "1" * 32
+        logs = [
+            self.create_ourlog(
+                {"body": "foo", "trace_id": trace_id},
+                timestamp=self.ten_mins_ago,
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["id", "timestamp", "message"],
+                "query": f"trace:{trace_id}",
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            },
+        )
+        assert response.status_code == 200, response.content
+
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "false"
+
+    def test_high_accuracy_flex_time_without_orderby(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["count()"],
+                "query": "",
+                "orderby": "-count()",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            },
+        )
+        assert response.status_code == 400, response.content
+        assert "You must orderby timestamp to use HIGHEST_ACCURACY_FLEX_TIME" in str(
+            response.data["detail"]
+        )
+
+    def test_high_accuracy_flex_time_rejects_aggregates(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["timestamp", "count()"],
+                "query": "",
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            },
+        )
+        assert response.status_code == 400, response.content
+        assert "aggregates are not supported with flextime sampling" in str(response.data["detail"])
+
+    def test_high_accuracy_flex_time_ascending_orderby(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["timestamp", "message", "id"],
+                "query": "",
+                "orderby": ["timestamp"],
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            },
+        )
+        assert response.status_code == 400, response.content
+        assert "Your first orderby must be -timestamp to use HIGHEST_ACCURACY_FLEX_TIME" in str(
+            response.data["detail"]
+        )
+
+    def test_high_accuracy_flex_time_order_by_timestamp(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "foo"},
+                timestamp=self.nine_mins_ago,
+                log_id=uuid4().hex,
+            ),
+            self.create_ourlog(
+                {"body": "bar"},
+                timestamp=self.ten_mins_ago,
+                log_id="1" + uuid4().hex[1:],
+            ),
+            self.create_ourlog(
+                {"body": "qux"},
+                timestamp=self.ten_mins_ago,
+                log_id="0" + uuid4().hex[1:],  # qux's id sorts after bar's id
+            ),
+        ]
+        self.store_eap_items(logs)
+        response = self.do_request(
+            {
+                "field": ["id", "timestamp", "message"],
+                "query": "",
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            },
+        )
+        assert response.status_code == 200, response.content
+
+        assert [row["message"] for row in response.data["data"]] == ["foo", "bar", "qux"]
+
+    def test_high_accuracy_flex_time_empty_page_no_next(self) -> None:
+        response = self.do_request(
+            {
+                "field": ["timestamp", "message"],
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == []
+        assert response.data["meta"]["dataScanned"] == "full"
+        assert isinstance(response.data["meta"]["routingHint"], str)
+        assert response.data["meta"]["routingHint"]
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "false"
+
+    def test_high_accuracy_flex_time_partial_page_no_next(self) -> None:
+        logs = [
+            self.create_ourlog(
+                {"body": "log"},
+                timestamp=self.nine_mins_ago,
+            )
+        ]
+        self.store_eap_items(logs)
+
+        response = self.do_request(
+            {
+                "field": ["timestamp", "message"],
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+                "per_page": 10,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == ["log"]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "false"
+
+    def test_high_accuracy_flex_time_full_page_no_next(self) -> None:
+        n = 5
+        logs = [
+            self.create_ourlog(
+                {"body": f"log {i + 1} of {n}"},
+                timestamp=self.nine_mins_ago - timedelta(minutes=i + 1),
+            )
+            for i in range(n)
+        ]
+        self.store_eap_items(logs)
+
+        response = self.do_request(
+            {
+                "field": ["timestamp", "message"],
+                "orderby": "-timestamp",
+                "project": self.project.id,
+                "dataset": self.dataset,
+                "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+                "per_page": 5,
+            },
+        )
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == [
+            f"log {i + 1} of {n}" for i in range(5)
+        ]
+        assert isinstance(response.data["meta"]["routingHint"], str)
+        assert response.data["meta"]["routingHint"]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "false"
+
+    def test_high_accuracy_flex_time_full_page_with_next(self) -> None:
+        n = 8
+        logs = [
+            self.create_ourlog(
+                {"body": f"log {i + 1} of {n}"},
+                timestamp=self.nine_mins_ago - timedelta(minutes=i + 1),
+            )
+            for i in range(n)
+        ]
+        self.store_eap_items(logs)
+
+        request = {
+            "field": ["timestamp", "message"],
+            "orderby": "-timestamp",
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            "per_page": 5,
+        }
+
+        response = self.do_request(request)
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == [
+            f"log {i + 1} of {n}" for i in range(5)
+        ]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "true"
+
+        response = self.do_request(
+            {**request, "cursor": links["next"]["cursor"]},
+        )
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == [
+            f"log {i + 6} of {n}" for i in range(3)
+        ]
+        assert isinstance(response.data["meta"]["routingHint"], str)
+        assert response.data["meta"]["routingHint"]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "false"
+
+    def test_high_accuracy_flex_time_partial_page_with_next(self) -> None:
+        hour_1 = before_now(hours=4).replace(minute=0, second=0, microsecond=0)
+        hour_2 = before_now(hours=3).replace(minute=0, second=0, microsecond=0)
+        hour_3 = before_now(hours=2).replace(minute=0, second=0, microsecond=0)
+        hour_4 = before_now(hours=1).replace(minute=0, second=0, microsecond=0)
+
+        logs = [
+            self.create_ourlog(
+                {"body": "log 1"},
+                timestamp=hour_4 - timedelta(minutes=30),
+            ),
+            self.create_ourlog(
+                {"body": "log 2"},
+                timestamp=hour_3 - timedelta(minutes=30),
+            ),
+        ]
+        self.store_eap_items(logs)
+        for hour in [hour_4, hour_3]:
+            self.store_outcomes(
+                {
+                    "org_id": self.organization.id,
+                    "timestamp": hour - timedelta(minutes=30),
+                    "project_id": self.project.id,
+                    "outcome": Outcome.ACCEPTED,
+                    "reason": "none",
+                    "category": DataCategory.LOG_ITEM,
+                    "quantity": 1,
+                },
+                1,
+            )
+
+        self.store_outcomes(
+            {
+                "org_id": self.organization.id,
+                "timestamp": hour_2 - timedelta(minutes=30),
+                "project_id": self.project.id,
+                "outcome": Outcome.ACCEPTED,
+                "reason": "none",
+                "category": DataCategory.LOG_ITEM,
+                "quantity": 300_000_000,
+            },
+            1,
+        )
+
+        request = {
+            "field": ["timestamp", "message"],
+            "orderby": "-timestamp",
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            "per_page": 5,
+            "start": hour_1.isoformat(),
+            "end": hour_4.isoformat(),
+        }
+
+        response = self.do_request(request)
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == ["log 1"]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "true"
+
+        response = self.do_request(
+            {**request, "cursor": links["next"]["cursor"]},
+        )
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == ["log 2"]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "true"
+
+    def test_high_accuracy_flex_time_empty_page_with_next(self) -> None:
+        hour_1 = before_now(hours=4).replace(minute=0, second=0, microsecond=0)
+        hour_2 = before_now(hours=3).replace(minute=0, second=0, microsecond=0)
+        hour_3 = before_now(hours=2).replace(minute=0, second=0, microsecond=0)
+        hour_4 = before_now(hours=1).replace(minute=0, second=0, microsecond=0)
+
+        logs = [
+            self.create_ourlog(
+                {"body": "log 2"},
+                timestamp=hour_3 - timedelta(minutes=30),
+            ),
+        ]
+        self.store_eap_items(logs)
+        self.store_outcomes(
+            {
+                "org_id": self.organization.id,
+                "timestamp": hour_3 - timedelta(minutes=30),
+                "project_id": self.project.id,
+                "outcome": Outcome.ACCEPTED,
+                "reason": "none",
+                "category": DataCategory.LOG_ITEM,
+                "quantity": 1,
+            },
+            1,
+        )
+
+        self.store_outcomes(
+            {
+                "org_id": self.organization.id,
+                "timestamp": hour_2 - timedelta(minutes=30),
+                "project_id": self.project.id,
+                "outcome": Outcome.ACCEPTED,
+                "reason": "none",
+                "category": DataCategory.LOG_ITEM,
+                "quantity": 300_000_000,
+            },
+            1,
+        )
+
+        request = {
+            "field": ["timestamp", "message"],
+            "orderby": "-timestamp",
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "sampling": "HIGHEST_ACCURACY_FLEX_TIME",
+            "per_page": 5,
+            "start": hour_1.isoformat(),
+            "end": hour_4.isoformat(),
+        }
+
+        response = self.do_request(request)
+
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == []
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "true"
+
+        response = self.do_request(
+            {**request, "cursor": links["next"]["cursor"]},
+        )
+
+        assert response.status_code == 200, response.content
+        assert [row["message"] for row in response.data["data"]] == ["log 2"]
+        assert response.data["meta"]["dataScanned"] == "full"
+        links = {
+            attrs["rel"]: {**attrs, "href": url}
+            for url, attrs in parse_link_header(response["link"]).items()
+        }
+        assert links["previous"]["results"] == "false"
+        assert links["next"]["results"] == "true"
+
+    def test_bytes_scanned(self) -> None:
+        self.store_eap_items([self.create_ourlog({"body": "log"}, timestamp=self.ten_mins_ago)])
+
+        request = {
+            "field": ["timestamp", "message"],
+            "orderby": "-timestamp",
+            "project": self.project.id,
+            "dataset": self.dataset,
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200
+        assert response.data["meta"]["bytesScanned"] > 0
+
+    def test_count_message(self) -> None:
+        self.store_eap_items([self.create_ourlog({"body": "log"}, timestamp=self.ten_mins_ago)])
+        request = {
+            "field": ["count(message)"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "statsPeriod": "1h",
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200
+        assert response.data["data"] == [{"count(message)": 1}]
+
+    def test_count_if_message(self) -> None:
+        self.store_eap_items(
+            [
+                self.create_ourlog({"body": "log"}, timestamp=self.ten_mins_ago),
+                self.create_ourlog({"body": "hello"}, timestamp=self.ten_mins_ago),
+            ]
+        )
+        request = {
+            "field": ["count_if(`message:log`, message)"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "statsPeriod": "1h",
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200
+        assert response.data["data"] == [{"count_if(`message:log`, message)": 1}]
+
+    def test_p50_if_message(self) -> None:
+        self.store_eap_items(
+            [
+                self.create_ourlog(
+                    {"body": "log"},
+                    attributes={"sentry.payload_size_bytes": 1234567},
+                    timestamp=self.ten_mins_ago,
+                ),
+                self.create_ourlog(
+                    {"body": "hello"},
+                    attributes={"sentry.payload_size_bytes": 7654321},
+                    timestamp=self.ten_mins_ago,
+                ),
+            ]
+        )
+        request = {
+            "field": ["p50_if(`message:log`,payload_size)"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "statsPeriod": "1h",
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200
+        assert response.data["data"] == [{"p50_if(`message:log`,payload_size)": 1234567}]
+
+    def test_any_function(self) -> None:
+        log = self.create_ourlog(
+            {"body": "log"},
+            attributes={"sentry.payload_size_bytes": 1234567},
+            timestamp=self.ten_mins_ago,
+        )
+        self.store_eap_items([log])
+        request = {
+            "field": ["any(trace)", "any(timestamp)"],
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "statsPeriod": "1h",
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [
+            {
+                "any(trace)": log.trace_id,
+                "any(timestamp)": math.floor(self.ten_mins_ago.timestamp()),
+            }
+        ]
+
+    def test_aggregate_condition_filters_grouped_logs(self) -> None:
+        self.store_eap_items(
+            [
+                self.create_ourlog({"body": "foo"}, timestamp=self.ten_mins_ago),
+                self.create_ourlog({"body": "foo"}, timestamp=self.nine_mins_ago),
+                self.create_ourlog({"body": "bar"}, timestamp=self.ten_mins_ago),
+            ]
+        )
+        request = {
+            "field": ["message", "count(message)"],
+            "orderby": "message",
+            "project": self.project.id,
+            "dataset": self.dataset,
+            "statsPeriod": "1h",
+        }
+
+        unfiltered = self.do_request(request)
+        filtered = self.do_request({**request, "query": "count(message):>1"})
+
+        assert unfiltered.status_code == 200, unfiltered.content
+        assert unfiltered.data["data"] == [
+            {"message": "bar", "count(message)": 1},
+            {"message": "foo", "count(message)": 2},
+        ]
+        assert filtered.status_code == 200, filtered.content
+        assert filtered.data["data"] == [{"message": "foo", "count(message)": 2}]
+
+    def test_resolves_latest_release_alias(self) -> None:
+        self.create_release(version="0.8")
+        self.store_eap_items(
+            [self.create_ourlog(attributes={"sentry.release": "0.8"}, timestamp=self.ten_mins_ago)]
+        )
+
+        request = {
+            "field": ["release"],
+            "query": "release:latest",
+            "project": self.project.id,
+            "dataset": self.dataset,
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"release": "0.8"}]
+
+        self.create_release(version="0.9")
+        self.store_eap_items(
+            [self.create_ourlog(attributes={"sentry.release": "0.9"}, timestamp=self.ten_mins_ago)]
+        )
+
+        response = self.do_request(request)
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"release": "0.9"}]
+
+    def test_resolves_semver_release_filter(self) -> None:
+        self.create_release(version="test@1.2.3")
+        self.create_release(version="test@1.2.4")
+        self.store_eap_items(
+            [
+                self.create_ourlog(
+                    attributes={"sentry.release": "test@1.2.3"}, timestamp=self.ten_mins_ago
+                ),
+                self.create_ourlog(
+                    attributes={"sentry.release": "test@1.2.4"}, timestamp=self.ten_mins_ago
+                ),
+            ]
+        )
+
+        response = self.do_request(
+            {
+                "field": ["release"],
+                "query": "release.version:>1.2.3",
+                "orderby": "release",
+                "project": self.project.id,
+                "dataset": self.dataset,
+            }
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["data"] == [{"release": "test@1.2.4"}]
+
+    @override_settings(SENTRY_MODE=SentryMode.SAAS)
+    def test_no_project_sent_logs(self) -> None:
+        project1 = self.create_project()
+        project2 = self.create_project()
+
+        request = {
+            "field": ["timestamp", "message"],
+            "project": [project1.id, project2.id],
+            "dataset": self.dataset,
+            "sort": "-timestamp",
+            "statsPeriod": "1h",
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200
+        assert response.data["data"] == []
+
+    @override_settings(SENTRY_MODE=SentryMode.SAAS)
+    @patch("sentry.utils.snuba_rpc.table_rpc", wraps=table_rpc)
+    def test_sent_logs_project_optimization(self, mock_table_rpc: MagicMock) -> None:
+        project1 = self.create_project()
+        project2 = self.create_project()
+
+        self.store_eap_items(
+            [self.create_ourlog({"body": "log"}, project=project1, timestamp=self.ten_mins_ago)]
+        )
+
+        request = {
+            "field": ["timestamp", "message"],
+            "project": [project1.id, project2.id],
+            "dataset": self.dataset,
+            "sort": "-timestamp",
+            "statsPeriod": "1h",
+        }
+
+        response = self.do_request(request)
+        assert response.status_code == 200
+        assert response.data["data"] == [
+            {
+                "timestamp": ANY,
+                "timestamp_precise": ANY,
+                "message": "log",
+            }
+        ]
+
+        mock_table_rpc.assert_called_once()
+        assert mock_table_rpc.call_args.args[0][0].meta.project_ids == [project1.id]

@@ -1,0 +1,222 @@
+import {Fragment, useCallback, useState} from 'react';
+import {createPortal} from 'react-dom';
+import styled from '@emotion/styled';
+import {autoUpdate, offset, useFloating} from '@floating-ui/react-dom';
+import type {Location, LocationDescriptorObject} from 'history';
+
+import {Flex, Container} from '@sentry/scraps/layout';
+import {flipOverlay, shiftOverlay} from '@sentry/scraps/overlayPositioning';
+import {Radio} from '@sentry/scraps/radio';
+
+import {MenuItem} from 'sentry/components/menuItem';
+import {t} from 'sentry/locale';
+import type {TableData} from 'sentry/utils/discover/discoverQuery';
+import type {EventView} from 'sentry/utils/discover/eventView';
+import {useNavigate} from 'sentry/utils/useNavigate';
+
+export type TitleProps = {
+  onClick?: (e: React.MouseEvent) => void;
+  onKeyDown?: (e: React.KeyboardEvent) => void;
+  onMouseEnter?: (e: React.MouseEvent) => void;
+  onMouseLeave?: (e: React.MouseEvent) => void;
+};
+
+const MENU_MIDDLEWARE = [
+  // Leaves room for the menu's arrow
+  offset(9),
+  flipOverlay(),
+  shiftOverlay({padding: 10}),
+];
+
+type Props = {
+  eventView: EventView;
+  location: Location;
+  tableMeta: TableData['meta'];
+  title: React.ComponentType<TitleProps>;
+};
+
+export function OperationSort({eventView, location, tableMeta, title: Title}: Props) {
+  const navigate = useNavigate();
+  const [isOpen, setIsOpen] = useState(false);
+  const {
+    refs: {setReference, setFloating},
+    floatingStyles,
+    placement,
+  } = useFloating({
+    placement: 'top',
+    middleware: MENU_MIDDLEWARE,
+    whileElementsMounted: autoUpdate,
+  });
+
+  // Close the menu on any click outside of it, for as long as it is open
+  const menuRef = useCallback(
+    (menu: HTMLDivElement) => {
+      setFloating(menu);
+
+      const handleClickOutside = (event: MouseEvent) => {
+        if (event.target instanceof Element && !menu.contains(event.target)) {
+          setIsOpen(false);
+        }
+      };
+      document.addEventListener('click', handleClickOutside, true);
+
+      return () => {
+        document.removeEventListener('click', handleClickOutside, true);
+        setFloating(null);
+      };
+    },
+    [setFloating]
+  );
+
+  function generateSortLink(field: any): LocationDescriptorObject | undefined {
+    if (!tableMeta) {
+      return undefined;
+    }
+
+    const nextEventView = eventView.sortOnField(field, tableMeta, 'desc');
+    const queryStringObject = nextEventView.generateQueryStringObject();
+
+    return {
+      ...location,
+      query: {...location.query, sort: queryStringObject.sort},
+    };
+  }
+
+  return (
+    <Fragment>
+      <TitleWrapper ref={setReference}>
+        <Title onClick={() => setIsOpen(open => !open)} />
+      </TitleWrapper>
+      {isOpen &&
+        createPortal(
+          <DropdownWrapper
+            ref={menuRef}
+            style={floatingStyles}
+            data-placement={placement}
+          >
+            <Container maxHeight="250px" overflowY="auto">
+              {[
+                {operation: 'spans.http', title: t('Sort By HTTP')},
+                {operation: 'spans.db', title: t('Sort By DB')},
+                {operation: 'spans.resource', title: t('Sort By Resource')},
+                {operation: 'spans.browser', title: t('Sort By Browser')},
+              ].map(({operation, title}) => (
+                <DropdownMenuItem key={operation}>
+                  <Flex justify="start" align="center" width="100%">
+                    <RadioLabel>
+                      <StyledRadio
+                        readOnly
+                        size="sm"
+                        checked={eventView.sorts.some(({field}) => field === operation)}
+                        onClick={() => {
+                          const sortLink = generateSortLink({field: operation});
+                          if (sortLink) {
+                            navigate(sortLink);
+                          }
+                        }}
+                      />
+                      <span>{title}</span>
+                    </RadioLabel>
+                  </Flex>
+                </DropdownMenuItem>
+              ))}
+            </Container>
+          </DropdownWrapper>,
+          document.body
+        )}
+    </Fragment>
+  );
+}
+
+const DropdownWrapper = styled('div')`
+  /* Adapted from the dropdown-menu class */
+  border: none;
+  border-radius: 2px;
+  box-shadow:
+    0 0 0 1px rgba(52, 60, 69, 0.2),
+    0 1px 3px rgba(70, 82, 98, 0.25);
+  background-clip: padding-box;
+  background-color: ${p => p.theme.tokens.background.primary};
+  width: 220px;
+  overflow: visible;
+  z-index: ${p => p.theme.zIndex.tooltip};
+
+  &:before,
+  &:after {
+    width: 0;
+    height: 0;
+    content: '';
+    display: block;
+    position: absolute;
+    right: auto;
+  }
+
+  &:before {
+    border-left: 9px solid transparent;
+    border-right: 9px solid transparent;
+    left: calc(50% - 9px);
+    z-index: -2;
+  }
+
+  &:after {
+    border-left: 8px solid transparent;
+    border-right: 8px solid transparent;
+    left: calc(50% - 8px);
+    z-index: -1;
+  }
+
+  &[data-placement*='bottom'] {
+    &:before {
+      /* oxlint-disable-next-line @sentry/scraps/use-semantic-token */
+      border-bottom: 9px solid ${p => p.theme.tokens.background.primary};
+      top: -9px;
+    }
+
+    &:after {
+      /* oxlint-disable-next-line @sentry/scraps/use-semantic-token */
+      border-bottom: 8px solid ${p => p.theme.tokens.background.primary};
+      top: -8px;
+    }
+  }
+
+  &[data-placement*='top'] {
+    &:before {
+      /* oxlint-disable-next-line @sentry/scraps/use-semantic-token */
+      border-top: 9px solid ${p => p.theme.tokens.background.primary};
+      bottom: -9px;
+    }
+
+    &:after {
+      /* oxlint-disable-next-line @sentry/scraps/use-semantic-token */
+      border-top: 8px solid ${p => p.theme.tokens.background.primary};
+      bottom: -8px;
+    }
+  }
+`;
+
+const DropdownMenuItem = styled(MenuItem)`
+  font-size: ${p => p.theme.font.size.md};
+
+  &:not(:last-child) {
+    border-bottom: 1px solid ${p => p.theme.tokens.border.secondary};
+  }
+`;
+
+const RadioLabel = styled('label')`
+  display: grid;
+  cursor: pointer;
+  gap: 0.25em 0.5em;
+  grid-template-columns: max-content auto;
+  align-items: center;
+  outline: none;
+  font-weight: ${p => p.theme.font.weight.sans.regular};
+  margin: 0;
+`;
+
+const StyledRadio = styled(Radio)`
+  margin: 0;
+`;
+
+const TitleWrapper = styled('div')`
+  cursor: pointer;
+`;

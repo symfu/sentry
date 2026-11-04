@@ -1,11 +1,11 @@
 import pytest
 
-from sentry.models import Environment
-from sentry.testutils import TestCase
+from sentry.models.environment import Environment
+from sentry.testutils.cases import TestCase
 
 
 class GetOrCreateTest(TestCase):
-    def test_simple(self):
+    def test_simple(self) -> None:
         project = self.create_project()
 
         with pytest.raises(Environment.DoesNotExist):
@@ -14,7 +14,9 @@ class GetOrCreateTest(TestCase):
         env = Environment.get_or_create(project=project, name="prod")
 
         assert env.name == "prod"
-        assert env.projects.first().id == project.id
+        first_project = env.projects.first()
+        assert first_project is not None
+        assert first_project.id == project.id
 
         env2 = Environment.get_or_create(project=project, name="prod")
 
@@ -40,5 +42,5 @@ class GetOrCreateTest(TestCase):
         ("no\fform-feed", False),
     ],
 )
-def test_valid_name(val, expected):
+def test_valid_name(val: str, expected: bool) -> None:
     assert Environment.is_valid_name(val) == expected

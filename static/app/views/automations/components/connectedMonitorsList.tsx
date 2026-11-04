@@ -1,0 +1,221 @@
+import {Fragment} from 'react';
+import {useQuery} from '@tanstack/react-query';
+
+import {Button} from '@sentry/scraps/button';
+import {Container} from '@sentry/scraps/layout';
+import type {CursorHandler} from '@sentry/scraps/pagination';
+import {Pagination, useGetPaginationCaption} from '@sentry/scraps/pagination';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+
+import {Placeholder} from 'sentry/components/placeholder';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {IssueCell} from 'sentry/components/workflowEngine/gridCell/issueCell';
+import {t} from 'sentry/locale';
+import type {Automation} from 'sentry/types/workflowEngine/automations';
+import type {Detector} from 'sentry/types/workflowEngine/detectors';
+import {selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {defined} from 'sentry/utils/defined';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {canConnectAutomationToDetector} from 'sentry/views/automations/utils/permissions';
+import {DetectorLink} from 'sentry/views/detectors/components/detectorLink';
+import {DetectorAssigneeCell} from 'sentry/views/detectors/components/detectorListTable/detectorAssigneeCell';
+import {DetectorTypeCell} from 'sentry/views/detectors/components/detectorListTable/detectorTypeCell';
+import {detectorListApiOptions} from 'sentry/views/detectors/hooks';
+
+const DEFAULT_DETECTORS_PER_PAGE = 10;
+
+type Props = React.HTMLAttributes<HTMLDivElement> & {
+  cursor: string | undefined;
+  onCursor: CursorHandler;
+  connectedDetectorIds?: Set<string>;
+  /**
+   * Filters detectors to those with the given IDs.
+   */
+  detectorIds?: Automation['detectorIds'];
+  emptyMessage?: string;
+  limit?: number | null;
+  openInNewTab?: boolean;
+  projectIds?: number[];
+  query?: string;
+  toggleConnected?: (params: {detector: Detector}) => void;
+  /**
+   * Filters detectors by those connected to the given workflow.
+   */
+  workflowId?: string;
+};
+
+function Skeletons({canEdit, numberOfRows}: {canEdit: boolean; numberOfRows: number}) {
+  return (
+    <Fragment>
+      {Array.from({length: numberOfRows}).map((_, index) => (
+        <SimpleTable.Row key={index}>
+          <SimpleTable.RowCell>
+            <div style={{width: '100%'}}>
+              <Placeholder height="20px" width="50%" style={{marginBottom: '4px'}} />
+              <Placeholder height="16px" width="20%" />
+            </div>
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <Placeholder height="20px" />
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <Placeholder height="20px" />
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <Placeholder height="20px" />
+          </SimpleTable.RowCell>
+          {canEdit && (
+            <SimpleTable.RowCell>
+              <Placeholder height="20px" />
+            </SimpleTable.RowCell>
+          )}
+        </SimpleTable.Row>
+      ))}
+    </Fragment>
+  );
+}
+
+export function ConnectedMonitorsList({
+  detectorIds,
+  connectedDetectorIds,
+  toggleConnected,
+  emptyMessage = t('No monitors connected'),
+  cursor,
+  onCursor,
+  limit = DEFAULT_DETECTORS_PER_PAGE,
+  query,
+  openInNewTab,
+  projectIds,
+  workflowId,
+  ...props
+}: Props) {
+  const getPaginationCaption = useGetPaginationCaption();
+  const organization = useOrganization();
+  const {projects} = useProjects();
+  const canEdit = Boolean(connectedDetectorIds && typeof toggleConnected === 'function');
+  const emptySelection = defined(detectorIds) && detectorIds.length === 0;
+
+  const {data, isLoading, isError, isSuccess} = useQuery({
+    ...detectorListApiOptions(organization, {
+      ids: detectorIds,
+      limit: limit ?? undefined,
+      cursor,
+      query: workflowId
+        ? new MutableSearch([query ?? '', `workflow:${workflowId}`]).formatString()
+        : query,
+      includeIssueStreamDetectors: true,
+      projects: projectIds ?? [-1],
+    }),
+    select: selectJsonWithHeaders,
+    enabled: !defined(detectorIds) || !emptySelection,
+  });
+
+  const detectors = data?.json;
+  const pageLinks = data?.headers.Link;
+  const totalCountInt = data?.headers['X-Hits'] ?? 0;
+
+  const paginationCaption =
+    isLoading || !detectors || limit === null
+      ? undefined
+      : getPaginationCaption({
+          cursor,
+          limit,
+          pageLength: detectors.length,
+          total: totalCountInt,
+        });
+
+  const columns: TableColumnConfig[] = [
+    {key: 'name', width: '1fr'},
+    {key: 'type', visible: {sm: true}, width: '100px'},
+    {key: 'last-issue', visible: {'3xl': true}, width: 'minmax(0, 0.8fr)'},
+    {key: 'owner', visible: {xl: true}, width: 'auto'},
+    ...(canEdit ? [{key: 'connected', width: '140px'} satisfies TableColumnConfig] : []),
+  ];
+
+  return (
+    <Container containerType="inline-size" {...props}>
+      <SimpleTable
+        columns={columns}
+        header={
+          <SimpleTable.HeaderRow>
+            <SimpleTable.HeaderCell>{t('Name')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell>{t('Type')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell>{t('Last Issue')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell>{t('Assignee')}</SimpleTable.HeaderCell>
+            {canEdit && <SimpleTable.HeaderCell />}
+          </SimpleTable.HeaderRow>
+        }
+      >
+        {isLoading && (
+          <Skeletons
+            canEdit={canEdit}
+            numberOfRows={
+              defined(detectorIds)
+                ? Math.min(detectorIds.length, DEFAULT_DETECTORS_PER_PAGE)
+                : (limit ?? DEFAULT_DETECTORS_PER_PAGE)
+            }
+          />
+        )}
+        {isError && <SimpleTable.Error />}
+        {((isSuccess && detectors?.length === 0) || emptySelection) && (
+          <SimpleTable.Empty>{emptyMessage}</SimpleTable.Empty>
+        )}
+        {isSuccess &&
+          !emptySelection &&
+          detectors?.map(detector => {
+            const canEditConnection = canConnectAutomationToDetector({
+              organization,
+              detector,
+              project: projects.find(project => project.id === detector.projectId),
+            });
+
+            return (
+              <SimpleTable.Row key={detector.id}>
+                <SimpleTable.RowCell>
+                  <DetectorLink detector={detector} openInNewTab={openInNewTab} />
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  <DetectorTypeCell type={detector.type} />
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  <IssueCell group={detector.latestGroup} />
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  <DetectorAssigneeCell assignee={detector.owner} />
+                </SimpleTable.RowCell>
+                {canEdit && (
+                  <SimpleTable.RowCell justify="end">
+                    <Button
+                      onClick={() => toggleConnected?.({detector})}
+                      size="sm"
+                      disabled={!canEditConnection}
+                      tooltipProps={{
+                        title: canEditConnection
+                          ? undefined
+                          : t(
+                              "You don't have permission to change this monitor's alert connections."
+                            ),
+                      }}
+                    >
+                      {connectedDetectorIds?.has(detector.id)
+                        ? t('Disconnect')
+                        : t('Connect')}
+                    </Button>
+                  </SimpleTable.RowCell>
+                )}
+              </SimpleTable.Row>
+            );
+          })}
+      </SimpleTable>
+      {limit && (
+        <Pagination
+          onCursor={onCursor}
+          pageLinks={pageLinks}
+          caption={paginationCaption}
+        />
+      )}
+    </Container>
+  );
+}

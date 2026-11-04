@@ -1,14 +1,23 @@
 import copy
+from unittest import mock
 
+import orjson
 import pytest
 
-from sentry.lang.native.symbolicator import (
+from sentry.lang.native.sources import (
     get_sources_for_project,
     redact_internal_sources,
+    reverse_aliases_map,
 )
+from sentry.lang.native.symbolicator import (
+    FrameOrder,
+    Symbolicator,
+    SymbolicatorFunction,
+    SymbolicatorTaskKind,
+)
+from sentry.models.project import Project
 from sentry.testutils.helpers import Feature
-from sentry.utils.compat import map
-
+from sentry.testutils.pytest.fixtures import django_db_all
 
 CUSTOM_SOURCE_CONFIG = """
 [{
@@ -16,25 +25,40 @@ CUSTOM_SOURCE_CONFIG = """
     "id": "custom",
     "layout": {"type": "symstore"},
     "url": "https://msdl.microsoft.com/download/symbols/"
+},{
+    "type": "appStoreConnect",
+    "id": "asc",
+    "name": "appconnect-disabled",
+    "appconnectIssuer": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "appconnectKey": "foobar",
+    "appconnectPrivateKey": "quux",
+    "appName": "test",
+    "appId": "test",
+    "bundleId": "test"
 }]
 """
 
 
-@pytest.mark.django_db
-def test_sources_no_feature(default_project):
-    features = {"organizations:symbol-sources": False, "organizations:custom-symbol-sources": False}
+@django_db_all
+@pytest.mark.parametrize("enabled", [False, True])
+def test_process_payload_apply_source_server_info(default_project: Project, enabled: bool) -> None:
+    default_project.update_option("sentry:enable_native_source_server_mapping", enabled)
+    symbolicator = Symbolicator(
+        task_kind=SymbolicatorTaskKind(function=SymbolicatorFunction.native),
+        on_request=lambda: None,
+        project=default_project,
+        event_id="0" * 32,
+    )
 
-    with Feature(features):
-        sources = get_sources_for_project(default_project)
+    with mock.patch.object(Symbolicator, "_process", return_value={}) as process:
+        symbolicator.process_payload("native", [], [], FrameOrder.caller_first)
 
-    assert len(sources) == 1
-    assert sources[0]["type"] == "sentry"
-    assert sources[0]["id"] == "sentry:project"
+    assert process.call_args.kwargs["json"]["options"]["apply_source_server_info"] is enabled
 
 
-@pytest.mark.django_db
-def test_sources_builtin(default_project):
-    features = {"organizations:symbol-sources": True, "organizations:custom-symbol-sources": False}
+@django_db_all
+def test_sources_builtin(default_project: Project) -> None:
+    features = {"organizations:custom-symbol-sources": False}
 
     default_project.update_option("sentry:builtin_symbol_sources", ["microsoft"])
 
@@ -42,43 +66,28 @@ def test_sources_builtin(default_project):
         sources = get_sources_for_project(default_project)
 
     # XXX: The order matters here! Project is always first, then builtin sources
-    source_ids = map(lambda s: s["id"], sources)
+    source_ids = list(map(lambda s: s["id"], sources))
     assert source_ids == ["sentry:project", "sentry:microsoft"]
 
 
 # Test that a builtin source that is not declared in SENTRY_BUILTIN_SOURCES does
 # not lead to an error. It should simply be ignored.
-@pytest.mark.django_db
-def test_sources_builtin_unknown(default_project):
-    features = {"organizations:symbol-sources": True, "organizations:custom-symbol-sources": False}
+@django_db_all
+def test_sources_builtin_unknown(default_project: Project) -> None:
+    features = {"organizations:custom-symbol-sources": False}
 
     default_project.update_option("sentry:builtin_symbol_sources", ["invalid"])
 
     with Feature(features):
         sources = get_sources_for_project(default_project)
 
-    source_ids = map(lambda s: s["id"], sources)
+    source_ids = list(map(lambda s: s["id"], sources))
     assert source_ids == ["sentry:project"]
 
 
-# Test that previously saved builtin sources are not returned if the feature for
-# builtin sources is missing at query time.
-@pytest.mark.django_db
-def test_sources_builtin_disabled(default_project):
-    features = {"organizations:symbol-sources": False, "organizations:custom-symbol-sources": False}
-
-    default_project.update_option("sentry:builtin_symbol_sources", ["microsoft"])
-
-    with Feature(features):
-        sources = get_sources_for_project(default_project)
-
-    source_ids = map(lambda s: s["id"], sources)
-    assert source_ids == ["sentry:project"]
-
-
-@pytest.mark.django_db
-def test_sources_custom(default_project):
-    features = {"organizations:symbol-sources": True, "organizations:custom-symbol-sources": True}
+@django_db_all
+def test_sources_custom(default_project: Project) -> None:
+    features = {"organizations:custom-symbol-sources": True}
 
     # Remove builtin sources explicitly to avoid defaults
     default_project.update_option("sentry:builtin_symbol_sources", [])
@@ -88,15 +97,38 @@ def test_sources_custom(default_project):
         sources = get_sources_for_project(default_project)
 
     # XXX: The order matters here! Project is always first, then custom sources
-    source_ids = map(lambda s: s["id"], sources)
+    # The appStoreConnect source should be filtered out.
+    source_ids = list(map(lambda s: s["id"], sources))
     assert source_ids == ["sentry:project", "custom"]
+
+
+@django_db_all
+def test_sources_custom_with_event_id(default_project: Project) -> None:
+    features = {"organizations:custom-symbol-sources": True}
+
+    # Remove builtin sources explicitly to avoid defaults
+    default_project.update_option("sentry:builtin_symbol_sources", [])
+    default_project.update_option("sentry:symbol_sources", CUSTOM_SOURCE_CONFIG)
+
+    event_id = "a" * 32
+    with Feature(features):
+        sources = get_sources_for_project(default_project, event_id)
+
+    custom_source = sources[1]
+    headers = custom_source.pop("headers")
+    assert headers == {
+        "x-sentry-project-id": str(default_project.id),
+        "x-sentry-event-id": event_id,
+    }
+
+    assert custom_source == orjson.loads(CUSTOM_SOURCE_CONFIG)[0]
 
 
 # Test that previously saved custom sources are not returned if the feature for
 # custom sources is missing at query time.
-@pytest.mark.django_db
-def test_sources_custom_disabled(default_project):
-    features = {"organizations:symbol-sources": True, "organizations:custom-symbol-sources": False}
+@django_db_all
+def test_sources_custom_disabled(default_project: Project) -> None:
+    features = {"organizations:custom-symbol-sources": False}
 
     default_project.update_option("sentry:builtin_symbol_sources", [])
     default_project.update_option("sentry:symbol_sources", CUSTOM_SOURCE_CONFIG)
@@ -104,12 +136,12 @@ def test_sources_custom_disabled(default_project):
     with Feature(features):
         sources = get_sources_for_project(default_project)
 
-    source_ids = map(lambda s: s["id"], sources)
+    source_ids = list(map(lambda s: s["id"], sources))
     assert source_ids == ["sentry:project"]
 
 
 class TestInternalSourcesRedaction:
-    def test_custom_untouched(self):
+    def test_custom_untouched(self) -> None:
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
             {
@@ -119,10 +151,10 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
-        assert redacted["modules"][0]["candidates"] == candidates
+        redact_internal_sources(response)
+        assert response["modules"][0]["candidates"] == candidates
 
-    def test_location_debug_id(self):
+    def test_location_debug_id(self) -> None:
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
             {
@@ -132,11 +164,11 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
+        redact_internal_sources(response)
         expected = [{"source": "sentry:microsoft", "download": {"status": "ok"}}]
-        assert redacted["modules"][0]["candidates"] == expected
+        assert response["modules"][0]["candidates"] == expected
 
-    def test_notfound_deduplicated(self):
+    def test_notfound_deduplicated(self) -> None:
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
             {
@@ -151,11 +183,11 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
+        redact_internal_sources(response)
         expected = [{"source": "sentry:microsoft", "download": {"status": "notfound"}}]
-        assert redacted["modules"][0]["candidates"] == expected
+        assert response["modules"][0]["candidates"] == expected
 
-    def test_notfound_omitted(self):
+    def test_notfound_omitted(self) -> None:
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
             {
@@ -170,11 +202,11 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
+        redact_internal_sources(response)
         expected = [{"source": "sentry:microsoft", "download": {"status": "ok"}}]
-        assert redacted["modules"][0]["candidates"] == expected
+        assert response["modules"][0]["candidates"] == expected
 
-    def test_multiple_notfound_filtered(self):
+    def test_multiple_notfound_filtered(self) -> None:
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
             {
@@ -199,14 +231,14 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
+        redact_internal_sources(response)
         expected = [
             {"source": "sentry:microsoft", "download": {"status": "ok"}},
             {"source": "sentry:apple", "download": {"status": "ok"}},
         ]
-        assert redacted["modules"][0]["candidates"] == expected
+        assert response["modules"][0]["candidates"] == expected
 
-    def test_sentry_project(self):
+    def test_sentry_project(self) -> None:
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
             {
@@ -216,7 +248,7 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
+        redact_internal_sources(response)
         expected = [
             {
                 "source": "sentry:project",
@@ -224,9 +256,9 @@ class TestInternalSourcesRedaction:
                 "download": {"status": "ok"},
             },
         ]
-        assert redacted["modules"][0]["candidates"] == expected
+        assert response["modules"][0]["candidates"] == expected
 
-    def test_sentry_project_notfound_no_location(self):
+    def test_sentry_project_notfound_no_location(self) -> None:
         # For sentry:project status=notfound the location needs to be removed
         debug_id = "451a38b5-0679-79d2-0738-22a5ceb24c4b"
         candidates = [
@@ -237,6 +269,34 @@ class TestInternalSourcesRedaction:
             },
         ]
         response = {"modules": [{"debug_id": debug_id, "candidates": copy.copy(candidates)}]}
-        redacted = redact_internal_sources(response)
+        redact_internal_sources(response)
         expected = [{"source": "sentry:project", "download": {"status": "notfound"}}]
-        assert redacted["modules"][0]["candidates"] == expected
+        assert response["modules"][0]["candidates"] == expected
+
+
+class TestAliasReversion:
+    @pytest.fixture
+    def builtin_sources(self) -> dict[str, dict[str, object]]:
+        return {
+            "ios": {
+                "id": "sentry:ios",
+                "name": "Apple",
+                "type": "alias",
+                "sources": ["ios-source", "tvos-source"],
+            },
+            "ios-source": {
+                "id": "sentry:ios-source",
+                "name": "iOS",
+                "type": "gcs",
+            },
+            "tvos-source": {
+                "id": "sentry:tvos-source",
+                "name": "TvOS",
+                "type": "gcs",
+            },
+        }
+
+    def test_reverse_aliases(self, builtin_sources: dict[str, dict[str, object]]) -> None:
+        reverse_aliases = reverse_aliases_map(builtin_sources)
+        expected = {"sentry:ios-source": "sentry:ios", "sentry:tvos-source": "sentry:ios"}
+        assert reverse_aliases == expected

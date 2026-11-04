@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from typing import IO, cast
+from urllib.parse import parse_qs
+
+import responses
+from django.conf import settings
+from django.http import HttpResponseRedirect
+from django.test import override_settings
+from django.urls import re_path
+from requests import PreparedRequest
+from rest_framework.permissions import AllowAny, BasePermission
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+import sentry.api.urls as api_urls
+from sentry.api.base import Endpoint, cell_silo_endpoint, control_silo_endpoint
+from sentry.api.bases.organization import ControlSiloOrganizationEndpoint, OrganizationEndpoint
+from sentry.feedback.endpoints.error_page_embed import ErrorEmbedResolver
+from sentry.models.organization import Organization
+from sentry.testutils.cases import APITestCase
+from sentry.types.cell import Cell
+from sentry.utils import json
+
+
+@control_silo_endpoint
+class ControlEndpoint(ControlSiloOrganizationEndpoint):
+    permission_classes: tuple[type[BasePermission], ...] = (AllowAny,)
+
+    def get(self, request: Request, organization: Organization, **kwargs: object) -> Response:
+        return Response({"proxy": False})
+
+
+@cell_silo_endpoint
+class RegionEndpoint(OrganizationEndpoint):
+    permission_classes: tuple[type[BasePermission], ...] = (AllowAny,)
+
+    def get(self, request: Request, organization: Organization) -> Response:
+        return Response({"proxy": False})
+
+    def post(self, request: Request, organization: Organization) -> HttpResponseRedirect:
+        return HttpResponseRedirect("https://zombo.com")
+
+
+@cell_silo_endpoint
+class NoOrgRegionEndpoint(Endpoint):
+    permission_classes: tuple[type[BasePermission], ...] = (AllowAny,)
+
+    def get(self, request: Request) -> Response:
+        return Response({"proxy": False})
+
+
+@cell_silo_endpoint(cell_resolver=ErrorEmbedResolver())
+class MockErrorEmbedEndpoint(Endpoint):
+    # Mock embed endpoint to e2e test the resolver logic in apigateway tests
+    permission_classes: tuple[type[BasePermission], ...] = (AllowAny,)
+
+    def get(self, request: Request) -> Response:
+        return Response({"proxy": False, "name": "error-embed"})
+
+
+urlpatterns = [
+    re_path(
+        r"^organizations/(?P<organization_slug>[^/]+)/control/$",
+        ControlEndpoint.as_view(),
+        name="control-endpoint",
+    ),
+    re_path(
+        r"^organizations/(?P<organization_slug>[^/]+)/region/$",
+        RegionEndpoint.as_view(),
+        name="region-endpoint",
+    ),
+    re_path(
+        r"^organizations/(?P<organization_id_or_slug>[^/]+)/control/$",
+        ControlEndpoint.as_view(),
+        name="control-endpoint-id-or-slug",
+    ),
+    re_path(
+        r"^organizations/(?P<organization_id_or_slug>[^/]+)/region/$",
+        RegionEndpoint.as_view(),
+        name="region-endpoint-id-or-slug",
+    ),
+    re_path(
+        r"^api/embed/error-page/$",
+        MockErrorEmbedEndpoint.as_view(),
+        name="sentry-error-page-embed",
+    ),
+] + api_urls.urlpatterns
+
+
+def verify_request_body(
+    body: object, headers: Mapping[str, str]
+) -> Callable[[PreparedRequest], tuple[int, Mapping[str, str], str]]:
+    """Wrapper for a callback function for responses.add_callback"""
+
+    def request_callback(request: PreparedRequest) -> tuple[int, Mapping[str, str], str]:
+        if request.headers.get("content-type") == "application/json":
+            assert json.load(cast(IO[bytes], request.body)) == body
+        else:
+            assert cast(IO[bytes], request.body).read() == body
+        assert (request.headers[key] == headers[key] for key in headers)
+        return 200, {}, json.dumps({"proxy": True})
+
+    return request_callback
+
+
+def verify_request_headers(
+    headers: Mapping[str, str],
+) -> Callable[[PreparedRequest], tuple[int, Mapping[str, str], str]]:
+    """Wrapper for a callback function for responses.add_callback"""
+
+    def request_callback(request: PreparedRequest) -> tuple[int, Mapping[str, str], str]:
+        assert (request.headers[key] == headers[key] for key in headers)
+        return 200, {}, json.dumps({"proxy": True})
+
+    return request_callback
+
+
+def verify_request_params(
+    params: Mapping[str, str | list[str]], headers: Mapping[str, str]
+) -> Callable[[PreparedRequest], tuple[int, Mapping[str, str], str]]:
+    """Wrapper for a callback function for responses.add_callback"""
+
+    def request_callback(request: PreparedRequest) -> tuple[int, Mapping[str, str], str]:
+        assert request.url is not None
+        request_params = parse_qs(request.url.split("?")[1])
+        assert (request.headers[key] == headers[key] for key in headers)
+        for key in params:
+            assert key in request_params
+            if len(request_params[key]) > 1:
+                assert request_params[key] == params[key]
+            else:
+                assert request_params[key][0] == params[key]
+        return 200, {}, json.dumps({"proxy": True})
+
+    return request_callback
+
+
+def verify_file_body(
+    file_body: bytes, headers: Mapping[str, str]
+) -> Callable[[PreparedRequest], tuple[int, Mapping[str, str], str]]:
+    """Wrapper for a callback function for responses.add_callback"""
+
+    def request_callback(request: PreparedRequest) -> tuple[int, Mapping[str, str], str]:
+        assert file_body in cast(IO[bytes], request.body).read()
+        assert (request.headers[key] == headers[key] for key in headers)
+        return 200, {}, json.dumps({"proxy": True})
+
+    return request_callback
+
+
+def provision_middleware() -> list[str]:
+    middleware = list(settings.MIDDLEWARE)
+    if "sentry.hybridcloud.apigateway.middleware.ApiGatewayMiddleware" not in middleware:
+        middleware = ["sentry.hybridcloud.apigateway.middleware.ApiGatewayMiddleware"] + middleware
+    return middleware
+
+
+@override_settings(ROOT_URLCONF=__name__)
+class ApiGatewayTestCase(APITestCase):
+    # Subclasses will generally need to be decorated with
+    #     @*_silo_test(cells=[ApiGatewayTestCase.CELL])
+
+    CELL = Cell(
+        name="us",
+        snowflake_id=1,
+        address="http://us.internal.sentry.io",
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        responses.add(
+            responses.GET,
+            f"{self.CELL.address}/get",
+            body=json.dumps({"proxy": True}),
+            content_type="application/json",
+            adding_headers={"test": "header"},
+        )
+        responses.add(
+            responses.GET,
+            f"{self.CELL.address}/error",
+            body=json.dumps({"proxy": True}),
+            status=400,
+            content_type="application/json",
+            adding_headers={"test": "header"},
+        )
+
+        self.organization = self.create_organization(cell=self.CELL)
+
+        # Echos the request body and header back for verification
+        def return_request_body(
+            request: PreparedRequest,
+        ) -> tuple[int, Mapping[str, str], str | bytes | None]:
+            return (200, request.headers, request.body)
+
+        # Echos the query params and header back for verification
+        def return_request_params(
+            request: PreparedRequest,
+        ) -> tuple[int, Mapping[str, str], str | bytes | None]:
+            assert request.url is not None
+            params = parse_qs(request.url.split("?")[1])
+            return (200, request.headers, json.dumps(params).encode())
+
+        responses.add_callback(responses.GET, f"{self.CELL.address}/echo", return_request_params)
+        responses.add_callback(responses.POST, f"{self.CELL.address}/echo", return_request_body)
+
+        self.middleware = provision_middleware()

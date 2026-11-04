@@ -1,0 +1,167 @@
+import {useState} from 'react';
+import {IconChevron} from '@sentry/icons/chevron';
+
+import {Container, Grid} from '@sentry/scraps/layout';
+
+import {LoadingError} from 'sentry/components/loadingError';
+import {t} from 'sentry/locale';
+import type {Group} from 'sentry/types/group';
+import {parseLinkHeader} from 'sentry/utils/parseLinkHeader';
+import {decodeSorts} from 'sentry/utils/queryString';
+import {getRequestErrorUserMessage} from 'sentry/utils/requestError/getRequestErrorUserMessage';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useEventColumns} from 'sentry/views/issueDetails/allEventsTable';
+import {
+  EventListTable,
+  Header,
+  HeaderItem,
+  PaginationButton,
+  PaginationText,
+  Title,
+} from 'sentry/views/issueDetails/eventListTable';
+import {ALL_EVENTS_EXCLUDED_TAGS} from 'sentry/views/issueDetails/hooks/useEventQuery';
+import {useIssueDetailsEventView} from 'sentry/views/issueDetails/hooks/useIssueDetailsDiscoverQuery';
+import {EventsTable} from 'sentry/views/performance/transactionSummary/transactionEvents/eventsTable';
+
+interface EventListProps {
+  group: Group;
+}
+
+export function EventList({group}: EventListProps) {
+  const referrer = 'issue_details.streamline_list';
+  const location = useLocation();
+  const organization = useOrganization();
+  // Remount both Discover queries on retry, preserving the filters in the URL.
+  const [retryCount, setRetryCount] = useState(0);
+  const {fields, columnTitles} = useEventColumns(group, organization);
+  const eventView = useIssueDetailsEventView({
+    group,
+    queryProps: {
+      fields,
+      widths: fields.map(field => {
+        switch (field) {
+          case 'id':
+          case 'trace':
+          case 'replayId':
+            // Id columns can be smaller
+            return '100';
+          case 'environment':
+            // Big enough to fit "Environment"
+            return '115';
+          case 'timestamp':
+            return '220';
+          case 'url':
+            return '300';
+          case 'title':
+          case 'transaction':
+            return '200';
+          default:
+            return '150';
+        }
+      }),
+    },
+  });
+
+  // oxlint-disable-next-line react/immutability
+  eventView.sorts = decodeSorts(location.query.sort).filter(sort =>
+    fields.includes(sort.field)
+  );
+
+  if (!eventView.sorts.length) {
+    // oxlint-disable-next-line react/immutability
+    eventView.sorts = [{field: 'timestamp', kind: 'desc'}];
+  }
+
+  return (
+    <EventListTable pagination={{enabled: false}}>
+      <EventsTable
+        key={retryCount}
+        eventView={eventView}
+        location={location}
+        issueId={group.id}
+        organization={organization}
+        excludedTags={ALL_EVENTS_EXCLUDED_TAGS}
+        projectSlug={group.project.slug}
+        customColumns={['minidump']}
+        transactionName={group.title || group.type}
+        columnTitles={columnTitles}
+        referrer={referrer}
+        hidePagination
+        applyEnvironmentFilter
+        renderError={error => (
+          <Container>
+            <Header>
+              <Title>{t('All Events')}</Title>
+            </Header>
+            <Container padding="lg">
+              <LoadingError
+                message={getRequestErrorUserMessage(
+                  error.getOriginalError(),
+                  error.message
+                )}
+                onRetry={() => setRetryCount(count => count + 1)}
+              />
+            </Container>
+          </Container>
+        )}
+        renderTableHeader={({
+          pageLinks,
+          pageEventsCount,
+          totalEventsCount,
+          isPending,
+        }) => {
+          const links = parseLinkHeader(pageLinks);
+          const previousDisabled = links.previous?.results === false;
+          const nextDisabled = links.next?.results === false;
+
+          return (
+            <Header>
+              <Title>{t('All Events')}</Title>
+              <HeaderItem>
+                <PaginationText
+                  pageCount={pageEventsCount}
+                  totalCount={totalEventsCount}
+                  tableUnits={t('events')}
+                  paginatorType="cursor"
+                />
+              </HeaderItem>
+              <HeaderItem>
+                <Grid flow="column" align="center" gap="2xs">
+                  <PaginationButton
+                    aria-label={t('Previous Page')}
+                    variant="transparent"
+                    size="xs"
+                    icon={<IconChevron direction="left" />}
+                    to={{
+                      ...location,
+                      query: {
+                        ...location.query,
+                        cursor: links.previous?.cursor,
+                      },
+                    }}
+                    disabled={isPending || previousDisabled}
+                  />
+                  <PaginationButton
+                    aria-label={t('Next Page')}
+                    variant="transparent"
+                    size="xs"
+                    icon={<IconChevron direction="right" />}
+                    to={{
+                      ...location,
+                      query: {
+                        ...location.query,
+                        cursor: links.next?.cursor,
+                      },
+                    }}
+                    disabled={isPending || nextDisabled}
+                  />
+                </Grid>
+              </HeaderItem>
+            </Header>
+          );
+        }}
+      />
+    </EventListTable>
+  );
+}

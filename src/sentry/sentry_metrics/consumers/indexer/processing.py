@@ -1,0 +1,145 @@
+import logging
+from collections.abc import Callable, Mapping
+
+import sentry_sdk
+from arroyo.types import Message
+from django.conf import settings
+from sentry_kafka_schemas.codecs import Codec
+from sentry_kafka_schemas.schema_types.ingest_metrics_v1 import IngestMetric
+from sentry_sdk import traces
+from sentry_sdk.scope import Scope
+
+from sentry.conf.types.kafka_definition import Topic, get_topic_codec
+from sentry.sentry_metrics.configuration import IndexerStorage, MetricsIngestConfiguration
+from sentry.sentry_metrics.consumers.indexer.batch import IndexerBatch
+from sentry.sentry_metrics.consumers.indexer.common import IndexerOutputMessageBatch, MessageBatch
+from sentry.sentry_metrics.consumers.indexer.schema_validator import MetricsSchemaValidator
+from sentry.sentry_metrics.consumers.indexer.tags_validator import ReleaseHealthTagsValidator
+from sentry.sentry_metrics.indexer.base import StringIndexer
+from sentry.sentry_metrics.indexer.mock import MockIndexer
+from sentry.sentry_metrics.indexer.postgres.postgres_v2 import PostgresIndexer
+from sentry.utils import metrics
+
+logger = logging.getLogger(__name__)
+
+STORAGE_TO_INDEXER: Mapping[IndexerStorage, Callable[[], StringIndexer]] = {
+    IndexerStorage.POSTGRES: PostgresIndexer,
+    IndexerStorage.MOCK: MockIndexer,
+}
+
+INGEST_CODEC: Codec[IngestMetric] = get_topic_codec(Topic.INGEST_METRICS)
+
+
+class MessageProcessor:
+    def __init__(self, config: MetricsIngestConfiguration):
+        self._indexer = STORAGE_TO_INDEXER[config.db_backend](**config.db_backend_options)
+        self._config = config
+
+    # The following two methods are required to work such that the parallel
+    # indexer can spawn subprocesses correctly.
+    #
+    # We get/set just the config (assuming it's pickleable) and re-instantiate
+    # the indexer backend in the subprocess (assuming that it usually isn't)
+
+    def __getstate__(self) -> MetricsIngestConfiguration:
+        return self._config
+
+    def __setstate__(self, config: MetricsIngestConfiguration) -> None:
+        # mypy: "cannot access init directly"
+        # yes I can, watch me.
+        self.__init__(config)  # type: ignore[misc]
+
+    def __get_tags_validator(self) -> Callable[[Mapping[str, str]], bool]:
+        """
+        Get the tags validator function for the current use case.
+        """
+        return ReleaseHealthTagsValidator().is_allowed
+
+    def __get_schema_validator(self) -> Callable[[str, IngestMetric], None]:
+        """
+        Get the schema validator function for the current use case.
+        """
+        return MetricsSchemaValidator(
+            input_codec=INGEST_CODEC,
+            validation_option=self._config.schema_validation_rule_option_name,
+        ).validate
+
+    def process_messages(self, outer_message: Message[MessageBatch]) -> IndexerOutputMessageBatch:
+        sample_rate = (
+            settings.SENTRY_METRICS_INDEXER_TRANSACTIONS_SAMPLE_RATE
+            * settings.SENTRY_BACKEND_APM_SAMPLING
+        )
+        traces.new_trace()
+        propagation_context = sentry_sdk.get_current_scope().get_active_propagation_context()
+        prev_sampling_context = propagation_context.custom_sampling_context
+        Scope.set_custom_sampling_context({"sample_rate": sample_rate})
+        try:
+            span = traces.start_span(
+                name="sentry.sentry_metrics.consumers.indexer.processing.process_messages",
+                parent_span=None,
+            )
+        finally:
+            propagation_context = sentry_sdk.get_current_scope().get_active_propagation_context()
+            propagation_context.custom_sampling_context = prev_sampling_context
+        with span:
+            return self._process_messages_impl(outer_message)
+
+    def _process_messages_impl(
+        self,
+        outer_message: Message[MessageBatch],
+    ) -> IndexerOutputMessageBatch:
+        """
+        We have an outer_message which contains a collection of Message() objects.
+        Each of them represents a single message/metric on kafka.
+            Message(
+                payload=[Message(...), Message(...), etc]
+            )
+
+        The inner messages payloads are KafkaPayload's that have:
+            * kafka meta data (partition/offsets)
+            * key
+            * headers
+            * value
+
+        The value of the message is what we need to parse and then translate
+        using the indexer.
+
+        We create an IndexerBatch object to:
+
+        1. Parse and validate the inner messages from a sequence of bytes into
+           Python objects (initalization)
+        2. Filter messages (filter_messages)
+        3. Create a collection of all the strings that needs to to be indexed
+        (extract_strings)
+        4. Take a mapping of string -> int (indexed strings), and replace all of
+           the messages strings into ints
+        """
+        batch = IndexerBatch(
+            outer_message,
+            tags_validator=self.__get_tags_validator(),
+            schema_validator=self.__get_schema_validator(),
+        )
+        span = traces.get_current_span()
+        if span:
+            span.set_attribute("indexer_batch.payloads.len", len(batch.parsed_payloads_by_meta))
+
+        extracted_strings = batch.extract_strings()
+
+        if span:
+            span.set_attribute("org_strings.len", len(extracted_strings))
+
+        with (
+            metrics.timer("metrics_consumer.bulk_record"),
+            traces.start_span(name="bulk_record", attributes={"sentry.op": "bulk_record"}),
+        ):
+            record_result = self._indexer.bulk_record(extracted_strings)
+
+        mapping = record_result.get_mapped_results()
+        bulk_record_meta = record_result.get_fetch_metadata()
+
+        results = batch.reconstruct_messages(mapping, bulk_record_meta)
+
+        if span:
+            span.set_attribute("new_messages.len", len(results.data))
+
+        return results

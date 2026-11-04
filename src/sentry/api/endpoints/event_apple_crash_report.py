@@ -1,14 +1,27 @@
+import sentry_sdk
 from django.http import HttpResponse, StreamingHttpResponse
+from django.http.response import HttpResponseBase
+from rest_framework.request import Request
 
-from sentry import eventstore
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
 from sentry.api.bases.project import ProjectEndpoint
 from sentry.api.exceptions import ResourceDoesNotExist
 from sentry.lang.native.applecrashreport import AppleCrashReport
+from sentry.models.project import Project
+from sentry.services import eventstore
 from sentry.utils.safe import get_path
 
 
+@cell_silo_endpoint
 class EventAppleCrashReportEndpoint(ProjectEndpoint):
-    def get(self, request, project, event_id):
+    owner = ApiOwner.OWNERS_INGEST
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+    }
+
+    def get(self, request: Request, project: Project, event_id: str) -> HttpResponseBase:
         """
         Retrieve an Apple Crash Report from an event
         `````````````````````````````````````````````
@@ -16,9 +29,11 @@ class EventAppleCrashReportEndpoint(ProjectEndpoint):
         This endpoint returns the an apple crash report for a specific event.
         This works only if the event.platform == cocoa
         """
-        event = eventstore.get_event_by_id(project.id, event_id)
+        event = eventstore.backend.get_event_by_id(project.id, event_id)
         if event is None:
             raise ResourceDoesNotExist
+
+        sentry_sdk.set_attribute("event.type", event.get_event_type())
 
         if event.platform not in ("cocoa", "native"):
             return HttpResponse(
@@ -26,6 +41,7 @@ class EventAppleCrashReportEndpoint(ProjectEndpoint):
             )
 
         symbolicated = request.GET.get("minified") not in ("1", "true")
+        prioritized_thread_id = request.GET.get("thread_id") or None
 
         apple_crash_report_string = str(
             AppleCrashReport(
@@ -34,15 +50,19 @@ class EventAppleCrashReportEndpoint(ProjectEndpoint):
                 debug_images=get_path(event.data, "debug_meta", "images", filter=True),
                 exceptions=get_path(event.data, "exception", "values", filter=True),
                 symbolicated=symbolicated,
+                prioritized_thread_id=prioritized_thread_id,
             )
         )
 
-        response = HttpResponse(apple_crash_report_string, content_type="text/plain")
-
         if request.GET.get("download") is not None:
             filename = "{}{}.crash".format(event.event_id, symbolicated and "-symbolicated" or "")
-            response = StreamingHttpResponse(apple_crash_report_string, content_type="text/plain")
-            response["Content-Length"] = len(apple_crash_report_string)
-            response["Content-Disposition"] = 'attachment; filename="%s"' % filename
-
-        return response
+            return StreamingHttpResponse(
+                apple_crash_report_string,
+                content_type="text/plain",
+                headers={
+                    "Content-Length": len(apple_crash_report_string),
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                },
+            )
+        else:
+            return HttpResponse(apple_crash_report_string, content_type="text/plain")

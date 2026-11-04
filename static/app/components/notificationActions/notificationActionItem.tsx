@@ -1,0 +1,439 @@
+import {Fragment, useState} from 'react';
+import styled from '@emotion/styled';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+import {IconMail} from '@sentry/icons/mail';
+
+import {Badge} from '@sentry/scraps/badge';
+import {Button} from '@sentry/scraps/button';
+import type {MenuItemProps} from '@sentry/scraps/dropdownMenu';
+import {DropdownMenu} from '@sentry/scraps/dropdownMenu';
+import {Flex, Grid} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {
+  addErrorMessage,
+  addLoadingMessage,
+  addSuccessMessage,
+} from 'sentry/actionCreators/indicator';
+import {Card} from 'sentry/components/card';
+import {openConfirmModal} from 'sentry/components/confirm';
+import {OnCallServiceForm} from 'sentry/components/notificationActions/forms/onCallServiceForm';
+import {SlackForm} from 'sentry/components/notificationActions/forms/slackForm';
+import {PluginIcon} from 'sentry/icons/pluginIcon';
+import {t} from 'sentry/locale';
+import type {
+  AvailableNotificationAction,
+  NotificationAction,
+} from 'sentry/types/notificationActions';
+import {NotificationActionService} from 'sentry/types/notificationActions';
+import type {Project} from 'sentry/types/project';
+import {useApi} from 'sentry/utils/useApi';
+import {useOrganization} from 'sentry/utils/useOrganization';
+
+type NotificationActionItemProps = {
+  /**
+   * The notification action being represented
+   */
+  action: Partial<NotificationAction>;
+  /**
+   * The available actions for the action's serviceType
+   * (serviceType as in "slack", "pagerduty")
+   */
+  availableActions: AvailableNotificationAction[];
+  /**
+   * The notif action's index in the parent component (NotificationActionManager)
+   */
+  index: number;
+  /**
+   * Update state in the parent component upon deleting this notification action
+   */
+  onDelete: (actionId: number) => void;
+  /**
+   * Update state in the parent component upon updating this notification action
+   */
+  onUpdate: (actionId: number, editedAction: NotificationAction) => void;
+  /**
+   * Map of opsgenie integration IDs to available actions for those IDs
+   */
+  opsgenieIntegrations: Record<number, AvailableNotificationAction[]>;
+  /**
+   * Map of pagerduty integration IDs to available actions for those IDs
+   */
+  pagerdutyIntegrations: Record<number, AvailableNotificationAction[]>;
+  project: Project;
+  /**
+   * Whether to initially display edit mode
+   * Set to "true" when adding a new notification action
+   */
+  defaultEdit?: boolean;
+  disabled?: boolean;
+  /**
+   * Optional list of roles to display as recipients of Sentry notifications
+   */
+  recipientRoles?: string[];
+};
+
+type NotificationActionDescriptionProps = {
+  action: Partial<NotificationAction>;
+  recipientRoles?: string[];
+};
+
+function NotificationActionDescription({
+  action,
+  recipientRoles,
+}: NotificationActionDescriptionProps) {
+  switch (action.serviceType) {
+    case NotificationActionService.SENTRY_NOTIFICATION:
+      return (
+        <Fragment>
+          <div>{t('Send an email notification to the following roles')}</div>
+          {recipientRoles?.map(role => (
+            <NotificationRecipientBadge variant="muted" key={role}>
+              {role}
+            </NotificationRecipientBadge>
+          ))}
+        </Fragment>
+      );
+    case NotificationActionService.SLACK:
+      return (
+        <Fragment>
+          <div>{t('Send a notification to the')}</div>
+          <NotificationRecipientBadge variant="muted">
+            {action.targetDisplay}
+          </NotificationRecipientBadge>
+          <div>{t('channel')}</div>
+        </Fragment>
+      );
+    case NotificationActionService.PAGERDUTY:
+      return (
+        <Fragment>
+          <div>{t('Send a notification to the')}</div>
+          <NotificationRecipientBadge variant="muted">
+            {action.targetDisplay}
+          </NotificationRecipientBadge>
+          <div>{t('service')}</div>
+        </Fragment>
+      );
+    case NotificationActionService.OPSGENIE:
+      return (
+        <Fragment>
+          <div>{t('Send a notification to the')}</div>
+          <NotificationRecipientBadge variant="muted">
+            {action.targetDisplay}
+          </NotificationRecipientBadge>
+          <div>{t('team')}</div>
+        </Fragment>
+      );
+    default:
+      // TODO(enterprise): descriptions for email, msteams, sentry_app
+      return null;
+  }
+}
+
+type NotificationActionEditButtonProps = {
+  disabled: boolean;
+  onDelete: () => Promise<void>;
+  onEdit: () => void;
+  serviceType: string | undefined;
+};
+
+function NotificationActionEditButton({
+  disabled,
+  onDelete,
+  onEdit,
+  serviceType,
+}: NotificationActionEditButtonProps) {
+  const menuItems: MenuItemProps[] = [
+    {
+      key: 'notificationaction-delete',
+      label: t('Delete'),
+      priority: 'danger',
+      onAction: () => {
+        openConfirmModal({
+          message: t('Are you sure you want to delete this notification action?'),
+          onConfirm: onDelete,
+        });
+      },
+    },
+  ];
+
+  // No edit mode for Sentry notifications
+  if (serviceType !== NotificationActionService.SENTRY_NOTIFICATION) {
+    menuItems.unshift({
+      key: 'notificationaction-edit',
+      label: t('Edit'),
+      onAction: onEdit,
+    });
+  }
+
+  return (
+    <Tooltip
+      disabled={!disabled}
+      title={t('You do not have permission to edit notification actions.')}
+    >
+      <DropdownMenu
+        items={menuItems}
+        trigger={triggerProps => (
+          <OverlayTrigger.IconButton
+            {...triggerProps}
+            aria-label={t('Actions')}
+            size="xs"
+            icon={<IconEllipsis direction="down" size="sm" />}
+            data-test-id="edit-dropdown"
+          />
+        )}
+        isDisabled={disabled}
+      />
+    </Tooltip>
+  );
+}
+
+type NotificationActionFormProps = {
+  action: Partial<NotificationAction>;
+  availableActions: AvailableNotificationAction[];
+  description: React.ReactNode;
+  onCallServiceChange: (names: string[], values: any[]) => void;
+  onCancel: () => void;
+  onChange: (name: string, value: any) => void;
+  onSave: () => void;
+  opsgenieIntegrations: Record<number, AvailableNotificationAction[]>;
+  pagerdutyIntegrations: Record<number, AvailableNotificationAction[]>;
+  serviceType: string | undefined;
+};
+
+function NotificationActionForm({
+  action,
+  availableActions,
+  description,
+  onCallServiceChange,
+  onCancel,
+  onChange,
+  onSave,
+  opsgenieIntegrations,
+  pagerdutyIntegrations,
+  serviceType,
+}: NotificationActionFormProps) {
+  switch (serviceType) {
+    case NotificationActionService.SENTRY_NOTIFICATION:
+      return (
+        <Flex justify="between" width="100%">
+          <Flex align="center" wrap="wrap" gap="xs">
+            {description}
+          </Flex>
+          <Grid flow="column" align="center" gap="xs">
+            <Button onClick={onCancel} size="xs">
+              {t('Cancel')}
+            </Button>
+            <Button variant="primary" size="xs" onClick={onSave}>
+              {t('Save')}
+            </Button>
+          </Grid>
+        </Flex>
+      );
+    case NotificationActionService.SLACK:
+      return (
+        <SlackForm
+          action={action}
+          onChange={onChange}
+          onSave={onSave}
+          onCancel={onCancel}
+          availableActions={availableActions}
+        />
+      );
+    case NotificationActionService.PAGERDUTY:
+      return (
+        <OnCallServiceForm
+          action={action}
+          onChange={onCallServiceChange}
+          onSave={onSave}
+          onCancel={onCancel}
+          Integrations={pagerdutyIntegrations}
+          onCallService="pagerduty"
+        />
+      );
+    case NotificationActionService.OPSGENIE:
+      return (
+        <OnCallServiceForm
+          action={action}
+          onChange={onCallServiceChange}
+          onSave={onSave}
+          onCancel={onCancel}
+          Integrations={opsgenieIntegrations}
+          onCallService="opsgenie"
+        />
+      );
+    default:
+      return null;
+  }
+}
+
+export function NotificationActionItem({
+  action,
+  index,
+  availableActions,
+  defaultEdit = false,
+  pagerdutyIntegrations,
+  opsgenieIntegrations,
+  project,
+  recipientRoles,
+  onDelete,
+  onUpdate,
+  disabled = false,
+}: NotificationActionItemProps) {
+  const [isEditing, setIsEditing] = useState(defaultEdit);
+  const [editedAction, setEditedAction] = useState(action);
+  const serviceType = action.serviceType;
+  const api = useApi();
+  const organization = useOrganization();
+
+  const icon =
+    serviceType === NotificationActionService.EMAIL ||
+    serviceType === NotificationActionService.SENTRY_NOTIFICATION ? (
+      <IconMail size="sm" />
+    ) : (
+      <PluginIcon pluginId={serviceType ?? 'placeholder'} size={16} />
+    );
+
+  const description = (
+    <NotificationActionDescription action={action} recipientRoles={recipientRoles} />
+  );
+
+  const handleDelete = async () => {
+    const endpoint = `/organizations/${organization.slug}/notifications/actions/${action.id}/`;
+    try {
+      await api.requestPromise(endpoint, {
+        method: 'DELETE',
+      });
+      addSuccessMessage(t('Successfully deleted notification action'));
+      onDelete(index);
+    } catch (err) {
+      addErrorMessage(t('Unable to delete notification action'));
+    }
+  };
+
+  const handleCancel = () => {
+    if (action.id) {
+      setEditedAction(action);
+      setIsEditing(false);
+      return;
+    }
+    // Delete the unsaved notification action
+    onDelete(index);
+  };
+
+  const handleSave = async () => {
+    const {apiMethod, apiEndpoint, successMessage, errorMessage} = getFormData();
+    addLoadingMessage();
+    // TODO(enterprise): use "requires" to get data to send
+    // This is currently optimized for spike protection
+    const data = {...editedAction};
+
+    // Remove keys from the data if they are falsy
+    Object.keys(data).forEach(key => {
+      // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+      if (!data[key]) {
+        // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+        delete data[key];
+      }
+    });
+
+    try {
+      const resp = await api.requestPromise(apiEndpoint, {
+        method: apiMethod,
+        data: {...data, projects: [project.slug]},
+      });
+      addSuccessMessage(successMessage);
+      onUpdate(index, resp);
+      setEditedAction(resp);
+      setIsEditing(false);
+    } catch (err) {
+      addErrorMessage(errorMessage);
+    }
+  };
+
+  // Used for PagerDuty/Opsgenie
+  const handleChange = (names: string[], values: any[]) => {
+    const updatedAction = {...editedAction};
+    names.forEach((name, i) => {
+      const value = values[i];
+      // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+      updatedAction[name] = value;
+    });
+    setEditedAction(updatedAction);
+  };
+
+  const getFormData = () => {
+    if (editedAction.id) {
+      return {
+        apiMethod: 'PUT' as const,
+        apiEndpoint: `/organizations/${organization.slug}/notifications/actions/${action.id}/`,
+        successMessage: t('Successfully updated notification action'),
+        errorMessage: t('Unable to update notification action'),
+      };
+    }
+    return {
+      apiMethod: 'POST' as const,
+      apiEndpoint: `/organizations/${organization.slug}/notifications/actions/`,
+      successMessage: t('Successfully added notification action'),
+      errorMessage: t('Unable to add notification action'),
+    };
+  };
+
+  return (
+    <StyledCard isEditing={isEditing} data-test-id="notification-action">
+      {isEditing ? (
+        <Flex align="center" width="100%" data-test-id={`${serviceType}-form`}>
+          <Flex align="center" marginRight="md">
+            {icon}
+          </Flex>
+          <NotificationActionForm
+            action={editedAction}
+            availableActions={availableActions}
+            description={description}
+            onCallServiceChange={handleChange}
+            onCancel={handleCancel}
+            onChange={(name, value) => setEditedAction({...editedAction, [name]: value})}
+            onSave={handleSave}
+            opsgenieIntegrations={opsgenieIntegrations}
+            pagerdutyIntegrations={pagerdutyIntegrations}
+            serviceType={serviceType}
+          />
+        </Flex>
+      ) : (
+        <Fragment>
+          <Flex align="center" width="100%" data-test-id={`${serviceType}-action`}>
+            <Flex align="center" marginRight="md">
+              {icon}
+            </Flex>
+            <Flex align="center" wrap="wrap" gap="xs">
+              {description}
+            </Flex>
+          </Flex>
+          {/* Edit button is located outside of the form */}
+          <NotificationActionEditButton
+            disabled={disabled}
+            onDelete={handleDelete}
+            onEdit={() => setIsEditing(true)}
+            serviceType={serviceType}
+          />
+        </Fragment>
+      )}
+    </StyledCard>
+  );
+}
+
+const StyledCard = styled(Card)<{isEditing: boolean}>`
+  padding: ${p => p.theme.space.md} ${p => p.theme.space.lg};
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: ${p => p.theme.space.md};
+  background-color: ${props =>
+    props.isEditing ? props.theme.tokens.background.tertiary : 'inherit'};
+`;
+
+const NotificationRecipientBadge = styled(Badge)`
+  border-radius: ${p => p.theme.radius.md};
+  font-weight: ${p => p.theme.font.weight.sans.regular};
+`;

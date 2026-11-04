@@ -3,17 +3,20 @@ import logging
 from django.contrib.auth.models import update_last_login
 from django.contrib.auth.signals import user_logged_in
 from django.db.utils import DatabaseError
-from sentry.models import UserOption
+from django.http.request import HttpRequest
+
+from sentry.users.models.user import User
+from sentry.users.models.user_option import UserOption
 
 
 # Set user language if set
-def set_language_on_logon(request, user, **kwargs):
+def set_language_on_logon(request: HttpRequest, user: User, **kwargs: object) -> None:
     language = UserOption.objects.get_value(user=user, key="language")
     if language and hasattr(request, "session"):
         request.session["django_language"] = language
 
 
-def safe_update_last_login(sender, user, **kwargs):
+def safe_update_last_login(sender: type[User], user: User, **kwargs: object) -> None:
     """
     Identical to Django's built-in handler except that we gracefully
     handle database failures.
@@ -23,10 +26,10 @@ def safe_update_last_login(sender, user, **kwargs):
     try:
         update_last_login(sender, user, **kwargs)
     except DatabaseError as exc:
-        logging.warn(str(exc), exc_info=True)
+        logging.warning(str(exc), exc_info=True)
 
 
-def remove_lost_password_hashes(sender, user, **kwargs):
+def remove_lost_password_hashes(sender: type[User], user: User, **kwargs: object) -> None:
     # Remove pending password recovery hashes; user was able to login
     user.clear_lost_passwords()
 

@@ -1,40 +1,108 @@
-import logging
+from __future__ import annotations
 
-from sentry.utils.safe import safe_execute
+import logging
+from typing import TYPE_CHECKING
+
+from sentry.silo.base import SiloMode
 from sentry.tasks.base import instrumented_task
+from sentry.taskworker.namespaces import notifications_tasks
+from sentry.utils.sdk import bind_organization_context
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sentry.models.activity import Activity
+    from sentry.models.organization import Organization
 
-def get_activity_notifiers(project):
+
+def _send_legacy_activity_notification(activity: Activity) -> None:
     from sentry.mail import mail_adapter
-    from sentry.plugins.bases.notify import NotificationPlugin
-    from sentry.plugins.base import plugins
 
-    results = []
-    for plugin in plugins.for_project(project, version=1):
-        if isinstance(plugin, NotificationPlugin):
-            results.append(plugin)
+    mail_adapter.notify_about_activity(activity)
 
-    for plugin in plugins.for_project(project, version=2):
-        for notifier in safe_execute(plugin.get_notifiers, _with_transaction=False) or ():
-            results.append(notifier)
 
-    results.append(mail_adapter)
+def _send_deploy_activity_notification(activity: Activity, organization: Organization) -> None:
+    from sentry.notifications.platform.service import NotificationService
+    from sentry.notifications.platform.strategies.deploy_release import DeployReleaseStrategy
+    from sentry.notifications.platform.templates.deploy import (
+        DeployReleaseData,
+        build_deploy_release_data,
+        create_target_specific_deploy_data,
+    )
+    from sentry.notifications.platform.types import NotificationSource
+    from sentry.notifications.utils import get_deploy, get_release
 
-    return results
+    if not NotificationService.has_access(
+        organization=organization, source=NotificationSource.DEPLOY_RELEASE
+    ):
+        _send_legacy_activity_notification(activity=activity)
+        return
+
+    deploy = get_deploy(activity)
+    release = get_release(activity, organization)
+
+    if not deploy or not release:
+        _send_legacy_activity_notification(activity=activity)
+        return
+
+    result = build_deploy_release_data(deploy=deploy, release=release)
+    strategy = DeployReleaseStrategy(
+        projects=frozenset(result["projects"]),
+        activity=activity,
+        organization=organization,
+        committer_user_ids=frozenset(result["committer_user_ids"]),
+    )
+    targets = strategy.get_targets()
+
+    for target in targets:
+        data = create_target_specific_deploy_data(
+            data=result["data"], activity=activity, target=target, organization=organization
+        )
+        NotificationService[DeployReleaseData](data=data).notify_target(target=target)
 
 
 @instrumented_task(
-    name="sentry.tasks.activity.send_activity_notifications", queue="activity.notify"
+    name="sentry.tasks.activity.send_activity_notifications",
+    namespace=notifications_tasks,
+    processing_deadline_duration=180,
+    silo_mode=SiloMode.CELL,
 )
-def send_activity_notifications(activity_id):
-    from sentry.models import Activity
+def send_activity_notifications(activity_id: int) -> None:
+    from sentry.models.activity import Activity
+    from sentry.models.organization import Organization
+    from sentry.notifications.platform.service import NotificationService
+    from sentry.notifications.platform.strategies.issue_subscribers import (
+        IssueSubscribersActivityStrategy,
+    )
+    from sentry.notifications.platform.templates.activity.base import (
+        ACTIVITY_TYPE_TO_SOURCE,
+        ActivityNotificationData,
+        build_activity_notification_data,
+    )
+    from sentry.types.activity import ActivityType
 
     try:
         activity = Activity.objects.get(pk=activity_id)
     except Activity.DoesNotExist:
         return
 
-    for notifier in get_activity_notifiers(activity.project):
-        notifier.notify_about_activity(activity)
+    organization = Organization.objects.get_from_cache(pk=activity.project.organization_id)
+    bind_organization_context(organization)
+
+    if activity.type == ActivityType.DEPLOY.value:
+        _send_deploy_activity_notification(activity=activity, organization=organization)
+        return
+
+    source = ACTIVITY_TYPE_TO_SOURCE.get(activity.type)
+    if not source:
+        _send_legacy_activity_notification(activity=activity)
+        return
+
+    if not NotificationService.has_access(organization=organization, source=source):
+        _send_legacy_activity_notification(activity=activity)
+        return
+
+    strategy = IssueSubscribersActivityStrategy(activity=activity)
+    for target in strategy.get_targets():
+        data = build_activity_notification_data(activity=activity, target=target)
+        NotificationService[ActivityNotificationData](data=data).notify_target(target=target)

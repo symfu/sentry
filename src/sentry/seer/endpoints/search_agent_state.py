@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from django.conf import settings
+from rest_framework import status
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases import OrganizationEndpoint
+from sentry.auth.principal import acting_user_id
+from sentry.models.organization import Organization
+from sentry.seer.endpoints.utils import OrganizationTraceExplorerAIPermission, resolve_seer_run
+from sentry.seer.models import SeerApiError
+from sentry.seer.seer_setup import has_seer_access_with_detail
+from sentry.seer.signed_seer_api import (
+    SearchAgentStateRequest,
+    SeerViewerContext,
+    make_search_agent_state_request,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def fetch_search_agent_state(
+    run_id: int, organization_id: int, viewer_context: SeerViewerContext | None = None
+) -> dict[str, Any]:
+    """
+    Fetch the current state of a search agent run from Seer.
+
+    Calls POST /v1/assisted-query/state with the run_id and organization_id.
+    """
+    body = SearchAgentStateRequest(run_id=run_id, organization_id=organization_id)
+    response = make_search_agent_state_request(body, timeout=10, viewer_context=viewer_context)
+    if response.status >= 400:
+        raise SeerApiError("Seer request failed", response.status)
+    data = response.json()
+    return data
+
+
+@cell_silo_endpoint
+class SearchAgentStateEndpoint(OrganizationEndpoint):
+    """
+    Endpoint to poll for search agent state by run_id.
+
+    This returns the current state of a search agent run, including:
+    - status: processing, completed, or error
+    - current_step: the step currently being processed (if any)
+    - completed_steps: list of completed steps
+    - final_response: the translated query result (when completed)
+    - unsupported_reason: error message (when status is error)
+    """
+
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+    }
+    owner = ApiOwner.ML_AI
+
+    permission_classes = (OrganizationTraceExplorerAIPermission,)
+
+    def get(self, request: Request, organization: Organization, run_id: str) -> Response:
+        """
+        Get the current state of a search agent run.
+
+        Args:
+            run_id: The run ID returned from /search-agent/start/
+
+        Returns:
+            {
+                "session": {
+                    "run_id": int,
+                    "status": "processing" | "completed" | "error",
+                    "current_step": {"key": str} | null,
+                    "completed_steps": [{"key": str}, ...],
+                    "updated_at": str,
+                    "final_response": {...} | null,  // Present when completed
+                    "unsupported_reason": str | null  // Present on error
+                }
+            }
+        """
+        has_seer_access, detail = has_seer_access_with_detail(organization)
+        if not has_seer_access:
+            return Response(
+                {"detail": detail},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not settings.SEER_AUTOFIX_URL:
+            return Response(
+                {"detail": "Seer is not properly configured."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        user_id = acting_user_id(request.user)
+        if user_id is None:
+            return Response(
+                {"detail": "You do not have access to this run."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        resolved = resolve_seer_run(run_id, organization, user_id=user_id)
+        if isinstance(resolved, Response):
+            return resolved
+        seer_run_id = resolved.seer_run_state_id
+
+        try:
+            viewer_context = SeerViewerContext(organization_id=organization.id, user_id=user_id)
+            data = fetch_search_agent_state(
+                seer_run_id, organization.id, viewer_context=viewer_context
+            )
+            data["sentry_run_id"] = resolved.uuid
+            return Response(data)
+
+        except SeerApiError as e:
+            if e.status == 404:
+                logger.warning(
+                    "search_agent.state_not_found",
+                    extra={"run_id": seer_run_id},
+                )
+                return Response(
+                    {"session": None},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            logger.exception(
+                "search_agent.state_error",
+                extra={"run_id": seer_run_id, "status_code": e.status},
+            )
+            return Response(
+                {"detail": "Failed to fetch run state"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        except Exception:
+            logger.exception(
+                "search_agent.state_error",
+                extra={"run_id": seer_run_id},
+            )
+            return Response(
+                {"detail": "Failed to fetch run state"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

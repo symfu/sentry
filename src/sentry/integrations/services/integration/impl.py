@@ -1,0 +1,789 @@
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import requests
+import sentry_sdk
+from django.utils import timezone
+
+from sentry import analytics
+from sentry.analytics.events.alert_rule_ui_component_webhook_sent import (
+    AlertRuleUiComponentWebhookSentEvent,
+)
+from sentry.api.paginator import OffsetPaginator
+from sentry.auth.exceptions import IdentityNotValid
+from sentry.constants import ObjectStatus, SentryAppInstallationStatus
+from sentry.exceptions import RestrictedIPAddress
+from sentry.hybridcloud.rpc.pagination import RpcPaginationArgs, RpcPaginationResult
+from sentry.incidents.models.incident import INCIDENT_STATUS, IncidentStatus
+from sentry.integrations.errors import OrganizationIntegrationNotFound
+from sentry.integrations.messaging.metrics import (
+    MessagingInteractionEvent,
+    MessagingInteractionType,
+)
+from sentry.integrations.mixins import NotifyBasicMixin
+from sentry.integrations.models.gcp_service_account import GcpServiceAccount
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.models.integration_external_project import IntegrationExternalProject
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.msteams.client import MsTeamsClient
+from sentry.integrations.msteams.metrics import record_lifecycle_termination_level
+from sentry.integrations.msteams.spec import MsTeamsMessagingSpec
+from sentry.integrations.services.integration import (
+    IntegrationService,
+    RpcIntegration,
+    RpcOrganizationIntegration,
+)
+from sentry.integrations.services.integration.model import (
+    RpcAccessToken,
+    RpcIntegrationExternalProject,
+    RpcIntegrationIdentityContext,
+    RpcOrganizationContext,
+    RpcOrganizationContextList,
+)
+from sentry.integrations.services.integration.serial import (
+    serialize_integration,
+    serialize_integration_external_project,
+    serialize_organization_integration,
+)
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.sentry_apps.api.serializers.app_platform_event import AppPlatformEvent
+from sentry.sentry_apps.event_types import SentryAppEventType
+from sentry.sentry_apps.metrics import (
+    SentryAppInteractionEvent,
+    SentryAppInteractionType,
+)
+from sentry.sentry_apps.models.sentry_app import SentryApp
+from sentry.sentry_apps.models.sentry_app_installation import SentryAppInstallation
+from sentry.sentry_apps.utils.webhooks import (
+    MetricAlertActionType,
+    SentryAppResourceType,
+    find_alert_rule_action_ui_component,
+)
+from sentry.shared_integrations.exceptions import (
+    ApiError,
+    IntegrationConfigurationError,
+    IntegrationError,
+)
+from sentry.users.models.identity import Identity
+from sentry.utils import json
+from sentry.utils.locking import UnableToAcquireLock
+from sentry.utils.sentry_apps import send_and_save_webhook_request
+
+logger = logging.getLogger(__name__)
+
+# Providers whose client takes token_minimum_validity_time and refreshes ahead of expiry.
+ACCESS_TOKEN_PROVIDERS = (
+    IntegrationProviderSlug.GITHUB.value,
+    IntegrationProviderSlug.GITHUB_ENTERPRISE.value,
+    IntegrationProviderSlug.CURSOR_ORIGIN.value,
+    IntegrationProviderSlug.GITLAB.value,
+)
+
+# Not tuned: a caller uses the token within seconds, and a wider margin only means minting
+# a little more often.
+ACCESS_TOKEN_MINIMUM_VALIDITY = timedelta(minutes=5)
+
+
+def _parse_expires_at(value: str) -> datetime:
+    # GitHub stores a naive UTC time, Cursor Origin and GitLab an aware one.
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _log_access_token_unavailable(
+    integration: Integration, organization_id: int, error: str, status_code: int | None = None
+) -> None:
+    logger.warning(
+        "integration_service.access_token.unavailable",
+        extra={
+            "integration_id": integration.id,
+            "organization_id": organization_id,
+            "provider": integration.provider,
+            "error": error,
+            "status_code": status_code,
+        },
+    )
+
+
+class DatabaseBackedIntegrationService(IntegrationService):
+    def send_message(
+        self, *, integration_id: int, organization_id: int, channel: str, message: str
+    ) -> bool:
+        try:
+            integration = Integration.objects.get(id=integration_id)
+        except Integration.DoesNotExist:
+            return False
+        install = integration.get_installation(organization_id=organization_id)
+        if isinstance(install, NotifyBasicMixin):
+            install.send_message(channel_id=channel, message=message)
+            return True
+
+        return False
+
+    def page_integration_ids(
+        self,
+        *,
+        provider_keys: list[str],
+        organization_id: int,
+        args: RpcPaginationArgs,
+    ) -> RpcPaginationResult:
+        return args.do_hybrid_cloud_pagination(
+            description="page_integration_ids",
+            paginator_cls=OffsetPaginator,
+            order_by="name",
+            queryset=Integration.objects.filter(
+                organizationintegration__organization_id=organization_id,
+                provider__in=provider_keys,
+            ),
+        )
+
+    def get_integrations(
+        self,
+        *,
+        integration_ids: Iterable[int] | None = None,
+        organization_id: int | None = None,
+        status: int | None = None,
+        providers: list[str] | None = None,
+        org_integration_status: int | None = None,
+        organization_integration_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[RpcIntegration]:
+        integration_kwargs: dict[str, Any] = {}
+        if integration_ids is not None:
+            integration_kwargs["id__in"] = integration_ids
+        if organization_id is not None:
+            integration_kwargs["organizationintegration__organization_id"] = organization_id
+        if status is not None:
+            integration_kwargs["status"] = status
+        if providers is not None:
+            integration_kwargs["provider__in"] = providers
+        if org_integration_status is not None:
+            integration_kwargs["organizationintegration__status"] = org_integration_status
+        if organization_integration_id is not None:
+            integration_kwargs["organizationintegration__id"] = organization_integration_id
+
+        if not integration_kwargs:
+            return []
+
+        integrations = Integration.objects.filter(**integration_kwargs)
+
+        if limit is not None:
+            integrations = integrations[:limit]
+
+        return [serialize_integration(integration) for integration in integrations]
+
+    def get_integration(
+        self,
+        *,
+        integration_id: int | None = None,
+        provider: str | None = None,
+        external_id: str | None = None,
+        organization_id: int | None = None,
+        organization_integration_id: int | None = None,
+        status: int | None = None,
+        using_replica: bool = False,
+    ) -> RpcIntegration | None:
+        integration_kwargs: dict[str, Any] = {}
+        if integration_id is not None:
+            integration_kwargs["id"] = integration_id
+        if provider is not None:
+            integration_kwargs["provider"] = provider
+        if external_id is not None:
+            integration_kwargs["external_id"] = external_id
+        if organization_id is not None:
+            integration_kwargs["organizationintegration__organization_id"] = organization_id
+        if organization_integration_id is not None:
+            integration_kwargs["organizationintegration__id"] = organization_integration_id
+        if status is not None:
+            integration_kwargs["status"] = status
+        if not integration_kwargs:
+            return None
+
+        queryset = Integration.objects.all()
+        if using_replica:
+            queryset = Integration.objects.using_replica()
+
+        try:
+            integration = queryset.get(**integration_kwargs)
+        except Integration.DoesNotExist:
+            return None
+        except Integration.MultipleObjectsReturned:
+            return None
+        return serialize_integration(integration)
+
+    def get_organization_integrations(
+        self,
+        *,
+        org_integration_ids: list[int] | None = None,
+        integration_id: int | None = None,
+        organization_id: int | None = None,
+        organization_ids: list[int] | None = None,
+        status: int | None = None,
+        providers: list[str] | None = None,
+        has_grace_period: bool | None = None,
+        grace_period_expired: bool | None = None,
+        limit: int | None = None,
+        name: str | None = None,
+        using_replica: bool = False,
+    ) -> list[RpcOrganizationIntegration]:
+        oi_kwargs: dict[str, Any] = {}
+        if org_integration_ids is not None:
+            oi_kwargs["id__in"] = org_integration_ids
+        if integration_id is not None:
+            oi_kwargs["integration_id"] = integration_id
+        if organization_id is not None:
+            organization_ids = [organization_id]
+        if organization_ids is not None:
+            oi_kwargs["organization_id__in"] = organization_ids
+        if status is not None:
+            oi_kwargs["status"] = status
+        if providers is not None:
+            oi_kwargs["integration__provider__in"] = providers
+        if has_grace_period is not None:
+            oi_kwargs["grace_period_end__isnull"] = not has_grace_period
+        if grace_period_expired:
+            # Used by getsentry
+            oi_kwargs["grace_period_end__lte"] = timezone.now()
+        if name is not None:
+            oi_kwargs["integration__name"] = name
+
+        if not oi_kwargs:
+            return []
+
+        queryset = OrganizationIntegration.objects.all()
+        if using_replica:
+            queryset = OrganizationIntegration.objects.using_replica()
+
+        ois = queryset.filter(**oi_kwargs).select_related("integration")
+        if limit is not None:
+            ois = ois[:limit]
+
+        return [serialize_organization_integration(oi) for oi in ois]
+
+    def get_organization_ids_with_providers(
+        self,
+        *,
+        providers: list[str],
+        status: int | None = None,
+    ) -> list[int]:
+        kwargs: dict[str, Any] = {"integration__provider__in": providers}
+        if status is not None:
+            kwargs["status"] = status
+        return list(
+            OrganizationIntegration.objects.filter(**kwargs)
+            .values_list("organization_id", flat=True)
+            .distinct()
+        )
+
+    def organization_context(
+        self,
+        *,
+        organization_id: int,
+        integration_id: int | None = None,
+        provider: str | None = None,
+        external_id: str | None = None,
+    ) -> RpcOrganizationContext:
+        context = self.organization_contexts(
+            organization_id=organization_id,
+            integration_id=integration_id,
+            provider=provider,
+            external_id=external_id,
+        )
+        install = None
+        if context.organization_integrations:
+            install = context.organization_integrations[0]
+        if install and install.organization_id != organization_id:
+            with sentry_sdk.isolation_scope() as scope:
+                scope.set_context(
+                    "localscope",
+                    {
+                        "integration_id": integration_id,
+                        "organization_id": organization_id,
+                        "install.organization": install.organization_id,
+                    },
+                )
+                if integration_id is not None:
+                    scope.set_attribute("localscope.integration_id", integration_id)
+                scope.set_attribute("localscope.organization_id", organization_id)
+                scope.set_attribute("localscope.install.organization", install.organization_id)
+                sentry_sdk.capture_message(
+                    "integration.installation does not belong to requested_org"
+                )
+            install = None
+        return RpcOrganizationContext(
+            integration=context.integration, organization_integration=install
+        )
+
+    def organization_contexts(
+        self,
+        *,
+        organization_id: int | None = None,
+        integration_id: int | None = None,
+        provider: str | None = None,
+        external_id: str | None = None,
+    ) -> RpcOrganizationContextList:
+        integration = self.get_integration(
+            organization_id=organization_id,
+            integration_id=integration_id,
+            provider=provider,
+            external_id=external_id,
+        )
+        if not integration:
+            return RpcOrganizationContextList(integration=None, organization_integrations=[])
+        organization_integrations = self.get_organization_integrations(
+            integration_id=integration.id,
+            organization_id=organization_id,
+        )
+        return RpcOrganizationContextList(
+            integration=integration, organization_integrations=organization_integrations
+        )
+
+    def update_integrations(
+        self,
+        *,
+        integration_ids: list[int],
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: int | None = None,
+    ) -> list[RpcIntegration]:
+        integrations = Integration.objects.filter(id__in=integration_ids)
+        if not integrations.exists():
+            return []
+
+        integration_kwargs: dict[str, Any] = {}
+        if name is not None:
+            integration_kwargs["name"] = name
+        if metadata is not None:
+            integration_kwargs["metadata"] = metadata
+        if status is not None:
+            integration_kwargs["status"] = status
+
+        if not integration_kwargs:
+            return []
+        integration_kwargs["date_updated"] = timezone.now()
+
+        integrations.update(**integration_kwargs)
+
+        return [serialize_integration(integration) for integration in integrations]
+
+    def update_integration(
+        self,
+        *,
+        integration_id: int,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: int | None = None,
+    ) -> RpcIntegration | None:
+        integrations = self.update_integrations(
+            integration_ids=[integration_id],
+            name=name,
+            status=status,
+            metadata=metadata,
+        )
+        return integrations[0] if len(integrations) > 0 else None
+
+    def update_organization_integrations(
+        self,
+        *,
+        org_integration_ids: list[int],
+        config: dict[str, Any] | None = None,
+        status: int | None = None,
+        grace_period_end: datetime | None = None,
+        set_grace_period_end_null: bool | None = None,
+    ) -> list[RpcOrganizationIntegration]:
+        ois: list[OrganizationIntegration] = []
+        fields: set[str] = set()
+        for oi in OrganizationIntegration.objects.filter(id__in=org_integration_ids):
+            if config is not None:
+                oi.config = config
+                fields.add("config")
+            if status is not None:
+                oi.status = status
+                fields.add("status")
+            if grace_period_end is not None or set_grace_period_end_null:
+                gpe_value = grace_period_end if not set_grace_period_end_null else None
+                oi.grace_period_end = gpe_value
+                fields.add("grace_period_end")
+            ois.append(oi)
+
+        if fields:
+            OrganizationIntegration.objects.bulk_update(ois, fields=list(fields))
+        return [serialize_organization_integration(oi) for oi in ois]
+
+    def update_organization_integration(
+        self,
+        *,
+        org_integration_id: int,
+        config: dict[str, Any] | None = None,
+        status: int | None = None,
+        grace_period_end: datetime | None = None,
+        set_grace_period_end_null: bool | None = None,
+    ) -> RpcOrganizationIntegration | None:
+        ois = self.update_organization_integrations(
+            org_integration_ids=[org_integration_id],
+            config=config,
+            status=status,
+            grace_period_end=grace_period_end,
+            set_grace_period_end_null=set_grace_period_end_null,
+        )
+        return ois[0] if len(ois) > 0 else None
+
+    def start_grace_period_for_provider(
+        self,
+        *,
+        organization_id: int,
+        provider: str,
+        grace_period_end: datetime,
+        status: int | None = ObjectStatus.ACTIVE,
+        skip_oldest: bool = False,
+    ) -> list[RpcOrganizationIntegration]:
+        filter_kwargs = {
+            "organization_id": organization_id,
+            "integration__provider": provider,
+        }
+        all_ois_filter_kwargs: dict[str, Any] = {
+            "integration__provider": provider,
+        }
+
+        if status is not None:
+            filter_kwargs["status"] = status
+            all_ois_filter_kwargs["status"] = status
+
+        current_org_ois = OrganizationIntegration.objects.filter(**filter_kwargs)
+        ois_to_update = list(current_org_ois.values_list("id", flat=True))
+
+        if skip_oldest:
+            all_ois_filter_kwargs["integration__in"] = current_org_ois.values_list(
+                "integration_id", flat=True
+            )
+
+            # Get all associated OrganizationIntegrations for the Integrations used by this org
+            all_ois = (
+                OrganizationIntegration.objects.filter(**all_ois_filter_kwargs)
+                .order_by("id")
+                .distinct()
+            )
+
+            # Create mapping of integration_id to list of OrganizationIntegrations
+            integration_to_ois: dict[int, list[OrganizationIntegration]] = defaultdict(list)
+            for oi in all_ois:
+                integration_to_ois[oi.integration_id].append(oi)
+
+            for integration, ois in integration_to_ois.items():
+                # Check if the oldest OrganizationIntegration for the Integration belongs to THIS organization
+                # If not we want to start the grace period for this org's OrganizationIntegration
+                if integration_to_ois[integration][0].organization_id == organization_id:
+                    ois_to_update.remove(integration_to_ois[integration][0].id)
+
+        updated_ois = self.update_organization_integrations(
+            org_integration_ids=ois_to_update,
+            grace_period_end=grace_period_end,
+        )
+
+        return updated_ois
+
+    def add_organization(self, *, integration_id: int, org_ids: list[int]) -> RpcIntegration | None:
+        try:
+            integration = Integration.objects.get(id=integration_id)
+        except Integration.DoesNotExist:
+            return None
+        for org_id in org_ids:
+            integration.add_organization(organization_id=org_id)
+        return serialize_integration(integration)
+
+    def send_incident_alert_notification(
+        self,
+        *,
+        sentry_app_id: int,
+        action_id: int,
+        incident_id: int,
+        new_status: int,
+        incident_attachment_json: str,
+        organization_id: int,
+        metric_value: float,
+        notification_uuid: str | None = None,
+    ) -> bool:
+        try:
+            new_status_str = INCIDENT_STATUS[IncidentStatus(new_status)].lower()
+            event = SentryAppEventType(
+                f"{SentryAppResourceType.METRIC_ALERT}.{MetricAlertActionType(new_status_str)}"
+            )
+        except ValueError as e:
+            sentry_sdk.capture_exception(e)
+            return False
+
+        with SentryAppInteractionEvent(
+            operation_type=SentryAppInteractionType.PREPARE_WEBHOOK,
+            event_type=event,
+        ).capture() as lifecycle:
+            try:
+                sentry_app = SentryApp.objects.get(id=sentry_app_id)
+            except SentryApp.DoesNotExist as e:
+                sentry_sdk.capture_exception(e)
+                lifecycle.record_failure(e)
+                return False
+
+            try:
+                install = SentryAppInstallation.objects.get(
+                    organization_id=organization_id,
+                    sentry_app=sentry_app,
+                    status=SentryAppInstallationStatus.INSTALLED,
+                )
+            except SentryAppInstallation.DoesNotExist as e:
+                sentry_sdk.capture_exception(e)
+                lifecycle.record_failure(e)
+                return False
+
+            app_platform_event = AppPlatformEvent(
+                resource=SentryAppResourceType.METRIC_ALERT,
+                action=MetricAlertActionType(new_status_str),
+                install=install,
+                data=json.loads(incident_attachment_json),
+            )
+
+        # Can raise errors if client returns >= 400
+        send_and_save_webhook_request(
+            sentry_app,
+            app_platform_event,
+        )
+
+        # On success, record analytic event for Metric Alert Rule UI Component
+        alert_rule_action_ui_component = find_alert_rule_action_ui_component(app_platform_event)
+
+        if alert_rule_action_ui_component:
+            try:
+                analytics.record(
+                    AlertRuleUiComponentWebhookSentEvent(
+                        organization_id=organization_id,
+                        sentry_app_id=sentry_app.id,
+                        event=f"{app_platform_event.resource}.{app_platform_event.action}",
+                    )
+                )
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
+        return alert_rule_action_ui_component
+
+    def send_msteams_incident_alert_notification(
+        self, *, integration_id: int, channel: str, attachment: dict[str, Any]
+    ) -> bool:
+        integration = Integration.objects.get(id=integration_id)
+        client = MsTeamsClient(integration)
+
+        with MessagingInteractionEvent(
+            interaction_type=MessagingInteractionType.SEND_INCIDENT_ALERT_NOTIFICATION,
+            spec=MsTeamsMessagingSpec(),
+        ).capture() as lifecycle:
+            try:
+                client.send_card(channel, attachment)
+                return True
+            except (ApiError, IntegrationError) as e:
+                record_lifecycle_termination_level(lifecycle, e)
+            except Exception as e:
+                lifecycle.add_extras({"integration_id": integration_id, "channel": channel})
+                lifecycle.record_failure(e)
+            return False
+
+    def delete_integration(self, *, integration_id: int) -> None:
+        try:
+            integration = Integration.objects.get(id=integration_id)
+        except Integration.DoesNotExist:
+            return
+        integration.delete()
+
+    def get_integration_external_project(
+        self, *, organization_id: int, integration_id: int, external_id: str
+    ) -> RpcIntegrationExternalProject | None:
+        external_projects = self.get_integration_external_projects(
+            organization_id=organization_id,
+            integration_id=integration_id,
+            external_id=external_id,
+        )
+        return external_projects[0] if len(external_projects) > 0 else None
+
+    def get_integration_external_projects(
+        self, *, organization_id: int, integration_id: int, external_id: str | None = None
+    ) -> list[RpcIntegrationExternalProject]:
+        try:
+            oi = OrganizationIntegration.objects.get(
+                organization_id=organization_id,
+                integration_id=integration_id,
+            )
+        except OrganizationIntegration.DoesNotExist:
+            return []
+
+        iep_kwargs: dict[str, Any] = {"organization_integration_id": oi.id}
+        if external_id is not None:
+            iep_kwargs["external_id"] = external_id
+        external_projects = IntegrationExternalProject.objects.filter(**iep_kwargs)
+        return [serialize_integration_external_project(iep) for iep in external_projects]
+
+    def get_integration_identity_context(
+        self,
+        *,
+        integration_provider: str | None = None,
+        integration_external_id: str | None = None,
+        identity_external_id: str | None = None,
+        identity_provider_external_id: str | None = None,
+    ) -> RpcIntegrationIdentityContext:
+        from sentry.identity.services.identity.service import identity_service
+        from sentry.users.services.user.service import user_service
+
+        integration = self.get_integration(
+            provider=integration_provider,
+            external_id=integration_external_id,
+        )
+        identity_provider = identity_service.get_provider(
+            provider_type=integration_provider,
+            provider_ext_id=identity_provider_external_id,
+        )
+        identity = (
+            identity_service.get_identity(
+                filter={
+                    "provider_id": identity_provider.id,
+                    "identity_ext_id": identity_external_id,
+                }
+            )
+            if identity_provider
+            else None
+        )
+        user = user_service.get_user(identity.user_id) if identity else None
+        return RpcIntegrationIdentityContext(
+            integration=integration,
+            identity_provider=identity_provider,
+            identity=identity,
+            user=user,
+        )
+
+    def get_gcp_service_account_email(
+        self,
+        *,
+        organization_id: int,
+    ) -> str | None:
+        try:
+            sa = GcpServiceAccount.objects.get(organization_id=organization_id)
+        except GcpServiceAccount.DoesNotExist:
+            return None
+        return sa.service_account_email
+
+    def refresh_github_access_token(
+        self, *, integration_id: int, organization_id: int
+    ) -> RpcIntegration | None:
+        try:
+            integration = Integration.objects.get(
+                id=integration_id,
+                provider__in=["github", "github_enterprise"],
+                status=ObjectStatus.ACTIVE,
+            )
+        except Integration.DoesNotExist:
+            return None
+
+        installation = integration.get_installation(organization_id=organization_id)
+        # get_installation doesn't actually check if the integration is
+        # associated with the organization, so this validates that it does,
+        # and caches the org_integration preemptively.
+        try:
+            installation.org_integration
+        except OrganizationIntegrationNotFound:
+            return None
+
+        installation.get_client().get_access_token(
+            token_minimum_validity_time=timedelta(minutes=10)
+        )
+        integration.refresh_from_db()
+
+        return serialize_integration(integration)
+
+    def get_access_token(
+        self, *, integration_id: int, organization_id: int
+    ) -> RpcAccessToken | None:
+        integration = Integration.objects.filter(
+            id=integration_id,
+            provider__in=ACCESS_TOKEN_PROVIDERS,
+            status=ObjectStatus.ACTIVE,
+            organizationintegration__organization_id=organization_id,
+            organizationintegration__status=ObjectStatus.ACTIVE,
+        ).first()
+        if integration is None:
+            return None
+
+        try:
+            client = integration.get_installation(organization_id=organization_id).get_client()
+            token = client.get_access_token(
+                token_minimum_validity_time=ACCESS_TOKEN_MINIMUM_VALIDITY
+            )
+        except (
+            # The organization's install went away after the lookup above.
+            OrganizationIntegrationNotFound,
+            ApiError,
+            # GitLab: the install has no identity to take a token from.
+            IntegrationConfigurationError,
+            # GitLab: the identity was deleted while its token was being refreshed.
+            Identity.DoesNotExist,
+            # GitLab refused the refresh token.
+            IdentityNotValid,
+            # GitLab's refresh goes through safe_urlopen, not the API client that turns these
+            # into ApiErrors.
+            requests.exceptions.RequestException,
+            RestrictedIPAddress,
+            # Another refresh of the same GitLab token held its lock too long.
+            UnableToAcquireLock,
+        ) as e:
+            # Not the message: it can carry the provider's response.
+            _log_access_token_unavailable(
+                integration, organization_id, type(e).__name__, getattr(e, "code", None)
+            )
+            return None
+
+        if not token:
+            # The integration was deleted while a token was being minted.
+            _log_access_token_unavailable(integration, organization_id, "no_token")
+            return None
+        # A GitLab token stored before Sentry recorded expiries, with no refresh token, has no
+        # known expiry.
+        expires_at = token["expires_at"]
+        return RpcAccessToken(
+            token=token["access_token"],
+            expires_at=_parse_expires_at(expires_at) if expires_at else None,
+        )
+
+    def refresh_github_permissions(
+        self, *, integration_id: int, organization_id: int
+    ) -> RpcIntegration | None:
+        try:
+            integration = Integration.objects.get(
+                id=integration_id,
+                provider__in=[
+                    IntegrationProviderSlug.GITHUB.value,
+                    IntegrationProviderSlug.GITHUB_ENTERPRISE.value,
+                ],
+                status=ObjectStatus.ACTIVE,
+                # An integration id on its own is not enough to reach an
+                # installation: the organization has to actually have it
+                # installed. get_installation below does not check that.
+                organizationintegration__organization_id=organization_id,
+            )
+        except Integration.DoesNotExist:
+            return None
+
+        installation = integration.get_installation(organization_id=organization_id)
+
+        # Read with the app JWT rather than minting a token: the installation
+        # itself reports its current permissions, so there is no reason to
+        # rotate credentials just to see them.
+        client = installation.get_client()
+        info = client.get_installation_info(client._get_installation_id())
+
+        integration.refresh_from_db()
+        integration.metadata.update(
+            {
+                "permissions": info.get("permissions"),
+                "last_refresh_at": timezone.now().isoformat(),
+            }
+        )
+        integration.save(update_fields=["metadata"])
+        return serialize_integration(integration)

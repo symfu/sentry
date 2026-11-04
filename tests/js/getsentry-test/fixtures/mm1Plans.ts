@@ -1,0 +1,278 @@
+import {DataCategory} from 'sentry/types/core';
+
+import type {Plan} from 'getsentry/types';
+
+const BUDGET_TERM = 'on-demand';
+
+const MM1_CATEGORY_DISPLAY_NAMES = {
+  errors: {singular: 'error', plural: 'errors'},
+};
+
+const MM1_CATEGORIES = [DataCategory.ERRORS];
+
+const commonFields = {
+  addOnCategories: {},
+  categories: MM1_CATEGORIES,
+  categoryDisplayNames: MM1_CATEGORY_DISPLAY_NAMES,
+  onDemandCategories: MM1_CATEGORIES,
+  hasOnDemandModes: false,
+  budgetTerm: BUDGET_TERM as 'on-demand',
+  availableReservedBudgetTypes: {},
+};
+
+export const MM1_PLANS = {
+  e1_ac: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'e1_ac',
+    isEnterprise: true,
+    name: 'Enterprise',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [],
+    },
+    totalPrice: 0,
+    userSelectable: false,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  e1_auf: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'e1_auf',
+    isEnterprise: true,
+    name: 'Enterprise',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [],
+    },
+    totalPrice: 0,
+    userSelectable: false,
+    billingInterval: 'annual',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  f1: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'f1',
+    isEnterprise: false,
+    name: 'Free',
+    trialPlan: 'am1_t',
+    maxMembers: 1,
+    planCategories: {
+      errors: [
+        {
+          price: 0,
+          events: 10000,
+        },
+      ],
+    },
+    totalPrice: 0,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: false,
+    retentionDays: 30,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  l1: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'l1',
+    isEnterprise: false,
+    name: 'Large',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 49900,
+          events: 4000000,
+        },
+      ],
+    },
+    totalPrice: 49900,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  l1_ac: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'l1_ac',
+    isEnterprise: false,
+    name: 'Large',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 44900,
+          events: 4000000,
+        },
+      ],
+    },
+    totalPrice: 44900,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  l1_auf: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'l1_auf',
+    isEnterprise: false,
+    name: 'Large',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 538800,
+          events: 4000000,
+        },
+      ],
+    },
+    totalPrice: 538800,
+    userSelectable: true,
+    billingInterval: 'annual',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  m1: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'm1',
+    isEnterprise: false,
+    name: 'Medium',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 19900,
+          events: 1000000,
+        },
+      ],
+    },
+    totalPrice: 19900,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  m1_ac: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'm1_ac',
+    isEnterprise: false,
+    name: 'Medium',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 17900,
+          events: 1000000,
+        },
+      ],
+    },
+    totalPrice: 17900,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  m1_auf: {
+    ...commonFields,
+    basePrice: 0,
+    id: 'm1_auf',
+    isEnterprise: false,
+    name: 'Medium',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 214800,
+          events: 1000000,
+        },
+      ],
+    },
+    totalPrice: 214800,
+    userSelectable: true,
+    billingInterval: 'annual',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  s1: {
+    ...commonFields,
+    basePrice: 0,
+    id: 's1',
+    isEnterprise: false,
+    name: 'Small',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 2900,
+          events: 100000,
+        },
+      ],
+    },
+    totalPrice: 2900,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+  s1_ac: {
+    ...commonFields,
+    basePrice: 0,
+    id: 's1_ac',
+    isEnterprise: false,
+    name: 'Small',
+    trialPlan: 'mm2_a',
+    maxMembers: null,
+    planCategories: {
+      errors: [
+        {
+          price: 2600,
+          events: 100000,
+        },
+      ],
+    },
+    totalPrice: 2600,
+    userSelectable: true,
+    billingInterval: 'monthly',
+    allowOnDemand: true,
+    retentionDays: 90,
+    dashboardLimit: 0,
+    metricDetectorLimit: 0,
+  },
+} as const satisfies Record<string, Plan>;

@@ -1,0 +1,28 @@
+import type {IntegrationProvider} from 'sentry/types/integrations';
+
+export function VercelProviderFixture(): IntegrationProvider {
+  return {
+    canAdd: true,
+    canDisable: false,
+    name: 'Vercel',
+    key: 'vercel',
+    features: ['deployment'],
+    slug: 'vercel',
+    metadata: {
+      description: 'VERCEL DESC',
+      features: [
+        {
+          featureGate: 'integrations-deployment',
+          description: 'DEPLOYMENT DESCRIPTION',
+          featureId: 2,
+        },
+      ],
+      author: 'The Sentry Team',
+      noun: 'Installation',
+      issue_url:
+        'https://github.com/getsentry/sentry/issues/new?template=bug.yml&title=Vercel%20Integration:%20&labels=Component%3A%20Integrations',
+      source_url: 'https://docs.sentry.io/integrations/deployment/vercel/',
+      aspects: {},
+    },
+  };
+}

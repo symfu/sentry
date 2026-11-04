@@ -1,317 +1,152 @@
-import pytest
-from sentry.utils.compat import mock
+from contextlib import AbstractContextManager
+from functools import cached_property
+from unittest import mock
 
 from django.test import override_settings
-from django.conf import settings
-from django.core.urlresolvers import reverse
-from django.utils.http import urlquote
-from exam import fixture
+from django.urls import reverse
 
-from sentry import options, newsletter
-from sentry.testutils import TestCase
-from sentry.models import OrganizationMember, User
+from sentry.ratelimits.config import RateLimitConfig
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.hybrid_cloud import HybridCloudTestMixin
+from sentry.testutils.silo import control_silo_test
+from sentry.types.ratelimit import RateLimit, RateLimitCategory
+from sentry.web.frontend.auth_login import AuthPageView
 
 
 # TODO(dcramer): need tests for SSO behavior and single org behavior
-class AuthLoginTest(TestCase):
-    @fixture
-    def path(self):
+@control_silo_test
+class AuthLoginTest(TestCase, HybridCloudTestMixin):
+    @cached_property
+    def path(self) -> str:
         return reverse("sentry-login")
 
-    def test_renders_correct_template(self):
-        resp = self.client.get(self.path)
+    def allow_registration(self) -> AbstractContextManager[None]:
+        return self.options({"auth.allow-registration": True})
 
-        assert resp.status_code == 200
-        self.assertTemplateUsed("sentry/login.html")
+    def test_login_post_requires_api(self) -> None:
+        response = self.client.post(self.path, {"op": "login"})
 
-    def test_cannot_request_access(self):
-        resp = self.client.get(self.path)
+        assert response.status_code == 405
 
-        assert resp.status_code == 200
-        assert resp.context["join_request_link"] is None
+    def test_registration_post_requires_api(self) -> None:
+        response = self.client.post(reverse("sentry-register"), {"op": "register"})
 
-    def test_renders_session_expire_message(self):
-        self.client.cookies["session_expired"] = "1"
-        resp = self.client.get(self.path)
+        assert response.status_code == 405
 
-        assert resp.status_code == 200
-        self.assertTemplateUsed(resp, "sentry/login.html")
-        assert len(resp.context["messages"]) == 1
+    def test_renders_react_template_by_default(self) -> None:
+        response = self.client.get(self.path)
 
-    def test_login_invalid_password(self):
-        # load it once for test cookie
-        self.client.get(self.path)
+        assert response.status_code == 200
+        self.assertTemplateUsed(response, "sentry/base-react.html")
 
-        resp = self.client.post(
-            self.path, {"username": self.user.username, "password": "bizbar", "op": "login"}
-        )
-        assert resp.status_code == 200
-        assert resp.context["login_form"].errors["__all__"] == [
-            "Please enter a correct username and password. Note that both fields may be case-sensitive."
-        ]
+    @with_feature("system:multi-region")
+    def test_customer_domain_login_redirects_to_primary_domain(self) -> None:
+        organization = self.create_organization(slug="customer-domain-org")
 
-    def test_login_valid_credentials(self):
-        # load it once for test cookie
-        self.client.get(self.path)
-
-        resp = self.client.post(
-            self.path, {"username": self.user.username, "password": "admin", "op": "login"}
-        )
-        assert resp.status_code == 302
-
-    def test_registration_disabled(self):
-        options.set("auth.allow-registration", True)
-        with self.feature({"auth:register": False}):
-            resp = self.client.get(self.path)
-            assert resp.context["register_form"] is None
-
-    @mock.patch("sentry.analytics.record")
-    def test_registration_valid(self, mock_record):
-        options.set("auth.allow-registration", True)
-        with self.feature("auth:register"):
-            resp = self.client.post(
-                self.path,
-                {
-                    "username": "test-a-really-long-email-address@example.com",
-                    "password": "foobar",
-                    "name": "Foo Bar",
-                    "op": "register",
-                },
-            )
-        assert resp.status_code == 302, (
-            resp.context["register_form"].errors if resp.status_code == 200 else None
-        )
-        user = User.objects.get(username="test-a-really-long-email-address@example.com")
-        assert user.email == "test-a-really-long-email-address@example.com"
-        assert user.check_password("foobar")
-        assert user.name == "Foo Bar"
-        assert not OrganizationMember.objects.filter(user=user).exists()
-
-        signup_record = [r for r in mock_record.call_args_list if r[0][0] == "user.signup"]
-        assert signup_record == [
-            mock.call(
-                "user.signup",
-                user_id=user.id,
-                source="register-form",
-                provider=None,
-                referrer="in-app",
-            )
-        ]
-
-    @override_settings(SENTRY_SINGLE_ORGANIZATION=True)
-    def test_registration_single_org(self):
-        options.set("auth.allow-registration", True)
-        with self.feature("auth:register"):
-            resp = self.client.post(
-                self.path,
-                {
-                    "username": "test-a-really-long-email-address@example.com",
-                    "password": "foobar",
-                    "name": "Foo Bar",
-                    "op": "register",
-                },
-            )
-        assert resp.status_code == 302, (
-            resp.context["register_form"].errors if resp.status_code == 200 else None
-        )
-        user = User.objects.get(username="test-a-really-long-email-address@example.com")
-
-        # User is part of the default org
-        assert OrganizationMember.objects.filter(user=user).exists()
-
-    @override_settings(SENTRY_SINGLE_ORGANIZATION=True)
-    @mock.patch("sentry.web.frontend.auth_login.ApiInviteHelper.from_cookie")
-    def test_registration_single_org_with_invite(self, from_cookie):
-        self.session["can_register"] = True
-        self.save_session()
-
-        self.client.get(self.path)
-
-        invite_helper = mock.Mock(valid_request=True)
-        from_cookie.return_value = invite_helper
-
-        resp = self.client.post(
-            self.path,
-            {
-                "username": "test@example.com",
-                "password": "foobar",
-                "name": "Foo Bar",
-                "op": "register",
-            },
-        )
-
-        user = User.objects.get(username="test@example.com")
-
-        # An organization member should NOT have been created, even though
-        # we're in single org mode, accepting the invite will handle that
-        # (which we assert next)
-        assert not OrganizationMember.objects.filter(user=user).exists()
-
-        # Invitation was accepted
-        assert len(invite_helper.accept_invite.mock_calls) == 1
-        assert resp.status_code == 302
-
-    def test_register_renders_correct_template(self):
-        options.set("auth.allow-registration", True)
-        register_path = reverse("sentry-register")
-        resp = self.client.get(register_path)
-
-        assert resp.status_code == 200
-        assert resp.context["op"] == "register"
-        self.assertTemplateUsed("sentry/login.html")
-
-    def test_register_prefills_invite_email(self):
-        self.session["invite_email"] = "foo@example.com"
-        self.session["can_register"] = True
-        self.save_session()
-
-        register_path = reverse("sentry-register")
-        resp = self.client.get(register_path)
-
-        assert resp.status_code == 200
-        assert resp.context["op"] == "register"
-        assert resp.context["register_form"].initial["username"] == "foo@example.com"
-        self.assertTemplateUsed("sentry/login.html")
-
-    @mock.patch("sentry.web.frontend.auth_login.ApiInviteHelper.from_cookie")
-    def test_register_accepts_invite(self, from_cookie):
-        self.session["can_register"] = True
-        self.save_session()
-
-        self.client.get(self.path)
-
-        invite_helper = mock.Mock(valid_request=True)
-        from_cookie.return_value = invite_helper
-
-        resp = self.client.post(
-            self.path,
-            {
-                "username": "test@example.com",
-                "password": "foobar",
-                "name": "Foo Bar",
-                "op": "register",
-            },
-        )
-        assert resp.status_code == 302
-        assert len(invite_helper.accept_invite.mock_calls) == 1
-
-    def test_redirects_to_relative_next_url(self):
-        next = "/welcome"
-        self.client.get(self.path + "?next=" + next)
-
-        resp = self.client.post(
-            self.path, {"username": self.user.username, "password": "admin", "op": "login"}
-        )
-        assert resp.status_code == 302
-        assert resp.get("Location", "").endswith(next)
-
-    def test_doesnt_redirect_to_external_next_url(self):
-        next = "http://example.com"
-        self.client.get(self.path + "?next=" + urlquote(next))
-
-        resp = self.client.post(
-            self.path,
-            {"username": self.user.username, "password": "admin", "op": "login"},
-            follow=False,
-        )
-        self.assertRedirects(resp, reverse("sentry-login"), target_status_code=302)
-        resp = self.client.post(
-            self.path,
-            {"username": self.user.username, "password": "admin", "op": "login"},
+        response = self.client.get(
+            f"{self.path}?next=%2Fsettings%2Faccount%2F",
+            HTTP_HOST=f"{organization.slug}.testserver",
             follow=True,
         )
-        self.assertRedirects(resp, "/organizations/new/")
 
-    def test_redirects_already_authed_non_superuser(self):
-        self.user.update(is_superuser=False)
-        self.login_as(self.user)
-        with self.feature("organizations:create"):
-            resp = self.client.get(self.path)
-            self.assertRedirects(resp, "/organizations/new/")
+        assert response.status_code == 200
+        assert response.redirect_chain == [
+            (
+                f"http://testserver/auth/login/{organization.slug}/?next=%2Fsettings%2Faccount%2F",
+                302,
+            )
+        ]
+        self.assertTemplateUsed(response, "sentry/base-react.html")
 
-    def test_doesnt_redirect_already_authed_superuser(self):
-        self.login_as(self.user, superuser=False)
+    @with_feature("system:multi-region")
+    def test_customer_domain_register_redirects_to_primary_domain_registration(self) -> None:
+        organization = self.create_organization(slug="customer-domain-org")
+        self.session["can_register"] = True
+        self.save_session()
 
-        resp = self.client.get(self.path)
+        response = self.client.get(
+            reverse("sentry-register"),
+            HTTP_HOST=f"{organization.slug}.testserver",
+            follow=True,
+        )
 
-        assert resp.status_code == 200
+        assert response.status_code == 200
+        assert response.redirect_chain == [("http://testserver/auth/register/", 302)]
+        self.assertTemplateUsed(response, "sentry/base-react.html")
+
+    def test_customer_domain_login_does_not_redirect_without_multi_region(self) -> None:
+        organization = self.create_organization(slug="customer-domain-org")
+
+        response = self.client.get(
+            self.path,
+            HTTP_HOST=f"{organization.slug}.testserver",
+        )
+
+        assert response.status_code == 200
+        self.assertTemplateUsed(response, "sentry/base-react.html")
+
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    @mock.patch.object(
+        AuthPageView,
+        "rate_limits",
+        RateLimitConfig(
+            limit_overrides={
+                "GET": {
+                    RateLimitCategory.IP: RateLimit(limit=20, window=60),
+                }
+            }
+        ),
+    )
+    def test_login_ratelimited_ip_gets(self) -> None:
+        url = reverse("sentry-login")
+
+        with freeze_time("2000-01-01"):
+            for _ in range(25):
+                self.client.get(url)
+            resp = self.client.get(url)
+            assert resp.status_code == 429
+
+    def test_register_renders_correct_template(self) -> None:
+        with self.allow_registration():
+            register_path = reverse("sentry-register")
+            resp = self.client.get(register_path)
+
+            assert resp.status_code == 200
+            self.assertTemplateUsed("sentry/base-react.html")
 
 
-@pytest.mark.skipif(
-    settings.SENTRY_NEWSLETTER != "sentry.newsletter.dummy.DummyNewsletter",
-    reason="Requires DummyNewsletter.",
-)
-class AuthLoginNewsletterTest(TestCase):
-    @fixture
-    def path(self):
+@control_silo_test
+class AuthLoginCustomerDomainTest(TestCase):
+    @cached_property
+    def path(self) -> str:
         return reverse("sentry-login")
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
 
-        def disable_newsletter():
-            newsletter.backend.disable()
+    def disable_registration(self) -> AbstractContextManager[None]:
+        return self.options({"auth.allow-registration": False})
 
-        self.addCleanup(disable_newsletter)
-        newsletter.backend.enable()
-
-    def test_registration_requires_subscribe_choice_with_newsletter(self):
-        options.set("auth.allow-registration", True)
-        with self.feature("auth:register"):
-            resp = self.client.post(
+    def test_renders_correct_template_nonexistent_org(self) -> None:
+        with self.disable_registration():
+            resp = self.client.get(
                 self.path,
-                {
-                    "username": "test-a-really-long-email-address@example.com",
-                    "password": "foobar",
-                    "name": "Foo Bar",
-                    "op": "register",
-                },
+                HTTP_HOST="does-not-exist.testserver",
             )
+
+            assert resp.status_code == 200
+            self.assertTemplateUsed("sentry/base-react.html")
+
+    def test_explicit_org_path_does_not_use_customer_domain_subdomain(self) -> None:
+        visible_org = self.create_organization(owner=self.user)
+        self.create_organization(name="albertos-apples")
+        self.login_as(self.user)
+
+        resp = self.client.get(
+            reverse("sentry-organization-issue-list", args=[visible_org.slug]),
+            HTTP_HOST="albertos-apples.testserver",
+        )
+
         assert resp.status_code == 200
-
-        with self.feature("auth:register"):
-            resp = self.client.post(
-                self.path,
-                {
-                    "username": "test-a-really-long-email-address@example.com",
-                    "password": "foobar",
-                    "name": "Foo Bar",
-                    "op": "register",
-                    "subscribe": "0",
-                },
-            )
-        assert resp.status_code == 302
-
-        user = User.objects.get(username="test-a-really-long-email-address@example.com")
-        assert user.email == "test-a-really-long-email-address@example.com"
-        assert user.check_password("foobar")
-        assert user.name == "Foo Bar"
-        assert not OrganizationMember.objects.filter(user=user).exists()
-
-        assert newsletter.get_subscriptions(user) == {"subscriptions": []}
-
-    def test_registration_subscribe_to_newsletter(self):
-        options.set("auth.allow-registration", True)
-        with self.feature("auth:register"):
-            resp = self.client.post(
-                self.path,
-                {
-                    "username": "test-a-really-long-email-address@example.com",
-                    "password": "foobar",
-                    "name": "Foo Bar",
-                    "op": "register",
-                    "subscribe": "1",
-                },
-            )
-        assert resp.status_code == 302
-
-        user = User.objects.get(username="test-a-really-long-email-address@example.com")
-        assert user.email == "test-a-really-long-email-address@example.com"
-        assert user.check_password("foobar")
-        assert user.name == "Foo Bar"
-
-        results = newsletter.get_subscriptions(user)["subscriptions"]
-        assert len(results) == 1
-        assert results[0].list_id == newsletter.get_default_list_id()
-        assert results[0].subscribed
-        assert not results[0].verified

@@ -1,12 +1,12 @@
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.core.urlresolvers import reverse
 from django.test.client import RequestFactory
+from django.urls import reverse
 
-from tests.apidocs.util import APIDocsTestCase
+from fixtures.apidocs_test_case import APIDocsTestCase
 
 
 class ReleaseFilesListDocsTest(APIDocsTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         project = self.create_project(name="foo")
         release = self.create_release(project=self.project, version="1")
         file1 = self.create_file(
@@ -16,22 +16,27 @@ class ReleaseFilesListDocsTest(APIDocsTestCase):
             headers={"Content-Type": "application/json"},
             checksum="dc1e3f3e411979d336c3057cce64294f3420f93a",
         )
-        self.create_release_file(file=file1, release=release, name="http://example.com/blah.js")
+        self.create_release_file(
+            file=file1, release_id=release.id, name="http://example.com/blah.js"
+        )
 
         self.url = reverse(
             "sentry-api-0-organization-release-files",
-            kwargs={"organization_slug": project.organization.slug, "version": release.version},
+            kwargs={
+                "organization_id_or_slug": project.organization.slug,
+                "version": release.version,
+            },
         )
 
         self.login_as(user=self.user)
 
-    def test_get(self):
+    def test_get(self) -> None:
         response = self.client.get(self.url)
         request = RequestFactory().get(self.url)
 
         self.validate_schema(request, response)
 
-    def test_post(self):
+    def test_post(self) -> None:
         data = {
             "name": "http://example.com/application.js",
             "header": "X-SourceMap: http://example.com",
@@ -44,6 +49,10 @@ class ReleaseFilesListDocsTest(APIDocsTestCase):
             data,
             format="multipart",
         )
-        request = RequestFactory().post(self.url, data=data, content_type="multipart/form-data")
+        request = RequestFactory().post(
+            self.url,
+            data=data,
+            content_type="multipart/form-data",
+        )
 
         self.validate_schema(request, response)

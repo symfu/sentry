@@ -1,0 +1,234 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+import moment from 'moment-timezone';
+
+import {useTimezone} from '@sentry/scraps/datetime';
+import {DescriptionList} from '@sentry/scraps/descriptionList';
+import {Container, Grid} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {DateTime} from 'sentry/components/dateTime';
+import {Duration} from 'sentry/components/duration';
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import {BreadcrumbItemContent} from 'sentry/components/events/breadcrumbs/breadcrumbItemContent';
+import type {EnhancedCrumb} from 'sentry/components/events/breadcrumbs/utils';
+import {useVirtualRows} from 'sentry/components/tables/useVirtualRows';
+import {Timeline} from 'sentry/components/timeline';
+import {t} from 'sentry/locale';
+import {isValidDate} from 'sentry/utils/date/isValidDate';
+import {defined} from 'sentry/utils/defined';
+
+function BreadcrumbTimestampTooltipBody({timestamp}: {timestamp: Date}) {
+  const currentTimezone = useTimezone();
+  const isUTCLocalTimezone = currentTimezone === 'UTC';
+
+  return (
+    <Tooltip.Grid>
+      <DescriptionList terms="strong">
+        <DescriptionList.Term>{t('Occurred')}</DescriptionList.Term>
+        <DescriptionList.Details>
+          <TimestampValues>
+            <DateTime date={timestamp} seconds milliseconds timeZone />
+            {!isUTCLocalTimezone && (
+              <DateTime date={timestamp} seconds milliseconds timeZone utc />
+            )}
+          </TimestampValues>
+        </DescriptionList.Details>
+        {isUTCLocalTimezone && (
+          <Fragment>
+            <DescriptionList.Term />
+            <DescriptionList.Details>
+              <TimezoneLink to="/settings/account/details/#timezone">
+                {t('Add your local timezone')}
+              </TimezoneLink>
+            </DescriptionList.Details>
+          </Fragment>
+        )}
+      </DescriptionList>
+    </Tooltip.Grid>
+  );
+}
+
+interface BreadcrumbsTimelineProps {
+  breadcrumbs: EnhancedCrumb[];
+  /**
+   * Required reference to parent container for virtualization. It's recommended to use state instead
+   * of useRef since this component will not update when the ref changes, causing it to render empty initially.
+   * To enable virtualization, set a fixed height on the `containerElement` node.
+   *
+   * Example:
+   * ```
+   * const [container, setContainer] = useState<HTMLElement | null>(null);
+   * return (
+   *  <div ref={setContainer}>
+   *    <BreadcrumbsTimeline containerElement={container} />
+   *  </div>
+   * )
+   * ```
+   */
+  containerElement: HTMLElement | null;
+  /**
+   * If true, expands the contents of the breadcrumbs' data payload
+   */
+  fullyExpanded?: boolean;
+  /**
+   * Shows the line after the last breadcrumbs icon.
+   * Useful for connecting timeline to components rendered after it.
+   */
+  showLastLine?: boolean;
+  /**
+   * If specified, will display time relatively.
+   */
+  startTimeString?: string;
+}
+
+export function BreadcrumbsTimeline({
+  breadcrumbs,
+  containerElement,
+  startTimeString,
+  fullyExpanded = true,
+  showLastLine = false,
+}: BreadcrumbsTimelineProps) {
+  const {totalSize, virtualItems, virtualizer} = useVirtualRows({
+    count: breadcrumbs.length,
+    getScrollElement: () => containerElement,
+    estimateSize: () => 35,
+    // Must match rendered item margins.
+    gap: 8,
+    overscan: 25,
+  });
+
+  if (!breadcrumbs.length) {
+    return null;
+  }
+
+  const items = virtualItems.map(virtualizedRow => {
+    const {breadcrumb, raw, title, meta, iconComponent, colorConfig, levelComponent} =
+      breadcrumbs[virtualizedRow.index]!;
+    const isVirtualCrumb = !defined(raw);
+
+    const timestamp = new Date(breadcrumb.timestamp ?? '');
+    const startTimeDate = new Date(startTimeString ?? '');
+
+    const timestampComponent = isValidDate(timestamp) ? (
+      <Timestamp>
+        <Tooltip
+          title={<BreadcrumbTimestampTooltipBody timestamp={timestamp} />}
+          maxWidth={400}
+        >
+          {isValidDate(startTimeDate) ? (
+            <Duration
+              seconds={moment(timestamp).diff(moment(startTimeDate), 's', true)}
+              exact
+              abbreviation
+            />
+          ) : (
+            <DateTime date={timestamp} seconds milliseconds timeZone />
+          )}
+        </Tooltip>
+      </Timestamp>
+    ) : null;
+
+    return (
+      <BreadcrumbItem
+        key={virtualizedRow.key}
+        ref={virtualizer.measureElement}
+        title={
+          <Grid align="end" columns="1fr auto">
+            <div>
+              <TextBreak>{title}</TextBreak>
+              {isVirtualCrumb && <Subtitle> - {t('This event')}</Subtitle>}
+            </div>
+            {levelComponent}
+          </Grid>
+        }
+        colorConfig={colorConfig}
+        icon={iconComponent}
+        timestamp={timestampComponent}
+        // XXX: Only the virtual crumb can be marked as active for breadcrumbs
+        isActive={isVirtualCrumb ?? false}
+        data-index={virtualizedRow.index}
+        showLastLine={showLastLine}
+      >
+        <Container paddingBottom="md">
+          <ErrorBoundary mini>
+            <BreadcrumbItemContent
+              breadcrumb={breadcrumb}
+              meta={meta}
+              fullyExpanded={fullyExpanded}
+            />
+          </ErrorBoundary>
+        </Container>
+      </BreadcrumbItem>
+    );
+  });
+
+  return (
+    <div
+      style={{
+        height: totalSize,
+        position: 'relative',
+      }}
+    >
+      <VirtualOffset offset={virtualItems?.[0]?.start ?? 0}>
+        <Timeline.Container>{items}</Timeline.Container>
+      </VirtualOffset>
+    </div>
+  );
+}
+
+const VirtualOffset = styled('div')<{offset: number}>`
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  transform: translateY(${p => p.offset}px);
+`;
+
+const TextBreak = styled('span')`
+  word-wrap: break-word;
+  word-break: break-all;
+`;
+
+const Subtitle = styled('p')`
+  margin: 0;
+  font-weight: normal;
+  font-size: ${p => p.theme.font.size.sm};
+  display: inline;
+`;
+
+const Timestamp = styled('div')`
+  margin-right: ${p => p.theme.space.md};
+  color: ${p => p.theme.tokens.content.secondary};
+  font-size: ${p => p.theme.font.size.sm};
+  min-width: 50px;
+  text-align: right;
+  span {
+    text-decoration: underline dashed
+      ${p => p.theme.tokens.border.transparent.neutral.muted};
+  }
+`;
+
+const BreadcrumbItem = styled(Timeline.Item)`
+  border-bottom: 1px solid transparent;
+  &:not(:last-child) {
+    border-image: linear-gradient(
+        to right,
+        transparent 20px,
+        ${p => p.theme.tokens.border.secondary} 20px
+      )
+      100% 1;
+  }
+`;
+
+const TimestampValues = styled('div')`
+  display: flex;
+  flex-direction: column;
+  gap: ${p => p.theme.space['2xs']};
+  font-family: ${p => p.theme.font.family.mono};
+`;
+
+const TimezoneLink = styled(Link)`
+  line-height: 0.8;
+`;

@@ -1,0 +1,311 @@
+import {Fragment} from 'react';
+import {useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+import {IconAttachment} from '@sentry/icons/attachment';
+import {IconReleases} from '@sentry/icons/releases';
+import {IconWindow} from '@sentry/icons/window';
+
+import {Button} from '@sentry/scraps/button';
+import {Container, Flex} from '@sentry/scraps/layout';
+import {useModal} from '@sentry/scraps/modal';
+import {Text} from '@sentry/scraps/text';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {useFetchEventAttachments} from 'sentry/actionCreators/events';
+import {getOrderedContextItems} from 'sentry/components/events/contexts/contextItems';
+import {
+  getContextIcon,
+  getContextSummary,
+  getContextTitle,
+} from 'sentry/components/events/contexts/utils';
+import {
+  modalCss,
+  ScreenshotModal,
+} from 'sentry/components/events/eventTagsAndScreenshot/screenshot/modal';
+import {getRuntimeLabelAndTooltip} from 'sentry/components/events/highlights/util';
+import {ScrollCarousel} from 'sentry/components/scrollCarousel';
+import {Version} from 'sentry/components/version';
+import {VersionHoverCard} from 'sentry/components/versionHoverCard';
+import {t} from 'sentry/locale';
+import type {Event, EventTag} from 'sentry/types/event';
+import type {Group} from 'sentry/types/group';
+import type {Organization} from 'sentry/types/organization';
+import {isMobilePlatform, isNativePlatform} from 'sentry/utils/platform';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {Divider} from 'sentry/views/issueDetails/divider';
+import {SectionDivider} from 'sentry/views/issueDetails/foldSection';
+
+interface HighlightsIconSummaryProps {
+  event: Event;
+  group?: Group;
+}
+
+export function HighlightsIconSummary({event, group}: HighlightsIconSummaryProps) {
+  const {openModal} = useModal();
+
+  const theme = useTheme();
+  const organization = useOrganization();
+
+  // Project slug and project id are pull out because group is not always available
+  const projectSlug = group?.project.slug ?? event.projectSlug;
+  const projectId = group?.project.id ?? event.projectID;
+  const projectPlatform = group?.project.platform;
+
+  const {data: attachments = []} = useFetchEventAttachments({
+    orgSlug: organization.slug,
+    projectSlug,
+    eventId: event.id,
+  });
+  const screenshot = attachments.find(
+    ({name, mimetype}) => name.includes('screenshot') && mimetype.startsWith('image')
+  );
+  // Hide device for non-native platforms since it's mostly duplicate of the client_os or os context
+  const shouldDisplayDevice =
+    isMobilePlatform(projectPlatform) || isNativePlatform(projectPlatform);
+
+  // Events from the backend of a Meta-Framework (e.g. Next.js) also include the client context
+  const isMetaFrameworkBackendEvent =
+    Object.keys(event.contexts).includes('client_os') &&
+    Object.keys(event.contexts).includes('os');
+
+  // For now, highlight icons are only interpreted from context. We should extend this to tags
+  // eventually, but for now, it'll match the previous expectations.
+  const items = getOrderedContextItems(event)
+    .map(item => ({
+      ...getContextSummary(item),
+      contextTitle: getContextTitle(item),
+      contextType: item.type,
+      alias: item.alias,
+      icon: getContextIcon({
+        alias: item.alias,
+        type: item.type,
+        value: item.value,
+        contextIconProps: {
+          size: 'md',
+        },
+        theme,
+      }),
+    }))
+    .filter((item, _index, array) => {
+      if (
+        // Hide client information in backend events (always prefer `os` over `client_os`)
+        isMetaFrameworkBackendEvent &&
+        (item.contextType === 'browser' || item.alias === 'client_os')
+      ) {
+        return false;
+      }
+
+      // Prefer the runtime to browser if they're both the same
+      if (item.contextType === 'browser') {
+        // If the runtime is the same as the browser, prefer the runtime
+        const runtime = array.find(i => i.contextType === 'runtime');
+        if (runtime?.title === item.title) {
+          return false;
+        }
+      }
+
+      const hasData = item.icon !== null && Boolean(item.title || item.subtitle);
+      if (item.alias === 'device') {
+        return hasData && shouldDisplayDevice;
+      }
+
+      return hasData;
+    });
+
+  const releaseTag = event.tags?.find(tag => tag.key === 'release');
+  const environmentTag = event.tags?.find(tag => tag.key === 'environment');
+
+  const runtimeInfo = getRuntimeLabelAndTooltip(event);
+
+  return items.length || screenshot ? (
+    <Fragment>
+      <IconBar>
+        <ScrollCarousel gap="xl" aria-label={t('Icon highlights')}>
+          {runtimeInfo && (
+            <Fragment>
+              <Tooltip title={runtimeInfo.tooltip} skipWrapper>
+                <Container as="span" padding="xs 0">
+                  <Text>{runtimeInfo.label}</Text>
+                </Container>
+              </Tooltip>
+              <DividerWrapper>
+                <Divider />
+              </DividerWrapper>
+            </Fragment>
+          )}
+
+          {screenshot && group && (
+            <Fragment>
+              <ScreenshotButton
+                type="button"
+                variant="transparent"
+                size="zero"
+                icon={<IconAttachment variant="muted" />}
+                tooltipProps={{title: t('View Screenshot')}}
+                onClick={() => {
+                  const downloadUrl = `/api/0/projects/${organization.slug}/${group.project.slug}/events/${event.id}/attachments/${screenshot.id}/`;
+                  openModal(
+                    modalProps => (
+                      <ScreenshotModal
+                        {...modalProps}
+                        projectSlug={group.project.slug}
+                        eventAttachment={screenshot}
+                        downloadUrl={downloadUrl}
+                        attachments={attachments}
+                      />
+                    ),
+                    {modalCss}
+                  );
+                }}
+              >
+                <IconDescription>{t('Screenshot')}</IconDescription>
+              </ScreenshotButton>
+              {items.length > 0 && <Divider />}
+            </Fragment>
+          )}
+          {items.map((item, index) => (
+            <Flex align="center" flexShrink={0} gap="md" minHeight="24px" key={index}>
+              <IconWrapper>{item.icon}</IconWrapper>
+              <IconDescription>
+                <div>{item.title}</div>
+                {item.subtitle && (
+                  <IconSubtitle title={`${item.contextTitle} ${item.subtitleType}`}>
+                    {item.subtitle}
+                  </IconSubtitle>
+                )}
+              </IconDescription>
+            </Flex>
+          ))}
+          {projectSlug && projectId && (
+            <ReleaseHighlight
+              organization={organization}
+              projectSlug={projectSlug}
+              projectId={projectId}
+              releaseTag={releaseTag}
+            />
+          )}
+          <EnvironmentHighlight environmentTag={environmentTag} />
+        </ScrollCarousel>
+      </IconBar>
+      <SectionDivider margin="md 0 lg 0" orientation="horizontal" />
+    </Fragment>
+  ) : null;
+}
+
+function ReleaseHighlight({
+  releaseTag,
+  organization,
+  projectSlug,
+  projectId,
+}: {
+  organization: Organization;
+  projectId: string;
+  projectSlug: string;
+  releaseTag: EventTag | undefined;
+}) {
+  if (!releaseTag) {
+    return null;
+  }
+
+  return (
+    <Flex
+      align="center"
+      flexShrink={0}
+      gap="md"
+      minWidth="0"
+      maxWidth="240px"
+      minHeight="24px"
+      overflow="hidden"
+      key="release"
+    >
+      <IconWrapper>
+        <IconReleases size="sm" variant="muted" />
+      </IconWrapper>
+      <ReleaseIconDescription aria-label={t('Event release')}>
+        <Container
+          as="span"
+          display="block"
+          width="100%"
+          minWidth="0"
+          maxWidth="100%"
+          overflow="hidden"
+        >
+          <VersionHoverCard
+            organization={organization}
+            projectSlug={projectSlug}
+            releaseVersion={releaseTag.value}
+            containerDisplayMode="block"
+          >
+            <StyledVersion version={releaseTag.value} projectId={projectId} truncate />
+          </VersionHoverCard>
+        </Container>
+      </ReleaseIconDescription>
+    </Flex>
+  );
+}
+
+function EnvironmentHighlight({environmentTag}: {environmentTag: EventTag | undefined}) {
+  if (!environmentTag) {
+    return null;
+  }
+
+  return (
+    <Flex align="center" flexShrink={0} gap="md" minHeight="24px" key="environment">
+      <IconWrapper>
+        <IconWindow size="sm" variant="muted" />
+      </IconWrapper>
+      <IconDescription aria-label={t('Event environment')}>
+        <Tooltip title={t('Environment')}>{environmentTag.value}</Tooltip>
+      </IconDescription>
+    </Flex>
+  );
+}
+
+const IconBar = styled('div')`
+  position: relative;
+  padding: 0;
+`;
+
+const IconDescription = styled('div')`
+  display: flex;
+  gap: ${p => p.theme.space.sm};
+  font-size: ${p => p.theme.font.size.md};
+`;
+
+const IconWrapper = styled('div')`
+  flex: none;
+  line-height: 1;
+`;
+
+const IconSubtitle = styled(Tooltip)`
+  display: block;
+  color: ${p => p.theme.tokens.content.secondary};
+`;
+
+const ReleaseIconDescription = styled(IconDescription)`
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+`;
+
+const StyledVersion = styled(Version)`
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  font-size: ${p => p.theme.font.size.md};
+  color: ${p => p.theme.tokens.content.primary};
+  &:hover {
+    color: ${p => p.theme.tokens.content.primary};
+  }
+`;
+
+const ScreenshotButton = styled(Button)`
+  font-weight: normal;
+`;
+
+const DividerWrapper = styled('div')`
+  display: flex;
+  align-items: center;
+  font-size: 1.25rem;
+`;

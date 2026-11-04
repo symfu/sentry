@@ -1,0 +1,465 @@
+import functools
+import logging
+import os
+from collections.abc import Callable, Mapping, MutableMapping
+from typing import Any, ParamSpec, TypeVar
+
+import orjson
+import sentry_sdk
+from django.conf import settings
+from django.core.cache import cache
+from sentry_sdk import traces
+from sentry_sdk.scope import Scope
+from usageaccountant import UsageUnit
+
+from sentry import features, nodestore
+from sentry.attachments import CachedAttachment, attachment_cache, store_attachments_for_event
+from sentry.constants import DataCategory
+from sentry.event_manager import save_attachment
+from sentry.feedback.lib.utils import FeedbackCreationSource, is_in_feedback_denylist
+from sentry.feedback.usecases.ingest.userreport import Conflict, save_userreport
+from sentry.ingest.consumer import CACHE_TIMEOUT
+from sentry.ingest.event_payload import get_event_payload_transport
+from sentry.ingest.types import ConsumerType
+from sentry.killswitches import killswitch_matches_context
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.services import eventstore
+from sentry.services.eventstore import processing
+from sentry.services.eventstore.models import Event
+from sentry.signals import event_accepted
+from sentry.tasks.store import preprocess_event, save_event_feedback, save_event_transaction
+from sentry.usage_accountant import record
+from sentry.utils import metrics
+from sentry.utils.cache import cache_key_for_event
+from sentry.utils.dates import to_datetime
+from sentry.utils.event_tracker import TransactionStageStatus, track_sampled_event
+from sentry.utils.outcomes import Outcome, track_outcome
+from sentry.utils.snuba import RateLimitExceeded
+
+logger = logging.getLogger(__name__)
+
+IngestMessage = Mapping[str, Any]
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+class Retriable(Exception):
+    pass
+
+
+def trace_func(name: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def wrapper(f: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(f)
+        def inner(*args: P.args, **kwargs: P.kwargs) -> R:
+            # First we check a local env var
+            # if that's not set we check our conf file
+            # if neither are set use 0
+            sample_rate = float(
+                os.getenv(
+                    "SENTRY_INGEST_CONSUMER_APM_SAMPLING",
+                    default=getattr(settings, "SENTRY_INGEST_CONSUMER_APM_SAMPLING", 0),
+                )
+            )
+            traces.new_trace()
+            # New behavior is to add a custom `sample_rate` that is picked up by `traces_sampler`
+            propagation_context = sentry_sdk.get_current_scope().get_active_propagation_context()
+            prev_sampling_context = propagation_context.custom_sampling_context
+            Scope.set_custom_sampling_context({"sample_rate": sample_rate})
+            try:
+                span = traces.start_span(name=name, parent_span=None)
+            finally:
+                propagation_context = (
+                    sentry_sdk.get_current_scope().get_active_propagation_context()
+                )
+                propagation_context.custom_sampling_context = prev_sampling_context
+
+            with span:
+                return f(*args, **kwargs)
+
+        return inner
+
+    return wrapper
+
+
+@trace_func(name="ingest_consumer.process_event")
+@metrics.wraps("ingest_consumer.process_event")
+def process_event(
+    consumer_type: str,
+    message: IngestMessage,
+    project: Project,
+    reprocess_only_stuck_events: bool = False,
+    reprocess_only_events_not_in_nodestore: bool = False,
+    inline_save_event: bool = False,
+    inline_save_event_transaction: bool = False,
+) -> None:
+    """
+    Perform some initial filtering and deserialize the message payload.
+    """
+    payload = message["payload"]
+    start_time = float(message["start_time"])
+    event_id = message["event_id"]
+    project_id = int(message["project_id"])
+    remote_addr = message.get("remote_addr")
+    attachments = message.get("attachments") or ()
+
+    sentry_sdk.set_extra("event_id", event_id)
+    sentry_sdk.set_attribute("event_id", event_id)
+    sentry_sdk.set_extra("len_attachments", len(attachments))
+    sentry_sdk.set_attribute("len_attachments", len(attachments))
+
+    # check that we haven't already processed this event (a previous instance of the forwarder
+    # died before it could commit the event queue offset)
+    #
+    # XXX(markus): I believe this code is extremely broken:
+    #
+    # * it practically uses memcached in prod which has no consistency
+    #   guarantees (no idea how we don't run into issues there)
+    #
+    # * a TTL of 1h basically doesn't guarantee any deduplication at all. It
+    #   just guarantees a good error message... for one hour.
+    #
+    # This code has been ripped from the old python store endpoint. We're
+    # keeping it around because it does provide some protection against
+    # reprocessing good events if a single consumer is in a restart loop.
+    with traces.start_span(
+        name="deduplication_check", attributes={"sentry.op": "deduplication_check"}
+    ):
+        deduplication_key = f"ev:{project_id}:{event_id}"
+
+        try:
+            cached_value = cache.get(deduplication_key)
+        except Exception as exc:
+            raise Retriable(exc)
+
+        if cached_value is not None:
+            logger.warning(
+                "pre-process-forwarder detected a duplicated event with id:%s for project:%s.",
+                event_id,
+                project_id,
+            )
+            return  # message already processed do not reprocess
+
+    with traces.start_span(
+        name="store.load-shed-pipeline-projects",
+        attributes={"sentry.op": "killswitch_matches_context"},
+    ):
+        if killswitch_matches_context(
+            "store.load-shed-pipeline-projects",
+            {
+                "project_id": project_id,
+                "event_id": event_id,
+                "has_attachments": bool(attachments),
+            },
+        ):
+            # This killswitch is for the worst of scenarios and should probably not
+            # cause additional load on our logging infrastructure
+            return
+
+    # Parse the JSON payload. This is required to compute the cache key and
+    # call process_event. The payload will be put into Kafka raw, to avoid
+    # serializing it again.
+    with traces.start_span(name="orjson.loads", attributes={"sentry.op": "orjson.loads"}):
+        data = orjson.loads(payload)
+
+    # We also need to check "type" as transactions are also sent to ingest-attachments
+    # along with other event types if they have attachments.
+    if consumer_type == ConsumerType.Transactions or data.get("type") == "transaction":
+        processing_store = processing.transaction_processing_store
+    else:
+        processing_store = processing.event_processing_store
+
+    sentry_sdk.set_extra("event_type", data.get("type"))
+    sentry_sdk.set_attribute("event_type", data.get("type"))
+
+    with traces.start_span(
+        name="store.load-shed-parsed-pipeline-projects",
+        attributes={"sentry.op": "killswitch_matches_context"},
+    ):
+        if killswitch_matches_context(
+            "store.load-shed-parsed-pipeline-projects",
+            {
+                "organization_id": project.organization_id,
+                "project_id": project.id,
+                "event_type": data.get("type") or "null",
+                "has_attachments": bool(attachments),
+                "event_id": event_id,
+            },
+        ):
+            return
+
+    # Raise the retriable exception and skip DLQ if anything below this point fails as it may be caused by
+    # intermittent network issue
+    try:
+        # If we only want to reprocess "stuck" events, we check if this event is already in the
+        # `processing_store`. We only continue here if the event *is* present, as that will eventually
+        # process and consume the event from the `processing_store`, whereby getting it "unstuck".
+        if reprocess_only_stuck_events:
+            with traces.start_span(
+                name="event_processing_store.exists",
+                attributes={"sentry.op": "event_processing_store.exists"},
+            ):
+                if not processing_store.exists(data):
+                    return
+
+        # If we only want to reprocess events that never made it into `nodestore`, we check whether the event body has
+        # already been persisted. We only continue here if the event is *not* present.
+        if reprocess_only_events_not_in_nodestore:
+            with traces.start_span(
+                name="nodestore.exists", attributes={"sentry.op": "nodestore.exists"}
+            ):
+                node_id = Event.generate_node_id(project_id, event_id)
+                if nodestore.backend.get(node_id) is not None:
+                    return
+
+        attachment_objects = [
+            CachedAttachment(type=attachment.pop("attachment_type"), **attachment)
+            for attachment in attachments
+        ]
+        if attachment_objects:
+            store_attachments_for_event(project, data, attachment_objects, timeout=CACHE_TIMEOUT)
+
+        # Feedback events pass their payload inline to `save_event_feedback` and
+        # never read it back from the processing store, so skip the Redis write
+        # for them. Storing would orphan the payload in Redis until its TTL
+        # expires, since nothing on the feedback path deletes it.
+        cache_key = None
+        transport = get_event_payload_transport(data["event_id"])
+        if data.get("type") != "feedback" and transport.cache:
+            with metrics.timer("ingest_consumer._store_event"):
+                cache_key = processing_store.store(data)
+        if consumer_type == ConsumerType.Transactions and cache_key:
+            track_sampled_event(
+                data["event_id"], ConsumerType.Transactions, TransactionStageStatus.REDIS_PUT
+            )
+
+        try:
+            # Records rc-processing usage broken down by
+            # event type.
+            event_type = data.get("type")
+            if event_type == "error":
+                app_feature = "errors"
+            elif event_type == "transaction":
+                app_feature = "transactions"
+            else:
+                app_feature = None
+
+            if app_feature is not None and cache_key:
+                record(settings.EVENT_PROCESSING_STORE, app_feature, len(payload), UsageUnit.BYTES)
+        except Exception:
+            pass
+
+        try:
+            project.set_cached_field_value(
+                "organization", Organization.objects.get_from_cache(id=project.organization_id)
+            )
+        except Organization.DoesNotExist:
+            logger.warning(
+                "Organization does not exist",
+                extra={
+                    "project_id": project_id,
+                    "organization_id": project.organization_id,
+                },
+            )
+            return
+        if data.get("type") == "transaction":
+            # No need for preprocess/process for transactions thus submit
+            # directly transaction specific save_event task.
+            save_transaction_kwargs: dict[str, Any] = {
+                "cache_key": cache_key,
+                "data": data if transport.inline else None,
+                "start_time": start_time,
+                "event_id": event_id,
+                "project_id": project_id,
+            }
+            if inline_save_event_transaction:
+                save_event_transaction(**save_transaction_kwargs)
+            else:
+                save_event_transaction.delay(**save_transaction_kwargs)
+
+            try:
+                collect_span_metrics(project, data)
+            except Exception:
+                pass
+        elif data.get("type") == "feedback":
+            if not is_in_feedback_denylist(project.organization):
+                save_event_feedback.delay(
+                    cache_key=None,  # data is passed inline; not stored in Redis
+                    data=data,
+                    start_time=start_time,
+                    event_id=event_id,
+                    project_id=project_id,
+                )
+            else:
+                track_outcome(
+                    org_id=project.organization_id,
+                    project_id=project_id,
+                    key_id=None,
+                    outcome=Outcome.RATE_LIMITED,
+                    reason="feedback_denylist",
+                    timestamp=to_datetime(start_time),
+                    event_id=event_id,
+                    category=DataCategory.USER_REPORT_V2,
+                    quantity=1,
+                )
+        else:
+            # Preprocess this event, which spawns either process_event or
+            # save_event. Pass data explicitly to avoid fetching it again from the
+            # cache.
+            with traces.start_span(
+                name="ingest_consumer.process_event.preprocess_event",
+                attributes={"sentry.op": "ingest_consumer.process_event.preprocess_event"},
+            ):
+                preprocess_kwargs: dict[str, Any] = {
+                    "cache_key": cache_key,
+                    "data": data,
+                    "start_time": start_time,
+                    "event_id": event_id,
+                    "project": project,
+                    "has_attachments": bool(attachments),
+                }
+                if inline_save_event:
+                    preprocess_kwargs["inline_save_event"] = True
+                preprocess_event(**preprocess_kwargs)
+
+        # remember for an 1 hour that we saved this event (deduplication protection)
+        with traces.start_span(name="cache.set", attributes={"sentry.op": "cache.set"}):
+            cache.set(deduplication_key, "", CACHE_TIMEOUT)
+
+        # emit event_accepted once everything is done
+        with traces.start_span(
+            name="event_accepted.send_robust",
+            attributes={"sentry.op": "event_accepted.send_robust"},
+        ):
+            event_accepted.send_robust(
+                ip=remote_addr, data=data, project=project, sender=process_event
+            )
+    except Exception as exc:
+        if isinstance(exc, KeyError):  # ex: missing event_id in message["payload"]
+            raise
+        raise Retriable(exc)
+
+
+@trace_func(name="ingest_consumer.process_attachment_chunk")
+@metrics.wraps("ingest_consumer.process_attachment_chunk")
+def process_attachment_chunk(message: IngestMessage) -> None:
+    payload = message["payload"]
+    event_id = message["event_id"]
+    project_id = message["project_id"]
+    id = message["id"]
+    chunk_index = message["chunk_index"]
+    cache_key = cache_key_for_event({"event_id": event_id, "project": project_id})
+    attachment_cache.set_chunk(
+        key=cache_key, id=id, chunk_index=chunk_index, chunk_data=payload, timeout=CACHE_TIMEOUT
+    )
+
+
+@trace_func(name="ingest_consumer.process_individual_attachment")
+@metrics.wraps("ingest_consumer.process_individual_attachment")
+def process_individual_attachment(message: IngestMessage, project: Project) -> None:
+    event_id = message["event_id"]
+    cache_key = cache_key_for_event({"event_id": event_id, "project": project.id})
+
+    if not features.has("organizations:event-attachments", project.organization, actor=None):
+        logger.info("Organization has no event attachments: %s", project.id)
+        return
+
+    if killswitch_matches_context(
+        "store.load-shed-pipeline-projects",
+        {
+            "project_id": project.id,
+            "event_id": event_id,
+            "has_attachments": True,
+        },
+    ):
+        # This killswitch is for the worst of scenarios and should probably not
+        # cause additional load on our logging infrastructure
+        return
+
+    try:
+        # Attachments may be uploaded for events that already exist. Fetch the
+        # existing group_id, so that the attachment can be fetched by group-level
+        # APIs. This is inherently racy.
+        #
+        # This is not guaranteed to provide correct results. Eventstore runs queries
+        # against Snuba. This is problematic on the critical path on the ingestion
+        # pipeline as Snuba can rate limit queries for specific projects when they
+        # are above their quota. There is no guarantee that, when a project is within
+        # their ingestion quota, they are also within the snuba queries quota.
+        # Since there is no dead letter queue on this consumer, the only way to
+        # prevent the consumer to crash as of now is to ignore the error and proceed.
+        event = eventstore.backend.get_event_by_id(project.id, event_id)
+    except RateLimitExceeded as e:
+        event = None
+        logger.exception(str(e))
+
+    group_id = None
+    if event is not None:
+        group_id = event.group_id
+
+    attachment_msg = message["attachment"]
+    attachment_type = attachment_msg.pop("attachment_type")
+
+    # NOTE: `get_from_chunks` will avoid the cache if `attachment_msg` contains `data` inline,
+    # or if the attachment has already been stored with a `stored_id`.
+    attachment = attachment_cache.get_from_chunks(
+        key=cache_key, type=attachment_type, **attachment_msg
+    )
+
+    if attachment_type in ("event.attachment", "event.view_hierarchy"):
+        save_attachment(
+            cache_key,
+            attachment,
+            project,
+            event_id,
+            key_id=None,  # TODO: Inject this from Relay
+            group_id=group_id,
+            start_time=None,  # TODO: Inject this from Relay
+            is_pending=event is None,
+        )
+    else:
+        logger.error("invalid individual attachment type: %s", attachment_type)
+
+    attachment.delete()
+
+
+@trace_func(name="ingest_consumer.process_userreport")
+@metrics.wraps("ingest_consumer.process_userreport")
+def process_userreport(message: IngestMessage, project: Project) -> bool:
+    start_time = to_datetime(message["start_time"])
+    feedback = orjson.loads(message["payload"])
+
+    try:
+        save_userreport(
+            project,
+            feedback,
+            FeedbackCreationSource.USER_REPORT_ENVELOPE,
+            start_time=start_time,
+        )
+        return True
+    except Conflict as e:
+        logger.info("Invalid userreport: %s", e)
+        return False
+    except Exception:
+        # XXX(markus): Hotfix because we have broken data in kafka
+        # If you want to remove this make sure to have triaged all errors in Sentry
+        logger.exception("userreport.save.crash")
+        return False
+
+
+def collect_span_metrics(
+    project: Project,
+    data: MutableMapping[str, Any],
+) -> None:
+    if not features.has("organizations:am3-tier", project.organization) and not features.has(
+        "organizations:dynamic-sampling", project.organization
+    ):
+        amount = (
+            len(data.get("spans", [])) + 1
+        )  # Segment spans also get added to the total span count.
+        metrics.incr(
+            "event.save_event.unsampled.spans.count",
+            amount=amount,
+            tags={"organization": project.organization.slug},
+        )

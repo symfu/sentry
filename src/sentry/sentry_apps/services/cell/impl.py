@@ -1,0 +1,628 @@
+from typing import Any
+
+from django.db import router, transaction
+
+from sentry import deletions
+from sentry.auth.access import Access, OrganizationGlobalMembership, from_user
+from sentry.auth.services.auth.model import AuthenticationContext
+from sentry.issues.action_log import (
+    ActionSource,
+    GroupActionActor,
+    action_context_scope,
+    publish_action,
+)
+from sentry.issues.action_log.types import (
+    CreatePlatformExternalIssueAction,
+    LinkPlatformExternalIssueAction,
+    UnlinkPlatformExternalIssueAction,
+)
+from sentry.locks import locks
+from sentry.models.group import Group
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.sentry_apps.external_issues.external_issue_creator import ExternalIssueCreator
+from sentry.sentry_apps.external_issues.issue_link_creator import IssueLinkCreator
+from sentry.sentry_apps.external_requests.select_requester import SelectRequester
+from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+from sentry.sentry_apps.models.servicehook import ServiceHook, ServiceHookProject
+from sentry.sentry_apps.services.app import RpcSentryAppInstallation
+from sentry.sentry_apps.services.cell.model import (
+    RpcEmptyResult,
+    RpcPlatformExternalIssueResult,
+    RpcSelectRequesterResult,
+    RpcSentryAppError,
+    RpcServiceHookProjectsResult,
+)
+from sentry.sentry_apps.services.cell.serial import (
+    serialize_platform_external_issue,
+    serialize_service_hook_project,
+)
+from sentry.sentry_apps.services.cell.service import SentryAppCellService
+from sentry.sentry_apps.utils.errors import (
+    SentryAppError,
+    SentryAppIntegratorError,
+    SentryAppSentryError,
+)
+from sentry.users.services.user import RpcUser
+from sentry.utils.locking import UnableToAcquireLock
+
+
+def _get_external_issue_action_actor(
+    installation: RpcSentryAppInstallation, user: RpcUser
+) -> GroupActionActor:
+    if user.is_sentry_app:
+        return GroupActionActor.sentry_app(installation.sentry_app.id)
+    return GroupActionActor.user(user.id)
+
+
+class DatabaseBackedSentryAppCellService(SentryAppCellService):
+    def get_select_options(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        uri: str,
+        user: RpcUser,
+        project_id: int | None = None,
+        query: str | None = None,
+        dependent_data: str | None = None,
+    ) -> RpcSelectRequesterResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_external_requests.py @ GET
+        """
+
+        project_slug: str | None = None
+        if project_id is not None:
+            project = (
+                Project.objects.select_related("organization")
+                .filter(id=project_id, organization_id=organization_id)
+                .first()
+            )
+            if not project:
+                return RpcSelectRequesterResult(
+                    error=RpcSentryAppError(
+                        message="Could not find the given project for this organization.",
+                        status_code=404,
+                    )
+                )
+            access = self._access_for_installation_user(
+                organization=project.organization,
+                installation=installation,
+                user=user,
+            )
+            if not access.has_project_access(project):
+                return RpcSelectRequesterResult(
+                    error=RpcSentryAppError(
+                        message="You do not have permission to access this project.",
+                        status_code=403,
+                    )
+                )
+            project_slug = project.slug
+
+        try:
+            result = SelectRequester(
+                install=installation,
+                uri=uri,
+                query=query,
+                dependent_data=dependent_data,
+                project_slug=project_slug,
+            ).run()
+        except (SentryAppIntegratorError, SentryAppSentryError) as e:
+            return RpcSelectRequesterResult(error=RpcSentryAppError.from_exc(e))
+
+        return RpcSelectRequesterResult(
+            choices=list(result.get("choices", [])),
+            default_value=result.get("defaultValue"),
+        )
+
+    def create_issue_link(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        group_id: int,
+        action: str,
+        fields: dict[str, Any],
+        uri: str,
+        user: RpcUser,
+        expected_external_issue_url: str | None = None,
+    ) -> RpcPlatformExternalIssueResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_external_issue_actions.py @ POST
+        """
+        try:
+            group = Group.objects.select_related("project").get(
+                id=group_id,
+                project_id__in=Project.objects.filter(organization_id=organization_id),
+            )
+        except Group.DoesNotExist:
+            return RpcPlatformExternalIssueResult(
+                error=RpcSentryAppError(
+                    message="Could not find the corresponding issue for the given groupId",
+                    status_code=404,
+                )
+            )
+
+        try:
+            organization = Organization.objects.get(id=organization_id)
+        except Organization.DoesNotExist:
+            return RpcPlatformExternalIssueResult(
+                error=RpcSentryAppError(
+                    message="Could not find the corresponding issue for the given groupId",
+                    status_code=404,
+                )
+            )
+
+        access = self._access_for_installation_user(
+            organization=organization,
+            installation=installation,
+            user=user,
+        )
+        if not access.has_project_access(group.project):
+            return RpcPlatformExternalIssueResult(
+                error=RpcSentryAppError(
+                    message="You do not have permission to link this issue.",
+                    status_code=403,
+                )
+            )
+
+        actor = _get_external_issue_action_actor(installation, user)
+        try:
+            with action_context_scope(source=ActionSource.API, actor=actor):
+                creator = IssueLinkCreator(
+                    install=installation,
+                    group=group,
+                    action=action,
+                    fields=fields,
+                    uri=uri,
+                    user=user,
+                    expected_external_issue_url=expected_external_issue_url,
+                )
+                external_issue = creator.run()
+        except (SentryAppError, SentryAppIntegratorError, SentryAppSentryError) as e:
+            return RpcPlatformExternalIssueResult(error=RpcSentryAppError.from_exc(e))
+
+        action_cls = (
+            CreatePlatformExternalIssueAction
+            if action == "create"
+            else LinkPlatformExternalIssueAction
+        )
+        if creator.changed:
+            publish_action(
+                action_cls(
+                    service_type=external_issue.service_type,
+                    display_name=external_issue.display_name,
+                    web_url=external_issue.web_url,
+                ),
+                source=ActionSource.API,
+                group_id=group.id,
+                project=group.project,
+                actor=actor,
+            )
+
+        return RpcPlatformExternalIssueResult(
+            external_issue=serialize_platform_external_issue(external_issue),
+            changed=creator.changed if expected_external_issue_url is not None else None,
+        )
+
+    def create_external_issue(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        group_id: int,
+        web_url: str,
+        project: str,
+        identifier: str,
+        user: RpcUser,
+    ) -> RpcPlatformExternalIssueResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_external_issues.py @ POST
+        """
+        try:
+            group = Group.objects.select_related("project", "project__organization").get(
+                id=group_id,
+                project_id__in=Project.objects.filter(organization_id=organization_id),
+            )
+        except Group.DoesNotExist:
+            return RpcPlatformExternalIssueResult(
+                error=RpcSentryAppError(
+                    message="Could not find the corresponding issue for the given issueId",
+                    status_code=404,
+                )
+            )
+
+        if group.project.organization_id != organization_id:
+            return RpcPlatformExternalIssueResult(
+                error=RpcSentryAppError(
+                    message="Could not find the corresponding issue for the given issueId",
+                    status_code=404,
+                )
+            )
+
+        access = self._access_for_installation_user(
+            organization=group.project.organization,
+            installation=installation,
+            user=user,
+        )
+        if not access.has_project_access(group.project):
+            return RpcPlatformExternalIssueResult(
+                error=RpcSentryAppError(
+                    message="You do not have permission to create an external issue for this issue.",
+                    status_code=403,
+                )
+            )
+
+        actor = _get_external_issue_action_actor(installation, user)
+        try:
+            external_issue_creator = ExternalIssueCreator(
+                install=installation,
+                group=group,
+                web_url=web_url,
+                project=project,
+                identifier=identifier,
+                user_id=user.id,
+            )
+            external_issue, created = external_issue_creator.run()
+        except SentryAppSentryError as e:
+            return RpcPlatformExternalIssueResult(error=RpcSentryAppError.from_exc(e))
+
+        if created:
+            with action_context_scope(source=ActionSource.API, actor=actor):
+                external_issue_creator.create_issue_activity(external_issue)
+
+        publish_action(
+            CreatePlatformExternalIssueAction(
+                service_type=external_issue.service_type,
+                display_name=external_issue.display_name,
+                web_url=external_issue.web_url,
+            ),
+            source=ActionSource.API,
+            group_id=group.id,
+            project=group.project,
+            actor=actor,
+        )
+
+        return RpcPlatformExternalIssueResult(
+            external_issue=serialize_platform_external_issue(external_issue)
+        )
+
+    def delete_external_issue(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        external_issue_id: int,
+        user: RpcUser,
+    ) -> RpcEmptyResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_external_issue_details.py @ DELETE
+        """
+        external_issues = PlatformExternalIssue.objects.select_related(
+            "group",
+            "group__project",
+            "group__project__organization",
+            "project",
+            "project__organization",
+        ).filter(
+            id=external_issue_id,
+            group__project__organization_id=organization_id,
+            service_type=installation.sentry_app.slug,
+        )
+        try:
+            platform_external_issue = external_issues.get()
+        except PlatformExternalIssue.DoesNotExist:
+            return RpcEmptyResult(
+                success=False,
+                error=RpcSentryAppError(
+                    message="Could not find the corresponding external issue from given external_issue_id",
+                    status_code=404,
+                ),
+            )
+
+        issue_project = platform_external_issue.project or platform_external_issue.group.project
+        if issue_project.organization_id != organization_id:
+            return RpcEmptyResult(
+                success=False,
+                error=RpcSentryAppError(
+                    message="Could not find the corresponding external issue from given external_issue_id",
+                    status_code=404,
+                ),
+            )
+        organization = issue_project.organization
+
+        access = self._access_for_installation_user(
+            organization=organization,
+            installation=installation,
+            user=user,
+        )
+        if not access.has_project_access(issue_project):
+            return RpcEmptyResult(
+                success=False,
+                error=RpcSentryAppError(
+                    message="You do not have permission to delete this external issue.",
+                    status_code=403,
+                ),
+            )
+
+        try:
+            lock = locks.get(
+                f"platform-external-issue-link:{platform_external_issue.group_id}:{platform_external_issue.service_type}",
+                duration=300,
+                name="platform_external_issue_link",
+            ).acquire()
+        except UnableToAcquireLock:
+            return RpcEmptyResult(
+                success=False,
+                error=RpcSentryAppError(
+                    message="This issue link is being updated. Try again.", status_code=409
+                ),
+            )
+
+        with lock:
+            try:
+                platform_external_issue = external_issues.get()
+            except PlatformExternalIssue.DoesNotExist:
+                # Another request completed the unlink after we authorized it.
+                return RpcEmptyResult()
+
+            publish_action(
+                UnlinkPlatformExternalIssueAction(
+                    service_type=platform_external_issue.service_type,
+                    display_name=platform_external_issue.display_name,
+                    web_url=platform_external_issue.web_url,
+                ),
+                source=ActionSource.API,
+                group_id=platform_external_issue.group_id,
+                project=issue_project,
+                actor=_get_external_issue_action_actor(installation, user),
+            )
+
+            deletions.exec_sync(platform_external_issue)
+
+        return RpcEmptyResult()
+
+    def _access_for_installation_user(
+        self,
+        *,
+        organization: Organization,
+        installation: RpcSentryAppInstallation,
+        user: RpcUser,
+    ) -> Access:
+        if user.is_sentry_app:
+            return OrganizationGlobalMembership(
+                organization=organization,
+                scopes=installation.sentry_app.scope_list,
+                sso_is_valid=True,
+            )
+        return from_user(user=user, organization=organization)
+
+    def _determine_access(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        auth_context: AuthenticationContext,
+    ) -> Access:
+        try:
+            organization = Organization.objects.get(id=organization_id)
+        except Organization.DoesNotExist:
+            raise SentryAppSentryError(message="Organization not found")
+        if not (user := auth_context.user):
+            raise SentryAppSentryError(message="User not found")
+        return self._access_for_installation_user(
+            organization=organization,
+            installation=installation,
+            user=user,
+        )
+
+    def get_service_hook_projects(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        auth_context: AuthenticationContext,
+    ) -> RpcServiceHookProjectsResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py @ GET
+        """
+        try:
+            access = self._determine_access(
+                organization_id=organization_id,
+                installation=installation,
+                auth_context=auth_context,
+            )
+        except SentryAppSentryError as e:
+            return RpcServiceHookProjectsResult(error=RpcSentryAppError.from_exc(e))
+
+        try:
+            hook = ServiceHook.objects.get(
+                installation_id=installation.id, organization_id=organization_id
+            )
+        except ServiceHook.DoesNotExist:
+            return RpcServiceHookProjectsResult(
+                error=RpcSentryAppError(
+                    message="Service hook not found for installation",
+                    status_code=404,
+                )
+            )
+
+        hook_projects = list(
+            ServiceHookProject.objects.filter(service_hook_id=hook.id).order_by("project_id")
+        )
+        projects = Project.objects.filter(
+            id__in={hp.project_id for hp in hook_projects}, organization_id=organization_id
+        )
+        if any(not access.has_project_access(project) for project in projects):
+            return RpcServiceHookProjectsResult(
+                error=RpcSentryAppError(
+                    message="Some projects are not accessible",
+                    status_code=403,
+                )
+            )
+        return RpcServiceHookProjectsResult(
+            service_hook_projects=[serialize_service_hook_project(hp) for hp in hook_projects],
+        )
+
+    def set_service_hook_projects(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        project_identifiers: list[int | str],
+        auth_context: AuthenticationContext,
+    ) -> RpcServiceHookProjectsResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py @ POST
+        """
+        try:
+            access = self._determine_access(
+                organization_id=organization_id,
+                installation=installation,
+                auth_context=auth_context,
+            )
+        except SentryAppSentryError as e:
+            return RpcServiceHookProjectsResult(error=RpcSentryAppError.from_exc(e))
+
+        try:
+            hook = ServiceHook.objects.get(
+                installation_id=installation.id, organization_id=organization_id
+            )
+        except ServiceHook.DoesNotExist:
+            return RpcServiceHookProjectsResult(
+                error=RpcSentryAppError(
+                    message="Service hook not found for installation",
+                    status_code=404,
+                )
+            )
+
+        if not project_identifiers:
+            return RpcServiceHookProjectsResult(
+                error=RpcSentryAppError(
+                    message="Projects list cannot be empty",
+                    status_code=400,
+                )
+            )
+
+        incoming_project_ids = []
+        incoming_project_slugs = []
+        for project_identifier in project_identifiers:
+            if isinstance(project_identifier, int):
+                incoming_project_ids.append(project_identifier)
+            else:
+                incoming_project_slugs.append(project_identifier)
+
+        with transaction.atomic(router.db_for_write(ServiceHookProject)):
+            new_projects = Project.objects.filter(
+                id__in=incoming_project_ids, organization_id=organization_id
+            ).union(
+                Project.objects.filter(
+                    slug__in=incoming_project_slugs, organization_id=organization_id
+                )
+            )
+            new_project_ids = {p.id for p in new_projects}
+
+            if len(new_project_ids) != len(project_identifiers):
+                return RpcServiceHookProjectsResult(
+                    error=RpcSentryAppError(
+                        message="One or more project identifier is duplicate, not accessible, or does not exist.",
+                        status_code=400,
+                    )
+                )
+
+            current_project_ids = set(
+                ServiceHookProject.objects.filter(service_hook_id=hook.id).values_list(
+                    "project_id", flat=True
+                )
+            )
+            current_projects = Project.objects.filter(
+                id__in=current_project_ids, organization_id=organization_id
+            )
+
+            projects_to_add = new_project_ids - current_project_ids
+            projects_to_remove = current_project_ids - new_project_ids
+
+            if any(not access.has_project_access(project) for project in new_projects):
+                return RpcServiceHookProjectsResult(
+                    error=RpcSentryAppError(
+                        message="Some projects affected by this request are not accessible",
+                        status_code=403,
+                    )
+                )
+
+            projects_to_remove_objs = current_projects.filter(id__in=projects_to_remove)
+            if any(not access.has_project_access(project) for project in projects_to_remove_objs):
+                return RpcServiceHookProjectsResult(
+                    error=RpcSentryAppError(
+                        message="Cannot remove projects that are not accessible",
+                        status_code=403,
+                    )
+                )
+
+            ServiceHookProject.objects.filter(
+                service_hook_id=hook.id, project_id__in=projects_to_remove
+            ).delete()
+
+            for project_id in projects_to_add:
+                ServiceHookProject.objects.create(
+                    project_id=project_id,
+                    service_hook_id=hook.id,
+                )
+
+        hook_projects = ServiceHookProject.objects.filter(service_hook_id=hook.id).order_by(
+            "project_id"
+        )
+        return RpcServiceHookProjectsResult(
+            service_hook_projects=[serialize_service_hook_project(hp) for hp in hook_projects],
+        )
+
+    def delete_service_hook_projects(
+        self,
+        *,
+        organization_id: int,
+        installation: RpcSentryAppInstallation,
+        auth_context: AuthenticationContext,
+    ) -> RpcEmptyResult:
+        """
+        Matches: src/sentry/sentry_apps/api/endpoints/installation_service_hook_projects.py @ DELETE
+        """
+        try:
+            access = self._determine_access(
+                organization_id=organization_id,
+                installation=installation,
+                auth_context=auth_context,
+            )
+        except SentryAppSentryError as e:
+            return RpcEmptyResult(
+                success=False,
+                error=RpcSentryAppError.from_exc(e),
+            )
+        try:
+            hook = ServiceHook.objects.get(
+                installation_id=installation.id, organization_id=organization_id
+            )
+        except ServiceHook.DoesNotExist:
+            return RpcEmptyResult(
+                success=False,
+                error=RpcSentryAppError(
+                    message="Service hook not found for installation",
+                    status_code=404,
+                ),
+            )
+        with transaction.atomic(router.db_for_write(ServiceHookProject)):
+            hook_projects = ServiceHookProject.objects.filter(service_hook_id=hook.id)
+
+            projects = Project.objects.filter(
+                id__in={hp.project_id for hp in hook_projects}, organization_id=organization_id
+            )
+            if any(not access.has_project_access(project) for project in projects):
+                return RpcEmptyResult(
+                    success=False,
+                    error=RpcSentryAppError(
+                        message="Some projects are not accessible",
+                        status_code=403,
+                    ),
+                )
+            deletions.exec_sync_many(list(hook_projects))
+
+        return RpcEmptyResult()

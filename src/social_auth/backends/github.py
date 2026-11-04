@@ -11,15 +11,18 @@ By default account id and token expiration time are stored in extra_data
 field, check OAuthBackend class for details on how to extend it.
 """
 
-from django.conf import settings
+from collections.abc import Mapping
+from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request
-from social_auth.utils import dsa_urlopen
+
+from django.conf import settings
+
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.utils import json
 from social_auth.backends import BaseOAuth2, OAuthBackend
 from social_auth.exceptions import AuthFailed
-
-from sentry.utils import json
-
+from social_auth.utils import dsa_urlopen
 
 # GitHub configuration
 GITHUB_BASE_DOMAIN = getattr(settings, "GITHUB_BASE_DOMAIN", "github.com")
@@ -35,11 +38,11 @@ GITHUB_ORGANIZATION_MEMBER_OF_URL = "https://%s/orgs/{org}/members/{username}" %
 class GithubBackend(OAuthBackend):
     """Github OAuth authentication backend"""
 
-    name = "github"
+    name = IntegrationProviderSlug.GITHUB.value
     # Default extra data to store
     EXTRA_DATA = [("id", "id"), ("expires", "expires")]
 
-    def _fetch_emails(self, access_token):
+    def _fetch_emails(self, access_token: Any) -> list[Any]:
         """Fetch private emails from Github account"""
         req = Request(
             GITHUB_USER_DATA_URL + "/emails", headers={"Authorization": "token %s" % access_token}
@@ -51,7 +54,7 @@ class GithubBackend(OAuthBackend):
             data = []
         return data
 
-    def get_user_details(self, response):
+    def get_user_details(self, response: Mapping[str, Any]) -> dict[str, Any]:
         """Return user details from Github account"""
         name = response.get("name") or ""
         details = {"username": response.get("login")}
@@ -88,14 +91,15 @@ class GithubAuth(BaseOAuth2):
 
     GITHUB_ORGANIZATION = settings.GITHUB_ORGANIZATION
 
-    def user_data(self, access_token, *args, **kwargs):
+    def user_data(self, access_token: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         """Loads user data from service"""
         req = Request(GITHUB_USER_DATA_URL, headers={"Authorization": "token %s" % access_token})
 
         try:
-            data = json.load(dsa_urlopen(req))
+            loaded = json.load(dsa_urlopen(req))
         except ValueError:
-            data = None
+            loaded = None
+        data = loaded
 
         # if we have a github organization defined, test that the current users
         # is a member of that organization.
@@ -115,9 +119,9 @@ class GithubAuth(BaseOAuth2):
                 # if the user is a member of the organization, response code
                 # will be 204, see http://bit.ly/ZS6vFl
                 if response.code != 204:
-                    raise AuthFailed("User doesn't belong to the " "organization")
+                    raise AuthFailed("User doesn't belong to the organization")
         return data
 
 
 # Backend definition
-BACKENDS = {"github": GithubAuth}
+BACKENDS = {IntegrationProviderSlug.GITHUB.value: GithubAuth}

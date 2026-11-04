@@ -1,0 +1,430 @@
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+} from 'react';
+import {useMatches} from 'react-router';
+
+import {getRouteStringFromRoutes} from 'sentry/utils/getRouteStringFromRoutes';
+import {useParams} from 'sentry/utils/useParams';
+
+import type {
+  LLMContextInternalValue,
+  LLMContextLocation,
+  LLMContextNode,
+  LLMContextNodeSnapshot,
+  LLMContextOverlayNode,
+  LLMContextSnapshot,
+  LLMContextState,
+} from './llmContextTypes';
+
+/**
+ * The half of the location that needs router hooks to know. The URL and query
+ * string are read from `window.location` at snapshot time instead.
+ */
+interface RouteIdentity {
+  name: string;
+  params: Record<string, string>;
+}
+
+interface LLMContextReader {
+  getLLMContext: (componentOnly?: boolean) => LLMContextSnapshot;
+}
+
+// Internal context — holds the registry operations (registerNode, etc.)
+
+const LLMInternalContext = createContext<LLMContextInternalValue | undefined>(undefined);
+
+/**
+ * Hook for internal use by registerLLMContext, useLLMContext, and usePageContextReady
+ * to access the registry operations (registerNode, unregisterNode, updateNodeData,
+ * getSnapshot, subscribe, isNodeReady).
+ * Throws if called outside an LLMContextProvider.
+ */
+export function useLLMContextRegistry(): LLMContextInternalValue {
+  const context = useContext(LLMInternalContext);
+  if (context === undefined) {
+    throw new Error('useContext for "LLMContext" must be inside a Provider with a value');
+  }
+  return context;
+}
+
+/**
+ * LLMNodeContext — carries the current component's nodeId down the tree
+ * so child registerLLMContext wrappers can declare their parentId immediately
+ * during render (before any effects have fired).
+ * Default undefined = no parent (root level).
+ */
+export const LLMNodeContext = createContext<string | undefined>(undefined);
+
+// Tree assembly helpers — convert the flat node map to a nested snapshot.
+// Data is read from nodeData (imperative ref) rather than the reducer state
+// so that writes from useLLMContext(data) are visible immediately even
+// before the HOC's registerNode effect has fired.
+
+/**
+ * `useLLMContext(data)` stashes an optional `priority` alongside the node's
+ * data; readers need the two split apart. Shared by the tree builder, the
+ * snapshot serializer, and the flat overlay reader.
+ */
+function extractPriorityAndData(raw: unknown): {data: unknown; priority: number} {
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    const {priority, ...rest} = raw as Record<string, unknown>;
+    return {priority: typeof priority === 'number' ? priority : 0, data: rest};
+  }
+  return {priority: 0, data: raw};
+}
+
+function collectDescendantIds(
+  nodes: Map<string, LLMContextNode>,
+  nodeId: string,
+  result = new Set<string>()
+): Set<string> {
+  result.add(nodeId);
+  for (const [id, node] of nodes) {
+    if (node.parentId === nodeId) {
+      collectDescendantIds(nodes, id, result);
+    }
+  }
+  return result;
+}
+
+function buildTree(
+  nodes: LLMContextState['nodes'],
+  nodeData: Map<string, unknown>,
+  parentId: string | undefined
+): LLMContextNodeSnapshot[] {
+  const children: LLMContextNodeSnapshot[] = [];
+  for (const [id, node] of nodes) {
+    if (node.parentId === parentId) {
+      const raw = nodeData.has(id) ? nodeData.get(id) : {};
+      const {priority, data} = extractPriorityAndData(raw);
+      children.push({
+        nodeType: node.nodeType,
+        priority,
+        data,
+        children: buildTree(nodes, nodeData, id),
+      });
+    }
+  }
+  return children;
+}
+
+/**
+ * Reports the current route into the provider's location ref.
+ *
+ * A separate component on purpose: `useLocation`/`useParams`/`useMatches` all
+ * re-render their caller on every navigation, and the provider wraps the entire
+ * app — it currently never re-renders after mount and should stay that way. This
+ * renders null, so its own re-renders cost nothing.
+ *
+ * Only the route *pattern* and params need router hooks. The URL and query string
+ * are read straight off `window.location` at snapshot time, which is why they are
+ * absent here.
+ */
+function LocationWatcher({
+  onChange,
+}: {
+  onChange: (location: RouteIdentity) => void;
+}): null {
+  const params = useParams();
+  const matches = useMatches();
+  const name = getRouteStringFromRoutes({matches});
+
+  useEffect(() => {
+    onChange({name, params});
+  }, [name, params, onChange]);
+
+  return null;
+}
+
+/**
+ * Assembles the location at snapshot time. The URL and query string come from
+ * `window.location` rather than a subscription, so they cannot go stale; the
+ * route pattern and params come from the watcher's last report.
+ */
+function readLocation(route: RouteIdentity | null): LLMContextLocation | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+
+  const query: Record<string, string | string[]> = {};
+  for (const key of new Set(new URLSearchParams(window.location.search).keys())) {
+    const all = new URLSearchParams(window.location.search).getAll(key);
+    query[key] = all.length > 1 ? all : (all[0] ?? '');
+  }
+
+  return {
+    url: window.location.href,
+    name: route?.name ?? '',
+    params: route?.params ?? {},
+    query,
+  };
+}
+
+function serializeState(
+  state: LLMContextState,
+  nodeData: Map<string, unknown>,
+  route: RouteIdentity | null,
+  fromNodeId?: string
+): LLMContextSnapshot {
+  const location = readLocation(route);
+  if (fromNodeId) {
+    const node = state.nodes.get(fromNodeId);
+    if (!node) {
+      return {version: state.version, nodes: [], location};
+    }
+    const raw = nodeData.has(fromNodeId) ? nodeData.get(fromNodeId) : {};
+    const {priority, data} = extractPriorityAndData(raw);
+    return {
+      version: state.version,
+      nodes: [
+        {
+          nodeType: node.nodeType,
+          priority,
+          data,
+          children: buildTree(state.nodes, nodeData, fromNodeId),
+        },
+      ],
+      location,
+    };
+  }
+  return {
+    version: state.version,
+    nodes: buildTree(state.nodes, nodeData, undefined),
+    location,
+  };
+}
+
+// LLMContextProvider — root of the entire context tree
+
+interface LLMContextProviderProps {
+  children: ReactNode;
+}
+
+const INITIAL_STATE: LLMContextState = {
+  nodes: new Map(),
+  version: 0,
+};
+
+export function LLMContextProvider({children}: LLMContextProviderProps) {
+  // All state lives in refs — no re-renders needed. Consumers read
+  // the latest data imperatively via getSnapshot(), or subscribe() to changes.
+  const stateRef = useRef(INITIAL_STATE);
+  const nodeDataRef = useRef(new Map<string, unknown>());
+  const routeRef = useRef<RouteIdentity | null>(null);
+  const listenersRef = useRef(new Set<() => void>());
+  const loadingNodeIdsRef = useRef(new Set<string>());
+
+  const notifyListeners = useCallback(() => {
+    for (const listener of listenersRef.current) {
+      listener();
+    }
+  }, []);
+
+  // Stable so LocationWatcher's effect doesn't refire on every provider render.
+  const handleRouteChange = useCallback((route: RouteIdentity) => {
+    routeRef.current = route;
+  }, []);
+
+  const getSnapshot = useCallback((fromNodeId?: string): LLMContextSnapshot => {
+    return serializeState(
+      stateRef.current,
+      nodeDataRef.current,
+      routeRef.current,
+      fromNodeId
+    );
+  }, []);
+
+  const registerNode = useCallback(
+    (nodeId: string, nodeType: string, parentId?: string): void => {
+      const prev = stateRef.current;
+      const newNodes = new Map(prev.nodes);
+      newNodes.set(nodeId, {nodeType, parentId});
+      stateRef.current = {nodes: newNodes, version: prev.version + 1};
+      notifyListeners();
+    },
+    [notifyListeners]
+  );
+
+  const unregisterNode = useCallback(
+    (nodeId: string) => {
+      const prev = stateRef.current;
+      if (!prev.nodes.has(nodeId)) {
+        return;
+      }
+      const toRemove = collectDescendantIds(prev.nodes, nodeId);
+      const newNodes = new Map(prev.nodes);
+      for (const id of toRemove) {
+        newNodes.delete(id);
+        nodeDataRef.current.delete(id);
+        loadingNodeIdsRef.current.delete(id);
+      }
+      stateRef.current = {nodes: newNodes, version: prev.version + 1};
+      notifyListeners();
+    },
+    [notifyListeners]
+  );
+
+  const updateNodeData = useCallback(
+    (nodeId: string, data: unknown, isLoading = false) => {
+      nodeDataRef.current.set(nodeId, data);
+      if (isLoading) {
+        loadingNodeIdsRef.current.add(nodeId);
+      } else {
+        loadingNodeIdsRef.current.delete(nodeId);
+      }
+      // Bump version so consumers using it as a change token detect data updates.
+      stateRef.current = {...stateRef.current, version: stateRef.current.version + 1};
+      notifyListeners();
+    },
+    [notifyListeners]
+  );
+
+  const subscribe = useCallback((listener: () => void) => {
+    listenersRef.current.add(listener);
+    return () => listenersRef.current.delete(listener);
+  }, []);
+
+  // Reads the flat maps rather than building a snapshot: this runs as a
+  // useSyncExternalStore getSnapshot, so on every write and every render.
+  const isNodeReady = useCallback((nodeType: string): boolean => {
+    for (const [nodeId, node] of stateRef.current.nodes) {
+      if (node.nodeType === nodeType && !loadingNodeIdsRef.current.has(nodeId)) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+
+  // Flat (id-keyed) view of the registry, for consumers that need to pair a
+  // node's data with its DOM anchor (e.g. Seer XRay Mode) rather than the
+  // nested, id-less shape `getSnapshot()` returns for the LLM.
+  const getOverlayNodes = useCallback((): LLMContextOverlayNode[] => {
+    const nodes: LLMContextOverlayNode[] = [];
+    for (const [nodeId, node] of stateRef.current.nodes) {
+      const raw = nodeDataRef.current.has(nodeId) ? nodeDataRef.current.get(nodeId) : {};
+      const {data} = extractPriorityAndData(raw);
+      nodes.push({nodeId, nodeType: node.nodeType, parentId: node.parentId, data});
+    }
+    return nodes;
+  }, []);
+
+  // Memoize so that the context value reference is stable across re-renders.
+  const value = useMemo<LLMContextInternalValue>(
+    () => ({
+      getOverlayNodes,
+      getSnapshot,
+      isNodeReady,
+      registerNode,
+      subscribe,
+      unregisterNode,
+      updateNodeData,
+    }),
+    [
+      getOverlayNodes,
+      getSnapshot,
+      isNodeReady,
+      registerNode,
+      subscribe,
+      unregisterNode,
+      updateNodeData,
+    ]
+  );
+
+  return (
+    <LLMInternalContext value={value}>
+      <LocationWatcher onChange={handleRouteChange} />
+      {children}
+    </LLMInternalContext>
+  );
+}
+
+/**
+ * How many table rows a list page may sample into its context node.
+ *
+ * List nodes report a bounded sample, never the whole page: the registry exists
+ * to keep the prompt small, and a full table would put the token cost back.
+ * Report the total result count alongside the sample so the reader can tell
+ * "15 results" from "the first 15 of 400" and fall back to a tool call.
+ */
+export const LLM_CONTEXT_MAX_ROWS = 15;
+
+/**
+ * useLLMContext
+ *
+ * Pass `data` inside a registerLLMContext-wrapped component (or any descendant)
+ * to push structured data into the nearest registered context node.
+ * Accepts any value type — objects, arrays, strings, numbers, etc.
+ *
+ *   useLLMContext({ title: 'Error Rate', threshold: 5 });
+ *   useLLMContext(someComputedValue);
+ *
+ * Pass `isLoading` while the data is still being fetched, so the page isn't
+ * reported as ready (see isNodeReady) until the node is complete. Only affects
+ * routes listed in PAGE_CONTEXT_READY_NODES.
+ *
+ *   useLLMContext({ rows }, { isLoading: isPending });
+ *
+ * Omit `data` to only read:
+ *
+ *   const { getLLMContext } = useLLMContext();
+ *   getLLMContext()      // full tree from root
+ *   getLLMContext(true)  // current component's subtree only
+ */
+export function useLLMContext(
+  data?: unknown,
+  options?: {isLoading: boolean}
+): LLMContextReader {
+  const ctx = useLLMContextRegistry();
+  const nodeId = useContext(LLMNodeContext);
+  const prevDataRef = useRef('');
+  const prevIsLoadingRef = useRef(false);
+  const isLoading = options?.isLoading ?? false;
+
+  // Write path: sync data into the nearest node whenever it changes.
+  // JSON equality guard prevents redundant writes. updateNodeData writes
+  // imperatively to a ref — no dispatch, no re-render required.
+  useEffect(() => {
+    if (!nodeId || data === undefined) {
+      return;
+    }
+    let serialized: string | null;
+    let safeData: unknown = data;
+    try {
+      serialized = JSON.stringify(data);
+    } catch {
+      // Non-serializable value (e.g. circular reference) — store a
+      // placeholder so getSnapshot() remains JSON-serializable.
+      serialized = null;
+      safeData = {error: 'non-serializable value'};
+    }
+    if (
+      serialized === null ||
+      serialized !== prevDataRef.current ||
+      isLoading !== prevIsLoadingRef.current
+    ) {
+      if (serialized !== null) {
+        prevDataRef.current = serialized;
+      }
+      prevIsLoadingRef.current = isLoading;
+      ctx.updateNodeData(nodeId, safeData, isLoading);
+    }
+  });
+
+  const getLLMContext = useCallback(
+    (componentOnly?: boolean): LLMContextSnapshot => {
+      if (componentOnly && nodeId) {
+        return ctx.getSnapshot(nodeId);
+      }
+      return ctx.getSnapshot();
+    },
+    [ctx, nodeId]
+  );
+
+  return {getLLMContext};
+}

@@ -1,0 +1,786 @@
+import {useMatches} from 'react-router';
+import {AutofixSetupFixture} from 'sentry-fixture/autofixSetupFixture';
+import {GroupFixture} from 'sentry-fixture/group';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {DetailedProjectFixture} from 'sentry-fixture/project';
+
+import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {DiffFileType} from 'sentry/components/events/autofix/types';
+import {IssueCategory, IssueType, type Group} from 'sentry/types/group';
+import type {Project} from 'sentry/types/project';
+import {Tab, TabPaths} from 'sentry/views/issueDetails/types';
+import {
+  LLMContextProvider,
+  useLLMContext,
+} from 'sentry/views/seerExplorer/contexts/llmContext';
+import type {LLMContextSnapshot} from 'sentry/views/seerExplorer/contexts/llmContextTypes';
+
+import {AutofixSection} from './autofixSection';
+
+jest.mock('sentry/utils/cells');
+jest.mock('react-router', () => ({
+  ...jest.requireActual('react-router'),
+  useMatches: jest.fn(),
+}));
+
+const mockUseMatches = jest.mocked(useMatches);
+
+/** The route match shape `useCurrentTab` reads, for whichever tab is on screen. */
+function matchesForTab(tab: Tab) {
+  return [
+    {
+      id: '0',
+      pathname: '/organizations/org-slug/issues/1/',
+      params: {orgId: 'org-slug', groupId: '1'},
+      data: null,
+      loaderData: null,
+      handle: {path: TabPaths[tab]},
+    },
+  ];
+}
+
+describe('AutofixSection', () => {
+  const mockProject = DetailedProjectFixture();
+  const organization = OrganizationFixture({
+    hideAiFeatures: false,
+  });
+
+  let mockGroup: ReturnType<typeof GroupFixture>;
+
+  beforeEach(() => {
+    mockGroup = GroupFixture();
+    MockApiClient.clearMockResponses();
+    mockUseMatches.mockImplementation(() => matchesForTab(Tab.DETAILS));
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/setup/`,
+      body: AutofixSetupFixture({
+        integration: {ok: true, reason: null},
+        seerReposLinked: true,
+      }),
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/seer/onboarding-check/`,
+      body: {
+        hasSupportedScmIntegration: true,
+        isAutofixEnabled: true,
+        isCodeReviewEnabled: true,
+        isSeerConfigured: true,
+      },
+    });
+  });
+
+  it('renders Seer section title when AI features are enabled', () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/summarize/`,
+      method: 'POST',
+      body: {whatsWrong: 'Something broke', possibleCause: 'Bad code'},
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(screen.getByText('Seer Autofix')).toBeInTheDocument();
+  });
+
+  it('renders Resources section when AI features are disabled', () => {
+    const customOrganization = OrganizationFixture({
+      hideAiFeatures: true,
+    });
+
+    const performanceGroup: Group = {
+      ...mockGroup,
+      issueCategory: IssueCategory.PERFORMANCE,
+      title: 'ChunkLoadError',
+      platform: 'javascript',
+    };
+
+    const javascriptProject: Project = {
+      ...mockProject,
+      platform: 'javascript',
+    };
+
+    render(<AutofixSection group={performanceGroup} project={javascriptProject} />, {
+      organization: customOrganization,
+    });
+
+    expect(screen.getByText('Resources')).toBeInTheDocument();
+  });
+
+  it('renders Resources instead of Seer when the issue type does not support Seer', () => {
+    // Replay hydration errors set `autofix: false` and `issueSummary: {enabled: false}`
+    // but still carry resources, so the Resources fold must win even though the org
+    // has AI features enabled.
+    const hydrationGroup: Group = {
+      ...mockGroup,
+      issueCategory: IssueCategory.REPLAY,
+      issueType: IssueType.REPLAY_HYDRATION_ERROR,
+      title: 'Hydration Error',
+      platform: 'javascript-nextjs',
+    };
+
+    const nextjsProject: Project = {
+      ...mockProject,
+      platform: 'javascript-nextjs',
+    };
+
+    render(<AutofixSection group={hydrationGroup} project={nextjsProject} />, {
+      organization,
+    });
+
+    expect(screen.getByText('Resources')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', {name: 'Resolving Hydration Errors'})
+    ).toHaveAttribute('href', 'https://sentry.io/answers/hydration-error-nextjs/');
+    expect(screen.queryByText('Seer Autofix')).not.toBeInTheDocument();
+  });
+
+  it('returns null when AI features are disabled and no resources exist', () => {
+    const customOrganization = OrganizationFixture({
+      hideAiFeatures: true,
+    });
+
+    const {container} = render(
+      <AutofixSection group={mockGroup} project={mockProject} />,
+      {organization: customOrganization}
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders root cause artifact when autofix returns root cause', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Found root cause',
+                role: 'assistant',
+                metadata: {step: 'root_cause'},
+              },
+              timestamp: new Date().toISOString(),
+              artifacts: [
+                {
+                  key: 'root_cause',
+                  reason: 'Identified the issue',
+                  data: {
+                    one_line_description: 'Null pointer in user handler',
+                    five_whys: ['why1'],
+                    reproduction_steps: ['step1'],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByText('Root Cause')).toBeInTheDocument();
+    expect(screen.getByText('Null pointer in user handler')).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Open Autofix'})).toBeInTheDocument();
+  });
+
+  it('starts collapsed on the autofix tab even when saved as open', async () => {
+    mockUseMatches.mockImplementation(() => matchesForTab(Tab.AUTOFIX));
+    localStorage.setItem('issue-details-fold-section-collapse:seer', 'false');
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByRole('button', {name: 'View Section'})).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    );
+    expect(localStorage.getItem('issue-details-fold-section-collapse:seer')).toBe(
+      'false'
+    );
+    localStorage.clear();
+  });
+
+  it('drops the open button on the autofix tab but keeps the previews', async () => {
+    mockUseMatches.mockImplementation(() => matchesForTab(Tab.AUTOFIX));
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Found root cause',
+                role: 'assistant',
+                metadata: {step: 'root_cause'},
+              },
+              timestamp: new Date().toISOString(),
+              artifacts: [
+                {
+                  key: 'root_cause',
+                  reason: 'Identified the issue',
+                  data: {
+                    one_line_description: 'Null pointer in user handler',
+                    five_whys: ['why1'],
+                    reproduction_steps: ['step1'],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    await userEvent.click(await screen.findByRole('button', {name: 'View Section'}));
+
+    // The previews still earn their place as a table of contents; only the
+    // button, which would navigate to the page already on screen, goes.
+    expect(await screen.findByText('Root Cause')).toBeInTheDocument();
+    expect(screen.getByText('Null pointer in user handler')).toBeInTheDocument();
+    expect(screen.queryByRole('button', {name: 'Open Autofix'})).not.toBeInTheDocument();
+  });
+
+  it('renders solution artifact', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Found solution',
+                role: 'assistant',
+                metadata: {step: 'solution'},
+              },
+              timestamp: new Date().toISOString(),
+              artifacts: [
+                {
+                  key: 'solution',
+                  reason: 'Proposed a fix',
+                  data: {
+                    one_line_summary: 'Add null check before accessing user',
+                    steps: [{title: 'Step 1', description: 'Add guard clause'}],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByText('Plan')).toBeInTheDocument();
+    expect(screen.getByText('Add null check before accessing user')).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Open Autofix'})).toBeInTheDocument();
+  });
+
+  it('renders code changes preview from merged file patches', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Made changes',
+                role: 'assistant',
+                metadata: {step: 'code_changes'},
+              },
+              timestamp: new Date().toISOString(),
+              merged_file_patches: [
+                {
+                  diff: '',
+                  repo_name: 'org/repo',
+                  patch: {
+                    path: 'src/app.py',
+                    added: 5,
+                    removed: 2,
+                    hunks: [],
+                    source_file: 'src/app.py',
+                    target_file: 'src/app.py',
+                    type: DiffFileType.MODIFIED,
+                  },
+                },
+                {
+                  diff: '',
+                  repo_name: 'org/repo',
+                  patch: {
+                    path: 'src/utils.py',
+                    added: 3,
+                    removed: 0,
+                    hunks: [],
+                    source_file: 'src/utils.py',
+                    target_file: 'src/utils.py',
+                    type: DiffFileType.MODIFIED,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByText('Code Changes')).toBeInTheDocument();
+    expect(screen.getByText('2 files changed in 1 repo')).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Open Autofix'})).toBeInTheDocument();
+  });
+
+  it('renders pull request previews from repo_pr_states', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Created PR',
+                role: 'assistant',
+                metadata: {step: 'code_changes'},
+              },
+              timestamp: new Date().toISOString(),
+              merged_file_patches: [
+                {
+                  repo_name: 'org/repo',
+                  patch: {
+                    path: 'src/app.py',
+                    added: 1,
+                    removed: 0,
+                    hunks: [],
+                    source_file: 'src/app.py',
+                    target_file: 'src/app.py',
+                    type: DiffFileType.MODIFIED,
+                  },
+                },
+              ],
+            },
+          ],
+          repo_pr_states: {
+            'org/repo': {
+              repo_name: 'org/repo',
+              pr_number: 42,
+              pr_url: 'https://github.com/org/repo/pull/42',
+              branch_name: 'fix/issue',
+              commit_sha: 'abc123',
+              pr_creation_error: null,
+              pr_creation_status: 'completed',
+              pr_id: 1,
+              title: 'Fix null pointer',
+            },
+          },
+        },
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByText('Pull Requests')).toBeInTheDocument();
+    const link = screen.getByRole('link', {name: 'org/repo#42'});
+    expect(link).toHaveAttribute('href', 'https://github.com/org/repo/pull/42');
+    expect(screen.getByRole('button', {name: 'Open Autofix'})).toBeInTheDocument();
+  });
+
+  it('shows empty state when autofix returns null', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+      statusCode: 200,
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    // The Seer title should still render
+    expect(screen.getByText('Seer Autofix')).toBeInTheDocument();
+    expect(await screen.findByText('Have Seer...')).toBeInTheDocument();
+  });
+
+  it('renders multiple artifact types in order', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Found root cause',
+                role: 'assistant',
+                metadata: {step: 'root_cause'},
+              },
+              timestamp: new Date().toISOString(),
+              artifacts: [
+                {
+                  key: 'root_cause',
+                  reason: 'Found root cause',
+                  data: {
+                    one_line_description: 'Missing null check',
+                    five_whys: ['why'],
+                    reproduction_steps: ['step'],
+                  },
+                },
+              ],
+            },
+            {
+              id: 'block-2',
+              message: {
+                content: 'Proposed fix',
+                role: 'assistant',
+                metadata: {step: 'solution'},
+              },
+              timestamp: new Date().toISOString(),
+              artifacts: [
+                {
+                  key: 'solution',
+                  reason: 'Proposed fix',
+                  data: {
+                    one_line_summary: 'Add validation',
+                    steps: [{title: 'Validate', description: 'Add check'}],
+                  },
+                },
+              ],
+            },
+            {
+              id: 'block-3',
+              message: {
+                content: 'Made code changes',
+                role: 'assistant',
+                metadata: {step: 'code_changes'},
+              },
+              timestamp: new Date().toISOString(),
+              merged_file_patches: [
+                {
+                  diff: '',
+                  repo_name: 'org/repo',
+                  patch: {
+                    path: 'src/handler.py',
+                    added: 2,
+                    removed: 1,
+                    hunks: [],
+                    source_file: 'src/handler.py',
+                    target_file: 'src/handler.py',
+                    type: DiffFileType.MODIFIED,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByText('Root Cause')).toBeInTheDocument();
+    expect(screen.getByText('Plan')).toBeInTheDocument();
+    expect(screen.getByText('Code Changes')).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Open Autofix'})).toBeInTheDocument();
+  });
+
+  it('shows org setup UI when SCM integration is missing', async () => {
+    const seatBasedOrg = OrganizationFixture({
+      hideAiFeatures: false,
+      features: ['seat-based-seer-enabled'],
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${seatBasedOrg.slug}/seer/onboarding-check/`,
+      body: {
+        hasSupportedScmIntegration: false,
+        isAutofixEnabled: false,
+        isCodeReviewEnabled: false,
+        isSeerConfigured: false,
+      },
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization: seatBasedOrg,
+    });
+
+    expect(await screen.findByText('Finish Configuring Seer')).toBeInTheDocument();
+    const link = screen.getByRole('button', {name: 'Set Up Seer'});
+    expect(link).toHaveAttribute(
+      'href',
+      `/settings/${organization.slug}/seer/onboarding/`
+    );
+  });
+
+  it('shows project setup UI when repos are not linked', async () => {
+    const seatBasedOrg = OrganizationFixture({
+      hideAiFeatures: false,
+      features: ['seat-based-seer-enabled'],
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/setup/`,
+      body: AutofixSetupFixture({
+        integration: {ok: true, reason: null},
+        seerReposLinked: false,
+      }),
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization: seatBasedOrg,
+    });
+
+    expect(await screen.findByText('Finish Configuring Seer')).toBeInTheDocument();
+    const link = screen.getByRole('button', {
+      name: 'Set Up Seer for This Project',
+    });
+    expect(link).toHaveAttribute(
+      'href',
+      `/settings/${organization.slug}/projects/${mockProject.slug}/seer/`
+    );
+  });
+
+  it('skips setup UI when the onboarding check fails', async () => {
+    const seatBasedOrg = OrganizationFixture({
+      hideAiFeatures: false,
+      features: ['seat-based-seer-enabled'],
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${seatBasedOrg.slug}/seer/onboarding-check/`,
+      statusCode: 500,
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization: seatBasedOrg,
+    });
+
+    expect(await screen.findByText('Have Seer...')).toBeInTheDocument();
+    expect(screen.queryByText('Finish Configuring Seer')).not.toBeInTheDocument();
+  });
+
+  it('skips setup UI for legacy seer plan orgs without SCM integration', async () => {
+    const legacyOrg = OrganizationFixture({
+      hideAiFeatures: false,
+      features: ['seer-added'],
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${legacyOrg.slug}/seer/onboarding-check/`,
+      body: {
+        hasSupportedScmIntegration: false,
+        isAutofixEnabled: false,
+        isCodeReviewEnabled: false,
+        isSeerConfigured: false,
+      },
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization: legacyOrg,
+    });
+
+    expect(await screen.findByText('Have Seer...')).toBeInTheDocument();
+    expect(screen.queryByText('Finish Configuring Seer')).not.toBeInTheDocument();
+  });
+
+  it('shows empty state when there are no artifacts', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: null,
+      },
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    expect(await screen.findByText('Have Seer...')).toBeInTheDocument();
+    expect(
+      screen.getByText('Determine the root cause of your issue')
+    ).toBeInTheDocument();
+    expect(screen.getByText('Outline a plan')).toBeInTheDocument();
+    expect(screen.getByText('Create a code fix')).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Start Analysis'})).toBeInTheDocument();
+  });
+
+  it('keeps the start card on screen while a run is starting', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {autofix: null},
+    });
+    const startRequest = MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      method: 'POST',
+      body: {run_id: 1},
+      // Never settles, so the start stays in flight for the whole test.
+      asyncDelay: new Promise(() => {}),
+    });
+
+    render(<AutofixSection group={mockGroup} project={mockProject} />, {
+      organization,
+    });
+
+    await userEvent.click(await screen.findByRole('button', {name: 'Start Analysis'}));
+
+    await waitFor(() => expect(startRequest).toHaveBeenCalled());
+    expect(screen.getByText('Have Seer...')).toBeInTheDocument();
+    const startButton = screen.getByRole('button', {name: 'Start Analysis'});
+    expect(startButton).toBeDisabled();
+    expect(startButton).toHaveAttribute('aria-busy', 'true');
+    expect(screen.queryByTestId('loading-placeholder')).not.toBeInTheDocument();
+  });
+
+  it('pushes autofix data into LLM context when results are available', async () => {
+    const snapshotRef: {current: (() => LLMContextSnapshot) | null} = {current: null};
+
+    function ContextCapture() {
+      const {getLLMContext} = useLLMContext();
+      // oxlint-disable-next-line react/immutability
+      snapshotRef.current = getLLMContext;
+      return null;
+    }
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${mockProject.organization.slug}/issues/${mockGroup.id}/autofix/`,
+      body: {
+        autofix: {
+          run_id: 1,
+          status: 'completed',
+          updated_at: new Date().toISOString(),
+          blocks: [
+            {
+              id: 'block-1',
+              message: {
+                content: 'Found root cause',
+                role: 'assistant',
+                metadata: {step: 'root_cause'},
+              },
+              timestamp: new Date().toISOString(),
+              artifacts: [
+                {
+                  key: 'root_cause',
+                  reason: 'Identified the issue',
+                  data: {
+                    one_line_description: 'Null pointer in user handler',
+                    five_whys: ['Missing guard clause'],
+                    reproduction_steps: ['Call /api/user with null id'],
+                  },
+                },
+              ],
+            },
+            {
+              id: 'block-2',
+              message: {
+                content: 'Made code changes',
+                role: 'assistant',
+                metadata: {step: 'code_changes'},
+              },
+              timestamp: new Date().toISOString(),
+              merged_file_patches: [
+                {
+                  diff: '--- a/src/handler.py\n+++ b/src/handler.py',
+                  repo_name: 'org/repo',
+                  patch: {
+                    path: 'src/handler.py',
+                    added: 2,
+                    removed: 1,
+                    hunks: [],
+                    source_file: 'src/handler.py',
+                    target_file: 'src/handler.py',
+                    type: DiffFileType.MODIFIED,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    render(
+      <LLMContextProvider>
+        <AutofixSection group={mockGroup} project={mockProject} />
+        <ContextCapture />
+      </LLMContextProvider>,
+      {organization}
+    );
+
+    await waitFor(() => {
+      const node = snapshotRef.current?.().nodes.find(n => n.nodeType === 'autofix');
+      expect((node?.data as Record<string, string> | undefined)?.autofixStatus).toBe(
+        'completed'
+      );
+    });
+
+    const data = snapshotRef.current!().nodes.find(n => n.nodeType === 'autofix')!
+      .data as Record<string, string>;
+    expect(data.rootCause).toContain('Null pointer in user handler');
+    expect(data.codeChanges).toBe('org/repo: src/handler.py');
+  });
+});

@@ -1,6 +1,14 @@
-from .manager import ProjectOptionsManager
+from __future__ import annotations
 
-__all__ = ("get", "set", "delete", "register", "isset")
+from typing import TYPE_CHECKING
+
+from .manager import OptionValue, ProjectOptionsManager
+
+if TYPE_CHECKING:
+    from sentry.models.project import Project
+    from sentry.projects.services.project.model import RpcProject
+
+__all__ = ("get", "set", "delete", "register", "isset", "LATEST_EPOCH")
 
 default_manager = ProjectOptionsManager()
 
@@ -12,10 +20,11 @@ register = default_manager.register
 all = default_manager.all
 isset = default_manager.isset
 lookup_well_known_key = default_manager.lookup_well_known_key
-update_rev_for_option = default_manager.update_rev_for_option
 
 
-def get_well_known_default(key, project=None, epoch=None):
+def get_well_known_default(
+    key: str, project: Project | RpcProject | int | None = None, epoch: int | None = None
+) -> OptionValue:
     """Utility function to return the default for a well known key."""
     well_known_key = lookup_well_known_key(key)
     if well_known_key is not None:
@@ -23,4 +32,5 @@ def get_well_known_default(key, project=None, epoch=None):
 
 
 from . import defaults  # NOQA
-from .defaults import LATEST_EPOCH  # NOQA
+
+LATEST_EPOCH = defaults.LATEST_EPOCH

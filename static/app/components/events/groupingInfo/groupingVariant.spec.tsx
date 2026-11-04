@@ -1,0 +1,95 @@
+import {EventFixture} from 'sentry-fixture/event';
+
+import {render, screen} from 'sentry-test/reactTestingLibrary';
+
+import {EventGroupVariantType} from 'sentry/types/event';
+
+import {GroupingVariant} from './groupingVariant';
+
+describe('Grouping Variant', () => {
+  const event = EventFixture({
+    entries: [
+      {
+        type: 'spans',
+        data: [
+          {
+            span_id: '1',
+            hash: 'hash1',
+          },
+          {
+            span_id: '2',
+            hash: 'hash2',
+          },
+        ],
+      },
+    ],
+  });
+  const occurrenceEvent = EventFixture({
+    ...event,
+    occurrence: {
+      fingerprint: ['test-fingerprint'],
+      evidenceData: {
+        op: 'db',
+        offenderSpanIds: ['2'],
+        causeSpanIds: ['1'],
+        parentSpanIds: [],
+      },
+    },
+  });
+  const performanceIssueVariant = {
+    type: EventGroupVariantType.PERFORMANCE_PROBLEM,
+    contributes: true,
+    description: 'performance issue',
+    hash: 'hash3',
+    hashMismatch: false,
+    hint: null,
+    key: 'perf-issue',
+    evidence: {
+      desc: 'performance issue',
+      fingerprint: 'a',
+      cause_span_ids: ['1'],
+      offender_span_ids: ['2'],
+      parent_span_ids: [],
+    },
+  };
+
+  it('renders the span hashes for performance issues from event data', () => {
+    render(
+      <GroupingVariant
+        variant={performanceIssueVariant}
+        event={event}
+        showNonContributing={false}
+      />
+    );
+
+    expect(screen.getByText('Parent Span Hashes').parentElement).toHaveTextContent(
+      'Parent Span Hashes[]'
+    );
+    expect(screen.getByText('Source Span Hashes').parentElement).toHaveTextContent(
+      'Source Span Hashes[hash1]'
+    );
+    expect(screen.getByText('Offender Span Hashes').parentElement).toHaveTextContent(
+      'Offender Span Hashes[hash2]'
+    );
+  });
+
+  it('renders grouping details for occurrence-backed performance issues', () => {
+    render(
+      <GroupingVariant
+        variant={performanceIssueVariant}
+        event={occurrenceEvent}
+        showNonContributing={false}
+      />
+    );
+
+    expect(screen.getByText('Parent Span Hashes').parentElement).toHaveTextContent(
+      'Parent Span Hashes[]'
+    );
+    expect(screen.getByText('Source Span Hashes').parentElement).toHaveTextContent(
+      'Source Span Hashes[hash1]'
+    );
+    expect(screen.getByText('Offender Span Hashes').parentElement).toHaveTextContent(
+      'Offender Span Hashes[hash2]'
+    );
+  });
+});

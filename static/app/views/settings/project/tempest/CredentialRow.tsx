@@ -1,0 +1,106 @@
+import {IconSubtract} from '@sentry/icons/subtract';
+
+import {Tag} from '@sentry/scraps/badge';
+import {Button} from '@sentry/scraps/button';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {Confirm} from 'sentry/components/confirm';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {TimeSince} from 'sentry/components/timeSince';
+import {t} from 'sentry/locale';
+
+import {MessageType, type TempestCredentials} from './types';
+
+export function CredentialRow({
+  credential,
+  isRemoving,
+  removeCredential,
+}: {
+  credential: TempestCredentials;
+  isRemoving: boolean;
+  removeCredential?: (data: {id: number}) => void;
+}) {
+  return (
+    <SimpleTable.Row>
+      <SimpleTable.RowCell gap="md">{credential.clientId}</SimpleTable.RowCell>
+
+      <SimpleTable.RowCell>
+        <StatusTag statusType={getStatusType(credential)} message={credential.message} />
+      </SimpleTable.RowCell>
+
+      <SimpleTable.RowCell>
+        <TimeSince date={credential.dateAdded} />
+      </SimpleTable.RowCell>
+
+      <SimpleTable.RowCell>
+        {credential.createdByEmail ? credential.createdByEmail : '\u2014'}
+      </SimpleTable.RowCell>
+
+      <SimpleTable.RowCell justify="end">
+        <Tooltip
+          title={t('You do not have permission to remove credentials.')}
+          disabled={!!removeCredential}
+        >
+          <Confirm
+            message={t('Are you sure you want to remove the credentials?')}
+            onConfirm={
+              removeCredential ? () => removeCredential({id: credential.id}) : undefined
+            }
+            disabled={isRemoving || !removeCredential}
+          >
+            <Button
+              size="xs"
+              disabled={isRemoving || !removeCredential}
+              aria-label={t('Remove credentials')}
+              icon={isRemoving ? <LoadingIndicator mini /> : <IconSubtract size="xs" />}
+            >
+              {t('Remove')}
+            </Button>
+          </Confirm>
+        </Tooltip>
+      </SimpleTable.RowCell>
+    </SimpleTable.Row>
+  );
+}
+
+type StatusTagProps = {
+  statusType: 'error' | 'success' | 'pending' | 'warning';
+  message?: string;
+};
+
+const STATUS_CONFIG = {
+  error: {label: 'Error', type: 'danger'},
+  success: {label: 'Active', type: 'muted'},
+  pending: {label: 'Pending', type: 'info'},
+  warning: {label: 'Active', type: 'warning'},
+} as const;
+
+function StatusTag({statusType, message}: StatusTagProps) {
+  const config = STATUS_CONFIG[statusType];
+  return (
+    <Tooltip title={message} skipWrapper>
+      <Tag variant={config.type}>{config.label}</Tag>
+    </Tooltip>
+  );
+}
+
+function getStatusType(credential: {
+  message: TempestCredentials['message'];
+  messageType: TempestCredentials['messageType'];
+}) {
+  if (credential.messageType === null) {
+    // If messageType is null, it is pending and still it wasn't validated
+    return 'pending';
+  }
+
+  if (credential.messageType === MessageType.ERROR) {
+    return 'error';
+  }
+
+  if (credential.messageType === MessageType.WARNING) {
+    return 'warning';
+  }
+
+  return 'success';
+}

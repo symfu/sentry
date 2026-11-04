@@ -1,8 +1,13 @@
-from .pickle import patch_pickle_loaders
+from __future__ import annotations
+
+import functools
+import sys
+import types
+from typing import Any
 
 
-def register_scheme(name):
-    from urllib import parse as urlparse  # NOQA
+def register_scheme(name: str) -> None:
+    from urllib import parse as urlparse
 
     uses = urlparse.uses_netloc, urlparse.uses_query, urlparse.uses_relative, urlparse.uses_fragment
     for use in uses:
@@ -14,53 +19,69 @@ register_scheme("app")
 register_scheme("chrome-extension")
 
 
-def patch_httprequest_repr():
+def _add_class_getitem(cls: Any) -> None:
+    cls.__class_getitem__ = classmethod(lambda cls, *a: cls)
+
+
+def _patch_distutils_version() -> None:
+    """Keep legacy redis-py 3.x importable on Python 3.13+.
+
+    Python 3.12 removed ``distutils``, but the redis-py version currently
+    required by Sentry still imports ``distutils.version.StrictVersion`` at
+    module import time.  A small standard-library-only replacement provides
+    the comparisons redis-py needs without adding setuptools or another
+    dependency to the build-time import path.
+    """
     try:
-        from django.http import HttpRequest
-    except ImportError:
-        # This module is potentially imported before Django is installed
-        # during a setup.py run
-        return
+        __import__("distutils.version", fromlist=["StrictVersion"])
+    except ModuleNotFoundError:
 
-    # Intentionally strip all GET/POST/COOKIE values out of repr() for HttpRequest
-    # and subclass WSGIRequest. This prevents sensitive information from getting
-    # logged. This was yanked out of Django master anyhow.
-    # https://code.djangoproject.com/ticket/12098
-    def safe_httprequest_repr(self):
-        return f"<{self.__class__.__name__}: {self.method} {self.get_full_path()!r}>"
+        @functools.total_ordering
+        class StrictVersion:
+            def __init__(self, version: str) -> None:
+                try:
+                    self._version = tuple(int(part) for part in version.split("."))
+                except ValueError:
+                    raise ValueError(f"invalid version number '{version}'") from None
 
-    HttpRequest.__repr__ = safe_httprequest_repr
+            def __eq__(self, other: object) -> bool:
+                if not isinstance(other, StrictVersion):
+                    return NotImplemented
+                return self._version == other._version
 
+            def __lt__(self, other: object) -> bool:
+                if not isinstance(other, StrictVersion):
+                    return NotImplemented
+                return self._version < other._version
 
-def patch_django_views_debug():
-    # Prevent exposing any Django SETTINGS on our debug error page
-    # This information is not useful for Sentry development
-    # and poses a significant security risk if this is exposed by accident
-    # in any production system if, by change, it were deployed
-    # with DEBUG=True.
-    try:
-        from django.views import debug
-    except ImportError:
-        return
+        version_module = types.ModuleType("distutils.version")
+        setattr(version_module, "StrictVersion", StrictVersion)
 
-    debug.get_safe_settings = lambda: {}
+        distutils_module = types.ModuleType("distutils")
+        setattr(distutils_module, "__path__", [])
+        setattr(distutils_module, "version", version_module)
 
-
-def patch_celery_imgcat():
-    # Remove Celery's attempt to display an rgb image in iTerm 2, as that
-    # attempt just prints out base64 trash in tmux.
-    try:
-        from celery.utils import term
-    except ImportError:
-        return
-
-    term.imgcat = lambda *a, **kw: b""
+        sys.modules["distutils"] = distutils_module
+        sys.modules["distutils.version"] = version_module
 
 
-for patch in (
-    patch_httprequest_repr,
-    patch_django_views_debug,
-    patch_celery_imgcat,
-    patch_pickle_loaders,
-):
-    patch()
+_patch_distutils_version()
+
+
+def _patch_generics() -> None:
+    for modname, clsname in (
+        # not all django types are generic at runtime
+        # this is a lightweight version of `django-stubs-ext`
+        ("django.db.models.fields", "Field"),
+        # only generic in stubs
+        ("parsimonious.nodes", "NodeVisitor"),
+    ):
+        try:
+            mod = __import__(modname, fromlist=["_trash"])
+        except ImportError:
+            pass
+        else:
+            getattr(mod, clsname).__class_getitem__ = classmethod(lambda cls, *a: cls)
+
+
+_patch_generics()

@@ -1,0 +1,188 @@
+import sentry_sdk
+from taskbroker_client.retry import Retry, RetryTaskError
+from taskbroker_client.state import current_task
+from taskbroker_client.worker.workerchild import ProcessingDeadlineExceeded
+
+from sentry.eventstream.base import GroupState
+from sentry.issues.action_log import ActionSource, action_context_scope
+from sentry.models.activity import Activity
+from sentry.models.group import Group
+from sentry.models.project import Project
+from sentry.services.eventstore.models import GroupEvent
+from sentry.silo.base import SiloMode
+from sentry.tasks.base import instrumented_task
+from sentry.taskworker import namespaces
+from sentry.utils import metrics
+from sentry.utils.exceptions import timeout_grouping_context
+from sentry.workflow_engine.models import Action
+from sentry.workflow_engine.models.workflow import Workflow
+from sentry.workflow_engine.tasks.utils import (
+    ProjectNotActiveError,
+    build_workflow_event_data_from_activity,
+    build_workflow_event_data_from_event,
+)
+from sentry.workflow_engine.types import WorkflowEventData, WorkflowId
+from sentry.workflow_engine.utils import log_context
+
+logger = log_context.get_logger(__name__)
+
+TRIGGER_ACTION_RETRY_IGNORED_EXCEPTIONS = (
+    Action.DoesNotExist,
+    Group.DoesNotExist,
+    Project.DoesNotExist,
+    ProjectNotActiveError,
+    Workflow.DoesNotExist,
+)
+
+TRIGGER_ACTION_RETRY_TIMES = 3
+
+
+def _is_final_attempt() -> bool:
+    # Don't use retry_task(raise_on_no_retries=False) here. It decides from the activation's
+    # retry_state.max_attempts, which the worker rewrites to `times + 1` when it schedules a
+    # retry, so on the final attempt it still raises RetryTaskError and the worker reports
+    # NoRetriesRemainingError. The worker decides whether to retry from the task's own Retry
+    # policy (attempts start at 0, `times` at 1), so check against that instead.
+    current = current_task()
+    if current is None:
+        return False
+    return current.attempt >= TRIGGER_ACTION_RETRY_TIMES - 1
+
+
+def build_trigger_action_task_params(
+    action: Action,
+    event_data: WorkflowEventData,
+    workflow_uuid_map: dict[WorkflowId, str],
+    *,
+    workflow_id: WorkflowId,
+) -> dict[str, object]:
+    """
+    Build parameters for trigger_action task invocation.
+
+    Args:
+        action: The action to trigger.
+        event_data: The event data to use for the action.
+        workflow_uuid_map: Mapping of workflow_id to notification_uuid.
+        workflow_id: The workflow this action is firing for.
+    """
+    event_id = None
+    activity_id = None
+    occurrence_id = None
+
+    if isinstance(event_data.event, GroupEvent):
+        event_id = event_data.event.event_id
+        occurrence_id = event_data.event.occurrence_id
+    elif isinstance(event_data.event, Activity):
+        activity_id = event_data.event.id
+
+    task_params: dict[str, object] = {
+        "action_id": action.id,
+        "workflow_id": workflow_id,
+        "event_id": event_id,
+        "activity_id": activity_id,
+        "group_id": event_data.event.group_id,
+        "occurrence_id": occurrence_id,
+        "group_state": event_data.group_state,
+        "has_reappeared": False,  # TODO: remove when deployed trigger_action task doesn't expect it
+        "has_escalated": event_data.has_escalated,
+    }
+
+    if workflow_id in workflow_uuid_map:
+        task_params["notification_uuid"] = workflow_uuid_map[workflow_id]
+
+    return task_params
+
+
+@instrumented_task(
+    name="sentry.workflow_engine.tasks.trigger_action",
+    namespace=namespaces.workflow_engine_tasks,
+    processing_deadline_duration=30,
+    retry=Retry(
+        times=TRIGGER_ACTION_RETRY_TIMES,
+        delay=5,
+        on=(Exception, ProcessingDeadlineExceeded),
+        ignore=TRIGGER_ACTION_RETRY_IGNORED_EXCEPTIONS,
+    ),
+    silo_mode=SiloMode.CELL,
+    silenced_exceptions=(
+        Project.DoesNotExist,
+        ProjectNotActiveError,
+        Workflow.DoesNotExist,
+    ),
+)
+def trigger_action(
+    action_id: int,
+    workflow_id: int,
+    event_id: str | None,
+    activity_id: int | None,
+    group_id: int,
+    occurrence_id: str | None,
+    group_state: GroupState,
+    has_escalated: bool,
+    notification_uuid: str | None = None,
+    **kwargs: dict[str, object],
+) -> None:
+    import uuid
+
+    from sentry.workflow_engine.processors.detector import get_preferred_detector
+
+    # Generate UUID if not provided (handles version skew at task boundary)
+    if notification_uuid is None:
+        notification_uuid = str(uuid.uuid4())
+
+    # XOR check to ensure exactly one of event_id or activity_id is provided
+    if (event_id is not None) == (activity_id is not None):
+        logger.error(
+            "Exactly one of event_id or activity_id must be provided",
+            extra={"event_id": event_id, "activity_id": activity_id},
+        )
+        raise ValueError("Exactly one of event_id or activity_id must be provided")
+
+    action = Action.objects.get(id=action_id)
+
+    if event_id is not None:
+        event_data = build_workflow_event_data_from_event(
+            event_id=event_id,
+            group_id=group_id,
+            workflow_id=workflow_id,
+            occurrence_id=occurrence_id,
+            group_state=group_state,
+            has_escalated=has_escalated,
+        )
+    elif activity_id is not None:
+        event_data = build_workflow_event_data_from_activity(
+            activity_id=activity_id, group_id=group_id
+        )
+    else:
+        # This should never happen, and if it does, need to investigate
+        logger.error(
+            "Exactly one of event_id or activity_id must be provided",
+            extra={"event_id": event_id, "activity_id": activity_id},
+        )
+        raise ValueError("Exactly one of event_id or activity_id must be provided")
+
+    detector = get_preferred_detector(event_data)
+
+    metrics.incr(
+        "workflow_engine.tasks.trigger_action_task_started",
+        tags={"action_type": action.type, "detector_type": detector.type},
+        sample_rate=1.0,
+    )
+    # Set up a timeout grouping context because we want to make sure any Sentry timeout reporting
+    # in this scope is grouped properly.
+    with timeout_grouping_context(action.type), action_context_scope(ActionSource.SYSTEM):
+        try:
+            action.trigger(event_data, notification_uuid=notification_uuid, workflow_id=workflow_id)
+        except TRIGGER_ACTION_RETRY_IGNORED_EXCEPTIONS:
+            return
+        except (Exception, ProcessingDeadlineExceeded) as error:
+            # Action triggering is best effort. This raises while attempts remain, but returns
+            # after the final attempt so giving up does not count as a task failure.
+            if not _is_final_attempt():
+                raise RetryTaskError()
+            # Notification handlers wrap retryable failures (e.g. ApiError) in RetryTaskError,
+            # so report the underlying error to keep issues grouped by what actually failed.
+            reported: BaseException = error
+            if isinstance(error, RetryTaskError) and error.__cause__ is not None:
+                reported = error.__cause__
+            sentry_sdk.capture_exception(reported)

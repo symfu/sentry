@@ -1,0 +1,454 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+
+import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+import type {RouterConfig} from 'sentry-test/reactTestingLibrary';
+
+import type {Organization} from 'sentry/types/organization';
+import {ELLIPSIS} from 'sentry/utils/string/unicode';
+import {WidgetBuilderSortBySelector} from 'sentry/views/dashboards/widgetBuilder/components/sortBySelector';
+import {WidgetBuilderProvider} from 'sentry/views/dashboards/widgetBuilder/contexts/widgetBuilderContext';
+
+describe('WidgetBuilderSortBySelector', () => {
+  let organization: Organization;
+
+  const defaultRouterConfig: RouterConfig = {
+    location: {
+      pathname: '/organizations/org-slug/dashboard/1/',
+      query: {
+        displayType: 'line',
+        fields: ['transaction.duration', 'count()', 'id'],
+        yAxis: ['count()', 'count_unique(transaction.duration)'],
+      },
+    },
+  };
+
+  beforeEach(() => {
+    organization = OrganizationFixture({
+      features: ['open-membership', 'visibility-explore-view'],
+    });
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      body: [],
+    });
+  });
+
+  it('renders for spans', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: defaultRouterConfig,
+      }
+    );
+
+    expect(await screen.findByText('Sort by')).toBeInTheDocument();
+    expect(await screen.findByText('Limit to 5 results')).toBeInTheDocument();
+    expect(await screen.findByText('High to low')).toBeInTheDocument();
+    expect(await screen.findByText('(Required)')).toBeInTheDocument();
+  });
+
+  it('renders for logs', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: defaultRouterConfig,
+      }
+    );
+
+    expect(await screen.findByText('Sort by')).toBeInTheDocument();
+    expect(await screen.findByText('Limit to 5 results')).toBeInTheDocument();
+    expect(await screen.findByText('High to low')).toBeInTheDocument();
+    expect(await screen.findByText('(Required)')).toBeInTheDocument();
+  });
+
+  it('renders correct fields for table widgets', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              ...defaultRouterConfig.location?.query,
+              displayType: 'table',
+            },
+          },
+        },
+      }
+    );
+
+    expect(await screen.findByText('Sort by')).toBeInTheDocument();
+    expect(await screen.findByText('High to low')).toBeInTheDocument();
+    expect(await screen.findByText('Select a column\u{2026}')).toBeInTheDocument();
+  });
+
+  it('renders and functions correctly', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: defaultRouterConfig,
+      }
+    );
+
+    const sortDirectionSelector = await screen.findByText('High to low');
+    const sortFieldSelector = await screen.findByText('(Required)');
+
+    expect(sortFieldSelector).toBeInTheDocument();
+
+    await userEvent.click(sortFieldSelector);
+    await userEvent.click(await screen.findByText('count()'));
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(expect.objectContaining({sort: '-count()'}));
+    });
+
+    await userEvent.click(sortDirectionSelector);
+    await userEvent.click(await screen.findByText('Low to high'));
+    await waitFor(() => {
+      expect(router.location.query).toEqual(expect.objectContaining({sort: 'count()'}));
+    });
+  });
+
+  it('renders the correct limit options', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: defaultRouterConfig,
+      }
+    );
+
+    // default limit is 5
+    expect(await screen.findByText('Limit to 5 results')).toBeInTheDocument();
+
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              ...defaultRouterConfig.location?.query,
+              yAxis: ['count()', 'count_unique(transaction.duration)', 'eps()'],
+            },
+          },
+        },
+      }
+    );
+
+    // default limit changes to 3 since its the max limit for 3 aggregates
+    expect(await screen.findByText('Limit to 3 results')).toBeInTheDocument();
+  });
+
+  it('correctly handles limit changes', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: defaultRouterConfig,
+      }
+    );
+
+    const limitSelector = await screen.findByText('Limit to 5 results');
+    await userEvent.click(limitSelector);
+    await userEvent.click(await screen.findByText('Limit to 3 results'));
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(expect.objectContaining({limit: '3'}));
+    });
+  });
+
+  it('switches the default value for count_unique functions', async () => {
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      body: [{key: 'span.duration', name: 'span.duration'}],
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          return options.query.attributeType === 'number';
+        },
+      ],
+    });
+
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: '/organizations/org-slug/dashboard/1/',
+            query: {
+              displayType: 'line',
+              fields: ['transaction.duration', 'count()', 'id'],
+              yAxis: ['count()', 'count_unique(span.op)'],
+              sort: ['-count(span.duration)'],
+              dataset: 'spans',
+            },
+          },
+        },
+      }
+    );
+
+    expect(await screen.findByText(`count(${ELLIPSIS})`)).toBeInTheDocument();
+    expect(screen.getByText('spans')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText(`count(${ELLIPSIS})`));
+    await userEvent.click(screen.getByText(`count_unique(${ELLIPSIS})`));
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: '-count_unique(span.op)'})
+      );
+    });
+  });
+
+  it('sorts by Explore _if combinators on line charts', async () => {
+    const combinator = 'avg_if(`span.op:db`,span.duration)';
+    const {router} = render(<WidgetBuilderSortBySelector />, {
+      additionalWrapper: WidgetBuilderProvider,
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/dashboard/1/',
+          query: {
+            displayType: 'line',
+            dataset: 'spans',
+            fields: ['transaction'],
+            yAxis: ['avg(span.duration)', combinator],
+            sort: ['-avg(span.duration)'],
+          },
+        },
+      },
+    });
+
+    await userEvent.click(await screen.findByText('(Required)'));
+    await userEvent.click(await screen.findByText(combinator));
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: `-${combinator}`})
+      );
+    });
+  });
+
+  it('shows the selected Explore _if combinator in sort by', async () => {
+    const combinator = 'avg_if(`span.op:db`,span.duration)';
+    render(<WidgetBuilderSortBySelector />, {
+      additionalWrapper: WidgetBuilderProvider,
+      organization,
+      initialRouterConfig: {
+        location: {
+          pathname: '/organizations/org-slug/dashboard/1/',
+          query: {
+            displayType: 'line',
+            dataset: 'spans',
+            fields: ['transaction'],
+            yAxis: ['avg(span.duration)', combinator],
+            sort: [`-${combinator}`],
+          },
+        },
+      },
+    });
+
+    expect(await screen.findByText(combinator)).toBeInTheDocument();
+  });
+
+  it('sorts by equations line chart', async () => {
+    const organizationWithFlag = OrganizationFixture({
+      features: ['open-membership', 'visibility-explore-view'],
+    });
+
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization: organizationWithFlag,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              ...defaultRouterConfig.location?.query,
+              yAxis: ['count()', 'equation|count_unique(transaction.duration) + 100'],
+            },
+          },
+        },
+      }
+    );
+
+    const sortDirectionSelector = await screen.findByText('High to low');
+    const sortFieldSelector = await screen.findByText('(Required)');
+
+    expect(sortFieldSelector).toBeInTheDocument();
+
+    await userEvent.click(sortFieldSelector);
+    await userEvent.click(
+      await screen.findByText('count_unique(transaction.duration) + 100')
+    );
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: '-equation[0]'})
+      );
+    });
+
+    await userEvent.click(sortDirectionSelector);
+    await userEvent.click(await screen.findByText('Low to high'));
+    await waitFor(() => {
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: 'equation[0]'})
+      );
+    });
+  });
+  it('renders a limit selector for categorical bar widgets', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              displayType: 'categorical_bar',
+              fields: ['transaction.duration', 'count()'],
+              limit: 20,
+              dataset: 'spans',
+            },
+          },
+        },
+      }
+    );
+
+    expect(await screen.findByText('Limit to 20 results')).toBeInTheDocument();
+  });
+
+  it('does not render a limit selector for table widgets', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              ...defaultRouterConfig.location?.query,
+              displayType: 'table',
+            },
+          },
+        },
+      }
+    );
+
+    expect(await screen.findByText('Sort by')).toBeInTheDocument();
+    expect(screen.queryByText('Limit to 5 results')).not.toBeInTheDocument();
+  });
+
+  it('correctly handles categorical bar limit changes', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              displayType: 'categorical_bar',
+              fields: ['transaction.duration', 'count()'],
+              limit: 20,
+              dataset: 'spans',
+            },
+          },
+        },
+      }
+    );
+
+    const limitSelector = await screen.findByText('Limit to 20 results');
+    await userEvent.click(limitSelector);
+    await userEvent.click(await screen.findByText('Limit to 15 results'));
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(expect.objectContaining({limit: '15'}));
+    });
+  });
+
+  it('sorts by equations table', async () => {
+    const organizationWithFlag = OrganizationFixture({
+      features: ['open-membership', 'visibility-explore-view'],
+    });
+
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <WidgetBuilderSortBySelector />
+      </WidgetBuilderProvider>,
+      {
+        organization: organizationWithFlag,
+        initialRouterConfig: {
+          ...defaultRouterConfig,
+          location: {
+            pathname: defaultRouterConfig.location?.pathname ?? '/mock-pathname/',
+            query: {
+              ...defaultRouterConfig.location?.query,
+              displayType: 'table',
+              yAxis: ['count()', 'equation|count_unique(transaction.duration) + 100'],
+            },
+          },
+        },
+      }
+    );
+
+    const sortDirectionSelector = await screen.findByText('High to low');
+    const sortFieldSelector = await screen.findByText('Select a column\u{2026}');
+
+    expect(sortFieldSelector).toBeInTheDocument();
+
+    await userEvent.click(sortFieldSelector);
+    await userEvent.click(
+      await screen.findByText('count_unique(transaction.duration) + 100')
+    );
+
+    await waitFor(() => {
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: '-equation[0]'})
+      );
+    });
+
+    await userEvent.click(sortDirectionSelector);
+    await userEvent.click(await screen.findByText('Low to high'));
+    await waitFor(() => {
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: 'equation[0]'})
+      );
+    });
+  });
+});

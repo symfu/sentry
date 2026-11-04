@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+
 import click
 from click.formatting import join_options
 
@@ -31,10 +32,7 @@ def write_page(out, data):
         filename += ".inc"
 
     dirname = os.path.dirname(filename)
-    try:
-        os.makedirs(dirname)
-    except OSError:
-        pass
+    os.makedirs(dirname, exist_ok=True)
 
     args = [x["metavar"] for x in data["arguments"]]
     title = "`%s`" % " ".join(data["path"] + args)

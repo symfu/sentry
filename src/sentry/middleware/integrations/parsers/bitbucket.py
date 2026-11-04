@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from django.http.response import HttpResponseBase
+
+from sentry.hybridcloud.mailbox import MailboxName
+from sentry.hybridcloud.outbox.category import WebhookProviderIdentifier
+from sentry.integrations.bitbucket.webhook import BitbucketWebhookEndpoint
+from sentry.integrations.middleware.hybrid_cloud.parser import BaseRequestParser
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.models.organizationmapping import OrganizationMapping
+from sentry.types.cell import CellResolutionError, get_cell_by_name
+
+logger = logging.getLogger(__name__)
+
+
+class BitbucketRequestParser(BaseRequestParser):
+    provider = IntegrationProviderSlug.BITBUCKET.value
+    webhook_identifier = WebhookProviderIdentifier.BITBUCKET
+
+    def get_bitbucket_webhook_response(self) -> HttpResponseBase:
+        """
+        Used for identifying cells from Bitbucket and Bitbucket Server webhooks
+        """
+        # The organization is provided in the path, so we can skip inferring organizations
+        # from the integration credentials
+        organization_id = self.match.kwargs.get("organization_id")
+        logging_extra: dict[str, Any] = {"path": self.request.path}
+        if not organization_id:
+            logger.info("%s.no_organization_id", self.provider, extra=logging_extra)
+            return self.get_response_from_control_silo()
+
+        # Shed before the lookups: provider-wide conditions do not need the integration.
+        shed_response = self.get_shed_response()
+        if shed_response is not None:
+            return shed_response
+
+        try:
+            mapping: OrganizationMapping = OrganizationMapping.objects.get(
+                organization_id=organization_id
+            )
+        except OrganizationMapping.DoesNotExist as e:
+            logging_extra["error"] = str(e)
+            logging_extra["organization_id"] = organization_id
+            logger.info("%s.no_mapping", self.provider, extra=logging_extra)
+            return self.get_response_from_control_silo()
+
+        try:
+            cell = get_cell_by_name(mapping.cell_name)
+        except CellResolutionError as e:
+            logging_extra["error"] = str(e)
+            logging_extra["mapping_id"] = mapping.id
+            logger.info("%s.no_region", self.provider, extra=logging_extra)
+            return self.get_response_from_control_silo()
+        return self.get_response_from_webhookpayload(
+            cells=[cell], mailbox=MailboxName(self.provider, str(mapping.organization_id))
+        )
+
+    def get_response(self) -> HttpResponseBase:
+        if self.view_class == BitbucketWebhookEndpoint:
+            return self.get_bitbucket_webhook_response()
+        return self.get_response_from_control_silo()

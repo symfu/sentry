@@ -1,6 +1,15 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
 from uuid import uuid4
 
-from sentry.utils.redis import clusters
+import sentry_sdk
+from django.conf import settings
+from django.http import HttpRequest
+from redis.client import StrictRedis
+from sentry_redis_tools.clients import RedisCluster
+
+from sentry.utils import redis
 from sentry.utils.json import dumps, loads
 
 EXPIRATION_TTL = 10 * 60
@@ -8,10 +17,18 @@ EXPIRATION_TTL = 10 * 60
 
 class RedisSessionStore:
     """
-    RedisSessionStore provides a convenience object, which when initalized will
+    RedisSessionStore provides a convenience object, which when initialized will
     store attributes assigned to it into redis. The redis key is stored into
     the request session. Useful for storing data too large to be stored into
     the session cookie.
+
+    The attributes to be backed by Redis must be declared in a subclass using
+    the `redis_property` function. Do not instantiate RedisSessionStore without
+    extending it to add properties. For example:
+
+    >>> class HotDogSessionStore(RedisSessionStore):
+    >>>     bun = redis_property("bun")
+    >>>     condiment = redis_property("condiment")
 
     NOTE: Assigning attributes immediately saves their value back into the
           redis key assigned for this store. Be aware of the multiple
@@ -38,45 +55,55 @@ class RedisSessionStore:
     modified within the provided ttl.
     """
 
-    def __init__(self, request, prefix, ttl=EXPIRATION_TTL):
-        self.__dict__["request"] = request
-        self.__dict__["prefix"] = prefix
-        self.__dict__["ttl"] = ttl
+    redis_namespace = "session-cache"
+
+    def __init__(self, request: HttpRequest, prefix: str, ttl: int = EXPIRATION_TTL) -> None:
+        self.request = request
+        self.prefix = prefix
+        self.ttl = ttl
 
     @property
-    def _client(self):
-        return clusters.get("default").get_local_client_for_key(self.redis_key)
+    def _client(self) -> RedisCluster[str] | StrictRedis[str]:
+        return redis.redis_clusters.get(settings.SENTRY_SESSION_STORE_REDIS_CLUSTER)
 
     @property
-    def session_key(self):
+    def session_key(self) -> str:
         return f"store:{self.prefix}"
 
     @property
-    def redis_key(self):
+    def redis_key(self) -> str | None:
         return self.request.session.get(self.session_key)
 
-    def regenerate(self, initial_state=None):
+    def mark_session(self) -> None:
+        # Subclasses may override to mark session as modified
+        pass
+
+    def regenerate(self, initial_state: Mapping[str, object] | None = None) -> None:
         if initial_state is None:
             initial_state = {}
 
-        redis_key = f"session-cache:{self.prefix}:{uuid4().hex}"
+        redis_key = f"{self.redis_namespace}:{self.prefix}:{uuid4().hex}"
 
         self.request.session[self.session_key] = redis_key
+        self.mark_session()
 
         value = dumps(initial_state)
         self._client.setex(redis_key, self.ttl, value)
 
-    def clear(self):
+    def clear(self) -> None:
         if not self.redis_key:
             return
 
         self._client.delete(self.redis_key)
-        del self.request.session[self.session_key]
 
-    def is_valid(self):
-        return self.redis_key and self._client.get(self.redis_key)
+        session = self.request.session
+        del session[self.session_key]
+        self.mark_session()
 
-    def get_state(self):
+    def is_valid(self) -> bool:
+        return bool(self.redis_key and self.get_state() is not None)
+
+    def get_state(self) -> dict[str, object] | None:
         if not self.redis_key:
             return None
 
@@ -84,21 +111,34 @@ class RedisSessionStore:
         if not state_json:
             return None
 
-        return loads(state_json)
+        try:
+            state = loads(state_json)
+            return state
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+        return None
 
-    def __getattr__(self, key):
-        state = self.get_state()
+
+def redis_property(key: str) -> property:
+    """Declare a property backed by Redis on a RedisSessionStore class."""
+
+    def getter(store: RedisSessionStore) -> object | None:
+        state = store.get_state()
 
         try:
             return state[key] if state else None
         except KeyError as e:
             raise AttributeError(e)
 
-    def __setattr__(self, key, value):
-        state = self.get_state()
+    def setter(store: RedisSessionStore, value: object) -> None:
+        state = store.get_state()
 
         if state is None:
             return
 
         state[key] = value
-        self._client.setex(self.redis_key, self.ttl, dumps(state))
+        redis_key = store.redis_key
+        assert redis_key is not None
+        store._client.setex(redis_key, store.ttl, dumps(state))
+
+    return property(getter, setter)

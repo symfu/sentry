@@ -1,0 +1,368 @@
+import * as Sentry from '@sentry/react';
+
+import {ERROR_MAP as origErrorMap} from 'sentry/utils/requestError/requestError';
+
+import {
+  addEndpointTagToRequestError,
+  initializeSdk,
+  isEventWithFileUrl,
+  isFilteredRequestErrorEvent,
+  isWalletProviderError,
+} from './initializeSdk';
+
+const ERROR_MAP: Record<number, string | undefined> = {
+  ...origErrorMap,
+  // remove `UndefinedResponseBodyError` since we don't filter those
+  200: undefined,
+};
+
+describe('initializeSdk', () => {
+  beforeAll(() => {
+    window.__initialData = {
+      ...window.__initialData,
+      customerDomain: null,
+    };
+  });
+
+  // This is a regression test for Sentry incident inc-433
+  // We need to make sure that /^\// is included in the list of tracePropagationTargets
+  // so that we can have frontend to backend tracing.
+  it('enables distributed tracing to sentry api endpoint', () => {
+    initializeSdk({
+      ...window.__initialData,
+      apmSampling: 1,
+      sentryConfig: {
+        allowUrls: [],
+        dsn: '',
+        release: '',
+        tracePropagationTargets: ['other', 'stuff'],
+      },
+    });
+
+    expect(Sentry.init).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tracePropagationTargets: expect.arrayContaining([/^\//]),
+      })
+    );
+  });
+
+  it('ignores the ECharts tooltip error thrown when a chart replaces its series (Chrome/V8)', () => {
+    initializeSdk({
+      ...window.__initialData,
+      apmSampling: 1,
+      sentryConfig: {
+        allowUrls: [],
+        dsn: '',
+        release: '',
+        tracePropagationTargets: [],
+      },
+    });
+
+    const ignoreErrors = jest.mocked(Sentry.init).mock.lastCall?.[0]?.ignoreErrors ?? [];
+    const message =
+      "TypeError: Cannot read properties of undefined (reading 'getDataParams')";
+
+    expect(
+      ignoreErrors.some(pattern =>
+        typeof pattern === 'string' ? message.includes(pattern) : pattern.test(message)
+      )
+    ).toBe(true);
+  });
+
+  it('ignores the ECharts tooltip error thrown when a chart replaces its series (Safari/WebKit)', () => {
+    initializeSdk({
+      ...window.__initialData,
+      apmSampling: 1,
+      sentryConfig: {
+        allowUrls: [],
+        dsn: '',
+        release: '',
+        tracePropagationTargets: [],
+      },
+    });
+
+    const ignoreErrors = jest.mocked(Sentry.init).mock.lastCall?.[0]?.ignoreErrors ?? [];
+    const message =
+      "TypeError: undefined is not an object (evaluating 'a.getDataParams')";
+
+    expect(
+      ignoreErrors.some(pattern =>
+        typeof pattern === 'string' ? message.includes(pattern) : pattern.test(message)
+      )
+    ).toBe(true);
+  });
+
+  it('drops unhandled rejections from crypto wallet extensions', () => {
+    initializeSdk({
+      ...window.__initialData,
+      apmSampling: 1,
+      sentryConfig: {
+        allowUrls: [],
+        dsn: '',
+        release: '',
+        tracePropagationTargets: [],
+      },
+    });
+
+    const beforeSend = jest.mocked(Sentry.init).mock.lastCall?.[0]?.beforeSend;
+    const event = {
+      type: undefined,
+      exception: {
+        values: [
+          {
+            type: 'UnhandledRejection',
+            value: 'Object captured as promise rejection with keys: code, message',
+          },
+        ],
+      },
+    };
+
+    expect(
+      beforeSend?.(event, {
+        originalException: {
+          code: 4900,
+          message: 'The provider is disconnected from all chains.',
+        },
+      })
+    ).toBeNull();
+  });
+});
+
+describe('isWalletProviderError', () => {
+  it.each([
+    {code: 4001, message: 'User rejected the request.'},
+    {code: 4900, message: 'The provider is disconnected from all chains.'},
+    {code: -32603, message: 'Internal JSON-RPC error.'},
+    {code: -32000, message: 'execution reverted', data: '0x'},
+  ])('recognizes provider error $code', error => {
+    expect(isWalletProviderError(error)).toBe(true);
+  });
+
+  it.each([
+    ['Error instances', Object.assign(new Error('Disconnected'), {code: 4900})],
+    ['HTTP status codes', {code: 404, message: 'Not Found'}],
+    ['string codes', {code: 'ECONNRESET', message: 'socket hang up'}],
+    ['objects without a message', {code: 4001}],
+    ['strings', 'User rejected the request.'],
+    ['undefined', undefined],
+  ])('rejects %s', (_, error) => {
+    expect(isWalletProviderError(error)).toBe(false);
+  });
+});
+
+describe('isFilteredRequestErrorEvent', () => {
+  const methods = ['GET', 'POST', 'PUT', 'DELETE'];
+  const stati = [200, 400, 401, 402, 403, 404, 429];
+
+  describe('matching error type, matching message', () => {
+    for (const method of methods) {
+      describe(`${method} requests`, () => {
+        for (const status of stati) {
+          // We have to filter out falsy values here because 200 isn't in `ERROR_MAP`
+          // and will never appear with any other error name besides `RequestError`
+          for (const errorName of ['RequestError', ERROR_MAP[status]].filter(Boolean)) {
+            describe('main error', () => {
+              it(`recognizes ${status} ${method} events of type ${errorName}`, () => {
+                const event = {
+                  exception: {
+                    values: [
+                      {type: errorName, value: `${method} /dogs/are/great/ ${status}`},
+                    ],
+                  },
+                };
+
+                expect(isFilteredRequestErrorEvent(event)).toBeTruthy();
+              });
+            });
+
+            describe('cause error', () => {
+              it(`recognizes ${status} ${method} events of type ${errorName} as causes`, () => {
+                const event = {
+                  exception: {
+                    values: [
+                      {type: errorName, value: `${method} /dogs/are/great/ ${status}`},
+                      {type: 'InsufficientTreatsError', value: 'Not enough treats!'},
+                    ],
+                  },
+                };
+
+                expect(isFilteredRequestErrorEvent(event)).toBeTruthy();
+              });
+            });
+          }
+        }
+      });
+    }
+  });
+
+  describe('matching error type, non-matching message', () => {
+    for (const status of stati) {
+      // We have to filter out falsy values here because 200 isn't in `ERROR_MAP`
+      // and will never appear with any other error name besides `RequestError`
+      for (const errorName of ['RequestError', ERROR_MAP[status]].filter(Boolean)) {
+        describe('main error', () => {
+          it(`rejects other errors of type ${errorName}`, () => {
+            const event = {
+              exception: {
+                values: [
+                  {type: errorName, value: "Failed to fetch requested object: 'ball'"},
+                ],
+              },
+            };
+
+            expect(isFilteredRequestErrorEvent(event)).toBeFalsy();
+          });
+        });
+
+        describe('cause error', () => {
+          it(`rejects other errors of type ${errorName} as causes`, () => {
+            const event = {
+              exception: {
+                values: [
+                  {type: errorName, value: "Failed to fetch requested object: 'ball'"},
+                  {type: 'InsufficientTreatsError', value: 'Not enough treats!'},
+                ],
+              },
+            };
+
+            expect(isFilteredRequestErrorEvent(event)).toBeFalsy();
+          });
+        });
+      }
+    }
+  });
+
+  describe('requests that never got a response', () => {
+    for (const method of [...methods, 'PATCH']) {
+      it(`recognizes ${method} RequestErrors without a status`, () => {
+        const event = {
+          exception: {values: [{type: 'RequestError', value: `${method} /assistant/`}]},
+        };
+
+        expect(isFilteredRequestErrorEvent(event)).toBeTruthy();
+      });
+    }
+
+    it('recognizes RequestErrors without a status as causes', () => {
+      const event = {
+        exception: {
+          values: [
+            {type: 'RequestError', value: 'GET /assistant/'},
+            {type: 'InsufficientTreatsError', value: 'Not enough treats!'},
+          ],
+        },
+      };
+
+      expect(isFilteredRequestErrorEvent(event)).toBeTruthy();
+    });
+
+    it('rejects RequestErrors with a non-numeric status', () => {
+      const event = {
+        exception: {values: [{type: 'RequestError', value: 'GET /assistant/ n/a'}]},
+      };
+
+      expect(isFilteredRequestErrorEvent(event)).toBeFalsy();
+    });
+
+    it('rejects other error types without a status', () => {
+      const event = {
+        exception: {values: [{type: 'InternalServerError', value: 'GET /assistant/'}]},
+      };
+
+      expect(isFilteredRequestErrorEvent(event)).toBeFalsy();
+    });
+  });
+
+  describe('non-matching error type, non-matching message', () => {
+    it('rejects other errors', () => {
+      const event = {
+        exception: {
+          values: [{type: 'UncaughtSquirrelError', value: 'Squirrel was not caught'}],
+        },
+      };
+
+      expect(isFilteredRequestErrorEvent(event)).toBeFalsy();
+    });
+
+    it('rejects other errors as causes', () => {
+      const event = {
+        exception: {
+          values: [
+            {type: 'UncaughtSquirrelError', value: 'Squirrel was not caught'},
+            {type: 'InsufficientTreatsError', value: 'Not enough treats!'},
+          ],
+        },
+      };
+
+      expect(isFilteredRequestErrorEvent(event)).toBeFalsy();
+    });
+  });
+});
+
+describe('isEventWithFileUrl', () => {
+  it('recognizes events with `file://` urls', () => {
+    const event = {request: {url: 'file://dogs/are/great.html'}};
+
+    expect(isEventWithFileUrl(event)).toBeTruthy();
+  });
+
+  it('rejects events with other urls', () => {
+    const event = {request: {url: 'http://dogs.are.great'}};
+
+    expect(isEventWithFileUrl(event)).toBeFalsy();
+  });
+
+  it('rejects events without urls', () => {
+    const event = {};
+
+    expect(isEventWithFileUrl(event)).toBeFalsy();
+  });
+});
+
+describe('addEndpointTagToRequestError', () => {
+  it('adds `endpoint` tag to events with matching message`', () => {
+    const event = {
+      exception: {
+        values: [{type: 'RequestError', value: 'GET /dogs/are/great/ 500'}],
+      },
+      tags: {},
+    };
+
+    addEndpointTagToRequestError(event);
+
+    expect(event.tags).toEqual({
+      endpoint: 'GET /dogs/are/great/',
+    });
+  });
+
+  it("doesn't add `endpoint` tag to events with non-matching message", () => {
+    const nonmatchingMessages = [
+      'RequestError with no endpoint for some reason',
+      'Some other stuff is wrong with endpoint /dogs/are/great/',
+      'This error has nothing to do with requests or endpoints at all',
+    ];
+
+    for (const msg of nonmatchingMessages) {
+      const event = {
+        exception: {
+          values: [{type: 'RequestError', value: msg}],
+        },
+        tags: {},
+      };
+
+      addEndpointTagToRequestError(event);
+
+      expect(event.tags).toEqual({});
+    }
+  });
+
+  it("doesn't add `endpoint` tag to events with no exception", () => {
+    const event = {
+      tags: {},
+    };
+
+    addEndpointTagToRequestError(event);
+
+    expect(event.tags).toEqual({});
+  });
+});

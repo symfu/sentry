@@ -1,0 +1,770 @@
+jest.mock('@tanstack/react-virtual', () => ({
+  useVirtualizer: ({count}: {count: number}) => {
+    const virtualItems = Array.from({length: count}, (_, index) => ({
+      key: index,
+      index,
+      start: index * 48,
+      size: 48,
+      lane: 0,
+    }));
+    return {
+      getVirtualItems: () => virtualItems,
+      getTotalSize: () => count * 48,
+      measureElement: jest.fn(),
+      measure: jest.fn(),
+      scrollToIndex: jest.fn(),
+    };
+  },
+}));
+
+import * as Sentry from '@sentry/react';
+import {DashboardListItemFixture} from 'sentry-fixture/dashboard';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {ProjectFixture} from 'sentry-fixture/project';
+import {UserFixture} from 'sentry-fixture/user';
+
+import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {
+  makeCloseButton,
+  makeClosableHeader,
+  ModalBody,
+  ModalFooter,
+} from '@sentry/scraps/modal';
+
+import {CommandPaletteProvider} from 'sentry/components/commandPalette/ui/cmdk';
+import {CommandPalette} from 'sentry/components/commandPalette/ui/commandPalette';
+import {CommandPaletteSlot} from 'sentry/components/commandPalette/ui/commandPaletteSlot';
+import {ConfigStore} from 'sentry/stores/configStore';
+import {ProjectsStore} from 'sentry/stores/projectsStore';
+
+function makeRenderProps(closeModal: jest.Mock) {
+  return {
+    closeModal,
+    Body: ModalBody,
+    Footer: ModalFooter,
+    Header: makeClosableHeader(closeModal),
+    CloseButton: makeCloseButton(closeModal),
+  };
+}
+
+import {GlobalCommandPaletteActions} from './commandPaletteGlobalActions';
+
+function SlotOutlets() {
+  return (
+    <div style={{display: 'none'}}>
+      <CommandPaletteSlot.Outlet name="task">
+        {p => <div {...p} />}
+      </CommandPaletteSlot.Outlet>
+      <CommandPaletteSlot.Outlet name="page">
+        {p => <div {...p} />}
+      </CommandPaletteSlot.Outlet>
+      <CommandPaletteSlot.Outlet name="global">
+        {p => <div {...p} />}
+      </CommandPaletteSlot.Outlet>
+    </div>
+  );
+}
+
+describe('GlobalCommandPaletteActions - project settings ordering', () => {
+  const organization = OrganizationFixture();
+  const projectA = ProjectFixture({id: '1', slug: 'project-a', organization});
+  const projectB = ProjectFixture({id: '2', slug: 'project-b', organization});
+  const projectC = ProjectFixture({id: '3', slug: 'project-c', organization});
+
+  beforeEach(() => {
+    ProjectsStore.loadInitialData([projectA, projectB, projectC]);
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/group-search-views/starred/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/starred/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/explore/all-queries/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/members/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/projects/`,
+      body: [],
+    });
+  });
+
+  async function drillIntoGeneralSettings() {
+    // Search for "General Settings" so it appears as a clickable action item.
+    // Use "Project Settings" in the pattern to disambiguate from the org-level
+    // "General Settings" entry that also appears in search results.
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'General Settings');
+    await userEvent.click(
+      await screen.findByRole('option', {name: /Project Settings.*General Settings/})
+    );
+    // The search query is cleared when drilling in; wait for project options to appear.
+    await screen.findByRole('textbox', {name: 'Search commands'});
+  }
+
+  it.isKnownFlake(
+    'shows a "Current Project" tag on the active project entry',
+    async () => {
+      render(
+        <CommandPaletteProvider>
+          <GlobalCommandPaletteActions />
+          <SlotOutlets />
+          <CommandPalette {...makeRenderProps(jest.fn())} />
+        </CommandPaletteProvider>,
+        {
+          organization,
+          initialRouterConfig: {
+            location: {pathname: `/settings/${organization.slug}/projects/project-b/`},
+            route: '/settings/:orgId/projects/:projectId/',
+          },
+        }
+      );
+
+      await drillIntoGeneralSettings();
+
+      expect(await screen.findByText('Current')).toBeInTheDocument();
+    }
+  );
+
+  it.isKnownFlake(
+    'places the current route project first when on a :projectId route',
+    async () => {
+      render(
+        <CommandPaletteProvider>
+          <GlobalCommandPaletteActions />
+          <SlotOutlets />
+          <CommandPalette {...makeRenderProps(jest.fn())} />
+        </CommandPaletteProvider>,
+        {
+          organization,
+          initialRouterConfig: {
+            location: {pathname: `/settings/${organization.slug}/projects/project-b/`},
+            route: '/settings/:orgId/projects/:projectId/',
+          },
+        }
+      );
+
+      await drillIntoGeneralSettings();
+
+      const option = (await screen.findAllByRole('option')).find(
+        el => !el.hasAttribute('aria-disabled')
+      );
+      expect(option).toHaveAccessibleName('project-b');
+    }
+  );
+
+  it('does not duplicate the current project in the list', async () => {
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/settings/${organization.slug}/projects/project-b/`},
+          route: '/settings/:orgId/projects/:projectId/',
+        },
+      }
+    );
+
+    await drillIntoGeneralSettings();
+
+    await screen.findByRole('option', {name: 'project-b'});
+    expect(screen.getAllByRole('option', {name: 'project-b'})).toHaveLength(1);
+  });
+
+  it.isKnownFlake(
+    'places the project first when identified by a single ?project= query param',
+    async () => {
+      render(
+        <CommandPaletteProvider>
+          <GlobalCommandPaletteActions />
+          <SlotOutlets />
+          <CommandPalette {...makeRenderProps(jest.fn())} />
+        </CommandPaletteProvider>,
+        {
+          organization,
+          initialRouterConfig: {
+            location: {
+              pathname: `/organizations/${organization.slug}/issues/`,
+              query: {project: projectB.id},
+            },
+          },
+        }
+      );
+
+      await drillIntoGeneralSettings();
+
+      const option = (await screen.findAllByRole('option')).find(
+        el => !el.hasAttribute('aria-disabled')
+      );
+      expect(option).toHaveAccessibleName('project-b');
+      expect(screen.getByText('Current')).toBeInTheDocument();
+    }
+  );
+
+  it('highlights all projects when multiple ?project= params are set', async () => {
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: `/organizations/${organization.slug}/issues/`,
+            query: {project: [projectA.id, projectB.id]},
+          },
+        },
+      }
+    );
+
+    await drillIntoGeneralSettings();
+
+    // Both selected projects should appear with the Current tag
+    expect(await screen.findByRole('option', {name: 'project-a'})).toBeInTheDocument();
+    expect(screen.getByRole('option', {name: 'project-b'})).toBeInTheDocument();
+    expect(screen.getAllByText('Current')).toHaveLength(2);
+    // Unselected project should still be present but without a tag
+    expect(screen.getByRole('option', {name: 'project-c'})).toBeInTheDocument();
+  });
+
+  it('shows all projects without priority when not on a :projectId route', async () => {
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/organizations/${organization.slug}/issues/`},
+        },
+      }
+    );
+
+    await drillIntoGeneralSettings();
+
+    expect(await screen.findByRole('option', {name: 'project-a'})).toBeInTheDocument();
+    expect(screen.getByRole('option', {name: 'project-b'})).toBeInTheDocument();
+    expect(screen.getByRole('option', {name: 'project-c'})).toBeInTheDocument();
+  });
+
+  it('places starred projects before other projects', async () => {
+    ProjectsStore.loadInitialData([
+      projectA,
+      projectB,
+      ProjectFixture({...projectC, isBookmarked: true}),
+    ]);
+
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/organizations/${organization.slug}/issues/`},
+        },
+      }
+    );
+
+    await drillIntoGeneralSettings();
+
+    await screen.findByRole('option', {name: 'project-c'});
+    const projectOptions = screen
+      .getAllByRole('option')
+      .filter(el => !el.hasAttribute('aria-disabled'))
+      .map(el => el.textContent);
+    expect(projectOptions).toEqual(['project-c', 'project-a', 'project-b']);
+  });
+});
+
+describe('GlobalCommandPaletteActions - search recall', () => {
+  const organization = OrganizationFixture({
+    features: [
+      'session-replay-ui',
+      'performance-view',
+      'dashboards-prebuilt-insights-dashboards',
+    ],
+  });
+  const project = ProjectFixture({id: '1', slug: 'project-a', organization});
+
+  beforeEach(() => {
+    ProjectsStore.loadInitialData([project]);
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/group-search-views/starred/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/starred/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/explore/all-queries/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/users/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/members/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/projects/`,
+      body: [],
+    });
+  });
+
+  function renderPalette() {
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/organizations/${organization.slug}/issues/`},
+        },
+      }
+    );
+  }
+
+  it.each([
+    ['auth tok', /Organization Tokens/, /Personal Tokens/],
+    [
+      'SENTRY_AUTH_TOKEN',
+      /Settings.*Organization Tokens/,
+      /Settings.*Custom Integrations/,
+      /Settings.*Personal Tokens/,
+    ],
+    [
+      'api key',
+      /Settings.*Organization Tokens/,
+      /Settings.*Custom Integrations/,
+      /Settings.*Personal Tokens/,
+    ],
+    ['source map', /Project Settings.*Source Maps/],
+    ['codeowners', /Project Settings.*Ownership Rules/],
+    ['inbound', /Project Settings.*Inbound Filters/],
+    ['size', /Project Settings.*Mobile Builds/],
+    // The SDK env var name (and its spaced form) should surface Client Keys
+    // (DSN), just like "dsn". The Next.js public-prefixed variant should too.
+    ['SENTRY_DSN', /Project Settings.*Client Keys \(DSN\)/],
+    ['sentry dsn', /Project Settings.*Client Keys \(DSN\)/],
+    ['NEXT_PUBLIC_SENTRY_DSN', /Project Settings.*Client Keys \(DSN\)/],
+  ])('finds expected actions for %s', async (query, ...expectedOptions) => {
+    renderPalette();
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, query);
+
+    for (const expectedOption of expectedOptions) {
+      expect(
+        await screen.findByRole('option', {name: expectedOption})
+      ).toBeInTheDocument();
+    }
+  });
+
+  it.each([
+    {
+      body: {
+        group: {
+          id: '42',
+          metadata: {},
+          project: {id: project.id, slug: project.slug},
+          status: 'unresolved',
+        },
+        groupId: '42',
+        organizationSlug: organization.slug,
+        projectSlug: project.slug,
+        shortId: 'WEB-HZX',
+      },
+      expectedOption: /Issue WEB-HZX/,
+      query: 'WEB-HZX',
+      lookupUrl: `/organizations/${organization.slug}/shortids/WEB-HZX/`,
+    },
+    {
+      body: {
+        event: {id: '954df831ab094388ac98eee198584479'},
+        eventId: '954df831ab094388ac98eee198584479',
+        groupId: '42',
+        organizationSlug: organization.slug,
+        projectSlug: project.slug,
+      },
+      expectedOption: /Event 954df831ab094388ac98eee198584479/,
+      query: '954df831ab094388ac98eee198584479',
+      lookupUrl: `/organizations/${organization.slug}/eventids/954df831ab094388ac98eee198584479/`,
+    },
+    {
+      body: {
+        event: {id: '954df831-ab09-4388-ac98-eee198584479'},
+        eventId: '954df831-ab09-4388-ac98-eee198584479',
+        groupId: '42',
+        organizationSlug: organization.slug,
+        projectSlug: project.slug,
+      },
+      expectedOption: /Event 954df831-ab09-4388-ac98-eee198584479/,
+      query: '954df831-ab09-4388-ac98-eee198584479',
+      lookupUrl: `/organizations/${organization.slug}/eventids/954df831-ab09-4388-ac98-eee198584479/`,
+    },
+  ])(
+    'resolves pasted identifiers for %s',
+    async ({query, lookupUrl, body, expectedOption}) => {
+      MockApiClient.addMockResponse({
+        url: lookupUrl,
+        body,
+      });
+
+      renderPalette();
+
+      const input = await screen.findByRole('textbox', {name: 'Search commands'});
+      await userEvent.type(input, query);
+
+      expect(
+        await screen.findByRole('option', {name: expectedOption})
+      ).toBeInTheDocument();
+    }
+  );
+
+  it('searches for projects and navigates to project page', async () => {
+    const projectToFind = ProjectFixture({
+      id: '2',
+      slug: 'test-project',
+      name: 'Test Project',
+      organization,
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/projects/`,
+      body: [projectToFind],
+      match: [MockApiClient.matchQuery({query: 'test'})],
+    });
+
+    renderPalette();
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'test');
+
+    expect(await screen.findByRole('option', {name: 'test-project'})).toBeInTheDocument();
+  });
+
+  it('searches for dashboards and displays results', async () => {
+    const dashboard1 = DashboardListItemFixture({
+      id: '1',
+      title: 'Queries Dashboard',
+      isFavorited: false,
+    });
+    const dashboard2 = DashboardListItemFixture({
+      id: '2',
+      title: 'Query Performance',
+      isFavorited: true,
+    });
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/`,
+      body: [dashboard1, dashboard2],
+      match: [MockApiClient.matchQuery({query: 'quer'})],
+    });
+
+    renderPalette();
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+
+    // Navigate to the Dashboards section
+    await userEvent.type(input, 'Dashboards');
+    await userEvent.click(await screen.findByRole('option', {name: /Dashboards/}));
+
+    // Click on the "Search Dashboards" search action
+    await userEvent.click(await screen.findByRole('option', {name: /Search Dashboards/}));
+
+    // Type the search query in the sub-prompt
+    await userEvent.type(input, 'quer');
+
+    expect(
+      await screen.findByRole('option', {name: 'Queries Dashboard'})
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole('option', {name: 'Query Performance'})
+    ).toBeInTheDocument();
+  });
+});
+
+function mockOrgApis(organization: ReturnType<typeof OrganizationFixture>) {
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/group-search-views/starred/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/dashboards/starred/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/dashboards/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/explore/all-queries/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/users/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/members/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/teams/`,
+    body: [],
+  });
+  MockApiClient.addMockResponse({
+    url: `/organizations/${organization.slug}/projects/`,
+    body: [],
+  });
+}
+
+describe('GlobalCommandPaletteActions - settings-v3', () => {
+  function renderPalette(organization: ReturnType<typeof OrganizationFixture>) {
+    mockOrgApis(organization);
+
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/organizations/${organization.slug}/issues/`},
+        },
+      }
+    );
+  }
+
+  it('lists account pages under Account Settings', async () => {
+    renderPalette(OrganizationFixture({features: ['settings-v3']}));
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'Personal Tokens');
+
+    expect(
+      await screen.findByRole('option', {name: /Account Settings.*Personal Tokens/})
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('option', {name: /Org Settings.*Personal Tokens/})
+    ).not.toBeInTheDocument();
+  });
+
+  it('titles the organization index page "General"', async () => {
+    renderPalette(OrganizationFixture({features: ['settings-v3']}));
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'General');
+
+    expect(
+      await screen.findByRole('option', {name: /Org Settings.*General/})
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('option', {name: /General Settings/})
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps account pages under Settings without the flag', async () => {
+    renderPalette(OrganizationFixture({features: []}));
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'Personal Tokens');
+
+    expect(
+      await screen.findByRole('option', {name: /Settings.*Personal Tokens/})
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('option', {name: /Account Settings/})
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe('GlobalCommandPaletteActions - Seer XRay Mode gating', () => {
+  function renderPalette(organization: ReturnType<typeof OrganizationFixture>) {
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/organizations/${organization.slug}/issues/`},
+        },
+      }
+    );
+  }
+
+  it('shows the toggle when the org has the seer-xray feature', async () => {
+    const organization = OrganizationFixture({features: ['seer-xray']});
+    mockOrgApis(organization);
+    renderPalette(organization);
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'xray');
+
+    expect(
+      await screen.findByRole('option', {name: /Enable Seer XRay Mode/})
+    ).toBeInTheDocument();
+  });
+
+  it('hides the toggle without the seer-xray feature', async () => {
+    const organization = OrganizationFixture({features: []});
+    mockOrgApis(organization);
+    renderPalette(organization);
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'xray');
+
+    expect(
+      screen.queryByRole('option', {name: /Seer XRay Mode/})
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe('GlobalCommandPaletteActions - Open my current replay session', () => {
+  const organization = OrganizationFixture();
+
+  beforeEach(() => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/group-search-views/starred/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/starred/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/dashboards/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/explore/all-queries/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/users/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/members/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/projects/`,
+      body: [],
+    });
+    ConfigStore.set(
+      'user',
+      UserFixture({
+        isStaff: false,
+        emails: [{id: '1', email: 'employee@sentry.io', is_verified: true}],
+      })
+    );
+    jest.spyOn(window, 'open').mockImplementation(() => null);
+    Object.assign(navigator, {clipboard: {writeText: jest.fn().mockResolvedValue('')}});
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  async function selectOpenCurrentReplay() {
+    render(
+      <CommandPaletteProvider>
+        <GlobalCommandPaletteActions />
+        <SlotOutlets />
+        <CommandPalette {...makeRenderProps(jest.fn())} />
+      </CommandPaletteProvider>,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {pathname: `/organizations/${organization.slug}/issues/`},
+        },
+      }
+    );
+
+    const input = await screen.findByRole('textbox', {name: 'Search commands'});
+    await userEvent.type(input, 'current replay');
+    await userEvent.click(
+      await screen.findByRole('option', {name: /Open my current replay session/})
+    );
+  }
+
+  it('flushes the replay, opens it, and copies the link', async () => {
+    const flush = jest.fn().mockResolvedValue(undefined);
+    jest.spyOn(Sentry, 'getReplay').mockReturnValue({
+      flush,
+      getReplayId: () => 'abc123',
+    } as unknown as ReturnType<typeof Sentry.getReplay>);
+
+    await selectOpenCurrentReplay();
+
+    const url = 'https://sentry.sentry.io/explore/replays/abc123/';
+    expect(flush).toHaveBeenCalled();
+    expect(window.open).toHaveBeenCalledWith(url, '_blank', 'noreferrer');
+    await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith(url));
+    // Copies before the new tab takes focus away from this document
+    const copyOrder = jest.mocked(navigator.clipboard.writeText).mock
+      .invocationCallOrder[0]!;
+    const openOrder = jest.mocked(window.open).mock.invocationCallOrder[0]!;
+    expect(copyOrder).toBeLessThan(openOrder);
+  });
+
+  it('does not open anything when replay is not enabled', async () => {
+    jest.spyOn(Sentry, 'getReplay').mockReturnValue(undefined);
+
+    await selectOpenCurrentReplay();
+
+    expect(window.open).not.toHaveBeenCalled();
+  });
+});

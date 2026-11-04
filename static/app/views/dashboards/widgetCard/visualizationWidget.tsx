@@ -1,0 +1,583 @@
+import {Fragment, memo} from 'react';
+import {Link} from 'react-router';
+import {useTheme} from '@emotion/react';
+import isEqual from 'lodash/isEqual';
+import omit from 'lodash/omit';
+
+import {Container, Flex, Stack, type ContainerProps} from '@sentry/scraps/layout';
+import {Text} from '@sentry/scraps/text';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import type {PageFilters} from 'sentry/types/core';
+import type {EChartDataZoomHandler} from 'sentry/types/echarts';
+import type {Confidence} from 'sentry/types/organization';
+import {defined} from 'sentry/utils/defined';
+import type {TableDataWithTitle} from 'sentry/utils/discover/discoverQuery';
+import type {IngestionMeta} from 'sentry/utils/timeSeries/useFetchEventsTimeSeries';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useReleaseStats} from 'sentry/utils/useReleaseStats';
+import {useWidgetErrorCallback} from 'sentry/views/dashboards/contexts/widgetErrorContext';
+import {
+  WidgetType,
+  type DashboardFilters,
+  type Widget as TWidget,
+  type WidgetQuery,
+} from 'sentry/views/dashboards/types';
+import {applyDashboardFilters, usesTimeSeriesData} from 'sentry/views/dashboards/utils';
+import {
+  findLinkedDashboardForField,
+  getLinkedDashboardUrl,
+} from 'sentry/views/dashboards/utils/getLinkedDashboardUrl';
+import {getChartType} from 'sentry/views/dashboards/utils/getWidgetExploreUrl';
+import type {WidgetTimeSeries} from 'sentry/views/dashboards/utils/transformTimeSeriesResponse';
+import {withGlobalFilterFallback} from 'sentry/views/dashboards/utils/withGlobalFilterFallback';
+import {canScaleThresholds} from 'sentry/views/dashboards/widgetCard/canScaleThresholds';
+import {matchTimeSeriesToTableRowValue} from 'sentry/views/dashboards/widgetCard/matchTimeSeriesToTableRowValue';
+import {scaleThresholdsToInterval} from 'sentry/views/dashboards/widgetCard/scaleThresholdsToInterval';
+import {WidgetLegendNameEncoderDecoder} from 'sentry/views/dashboards/widgetLegendNameEncoderDecoder';
+import type {
+  LegendSelection,
+  TimeSeries,
+} from 'sentry/views/dashboards/widgets/common/types';
+import {plottablesCanBeVisualized} from 'sentry/views/dashboards/widgets/plottablesCanBeVisualized';
+import {formatBreakdownLegendValue} from 'sentry/views/dashboards/widgets/timeSeriesWidget/formatters/formatBreakdownLegendValue';
+import {formatTimeSeriesLabel} from 'sentry/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesLabel';
+import {formatTimeSeriesLabelForWidgetQuery} from 'sentry/views/dashboards/widgets/timeSeriesWidget/formatters/formatTimeSeriesLabelForWidgetQuery';
+import {createPlottableFromTimeSeriesAndWidget} from 'sentry/views/dashboards/widgets/timeSeriesWidget/plottables/createPlottableFromTimeSeries';
+import type {Plottable} from 'sentry/views/dashboards/widgets/timeSeriesWidget/plottables/plottable';
+import {Thresholds} from 'sentry/views/dashboards/widgets/timeSeriesWidget/plottables/thresholds';
+import {TimeSeriesWidgetVisualization} from 'sentry/views/dashboards/widgets/timeSeriesWidget/timeSeriesWidgetVisualization';
+import {Widget} from 'sentry/views/dashboards/widgets/widget/widget';
+import {useIncompleteBucketTooltipDetails} from 'sentry/views/explore/components/chart/incompleteBucketTooltip';
+import {getExploreUrl} from 'sentry/views/explore/utils';
+import {navigationTypeSuppressesThresholds} from 'sentry/views/insights/browser/webVitals/navigationType/utils';
+import {TextAlignRight} from 'sentry/views/insights/common/components/textAlign';
+import type {LoadableChartWidgetProps} from 'sentry/views/insights/common/components/widgets/types';
+import {ModelName} from 'sentry/views/insights/pages/agents/components/modelName';
+import {NegativeCostInfo} from 'sentry/views/insights/pages/agents/components/negativeCostWarning';
+import {
+  SeriesColorIndicator,
+  WidgetFooterTable,
+} from 'sentry/views/insights/pages/platform/shared/styles';
+import {SpanFields} from 'sentry/views/insights/types';
+
+import {WidgetCardConfidenceFooter} from './confidenceFooter';
+import {WidgetCardDataLoader} from './widgetCardDataLoader';
+
+interface VisualizationWidgetProps {
+  selection: PageFilters;
+  widget: TWidget;
+  dashboardFilters?: DashboardFilters;
+  isFullScreen?: boolean;
+  legendSelection?: LegendSelection;
+  onDataFetchStart?: () => void;
+  onDataFetched?: (results: {
+    pageLinks?: string;
+    tableResults?: any[];
+    timeseriesResults?: WidgetTimeSeries[];
+  }) => void;
+  onLegendSelectionChange?: (selection: LegendSelection) => void;
+  onZoom?: EChartDataZoomHandler;
+  showConfidenceWarning?: boolean;
+  tableItemLimit?: number;
+  widgetInterval?: string;
+}
+
+function VisualizationWidgetComponent({
+  widget,
+  selection,
+  dashboardFilters,
+  onDataFetched,
+  onDataFetchStart,
+  tableItemLimit,
+  widgetInterval,
+  showConfidenceWarning,
+  onZoom,
+  legendSelection,
+  onLegendSelectionChange,
+  isFullScreen,
+}: VisualizationWidgetProps) {
+  const onWidgetError = useWidgetErrorCallback();
+
+  // WidgetLegendSelectionState persists legend selection to the URL with
+  // keys in `seriesName|~|widgetId` format so each widget's selection is
+  // tracked independently. TimeSeriesWidgetVisualization uses plain
+  // series names. Decode on the way in and encode on the way out.
+  const decodedLegendSelection = legendSelection
+    ? decodeLegendSelection(legendSelection)
+    : undefined;
+
+  const handleLegendSelectionChange = onLegendSelectionChange
+    ? (plain: LegendSelection) => {
+        onLegendSelectionChange(encodeLegendSelection(plain, widget.id));
+      }
+    : undefined;
+
+  const {releases: releasesWithDate} = useReleaseStats(selection);
+
+  const releases =
+    releasesWithDate?.map(({date, version}) => ({
+      timestamp: date,
+      version,
+    })) ?? [];
+
+  return (
+    <WidgetCardDataLoader
+      widget={widget}
+      selection={selection}
+      dashboardFilters={dashboardFilters}
+      onDataFetched={onDataFetched}
+      onDataFetchStart={onDataFetchStart}
+      tableItemLimit={tableItemLimit}
+      widgetInterval={widgetInterval}
+    >
+      {({
+        timeseriesResults,
+        timeseriesInterval,
+        tableResults,
+        errorMessage,
+        loading,
+        confidence,
+        dataScanned,
+        isSampled,
+        sampleCount,
+        ingestion,
+      }) => {
+        if (errorMessage && onWidgetError) {
+          onWidgetError(widget, errorMessage);
+        }
+
+        return (
+          <VisualizationWidgetContent
+            widget={widget}
+            timeseriesResults={timeseriesResults ?? []}
+            tableResults={tableResults}
+            errorMessage={errorMessage}
+            loading={loading}
+            releases={releases}
+            showReleaseAs="bubble"
+            dashboardFilters={dashboardFilters}
+            showConfidenceWarning={showConfidenceWarning}
+            confidence={confidence}
+            dataScanned={dataScanned}
+            isSampled={isSampled}
+            sampleCount={sampleCount}
+            ingestion={ingestion}
+            onZoom={onZoom}
+            legendSelection={decodedLegendSelection}
+            onLegendSelectionChange={handleLegendSelectionChange}
+            isFullScreen={isFullScreen}
+            widgetInterval={timeseriesInterval ?? widgetInterval}
+          />
+        );
+      }}
+    </WidgetCardDataLoader>
+  );
+}
+
+function shouldMemoizeVisualizationWidget(
+  prevProps: VisualizationWidgetProps,
+  props: VisualizationWidgetProps
+) {
+  // Title and description are rendered by the surrounding frame, so editing them
+  // (e.g. typing a name in the widget builder) shouldn't re-run the series
+  // transforms and redraw the chart
+  return isEqual(
+    {...prevProps, widget: omit(prevProps.widget, ['title', 'description'])},
+    {...props, widget: omit(props.widget, ['title', 'description'])}
+  );
+}
+
+export const VisualizationWidget = memo(
+  VisualizationWidgetComponent,
+  shouldMemoizeVisualizationWidget
+);
+
+interface VisualizationWidgetContentProps {
+  loading: boolean;
+  releases: Array<{timestamp: string; version: string}>;
+  showReleaseAs: LoadableChartWidgetProps['showReleaseAs'];
+  timeseriesResults: WidgetTimeSeries[];
+  widget: TWidget;
+  confidence?: Confidence;
+  dashboardFilters?: DashboardFilters;
+  dataScanned?: 'full' | 'partial';
+  errorMessage?: string;
+  ingestion?: IngestionMeta;
+  isFullScreen?: boolean;
+  isSampled?: boolean | null;
+  legendSelection?: LegendSelection;
+  onLegendSelectionChange?: (selection: LegendSelection) => void;
+  onZoom?: EChartDataZoomHandler;
+  sampleCount?: number;
+  showConfidenceWarning?: boolean;
+  tableResults?: TableDataWithTitle[];
+  widgetInterval?: string;
+}
+
+function VisualizationWidgetContent({
+  widget,
+  timeseriesResults,
+  tableResults,
+  errorMessage,
+  loading,
+  releases,
+  showReleaseAs,
+  dashboardFilters,
+  showConfidenceWarning,
+  confidence,
+  dataScanned,
+  isSampled,
+  sampleCount,
+  ingestion,
+  onZoom,
+  legendSelection,
+  onLegendSelectionChange,
+  isFullScreen,
+  widgetInterval,
+}: VisualizationWidgetContentProps) {
+  const theme = useTheme();
+  const organization = useOrganization();
+  const location = useLocation();
+  const {selection} = usePageFilters();
+
+  const timeSeriesWithPlottable = timeseriesResults
+    .map(({timeSeries, seriesName, queryIndex}) => {
+      const widgetQuery = widget.queries[queryIndex];
+      if (!widgetQuery) {
+        return null;
+      }
+
+      const label = formatTimeSeriesLabelForWidgetQuery(timeSeries, widget, widgetQuery);
+      const plottable = createPlottableFromTimeSeriesAndWidget(
+        timeSeries,
+        widget,
+        label,
+        seriesName,
+        timeSeries.meta.isOther ? theme.tokens.dataviz.semantic.neutral : undefined
+      );
+      if (!plottable) {
+        return null;
+      }
+
+      // Match the timeseries to its corresponding table result by query index
+      const tableData = tableResults?.[queryIndex]?.data;
+
+      return [timeSeries, plottable, tableData, widgetQuery] satisfies [
+        TimeSeries,
+        Plottable,
+        TableDataWithTitle['data'] | undefined,
+        WidgetQuery,
+      ];
+    })
+    .filter(defined);
+
+  const renderTooltipSeriesDetails = useIncompleteBucketTooltipDetails(
+    timeSeriesWithPlottable.map(([timeSeries]) => timeSeries),
+    ingestion?.completeThrough
+  );
+
+  const plottableWithNeedsColor = timeSeriesWithPlottable.filter(
+    ([_, plottable]) => plottable.needsColor
+  ).length;
+
+  const colorPalette =
+    plottableWithNeedsColor > 0
+      ? theme.chart.getColorPalette(plottableWithNeedsColor - 1)
+      : [];
+
+  const showBreakdownData =
+    !isFullScreen &&
+    widget.legendType === 'breakdown' &&
+    usesTimeSeriesData(widget.displayType) &&
+    tableResults &&
+    tableResults.length > 0;
+
+  const footerTable = showBreakdownData ? (
+    <WidgetFooterTable>
+      {timeSeriesWithPlottable.map((series, index) => {
+        const [timeSeries, plottable, tableDataRows, widgetQuery] = series;
+        if (timeSeries.meta.isOther) {
+          return null;
+        }
+
+        // Linked dashboards and custom labels use the query's first grouping column.
+        const firstColumn = widgetQuery.columns[0];
+        const linkedDashboard = findLinkedDashboardForField(widgetQuery, firstColumn);
+        const yAxis = timeSeries.yAxis;
+        const firstColumnGroupByValue = timeSeries.groupBy?.find(
+          groupBy => groupBy.key === firstColumn
+        )?.value;
+
+        const value = tableDataRows
+          ? matchTimeSeriesToTableRowValue({
+              tableDataRows,
+              timeSeries,
+            })
+          : null;
+        const dataType = timeSeries.meta.valueType;
+        const dataUnit = timeSeries.meta.valueUnit ?? undefined;
+        const label = plottable?.label ?? timeSeries.yAxis;
+
+        const labelDisplay = renderBreakdownLabel(timeSeries, firstColumn, label);
+
+        let labelContent = <Text>{labelDisplay}</Text>;
+
+        if (
+          organization.features.includes('visibility-explore-view') &&
+          ((firstColumn &&
+            (firstColumnGroupByValue === null ||
+              typeof firstColumnGroupByValue === 'string')) ||
+            (!firstColumn && widgetQuery.seriesLabel === 'query')) &&
+          (widget.queries.length === 1 || widgetQuery.seriesLabel) &&
+          widget.widgetType === WidgetType.SPANS
+        ) {
+          const exploreQuery = new MutableSearch(widgetQuery.conditions);
+          for (const {key, value: groupByValue} of timeSeries.groupBy ?? []) {
+            if (groupByValue === null) {
+              exploreQuery.addFilterValue('!has', key);
+            } else if (Array.isArray(groupByValue)) {
+              exploreQuery.addFilterValues(key, groupByValue.map(String));
+            } else {
+              exploreQuery.addFilterValue(key, String(groupByValue));
+            }
+          }
+          const exploreUrl = getExploreUrl({
+            organization,
+            selection,
+            aggregateField: [
+              {chartType: getChartType(widget.displayType), yAxes: [yAxis]},
+            ],
+            query: applyDashboardFilters({
+              baseQuery: exploreQuery.formatString(),
+              dashboardFilters: withGlobalFilterFallback(
+                dashboardFilters,
+                widgetQuery.globalFilterFallback
+              ),
+              widgetType: widget.widgetType,
+            }),
+          });
+          labelContent = <Link to={exploreUrl}>{labelDisplay}</Link>;
+        }
+
+        if (
+          linkedDashboard &&
+          firstColumn &&
+          widget.widgetType &&
+          typeof firstColumnGroupByValue === 'string'
+        ) {
+          const linkedDashbordUrl = getLinkedDashboardUrl({
+            linkedDashboard,
+            organizationSlug: organization.slug,
+            field: firstColumn,
+            value: firstColumnGroupByValue,
+            widgetType: widget.widgetType,
+            dashboardFilters,
+            locationQuery: location.query,
+          });
+          if (linkedDashbordUrl) {
+            labelContent = <Link to={linkedDashbordUrl}>{labelDisplay}</Link>;
+          }
+        }
+
+        return (
+          <Fragment key={plottable.name}>
+            <Container>
+              <SeriesColorIndicator
+                style={{
+                  backgroundColor: colorPalette[index],
+                }}
+              />
+            </Container>
+            <Tooltip title={label} showOnlyOnOverflow>
+              {labelContent}
+            </Tooltip>
+            <TextAlignRight>
+              {dataType === 'currency' && value !== null && value < 0 ? (
+                <NegativeCostInfo cost={value} />
+              ) : (
+                formatBreakdownLegendValue(value, dataType, dataUnit)
+              )}
+            </TextAlignRight>
+          </Fragment>
+        );
+      })}
+    </WidgetFooterTable>
+  ) : null;
+
+  if (loading) {
+    return <TimeSeriesWidgetVisualization.LoadingPlaceholder />;
+  }
+
+  if (errorMessage) {
+    return <Widget.WidgetError error={errorMessage} />;
+  }
+
+  const timeseriesContainerPadding: ContainerProps = {
+    paddingLeft: 'xl',
+    paddingRight: 'xl',
+    paddingBottom: 'lg',
+  };
+
+  const plottables: Plottable[] = timeSeriesWithPlottable.map(
+    ([, plottable]) => plottable
+  );
+
+  if (
+    !navigationTypeSuppressesThresholds(dashboardFilters, organization) &&
+    (defined(widget.thresholds?.max_values?.max1) ||
+      defined(widget.thresholds?.max_values?.max2))
+  ) {
+    plottables.push(
+      new Thresholds({
+        thresholds: canScaleThresholds(widget)
+          ? scaleThresholdsToInterval(widget.thresholds, widgetInterval)
+          : widget.thresholds,
+        dataType: timeSeriesWithPlottable[0]?.[0]?.meta?.valueType,
+      })
+    );
+  }
+
+  // Check for empty plottables before rendering the visualization
+  // This prevents TimeSeriesWidgetVisualization from throwing an error
+  // that would get caught by ErrorBoundary and persist across filter changes
+  const hasNoPlottableData = !plottablesCanBeVisualized(plottables);
+
+  if (hasNoPlottableData) {
+    return <TimeSeriesWidgetVisualization.NoData />;
+  }
+
+  const confidenceFooter = showConfidenceWarning ? (
+    <WidgetCardConfidenceFooter
+      confidence={confidence}
+      dataScanned={dataScanned}
+      isSampled={isSampled}
+      loading={loading}
+      sampleCount={sampleCount}
+      series={timeseriesResults.map(({timeSeries}) => timeSeries)}
+      timeseriesResults={timeseriesResults}
+      widget={widget}
+      yAxis={widget.queries[0]?.aggregates[0] ?? ''}
+    />
+  ) : null;
+
+  if (showBreakdownData) {
+    return (
+      <Stack height="100%">
+        <Container overflow="hidden" flex={2} {...timeseriesContainerPadding}>
+          <TimeSeriesWidgetVisualization
+            plottables={plottables}
+            releases={releases}
+            showReleaseAs={showReleaseAs}
+            showLegend="never"
+            axisRange={widget.axisRange}
+            onZoom={onZoom}
+            legendSelection={legendSelection}
+            onLegendSelectionChange={onLegendSelectionChange}
+            renderTooltipSeriesDetails={renderTooltipSeriesDetails}
+          />
+        </Container>
+        <Container {...timeseriesContainerPadding}>{confidenceFooter}</Container>
+        <Stack flex={1} borderTop="primary" overflowY="auto">
+          <Container flex={1} width="100%">
+            {footerTable}
+          </Container>
+        </Stack>
+      </Stack>
+    );
+  }
+
+  return (
+    <Stack height="100%">
+      <Container flex={1} {...timeseriesContainerPadding}>
+        <TimeSeriesWidgetVisualization
+          plottables={plottables}
+          releases={releases}
+          showReleaseAs={showReleaseAs}
+          axisRange={widget.axisRange}
+          onZoom={onZoom}
+          legendSelection={legendSelection}
+          onLegendSelectionChange={onLegendSelectionChange}
+          renderTooltipSeriesDetails={renderTooltipSeriesDetails}
+        />
+      </Container>
+      <Container {...timeseriesContainerPadding}>{confidenceFooter}</Container>
+    </Stack>
+  );
+}
+
+/**
+ * Returns a custom label element for breakdown legend rows that need special rendering
+ * (e.g., model icons for AI model fields), or falls back to the plain text label.
+ * Any group by values other than the model are appended so rows stay distinguishable
+ * when the widget groups by more than one column.
+ */
+function renderBreakdownLabel(
+  timeSeries: TimeSeries,
+  firstColumn?: string,
+  fallbackLabel?: string
+): React.ReactNode {
+  const groupBy = timeSeries.groupBy ?? [];
+  const modelGroupBy = groupBy.find(group => group.key === firstColumn);
+
+  if (
+    typeof modelGroupBy?.value !== 'string' ||
+    (firstColumn !== SpanFields.GEN_AI_REQUEST_MODEL &&
+      firstColumn !== SpanFields.GEN_AI_RESPONSE_MODEL)
+  ) {
+    return fallbackLabel;
+  }
+
+  const otherGroupBy = groupBy.filter(group => group !== modelGroupBy);
+  const otherGroupByLabel =
+    otherGroupBy.length > 0
+      ? formatTimeSeriesLabel({...timeSeries, groupBy: otherGroupBy})
+      : '';
+
+  return (
+    <Flex align="center">
+      <ModelName modelId={modelGroupBy.value} size={14} />
+      {otherGroupByLabel && <Text variant="inherit">{`,${otherGroupByLabel}`}</Text>}
+    </Flex>
+  );
+}
+
+/**
+ * Decodes legend selection keys from `seriesName|~|widgetId` format to
+ * plain `seriesName` keys used by `TimeSeriesWidgetVisualization`.
+ */
+function decodeLegendSelection(encoded: LegendSelection): LegendSelection {
+  const decoded: LegendSelection = {};
+  for (const key in encoded) {
+    decoded[WidgetLegendNameEncoderDecoder.decodeSeriesNameForLegend(key, true)] =
+      encoded[key]!;
+  }
+  // remove any keys that are empty strings
+  const filteredSelections = Object.keys(decoded).reduce<LegendSelection>((acc, key) => {
+    if (key && decoded[key] !== undefined) {
+      acc[key] = decoded[key];
+    }
+    return acc;
+  }, {});
+
+  return filteredSelections;
+}
+
+/**
+ * Encodes legend selection keys from plain `seriesName` format back to
+ * `seriesName|~|widgetId` format used by `WidgetLegendSelectionState`.
+ */
+function encodeLegendSelection(
+  plain: LegendSelection,
+  widgetId: string | undefined
+): LegendSelection {
+  const encoded: LegendSelection = {};
+  for (const key in plain) {
+    encoded[WidgetLegendNameEncoderDecoder.encodeSeriesNameForLegend(key, widgetId)] =
+      plain[key]!;
+  }
+  return encoded;
+}

@@ -1,0 +1,240 @@
+import {Fragment, useState} from 'react';
+import {IconCheckmark} from '@sentry/icons/checkmark';
+import {IconClose} from '@sentry/icons/close';
+import {IconFlag} from '@sentry/icons/flag';
+import {IconMail} from '@sentry/icons/mail';
+import {IconSubtract} from '@sentry/icons/subtract';
+
+import {UserAvatar} from '@sentry/scraps/avatar';
+import {Button} from '@sentry/scraps/button';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import {Text} from '@sentry/scraps/text';
+
+import {Confirm} from 'sentry/components/confirm';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {OverrideOrDefault} from 'sentry/components/overrideOrDefault';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {t, tct} from 'sentry/locale';
+import type {Member, Organization} from 'sentry/types/organization';
+import type {AvatarUser} from 'sentry/types/user';
+import {isMemberDisabledFromLimit} from 'sentry/utils/isMemberDisabledFromLimit';
+import {capitalize} from 'sentry/utils/string/capitalize';
+
+type Props = {
+  canAddMembers: boolean;
+  canRemoveMembers: boolean;
+  currentUser: AvatarUser;
+  member: Member;
+  memberCanLeave: boolean;
+  onLeave: (member: Member) => void;
+  onRemove: (member: Member) => void;
+  onSendInvite: (member: Member) => void;
+  organization: Organization;
+  requireLink: boolean;
+  status: '' | 'loading' | 'success' | 'error' | null;
+};
+
+const DisabledMemberTooltip = OverrideOrDefault({
+  overrideName: 'component:disabled-member-tooltip',
+  defaultComponent: ({children}) => <Fragment>{children}</Fragment>,
+});
+
+function MemberRole({member}: {member: Member}) {
+  const {roleName, pending: isPending, expired} = member;
+  if (isMemberDisabledFromLimit(member)) {
+    return <DisabledMemberTooltip>{t('Deactivated')}</DisabledMemberTooltip>;
+  }
+  if (isPending) {
+    return (
+      <Flex align="center" gap="md">
+        <IconMail size="md" />
+        {expired ? t('Expired Invite') : tct('Invited [roleName]', {roleName})}
+      </Flex>
+    );
+  }
+  return <Fragment>{capitalize(member.orgRole)}</Fragment>;
+}
+
+export function OrganizationMemberRow({
+  member,
+  organization,
+  status,
+  requireLink,
+  memberCanLeave,
+  currentUser,
+  canRemoveMembers,
+  canAddMembers,
+  onLeave,
+  onRemove,
+  onSendInvite,
+}: Props) {
+  const [busy, setBusy] = useState(false);
+
+  const handleRemove = () => {
+    if (typeof onRemove !== 'function') {
+      return;
+    }
+
+    setBusy(true);
+    onRemove(member);
+  };
+
+  const handleLeave = () => {
+    if (typeof onLeave !== 'function') {
+      return;
+    }
+
+    setBusy(true);
+    onLeave(member);
+  };
+
+  const handleSendInvite = () => {
+    if (typeof onSendInvite !== 'function') {
+      return;
+    }
+    onSendInvite(member);
+  };
+
+  const {id, flags, email, name, pending, user, inviterName} = member;
+  const {access} = organization;
+
+  // if member is not the only owner, they can leave
+  const isIdpProvisioned = flags['idp:provisioned'];
+  const isPartnershipUser = flags['partnership:restricted'];
+  const needsSso = !flags['sso:linked'] && requireLink;
+  const isCurrentUser = currentUser.email === email;
+  const showRemoveButton = !isCurrentUser;
+  const showLeaveButton = isCurrentUser;
+  const isInviteFromCurrentUser = pending && inviterName === currentUser.name;
+  const canInvite = organization.allowMemberInvite && access.includes('member:invite');
+  // members can remove invites they sent if allowMemberInvite is true
+  const canEditInvite = canInvite && isInviteFromCurrentUser;
+  const canRemoveMember =
+    (canRemoveMembers && !isCurrentUser && !isIdpProvisioned && !isPartnershipUser) ||
+    canEditInvite;
+  // member has a `user` property if they are registered with sentry
+  // i.e. has accepted an invite to join org
+  const has2fa = user?.has2fa;
+  const detailsUrl = `/settings/${organization.slug}/members/${id}/`;
+  const isInviteSuccessful = status === 'success';
+  const isInviting = status === 'loading';
+  const showResendButton = pending || needsSso;
+
+  return (
+    <SimpleTable.Row data-test-id={email}>
+      <SimpleTable.RowCell gap="md">
+        <UserAvatar
+          size={32}
+          user={user ?? {email, id: email, name: email, type: 'user'}}
+        />
+        <Stack minWidth={0}>
+          <Text wordBreak="break-word">
+            <Link to={detailsUrl}>{name}</Link>
+          </Text>
+          <Text variant="muted" size="sm" wordBreak="break-word">
+            {email}
+          </Text>
+        </Stack>
+      </SimpleTable.RowCell>
+
+      <SimpleTable.RowCell data-test-id="member-role">
+        <MemberRole member={member} />
+      </SimpleTable.RowCell>
+
+      <SimpleTable.RowCell data-test-id="member-status">
+        {showResendButton ? (
+          <Fragment>
+            {isInviting && <LoadingIndicator mini />}
+            {isInviteSuccessful && t('Sent!')}
+            {!isInviting && !isInviteSuccessful && (
+              <Button
+                disabled={!canAddMembers && !canEditInvite}
+                variant="primary"
+                size="sm"
+                onClick={handleSendInvite}
+              >
+                {pending ? t('Resend invite') : t('Resend SSO link')}
+              </Button>
+            )}
+          </Fragment>
+        ) : (
+          <Flex align="center" gap="md">
+            {has2fa ? <IconCheckmark variant="success" /> : <IconFlag variant="danger" />}
+            {has2fa ? t('2FA Enabled') : t('2FA Not Enabled')}
+          </Flex>
+        )}
+      </SimpleTable.RowCell>
+
+      <SimpleTable.RowCell justify="end">
+        {showRemoveButton && canRemoveMember && (
+          <Confirm
+            message={tct('Are you sure you want to remove [name] from [orgName]?', {
+              name,
+              orgName: organization.slug,
+            })}
+            onConfirm={handleRemove}
+          >
+            <Button data-test-id="remove" icon={<IconSubtract />} size="sm" busy={busy}>
+              {t('Remove')}
+            </Button>
+          </Confirm>
+        )}
+
+        {showRemoveButton && !canRemoveMember && (
+          <Button
+            disabled
+            size="sm"
+            tooltipProps={{
+              title: isIdpProvisioned
+                ? t("This user is managed through your organization's identity provider.")
+                : isPartnershipUser
+                  ? t('You cannot make changes to this partner-provisioned user.')
+                  : // only show this message if member can remove invites but invite was not sent by them
+                    pending && canInvite && !isInviteFromCurrentUser
+                    ? t('You cannot modify this invite.')
+                    : t('You do not have access to remove members'),
+            }}
+            icon={<IconSubtract />}
+          >
+            {t('Remove')}
+          </Button>
+        )}
+
+        {showLeaveButton && memberCanLeave && (
+          <Confirm
+            message={tct('Are you sure you want to leave [orgName]?', {
+              orgName: organization.slug,
+            })}
+            onConfirm={handleLeave}
+          >
+            <Button variant="danger" size="sm" icon={<IconClose />}>
+              {t('Leave')}
+            </Button>
+          </Confirm>
+        )}
+
+        {showLeaveButton && !memberCanLeave && (
+          <Button
+            size="sm"
+            icon={<IconClose />}
+            disabled
+            tooltipProps={{
+              title: isIdpProvisioned
+                ? t(
+                    "Your account is managed through your organization's identity provider."
+                  )
+                : isPartnershipUser
+                  ? t('You cannot make changes as a partner-provisioned user.')
+                  : t(
+                      'You cannot leave this organization as you are the only organization owner.'
+                    ),
+            }}
+          >
+            {t('Leave')}
+          </Button>
+        )}
+      </SimpleTable.RowCell>
+    </SimpleTable.Row>
+  );
+}

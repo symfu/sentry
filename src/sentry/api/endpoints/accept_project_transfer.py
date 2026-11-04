@@ -1,80 +1,102 @@
+import logging
+from typing import cast
+
+from django.core.signing import BadSignature, SignatureExpired
 from django.http import Http404
 from django.utils.encoding import force_str
-from django.core.signing import BadSignature, SignatureExpired
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.authentication import SessionAuthentication
+from rest_framework.request import Request
 from rest_framework.response import Response
 
-from sentry import roles
-from sentry.api.base import Endpoint, SessionAuthentication
+from sentry import audit_log, roles
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import Endpoint, cell_silo_endpoint
 from sentry.api.decorators import sudo_required
+from sentry.api.helpers.deprecation import deprecated
+from sentry.api.permissions import SentryIsAuthenticated
 from sentry.api.serializers import serialize
 from sentry.api.serializers.models.organization import (
-    DetailedOrganizationSerializerWithProjectsAndTeams,
+    OrganizationWithProjectsAndTeamsSerializer,
 )
+from sentry.auth.principal import require_user
+from sentry.constants import CELL_API_DEPRECATION_DATE
+from sentry.core.endpoints.project_transfer import SALT
+from sentry.models.options.project_option import ProjectOption
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.signals import project_transferred
+from sentry.users.models.user import User
+from sentry.utils import metrics
 from sentry.utils.signing import unsign
-from sentry.models import (
-    AuditLogEntryEvent,
-    OrganizationMember,
-    Organization,
-    OrganizationStatus,
-    Team,
-    Project,
-)
+
+logger = logging.getLogger(__name__)
 
 
 class InvalidPayload(Exception):
     pass
 
 
+@cell_silo_endpoint
 class AcceptProjectTransferEndpoint(Endpoint):
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+        "POST": ApiPublishStatus.PRIVATE,
+    }
     authentication_classes = (SessionAuthentication,)
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (SentryIsAuthenticated,)
 
-    def get_validated_data(self, data, user):
+    def get_validated_data(self, data: str, user: User) -> tuple[dict[str, object], Project]:
         try:
-            data = unsign(force_str(data))
+            payload = cast(dict[str, object], unsign(force_str(data), salt=SALT))
         except SignatureExpired:
             raise InvalidPayload("Project transfer link has expired.")
         except BadSignature:
             raise InvalidPayload("Could not approve transfer, please make sure link is valid.")
 
-        if data["user_id"] != user.id:
+        if payload["user_id"] != user.id:
             raise InvalidPayload("Invalid permissions")
 
         try:
             project = Project.objects.get(
-                id=data["project_id"], organization_id=data["from_organization_id"]
+                id=cast(str | int, payload["project_id"]),
+                organization_id=cast(str | int, payload["from_organization_id"]),
             )
         except Project.DoesNotExist:
             raise InvalidPayload("Project no longer exists")
 
-        return data, project
+        expected_transaction_id = ProjectOption.objects.get_value(
+            project, "sentry:project-transfer-transaction-id"
+        )
+        if payload["transaction_id"] != expected_transaction_id:
+            raise InvalidPayload("Invalid transaction id")
+
+        return payload, project
 
     @sudo_required
-    def get(self, request):
+    @deprecated(CELL_API_DEPRECATION_DATE, url_names=["sentry-api-0-accept-project-transfer"])
+    def get(self, request: Request) -> Response:
+        if not request.user.is_authenticated:
+            return Response(status=400)
+        user = require_user(request)
+
         try:
             data = request.GET["data"]
         except KeyError:
             raise Http404
 
         try:
-            data, project = self.get_validated_data(data, request.user)
+            _payload, project = self.get_validated_data(data, user)
         except InvalidPayload as e:
             return Response({"detail": str(e)}, status=400)
 
-        organizations = Organization.objects.filter(
-            status=OrganizationStatus.ACTIVE,
-            id__in=OrganizationMember.objects.filter(
-                user=request.user, role=roles.get_top_dog().id
-            ).values_list("organization_id", flat=True),
-        )
+        organizations = Organization.objects.get_organizations_where_user_is_owner(user_id=user.id)
 
         return Response(
             {
                 "organizations": serialize(
                     list(organizations),
                     request.user,
-                    DetailedOrganizationSerializerWithProjectsAndTeams(),
+                    OrganizationWithProjectsAndTeamsSerializer(),
                     access=request.access,
                 ),
                 "project": {"slug": project.slug, "id": project.id},
@@ -82,77 +104,76 @@ class AcceptProjectTransferEndpoint(Endpoint):
         )
 
     @sudo_required
-    def post(self, request):
+    @deprecated(CELL_API_DEPRECATION_DATE, url_names=["sentry-api-0-accept-project-transfer"])
+    def post(self, request: Request) -> Response:
+        if not request.user.is_authenticated:
+            return Response(status=400)
+        user = require_user(request)
+
         try:
             data = request.data["data"]
         except KeyError:
             raise Http404
 
         try:
-            data, project = self.get_validated_data(data, request.user)
+            payload, project = self.get_validated_data(data, user)
         except InvalidPayload as e:
             return Response({"detail": str(e)}, status=400)
 
-        transaction_id = data["transaction_id"]
+        transaction_id = cast("int | str | None", payload["transaction_id"])
 
         org_slug = request.data.get("organization")
+        # DEPRECATED
         team_id = request.data.get("team")
 
-        if org_slug is not None and team_id is not None:
-            return Response(
-                {"detail": "Choose either a team or an organization, not both"}, status=400
-            )
+        if org_slug is None and team_id is not None:
+            metrics.incr("accept_project_transfer.post.to_team")
+            return Response({"detail": "Cannot transfer projects to a team."}, status=400)
 
-        if org_slug is None and team_id is None:
-            return Response(
-                {"detail": "Choose either a team or an organization to transfer the project to"},
-                status=400,
-            )
+        try:
+            organization = Organization.objects.get(slug=org_slug)
+        except Organization.DoesNotExist:
+            return Response({"detail": "Invalid organization"}, status=400)
 
-        if team_id:
-            try:
-                team = Team.objects.get(id=team_id)
-            except Team.DoesNotExist:
-                return Response({"detail": "Invalid team"}, status=400)
+        # check if user is an owner of the organization
+        is_org_owner = request.access.has_role_in_organization(
+            role=roles.get_top_dog().id, organization=organization, user_id=user.id
+        )
 
-            # check if user is an owner of the team's org
-            is_team_org_owner = OrganizationMember.objects.filter(
-                user__is_active=True,
-                user=request.user,
-                role=roles.get_top_dog().id,
-                organization_id=team.organization_id,
-            ).exists()
+        if not is_org_owner:
+            return Response({"detail": "Invalid organization"}, status=400)
 
-            if not is_team_org_owner:
-                return Response({"detail": "Invalid team"}, status=400)
+        old_organization = project.organization
+        project.transfer_to(organization=organization)
+        ProjectOption.objects.unset_value(project, "sentry:project-transfer-transaction-id")
 
-            project.transfer_to(team=team)
+        project.refresh_from_db()
 
-        if org_slug:
-            try:
-                organization = Organization.objects.get(slug=org_slug)
-            except Organization.DoesNotExist:
-                return Response({"detail": "Invalid organization"}, status=400)
+        project_transferred.send_robust(
+            old_org_id=old_organization.id,
+            project=project,
+            sender=self,
+        )
 
-            # check if user is an owner of the organization
-            is_org_owner = OrganizationMember.objects.filter(
-                user__is_active=True,
-                user=request.user,
-                role=roles.get_top_dog().id,
-                organization_id=organization.id,
-            ).exists()
-
-            if not is_org_owner:
-                return Response({"detail": "Invalid organization"}, status=400)
-
-            project.transfer_to(organization=organization)
+        logger.info(
+            "project_transferred",
+            extra={
+                "old_organization_id": old_organization.id,
+                "new_organization_id": organization.id,
+                "project_id": project.id,
+            },
+        )
 
         self.create_audit_entry(
             request=request,
             organization=project.organization,
             target_object=project.id,
-            event=AuditLogEntryEvent.PROJECT_ACCEPT_TRANSFER,
-            data=project.get_audit_log_data(),
+            event=audit_log.get_event_id("PROJECT_ACCEPT_TRANSFER"),
+            data={
+                "old_organization_slug": old_organization.slug,
+                "new_organization_slug": organization.slug,
+                "project_slug": project.slug,
+            },
             transaction_id=transaction_id,
         )
 

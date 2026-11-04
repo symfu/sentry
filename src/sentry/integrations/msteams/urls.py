@@ -1,22 +1,24 @@
-from django.conf.urls import url
+from django.urls import re_path
+
+from sentry.integrations.msteams.spec import MsTeamsMessagingSpec
+from sentry.integrations.msteams.views.configure_redirect import MsTeamsConfigureRedirectView
 
 from .webhook import MsTeamsWebhookEndpoint
-from sentry.web.frontend.msteams_extension_configuration import MsTeamsExtensionConfigurationView
-from .link_identity import MsTeamsLinkIdentityView
-from .unlink_identity import MsTeamsUnlinkIdentityView
-
 
 urlpatterns = [
-    url(r"^webhook/$", MsTeamsWebhookEndpoint.as_view()),
-    url(r"^configure/$", MsTeamsExtensionConfigurationView.as_view()),
-    url(
-        r"^link-identity/(?P<signed_params>[^\/]+)/$",
-        MsTeamsLinkIdentityView.as_view(),
-        name="sentry-integration-msteams-link-identity",
+    re_path(
+        r"^webhook/$",
+        MsTeamsWebhookEndpoint.as_view(),
+        name="sentry-integration-msteams-webhooks",
     ),
-    url(
-        r"^unlink-identity/(?P<signed_params>[^\/]+)/$",
-        MsTeamsUnlinkIdentityView.as_view(),
-        name="sentry-integration-msteams-unlink-identity",
+    # The Sentry-Teams bot card links here with `signed_params`. We forward
+    # those to the link view, which opens the install pipeline modal to finish
+    # the install.
+    re_path(
+        r"^configure/$",
+        MsTeamsConfigureRedirectView.as_view(),
+        name="sentry-integration-msteams-configure",
     ),
 ]
+
+urlpatterns += MsTeamsMessagingSpec().get_identity_view_set_url_patterns()

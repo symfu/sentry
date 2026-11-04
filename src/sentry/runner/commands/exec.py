@@ -1,4 +1,5 @@
 import sys
+
 import click
 
 # If this changes, make sure to also update in the `__doc__`
@@ -19,7 +20,7 @@ except Exception:
 )
 @click.option("-c", default="", help="Read script from string.")
 @click.argument("file", default=None, required=False)
-def exec_(c, file):
+def exec_(c: str, file: str | None) -> None:
     """
     Execute a script.
 
@@ -67,7 +68,7 @@ def exec_(c, file):
     header = []
 
     if "from __future__" in c:
-        body = []
+        body_lines = []
         state = 0
 
         for line in c.splitlines():
@@ -76,10 +77,10 @@ def exec_(c, file):
             elif line and not line.startswith(("#", '"', "'")) and state == 1:
                 state = 2
             if state == 2:
-                body.append(line)
+                body_lines.append(line)
             else:
                 header.append(line)
-        body = "\n".join(body)
+        body = "\n".join(body_lines)
     else:
         header = []
         body = c

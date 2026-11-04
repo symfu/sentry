@@ -1,3 +1,14 @@
+from __future__ import annotations
+
+import abc
+import logging
+from collections.abc import MutableMapping, Sequence
+from typing import Any, ClassVar, NamedTuple, Protocol
+
+from sentry.models.project import Project
+from sentry.notifications.types import NotificationActionContext, RuleFuture
+from sentry.services.eventstore.models import GroupEvent
+
 """
 Rules apply either before an event gets stored, or immediately after.
 
@@ -28,66 +39,51 @@ by the rule's logic. Each rule condition may be associated with a form.
 - [ACTION:I want to group events when] [RULE:an event matches [FORM]]
 """
 
-import logging
-
-from collections import namedtuple
 
 # Encapsulates a reference to the callback, including arguments. The `key`
 # attribute may be specifically used to key the callbacks when they are
 # collated during rule processing.
-CallbackFuture = namedtuple("CallbackFuture", ["callback", "kwargs", "key"])
+class RuleCallback(Protocol):
+    def __call__(self, event: GroupEvent, futures: Sequence[RuleFuture]) -> None: ...
 
 
-class RuleDescriptor(type):
-    def __new__(cls, *args, **kwargs):
-        new_cls = super().__new__(cls, *args, **kwargs)
-        new_cls.id = f"{new_cls.__module__}.{new_cls.__name__}"
-        return new_cls
+class CallbackFuture(NamedTuple):
+    callback: RuleCallback
+    kwargs: dict[str, Any]
+    key: str | None
 
 
-class RuleBase(metaclass=RuleDescriptor):
-    label = None
-    form_cls = None
-
+class RuleBase(abc.ABC):
     logger = logging.getLogger("sentry.rules")
 
-    def __init__(self, project, data=None, rule=None):
+    def __init__(
+        self,
+        project: Project,
+        data: MutableMapping[str, Any] | None = None,
+        context: NotificationActionContext | None = None,
+    ) -> None:
         self.project = project
         self.data = data or {}
         self.had_data = data is not None
-        self.rule = rule
+        self.context = context
 
-    def is_enabled(self):
+    id: ClassVar[str]
+    label: ClassVar[str]
+    rule_type: ClassVar[str]
+
+    def is_enabled(self) -> bool:
         return True
 
-    def get_option(self, key, default=None):
+    def get_option(self, key: str, default: str | None = None) -> Any:
         return self.data.get(key, default)
 
-    def get_form_instance(self):
-        if self.had_data:
-            data = self.data
-        else:
-            data = None
-        return self.form_cls(data)
-
-    def render_label(self):
+    def render_label(self) -> str:
         return self.label.format(**self.data)
 
-    def validate_form(self):
-        if not self.form_cls:
-            return True
-
-        form = self.get_form_instance()
-
-        return form.is_valid()
-
-    def future(self, callback, key=None, **kwargs):
+    def future(
+        self,
+        callback: RuleCallback,
+        key: str | None = None,
+        **kwargs: Any,
+    ) -> CallbackFuture:
         return CallbackFuture(callback=callback, key=key, kwargs=kwargs)
-
-
-class EventState:
-    def __init__(self, is_new, is_regression, is_new_group_environment, has_reappeared):
-        self.is_new = is_new
-        self.is_regression = is_regression
-        self.is_new_group_environment = is_new_group_environment
-        self.has_reappeared = has_reappeared

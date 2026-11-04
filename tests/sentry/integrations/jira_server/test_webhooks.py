@@ -1,167 +1,268 @@
+from unittest.mock import MagicMock, patch
+
 import jwt
 import responses
-
-from django.core.urlresolvers import reverse
-from exam import fixture
-from sentry.utils.compat.mock import patch
+from django.test import override_settings
 from requests.exceptions import ConnectionError
 
 from sentry.integrations.jira_server.integration import JiraServerIntegration
-from sentry.models import Integration, IdentityProvider, Identity, IdentityStatus
-from sentry.testutils import APITestCase
-from .testutils import EXAMPLE_PRIVATE_KEY
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.services.integration.serial import serialize_integration
+from sentry.integrations.utils.external_issue_key import PROVIDER_ISSUE_ID_KEY
+from sentry.models.group import Group
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.users.models.user import User
+from sentry.users.models.useremail import UserEmail
+from sentry.viewer_context import ActorType, ViewerContext, get_viewer_context
+
+from . import EXAMPLE_PAYLOAD, get_integration, link_group
 
 
 class JiraServerWebhookEndpointTest(APITestCase):
-    @fixture
-    def integration(self):
-        integration = Integration.objects.create(
-            provider="jira_server",
-            name="Example Jira",
-            metadata={
-                "verify_ssl": False,
-                "webhook_secret": "a long secret value",
-                "base_url": "https://jira.example.org",
-            },
-        )
-        identity_provider = IdentityProvider.objects.create(
-            external_id="jira.example.org:sentry-test", type="jira_server"
-        )
-        identity = Identity.objects.create(
-            idp=identity_provider,
-            user=self.user,
-            scopes=(),
-            status=IdentityStatus.VALID,
-            data={
-                "consumer_key": "sentry-test",
-                "private_key": EXAMPLE_PRIVATE_KEY,
-                "access_token": "access-token",
-                "access_token_secret": "access-token-secret",
-            },
-        )
-        integration.add_organization(self.organization, self.user, default_auth_id=identity.id)
-        return integration
+    endpoint = "sentry-extensions-jiraserver-issue-updated"
+    method = "post"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.integration = get_integration(self.organization, self.user)
 
     @property
-    def jwt_token(self):
-        integration = self.integration
-        return jwt.encode({"id": integration.external_id}, integration.metadata["webhook_secret"])
+    def jwt_token(self) -> str:
+        return jwt.encode(
+            {"id": self.integration.external_id}, self.integration.metadata["webhook_secret"]
+        )
 
-    def test_post_empty_token(self):
+    def test_post_empty_token(self) -> None:
         # Read the property to get side-effects in the database.
-        token = self.jwt_token
-        token = " "
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path)
+        _ = self.jwt_token
 
-        assert resp.status_code == 400
+        self.get_error_response(" ", status_code=400)
 
-    def test_post_token_missing_id(self):
+    def test_post_missing_default_identity(self) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            org_integration = OrganizationIntegration.objects.get(
+                organization_id=self.organization.id,
+                integration_id=self.integration.id,
+            )
+            org_integration.update(default_auth_id=None, config={"sync_status_reverse": True})
+
+        link_group(self.organization, self.integration, self.group)
+
+        with self.tasks():
+            self.get_success_response(self.jwt_token, **EXAMPLE_PAYLOAD)
+
+    def test_post_token_missing_id(self) -> None:
         integration = self.integration
         # No id key in the token
         token = jwt.encode({"no": integration.id}, integration.metadata["webhook_secret"])
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path)
+        self.get_error_response(token, status_code=400)
 
-        assert resp.status_code == 400
-
-    def test_post_token_missing_integration(self):
+    def test_post_token_missing_integration(self) -> None:
         integration = self.integration
         # Use the wrong id in the token.
         token = jwt.encode({"no": integration.id}, integration.metadata["webhook_secret"])
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path)
+        self.get_error_response(token, status_code=400)
 
-        assert resp.status_code == 400
-
-    def test_post_token_invalid_signature(self):
+    def test_post_token_invalid_signature(self) -> None:
         integration = self.integration
         # Use the wrong id in the token.
         token = jwt.encode({"id": integration.external_id}, "bad-secret")
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path)
+        self.get_error_response(token, status_code=400)
 
-        assert resp.status_code == 400
+    def test_post_issue_moved_rekeys_external_issue(self) -> None:
+        # Jira Server announces a project move the same way Jira Cloud does, so the
+        # linked `ExternalIssue` has to follow the new key here too.
+        link_group(self.organization, self.integration, self.group)
 
-    @patch("sentry.integrations.jira.webhooks.sync_group_assignee_inbound")
-    def test_post_update_assignee(self, mock_sync):
+        payload = {
+            "changelog": {
+                "items": [
+                    {
+                        "field": "project",
+                        "fieldtype": "jira",
+                        "from": "10000",
+                        "fromString": "APP",
+                        "to": "10001",
+                        "toString": "PLATFORM",
+                    },
+                    {
+                        "field": "Key",
+                        "fieldtype": "jira",
+                        "fromString": "APP-1",
+                        "toString": "PLATFORM-9",
+                    },
+                ],
+                "id": 12345,
+            },
+            "issue": {
+                "id": "10001",
+                "key": "PLATFORM-9",
+                "fields": {"updated": "2023-01-01T00:00:00.000+0000"},
+            },
+        }
+        self.get_success_response(self.jwt_token, **payload)
+
+        external_issue = ExternalIssue.objects.get(
+            organization_id=self.organization.id, integration_id=self.integration.id
+        )
+        assert external_issue.key == "PLATFORM-9"
+        assert external_issue.metadata[PROVIDER_ISSUE_ID_KEY] == "10001"
+
+    @patch("sentry.integrations.jira_server.utils.api.sync_group_assignee_inbound")
+    def test_post_update_assignee(self, mock_sync: MagicMock) -> None:
         project = self.create_project()
         self.create_group(project=project)
 
         payload = {
             "changelog": {"items": [{"field": "assignee"}], "id": 12345},
-            "issue": {"fields": {"assignee": {"emailAddress": "bob@example.org"}}, "key": "APP-1"},
+            "issue": {
+                "fields": {
+                    "assignee": {"emailAddress": "bob@example.org"},
+                    "updated": "2023-01-01T00:00:00.000+0000",
+                },
+                "key": "APP-1",
+            },
         }
-        token = self.jwt_token
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path, data=payload)
-        assert resp.status_code == 200
+        self.get_success_response(self.jwt_token, **payload)
+        rpc_integration = serialize_integration(self.integration)
 
-        mock_sync.assert_called_with(self.integration, "bob@example.org", "APP-1", assign=True)
+        mock_sync.assert_called_with(
+            rpc_integration,
+            "bob@example.org",
+            "APP-1",
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+        )
+
+    def test_changelog_without_items(self) -> None:
+        # The endpoint admits any truthy `changelog`, so one carrying no `items` reaches
+        # both handlers and must not blow them up.
+        self.get_success_response(
+            self.jwt_token,
+            **{"changelog": {"id": 12345}, "issue": {"key": "APP-1", "fields": {}}},
+        )
+
+    def _linked_group_for_assignee_sync(self) -> Group:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            OrganizationIntegration.objects.get(
+                organization_id=self.organization.id, integration_id=self.integration.id
+            ).update(config={"sync_reverse_assignment": True})
+
+        group = self.create_group(project=self.project)
+        link_group(self.organization, self.integration, group)
+        return group
+
+    def _create_jira_member(self, email: str) -> User:
+        member = self.create_user(email=email)
+        self.create_member(organization=self.organization, user=member, teams=[self.team])
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            UserEmail.objects.filter(user=member).update(is_verified=True)
+        return member
+
+    def _assignee_payload(self, assignee: dict[str, str] | None, updated: str) -> dict[str, object]:
+        return {
+            "changelog": {"items": [{"field": "assignee"}], "id": 12345},
+            "issue": {
+                "fields": {"assignee": assignee, "updated": updated},
+                "key": EXAMPLE_PAYLOAD["issue"]["key"],
+            },
+        }
+
+    def test_assignment_delivered_out_of_order_keeps_newer_assignee(self) -> None:
+        # The reassignment to bob happened after the one to alice, so it wins even though
+        # it was delivered first.
+        group = self._linked_group_for_assignee_sync()
+        self._create_jira_member("alice@example.org")
+        bob = self._create_jira_member("bob@example.org")
+
+        with self.feature("organizations:integrations-issue-sync"):
+            self.get_success_response(
+                self.jwt_token,
+                **self._assignee_payload(
+                    {"emailAddress": "bob@example.org"}, "2023-01-01T00:00:03.000+0000"
+                ),
+            )
+            self.get_success_response(
+                self.jwt_token,
+                **self._assignee_payload(
+                    {"emailAddress": "alice@example.org"}, "2023-01-01T00:00:00.000+0000"
+                ),
+            )
+
+        assignee = group.get_assignee()
+        assert assignee is not None
+        assert assignee.id == bob.id
+
+    def test_unassignment_delivered_out_of_order_stays_unassigned(self) -> None:
+        # Jira Server deassigns via a null `assignee` snapshot, on the same code path.
+        group = self._linked_group_for_assignee_sync()
+        self._create_jira_member("alice@example.org")
+
+        with self.feature("organizations:integrations-issue-sync"):
+            self.get_success_response(
+                self.jwt_token, **self._assignee_payload(None, "2023-01-01T00:00:03.000+0000")
+            )
+            self.get_success_response(
+                self.jwt_token,
+                **self._assignee_payload(
+                    {"emailAddress": "alice@example.org"}, "2023-01-01T00:00:00.000+0000"
+                ),
+            )
+
+        assert group.get_assignee() is None
 
     @patch.object(JiraServerIntegration, "sync_status_inbound")
-    def test_post_update_status(self, mock_sync):
+    def test_post_update_status(self, mock_sync: MagicMock) -> None:
         project = self.create_project()
         self.create_group(project=project)
 
-        payload = {
-            "changelog": {
-                "items": [
-                    {
-                        "from": "10101",
-                        "field": "status",
-                        "fromString": "In Progress",
-                        "to": "10102",
-                        "toString": "Done",
-                        "fieldtype": "jira",
-                        "fieldId": "status",
-                    }
-                ],
-                "id": 12345,
-            },
-            "issue": {"project": {"key": "APP", "id": "10000"}, "key": "APP-1"},
-        }
-        token = self.jwt_token
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path, data=payload)
-        assert resp.status_code == 200
+        self.get_success_response(self.jwt_token, **EXAMPLE_PAYLOAD)
 
         mock_sync.assert_called_with(
-            "APP-1", {"changelog": payload["changelog"]["items"][0], "issue": payload["issue"]}
+            "APP-1",
+            {
+                "changelog": EXAMPLE_PAYLOAD["changelog"]["items"][0],
+                "issue": EXAMPLE_PAYLOAD["issue"],
+                "provider_event_time": "2023-01-01T00:00:00.000+0000",
+            },
         )
 
+    @override_settings(SENTRY_VIEWER_CONTEXT_ENABLED=True)
+    @patch.object(JiraServerIntegration, "sync_status_inbound")
+    def test_post_update_status_sets_viewer_context(self, mock_sync: MagicMock) -> None:
+        captured_contexts: list[ViewerContext | None] = []
+
+        def capture_context(*args: object, **kwargs: object) -> None:
+            captured_contexts.append(get_viewer_context())
+
+        mock_sync.side_effect = capture_context
+
+        project = self.create_project()
+        self.create_group(project=project)
+
+        self.get_success_response(self.jwt_token, **EXAMPLE_PAYLOAD)
+
+        assert len(captured_contexts) == 1
+        vc = captured_contexts[0]
+        assert vc is not None
+        assert vc.organization_id == self.organization.id
+        assert vc.actor.type == ActorType.INTEGRATION
+
     @responses.activate
-    def test_post_update_status_token_error(self):
+    def test_post_update_status_token_error(self) -> None:
         responses.add(
             method=responses.GET,
             url="https://jira.example.org/rest/api/2/status",
             body=ConnectionError(),
         )
-        project = self.create_project()
-        self.create_group(project=project)
-        integration = self.integration
-        installation = integration.get_installation(self.organization.id)
+        group = self.create_group(self.project)
+        installation = self.integration.get_installation(self.organization.id)
         installation.update_organization_config({"sync_status_reverse": True})
 
-        payload = {
-            "changelog": {
-                "items": [
-                    {
-                        "from": "10101",
-                        "field": "status",
-                        "fromString": "In Progress",
-                        "to": "10102",
-                        "toString": "Done",
-                        "fieldtype": "jira",
-                        "fieldId": "status",
-                    }
-                ],
-                "id": 12345,
-            },
-            "issue": {"project": {"key": "APP", "id": "10000"}, "key": "APP-1"},
-        }
-        token = self.jwt_token
-        path = reverse("sentry-extensions-jiraserver-issue-updated", args=[token])
-        resp = self.client.post(path, data=payload)
+        link_group(self.organization, self.integration, group)
 
-        assert resp.status_code == 400
+        with self.tasks():
+            self.get_success_response(self.jwt_token, **EXAMPLE_PAYLOAD)

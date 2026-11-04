@@ -1,28 +1,33 @@
+from contextlib import AbstractContextManager
+from typing import TypedDict, cast
+from unittest import mock
 from uuid import uuid4
 
-from django.core.urlresolvers import reverse
-from contextlib import contextmanager
+import orjson
+from django.urls import reverse
+from sentry_relay.auth import generate_key_pair
 
-from sentry.utils import json
-from sentry.models import Relay
-from sentry.testutils import APITestCase
-
-from sentry_relay import generate_key_pair
+from sentry.auth import system
+from sentry.models.relay import Relay
+from sentry.testutils.cases import APITestCase
 
 
-@contextmanager
-def disable_internal_networks():
-    from sentry.auth import system
+class RelayInfo(TypedDict):
+    publicKey: str
+    internal: bool
 
-    old_internal_networks = system.INTERNAL_NETWORKS
-    system.INTERNAL_NETWORKS = ()
-    yield
-    # restore INTERNAL NETWORKS
-    system.INTERNAL_NETWORKS = old_internal_networks
+
+class RelayPublicKeysResponse(TypedDict):
+    public_keys: dict[str, str | None]
+    relays: dict[str, RelayInfo | None]
+
+
+def disable_internal_networks() -> AbstractContextManager[object]:
+    return mock.patch.object(system, "INTERNAL_NETWORKS", ())
 
 
 class RelayPublicKeysConfigTest(APITestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
 
         self.key_pair = generate_key_pair()
@@ -57,7 +62,7 @@ class RelayPublicKeysConfigTest(APITestCase):
         self.project = self.create_project()
         self.path = reverse("sentry-api-0-relay-publickeys")
 
-    def test_get_project_config_internal(self):
+    def test_get_project_config_internal(self) -> None:
         result = self._call_endpoint(self.internal_relay)
         legacy_keys = result["public_keys"]
         keys = result["relays"]
@@ -68,18 +73,17 @@ class RelayPublicKeysConfigTest(APITestCase):
         assert legacy_keys[self.non_existing_key] is None
 
         # check new results
-        relay_a_info = keys[self.relay_a.relay_id]
+        relay_a_info = cast(RelayInfo, keys[self.relay_a.relay_id])
         assert relay_a_info["publicKey"] == self.relay_a.public_key
         assert not relay_a_info["internal"]
 
-        relay_b_info = keys[self.relay_b.relay_id]
+        relay_b_info = cast(RelayInfo, keys[self.relay_b.relay_id])
         assert relay_b_info["publicKey"] == self.relay_b.public_key
         assert relay_b_info["internal"]
 
         assert keys[self.non_existing_key] is None
 
-    def test_get_project_config_external(self):
-
+    def test_get_project_config_external(self) -> None:
         with disable_internal_networks():
             result = self._call_endpoint(self.external_relay)
 
@@ -92,18 +96,17 @@ class RelayPublicKeysConfigTest(APITestCase):
         assert legacy_keys[self.non_existing_key] is None
 
         # check new results
-        relay_a_info = keys[self.relay_a.relay_id]
+        relay_a_info = cast(RelayInfo, keys[self.relay_a.relay_id])
         assert relay_a_info["publicKey"] == self.relay_a.public_key
         assert not relay_a_info["internal"]
 
-        relay_b_info = keys[self.relay_b.relay_id]
+        relay_b_info = cast(RelayInfo, keys[self.relay_b.relay_id])
         assert relay_b_info["publicKey"] == self.relay_b.public_key
         assert not relay_b_info["internal"]
 
         assert keys[self.non_existing_key] is None
 
-    def _call_endpoint(self, calling_relay):
-
+    def _call_endpoint(self, calling_relay: Relay) -> RelayPublicKeysResponse:
         raw_json, signature = self.private_key.pack(
             {
                 "relay_ids": [
@@ -122,5 +125,4 @@ class RelayPublicKeysConfigTest(APITestCase):
             HTTP_X_SENTRY_RELAY_SIGNATURE=signature,
         )
 
-        result = json.loads(resp.content)
-        return result
+        return orjson.loads(resp.content)

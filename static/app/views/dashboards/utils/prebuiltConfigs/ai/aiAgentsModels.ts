@@ -1,0 +1,194 @@
+import {t} from 'sentry/locale';
+import {FieldKind} from 'sentry/utils/fields';
+import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+import type {
+  PrebuiltDashboard,
+  PrebuiltWidget,
+} from 'sentry/views/dashboards/utils/prebuiltConfigs';
+import {
+  AI_AGENTS_MODELS_DASHBOARD_DESCRIPTION,
+  AI_AGENTS_MODELS_DASHBOARD_TITLE,
+} from 'sentry/views/dashboards/utils/prebuiltConfigs/ai/settings';
+import {WIDGET_COLUMN_LABELS} from 'sentry/views/dashboards/utils/prebuiltConfigs/settings';
+import {spaceWidgetsEquallyOnRow} from 'sentry/views/dashboards/utils/prebuiltConfigs/utils/spaceWidgetsEquallyOnRow';
+import {getAiClientSpansFilter} from 'sentry/views/insights/pages/agents/utils/query';
+import {SpanFields} from 'sentry/views/insights/types';
+
+const AI_GENERATIONS_FILTER = getAiClientSpansFilter();
+
+const FIRST_ROW_WIDGETS = spaceWidgetsEquallyOnRow(
+  [
+    {
+      id: 'ai-agents-model-cost',
+      title: t('Model Cost'),
+      description: t('Estimated cost of LLM calls, grouped by response model.'),
+      displayType: DisplayType.BAR,
+      widgetType: WidgetType.SPANS,
+      interval: '1h',
+      legendType: 'breakdown',
+      queries: [
+        {
+          name: '',
+          conditions: AI_GENERATIONS_FILTER,
+          fields: [
+            SpanFields.GEN_AI_RESPONSE_MODEL,
+            `sum(${SpanFields.GEN_AI_COST_TOTAL_TOKENS})`,
+          ],
+          aggregates: [`sum(${SpanFields.GEN_AI_COST_TOTAL_TOKENS})`],
+          columns: [SpanFields.GEN_AI_RESPONSE_MODEL],
+          fieldAliases: [t('Model'), t('Total Cost')],
+          orderby: `-sum(${SpanFields.GEN_AI_COST_TOTAL_TOKENS})`,
+        },
+      ],
+      limit: 3,
+    },
+    {
+      id: 'ai-agents-token-usage',
+      title: t('Tokens Used'),
+      description: t('Total tokens used by LLM calls, grouped by response model.'),
+      displayType: DisplayType.BAR,
+      widgetType: WidgetType.SPANS,
+      interval: '1h',
+      legendType: 'breakdown',
+      queries: [
+        {
+          name: '',
+          conditions: AI_GENERATIONS_FILTER,
+          fields: [
+            SpanFields.GEN_AI_RESPONSE_MODEL,
+            `sum(${SpanFields.GEN_AI_USAGE_TOTAL_TOKENS})`,
+          ],
+          aggregates: [`sum(${SpanFields.GEN_AI_USAGE_TOTAL_TOKENS})`],
+          columns: [SpanFields.GEN_AI_RESPONSE_MODEL],
+          fieldAliases: [t('Model'), t('Total Tokens')],
+          orderby: `-sum(${SpanFields.GEN_AI_USAGE_TOTAL_TOKENS})`,
+        },
+      ],
+      limit: 3,
+    },
+    {
+      id: 'ai-agents-token-types',
+      title: t('Token Types'),
+      description: t('Input, cached input, output, and reasoning tokens used over time.'),
+      displayType: DisplayType.AREA,
+      widgetType: WidgetType.SPANS,
+      interval: '1h',
+      legendType: 'breakdown',
+      queries: [
+        {
+          name: '',
+          conditions: AI_GENERATIONS_FILTER,
+          fields: [
+            `sum(${SpanFields.GEN_AI_USAGE_INPUT_TOKENS})`,
+            `sum(${SpanFields.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS})`,
+            `sum(${SpanFields.GEN_AI_USAGE_OUTPUT_TOKENS})`,
+            `sum(${SpanFields.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS})`,
+          ],
+          aggregates: [
+            `sum(${SpanFields.GEN_AI_USAGE_INPUT_TOKENS})`,
+            `sum(${SpanFields.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS})`,
+            `sum(${SpanFields.GEN_AI_USAGE_OUTPUT_TOKENS})`,
+            `sum(${SpanFields.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS})`,
+          ],
+          columns: [],
+          fieldAliases: [
+            t('Input Tokens'),
+            t('Cached Input Tokens'),
+            t('Output Tokens'),
+            t('Reasoning Tokens'),
+          ],
+          orderby: '',
+        },
+      ],
+    },
+  ],
+  0,
+  {h: 3, minH: 3}
+);
+
+const MODELS_TABLE: PrebuiltWidget = {
+  id: 'ai-agents-models-table',
+  title: t('Models'),
+  description: t(
+    'LLM requests, errors, duration, cost, and token usage by response model.'
+  ),
+  displayType: DisplayType.TABLE,
+  widgetType: WidgetType.SPANS,
+  interval: '1h',
+  queries: [
+    {
+      name: '',
+      conditions: AI_GENERATIONS_FILTER,
+      fields: [
+        SpanFields.GEN_AI_RESPONSE_MODEL,
+        'count()',
+        'equation|count_if(`span.status:internal_error`) + count_if(`span.status:error`)',
+        `avg(${SpanFields.SPAN_DURATION})`,
+        `p95(${SpanFields.SPAN_DURATION})`,
+        `sum(${SpanFields.GEN_AI_COST_TOTAL_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_INPUT_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_OUTPUT_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS})`,
+      ],
+      aggregates: [
+        'count()',
+        'equation|count_if(`span.status:internal_error`) + count_if(`span.status:error`)',
+        `avg(${SpanFields.SPAN_DURATION})`,
+        `p95(${SpanFields.SPAN_DURATION})`,
+        `sum(${SpanFields.GEN_AI_COST_TOTAL_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_INPUT_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_OUTPUT_TOKENS})`,
+        `sum(${SpanFields.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS})`,
+      ],
+      columns: [SpanFields.GEN_AI_RESPONSE_MODEL],
+      fieldAliases: [
+        t('Model'),
+        t('Requests'),
+        t('Errors'),
+        WIDGET_COLUMN_LABELS.avg,
+        WIDGET_COLUMN_LABELS.p95,
+        t('Cost'),
+        t('Input Tokens'),
+        t('Cached Input Tokens'),
+        t('Output Tokens'),
+        t('Reasoning Tokens'),
+      ],
+      orderby: '-count()',
+    },
+  ],
+  layout: {
+    x: 0,
+    y: 3,
+    w: 6,
+    h: 4,
+    minH: 2,
+  },
+};
+
+export const AI_AGENTS_MODELS_PREBUILT_CONFIG: PrebuiltDashboard = {
+  dateCreated: '',
+  projects: [],
+  title: AI_AGENTS_MODELS_DASHBOARD_TITLE,
+  description: AI_AGENTS_MODELS_DASHBOARD_DESCRIPTION,
+  filters: {
+    globalFilter: [
+      {
+        dataset: WidgetType.SPANS,
+        tag: {
+          key: SpanFields.GEN_AI_RESPONSE_MODEL,
+          name: SpanFields.GEN_AI_RESPONSE_MODEL,
+          kind: FieldKind.TAG,
+        },
+        value: '',
+      },
+    ],
+  },
+  widgets: [...FIRST_ROW_WIDGETS, MODELS_TABLE],
+  onboarding: {
+    type: 'custom',
+    componentId: 'agent-monitoring',
+    requiredProjectFlags: ['hasInsightsAgentMonitoring'],
+  },
+};

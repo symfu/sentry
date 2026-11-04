@@ -16,7 +16,7 @@
       {
         "name": "external_issue_id",
         "in": "path",
-        "description": "The id of the external issue.",
+        "description": "The ID of the external issue.",
         "required": true,
         "schema": {
           "type": "string"
@@ -32,11 +32,14 @@
       },
       "404": {
         "description": "External issue not found"
+      },
+      "409": {
+        "description": "This issue link is being updated. Try again."
       }
     },
     "security": [
       {
-        "auth_token": ["event:admin"]
+        "auth_token": ["event:write", "event:admin"]
       }
     ]
   }

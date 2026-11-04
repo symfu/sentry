@@ -1,0 +1,383 @@
+import type {SelectValue} from '@sentry/scraps/select';
+
+import type {Client} from 'sentry/api';
+import type {GetTagValues} from 'sentry/components/searchQueryBuilder';
+import type {FilterKeySection} from 'sentry/components/searchQueryBuilder/types';
+import type {PageFilters} from 'sentry/types/core';
+import type {Series} from 'sentry/types/echarts';
+import type {TagCollection} from 'sentry/types/group';
+import type {Organization} from 'sentry/types/organization';
+import type {CustomMeasurementCollection} from 'sentry/utils/customMeasurements/customMeasurements';
+import type {TableData} from 'sentry/utils/discover/discoverQuery';
+import type {MetaType} from 'sentry/utils/discover/eventView';
+import type {getFieldRenderer} from 'sentry/utils/discover/fieldRenderers';
+import type {QueryFieldValue} from 'sentry/utils/discover/fields';
+import type {DiscoverDatasets} from 'sentry/utils/discover/types';
+import type {EventsTimeSeriesResponse} from 'sentry/utils/timeSeries/useFetchEventsTimeSeries';
+import type {
+  DashboardFilters,
+  DisplayType,
+  Widget,
+  WidgetQuery,
+} from 'sentry/views/dashboards/types';
+import {WidgetType} from 'sentry/views/dashboards/types';
+import type {AxisRange} from 'sentry/views/dashboards/utils/axisRange';
+import type {WidgetTimeSeries} from 'sentry/views/dashboards/utils/transformTimeSeriesResponse';
+import type {HookWidgetQueryResult} from 'sentry/views/dashboards/widgetCard/genericWidgetQueries';
+import type {FieldValueOption} from 'sentry/views/discover/table/queryField';
+import type {FieldValue} from 'sentry/views/discover/table/types';
+import type {SamplingMode} from 'sentry/views/explore/hooks/useProgressiveQuery';
+
+import {ErrorsConfig} from './errors';
+import {IssuesConfig} from './issues';
+import {LogsConfig} from './logs';
+import {MobileAppSizeConfig} from './mobileAppSize';
+import {ReleasesConfig} from './releases';
+import {SpansConfig} from './spans';
+import {TraceMetricsConfig} from './traceMetrics';
+import {TransactionsConfig} from './transactions';
+
+export type WidgetBuilderSearchBarProps = {
+  getFilterWarning: ((key: string) => React.ReactNode) | undefined;
+  onClose: (value: string, additionalSearchBarState: {validSearch: boolean}) => void;
+  onSearch: (query: string) => void;
+  pageFilters: PageFilters;
+  widgetQuery: WidgetQuery;
+  dataset?: DiscoverDatasets;
+  disabled?: boolean;
+  index?: number;
+  portalTarget?: HTMLElement | null;
+};
+
+export type SearchBarDataProviderProps = {
+  pageFilters: PageFilters;
+  filterKeySearch?: string;
+  widgetQuery?: WidgetQuery;
+};
+
+export interface SearchBarData {
+  getFilterKeySections: () => FilterKeySection[];
+  getFilterKeys: () => TagCollection;
+  getTagValues: GetTagValues;
+  isFetchingFilterKeys?: boolean;
+}
+
+/**
+ * Parameters passed to hook-based query methods (useSeriesQuery/useTableQuery).
+ * These hooks handle fetching data for all widget queries at once.
+ */
+export type WidgetQueryParams = {
+  /**
+   * Whether the queries should be enabled.
+   */
+  enabled: boolean;
+  /**
+   * The organization context.
+   */
+  organization: Organization;
+  /**
+   * Page filters (projects, environments, datetime).
+   */
+  pageFilters: PageFilters;
+  /**
+   * The widget configuration containing all queries.
+   */
+  widget: Widget;
+  /**
+   * Optional pagination cursor.
+   */
+  cursor?: string;
+  /**
+   * Dashboard-level filters to apply to queries.
+   */
+  dashboardFilters?: DashboardFilters;
+  /**
+   * Optional result limit.
+   */
+  limit?: number;
+  /**
+   * Sampling mode for the queries.
+   */
+  samplingMode?: SamplingMode;
+  /**
+   * Skip adding parentheses around widget conditions when applying dashboard filters.
+   */
+  skipDashboardFilterParens?: boolean;
+  /**
+   * Optional user-selected interval override for timeseries queries.
+   */
+  widgetInterval?: string;
+};
+
+/**
+ * Parameters for the heat map query hook — the subset of `WidgetQueryParams`
+ * that applies to heat maps, plus `yBuckets` (the Y-axis bucket count derived
+ * from the rendered chart height).
+ */
+export type HeatmapWidgetQueryParams = Pick<
+  WidgetQueryParams,
+  | 'enabled'
+  | 'organization'
+  | 'pageFilters'
+  | 'widget'
+  | 'dashboardFilters'
+  | 'skipDashboardFilterParens'
+  | 'widgetInterval'
+  | 'samplingMode'
+> & {
+  yBuckets?: number;
+};
+
+export interface DatasetConfig<SeriesResponse, TableResponse> {
+  /**
+   * Dataset specific search bar for the 'Filter' step in the
+   * widget builder.
+   */
+  SearchBar: (props: WidgetBuilderSearchBarProps) => React.JSX.Element;
+  /**
+   * Default field to add to the widget query when adding a new field.
+   */
+  defaultField: QueryFieldValue;
+  /**
+   * Default query to display when dataset is selected in the
+   * Widget Builder.
+   */
+  defaultWidgetQuery: WidgetQuery;
+  /**
+   * Whether or not the current dataset supports adding equations.
+   */
+  enableEquations: boolean;
+  /**
+   * Field options to display in the Column selectors for
+   * Table display type.
+   */
+  getTableFieldOptions: (
+    organization: Organization,
+    tags?: TagCollection,
+    customMeasurements?: CustomMeasurementCollection,
+    api?: Client,
+    displayType?: DisplayType
+  ) => Record<string, SelectValue<FieldValue>>;
+  /**
+   * Generate the list of sort options for timeseries
+   * displays on the 'Sort by' step of the Widget Builder.
+   */
+  getTimeseriesSortOptions: (
+    organization: Organization,
+    widgetQuery: WidgetQuery,
+    tags?: TagCollection
+  ) => Record<string, SelectValue<FieldValue>>;
+  /**
+   * List of supported display types for dataset.
+   */
+  supportedDisplayTypes: DisplayType[];
+  /**
+   * Transforms table API results into format that is used by
+   * table and big number components.
+   */
+  transformTable: (
+    data: TableResponse,
+    widgetQuery: WidgetQuery,
+    organization: Organization,
+    pageFilters: PageFilters
+  ) => TableData;
+  /**
+   * Default Y-axis range for this dataset. Defaults to 'auto' if not set.
+   */
+  axisRange?: AxisRange;
+  /**
+   * Default field to use as the X-axis category for categorical bar charts.
+   * This should be a non-aggregate field name (e.g., 'transaction', 'browser').
+   */
+  defaultCategoryField?: string;
+  /**
+   * Default field to add to the widget query when adding a new field for series display type.
+   */
+  defaultSeriesField?: QueryFieldValue;
+  /**
+   * Default query to display when dataset is selected in the
+   * Widget Builder for series display type. Currently only used
+   * by the issues dataset.
+   */
+  defaultSeriesWidgetQuery?: WidgetQuery;
+  /**
+   * Configure enabling/disabling sort/direction options with an
+   * optional message for why it is disabled.
+   */
+  disableSortOptions?: (widgetQuery: WidgetQuery) => {
+    disableSort: boolean;
+    disableSortDirection: boolean;
+    disableSortReason?: string;
+  };
+  /**
+   * Filter the options available to the parameters list
+   * of an aggregate function in QueryField component on the
+   * Widget Builder.
+   */
+  filterAggregateParams?: (
+    option: FieldValueOption,
+    fieldValue?: QueryFieldValue
+  ) => boolean;
+  /**
+   * Refine the options available in the sort options for timeseries
+   * displays on the 'Sort by' step of the Widget Builder.
+   */
+  filterSeriesSortOptions?: (
+    columns: Set<string>
+  ) => (option: FieldValueOption) => boolean;
+  /**
+   * Filter the primary options available in a table widget
+   * columns on the Widget Builder.
+   */
+  filterTableOptions?: (option: FieldValueOption) => boolean;
+  /**
+   * Filter the options available to the parameters list
+   * of an aggregate function in QueryField component on the
+   * Widget Builder.
+   */
+  filterYAxisAggregateParams?: (
+    fieldValue: QueryFieldValue,
+    displayType: DisplayType
+  ) => (option: FieldValueOption) => boolean;
+  filterYAxisOptions?: (
+    displayType: DisplayType
+  ) => (option: FieldValueOption) => boolean;
+  /**
+   * Used to select custom renderers for field types.
+   */
+  getCustomFieldRenderer?: (
+    field: string,
+    meta: MetaType,
+    widget?: Widget,
+    organization?: Organization,
+    dashboardFilters?: DashboardFilters
+  ) => ReturnType<typeof getFieldRenderer>;
+  /**
+   * Generate field header used for mapping column
+   * names to more desirable values in tables.
+   */
+  getFieldHeaderMap?: (widgetQuery?: WidgetQuery) => Record<string, string>;
+  /**
+   * Field options to display in the Group by selector and the X axis selector
+   */
+  getGroupByFieldOptions?: (
+    organization: Organization,
+    tags?: TagCollection,
+    customMeasurements?: CustomMeasurementCollection,
+    api?: Client,
+    queries?: WidgetQuery[]
+  ) => Record<string, SelectValue<FieldValue>>;
+  /**
+   * Generate the list of sort options for table
+   * displays on the 'Sort by' step of the Widget Builder.
+   */
+  getTableSortOptions?: (
+    organization: Organization,
+    widgetQuery: WidgetQuery
+  ) => Array<SelectValue<string>>;
+  /**
+   * Apply dataset specific overrides to the logic that handles
+   * column updates for tables in the Widget Builder.
+   */
+  handleColumnFieldChangeOverride?: (widgetQuery: WidgetQuery) => WidgetQuery;
+  /**
+   * Called on column or y-axis change in the Widget Builder
+   * to reset the orderby of the widget query.
+   */
+  handleOrderByReset?: (widgetQuery: WidgetQuery, newFields: string[]) => WidgetQuery;
+  /**
+   * Transforms timeseries API results into series data that is
+   * ingestable by echarts for timeseries visualizations.
+   */
+  transformSeries?: (
+    data: SeriesResponse,
+    widgetQuery: WidgetQuery,
+    organization: Organization
+  ) => Series[];
+  /**
+   * Wraps each series from an `/events-timeseries/` response with the widget
+   * query it came from and its legend key, applying any dataset-specific tweaks.
+   */
+  transformTimeSeries?: (
+    data: EventsTimeSeriesResponse,
+    widget: Widget,
+    queryIndex: number
+  ) => WidgetTimeSeries[];
+  /**
+   * Hook-based approach for fetching heat map data. Heat maps fetch from a
+   * dedicated endpoint and need the rendered chart dimensions to size their
+   * X/Y buckets. Only datasets that expose `DisplayType.HEATMAP` in
+   * `supportedDisplayTypes` need to implement this.
+   */
+  useHeatmapQuery?: (params: HeatmapWidgetQueryParams) => HookWidgetQueryResult;
+  /**
+   * Data provider hook that provides methods
+   * to retrieve tags and values for the search bar.
+   */
+  useSearchBarDataProvider?: (props: SearchBarDataProviderProps) => SearchBarData;
+
+  /**
+   * Hook-based approach for fetching series data.
+   * Returns transformed data, raw responses for callbacks, and refetch function.
+   */
+  useSeriesQuery?: (params: WidgetQueryParams) => HookWidgetQueryResult;
+  /**
+   * Hook-based approach for fetching table data.
+   * Returns transformed data, raw responses for callbacks, and refetch function.
+   */
+  useTableQuery?: (params: WidgetQueryParams) => HookWidgetQueryResult;
+}
+
+export function getDatasetConfig<T extends WidgetType | undefined>(
+  widgetType: T
+): T extends WidgetType.ISSUE
+  ? typeof IssuesConfig
+  : T extends WidgetType.RELEASE
+    ? typeof ReleasesConfig
+    : T extends WidgetType.ERRORS
+      ? typeof ErrorsConfig
+      : T extends WidgetType.TRANSACTIONS
+        ? typeof TransactionsConfig
+        : T extends WidgetType.LOGS
+          ? typeof LogsConfig
+          : T extends WidgetType.SPANS
+            ? typeof SpansConfig
+            : T extends WidgetType.TRACEMETRICS
+              ? typeof TraceMetricsConfig
+              : T extends WidgetType.PREPROD_APP_SIZE
+                ? typeof MobileAppSizeConfig
+                : typeof ErrorsConfig;
+
+export function getDatasetConfig(widgetType?: WidgetType):
+  | typeof IssuesConfig
+  | typeof ReleasesConfig
+  /* eslint-disable @typescript-eslint/no-duplicate-type-constituents */
+  | typeof ErrorsConfig
+  | typeof TransactionsConfig
+  | typeof LogsConfig
+  | typeof SpansConfig
+  /* eslint-enable @typescript-eslint/no-duplicate-type-constituents */
+  | typeof TraceMetricsConfig
+  | typeof MobileAppSizeConfig {
+  switch (widgetType) {
+    case WidgetType.ISSUE:
+      return IssuesConfig;
+    case WidgetType.RELEASE:
+      return ReleasesConfig;
+    case WidgetType.TRANSACTIONS:
+      return TransactionsConfig;
+    case WidgetType.LOGS:
+      return LogsConfig;
+    case WidgetType.SPANS:
+      return SpansConfig;
+    case WidgetType.TRACEMETRICS:
+      return TraceMetricsConfig;
+    case WidgetType.PREPROD_APP_SIZE:
+      return MobileAppSizeConfig;
+    case WidgetType.ERRORS:
+    case undefined:
+      return ErrorsConfig;
+    default:
+      throw new Error(`Unsupported widget type: ${widgetType}`);
+  }
+}

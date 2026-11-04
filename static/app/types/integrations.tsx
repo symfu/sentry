@@ -1,0 +1,631 @@
+import type {AlertProps} from '@sentry/scraps/alert';
+
+import type {JsonFormAdapterFieldConfig} from 'sentry/components/backendJsonFormAdapter/types';
+import type {CodeReviewTrigger} from 'sentry/types/seer';
+import type {
+  DISABLED as DISABLED_STATUS,
+  INSTALLED,
+  NOT_INSTALLED,
+  PENDING,
+  PENDING_DELETION,
+} from 'sentry/views/settings/organizationIntegrations/constants';
+
+import type {Avatar, ObjectStatus, Scope} from './core';
+import type {ParsedOwnershipRule} from './ownership';
+import type {BaseRelease} from './release';
+import type {User} from './user';
+
+export type {
+  PermissionValue,
+  Permissions,
+  PermissionResource,
+} from 'sentry/types/permissions';
+
+export type ExternalActorMapping = {
+  externalName: string;
+  id: string;
+  sentryName: string;
+  teamId?: string;
+  userId?: string;
+};
+
+export type ExternalActorSuggestion = {
+  externalName: string;
+  teamId?: string;
+  userId?: string;
+};
+
+export type ExternalActorMappingOrSuggestion =
+  | ExternalActorMapping
+  | ExternalActorSuggestion;
+
+export type ExternalUser = {
+  externalName: string;
+  id: string;
+  integrationId: string;
+  memberId: string;
+  provider: string;
+};
+
+export type ExternalTeam = {
+  externalName: string;
+  id: string;
+  integrationId: string;
+  provider: string;
+  teamId: string;
+};
+
+/**
+ * Repositories, pull requests, and commits
+ */
+export enum RepositoryStatus {
+  ACTIVE = 'active',
+  DISABLED = 'disabled',
+  HIDDEN = 'hidden',
+  PENDING_DELETION = 'pending_deletion',
+  DELETION_IN_PROGRESS = 'deletion_in_progress',
+}
+
+export type Repository = {
+  dateCreated: string;
+  externalId: string;
+  externalSlug: string;
+  id: string;
+  integrationId: string;
+  name: string;
+  provider: {id: string; name: string};
+  status: RepositoryStatus;
+  url: string;
+};
+
+/**
+ * Available only when calling API with `expand=settings` query parameter
+ */
+export interface RepositoryWithSettings extends Repository {
+  settings: null | {
+    codeReviewTriggers: CodeReviewTrigger[];
+    enabledCodeReview: boolean;
+  };
+}
+
+export const DEFAULT_CODE_REVIEW_TRIGGERS: CodeReviewTrigger[] = ['on_ready_for_review'];
+
+/**
+ * Integration Repositories from OrganizationIntegrationReposEndpoint
+ */
+export type IntegrationRepository = {
+  externalId: string;
+  /**
+   * ex - getsentry/sentry
+   */
+  identifier: string;
+  isInstalled: boolean;
+  name: string;
+  defaultBranch?: string | null;
+  url?: string | null;
+};
+
+export type Commit = {
+  dateCreated: string;
+  id: string;
+  message: string | null;
+  releases: BaseRelease[];
+  author?: User;
+  pullRequest?: PullRequest | null;
+  repository?: Repository;
+  suspectCommitType?: string;
+};
+
+export type Committer = {
+  author: User;
+  commits: Commit[];
+  /**
+   * Primary key of the GroupOwner record that linked this committer to the issue.
+   * Used for suspect commit feedback analytics.
+   */
+  group_owner_id?: number;
+};
+
+export type CommitAuthor = {
+  email?: string;
+  name?: string;
+};
+
+export type PullRequestAuthor = User | CommitAuthor;
+
+export type CommitFile = {
+  author: CommitAuthor;
+  commitMessage: string;
+  filename: string;
+  id: string;
+  orgId: number;
+  repoName: string;
+  type: string;
+};
+
+export interface PullRequest {
+  dateCreated: string;
+  externalUrl: string;
+  id: string;
+  message: string | null;
+  repository: Repository;
+  title: string | null;
+  author?: CommitAuthor;
+}
+
+export type PullRequestStatus = 'merged' | 'open' | 'closed' | 'draft' | 'unknown';
+
+export type PullRequestAttributionAgent =
+  | 'cursor'
+  | 'github_copilot'
+  | 'claude_code'
+  | 'unknown';
+
+type SeerAttribution = {
+  id: 'seer';
+  type: 'seer';
+  agent?: PullRequestAttributionAgent | null;
+};
+
+export type PullRequestAttribution = SeerAttribution;
+
+export type PullRequestChecksStatus = 'success' | 'failure' | 'pending';
+
+export type PullRequestReviewStatus =
+  | 'approved'
+  | 'changes_requested'
+  | 'review_required';
+
+export type PullRequestFileChangeType =
+  | 'ADDED'
+  | 'CHANGED'
+  | 'COPIED'
+  | 'DELETED'
+  | 'MODIFIED'
+  | 'RENAMED';
+
+export interface LinkedPullRequest extends Omit<PullRequest, 'author'> {
+  attribution: PullRequestAttribution | null;
+  checksStatus: PullRequestChecksStatus | null;
+  dateLinked: string;
+  reviewStatus: PullRequestReviewStatus | null;
+  status: PullRequestStatus;
+  author?: PullRequestAuthor;
+}
+
+export interface LinkedPullRequestsResponse {
+  pullRequests: LinkedPullRequest[];
+  latestRegressionAt?: string | null;
+}
+
+/**
+ * Sentry Apps
+ */
+export type SentryAppStatus =
+  | 'unpublished'
+  | 'published'
+  | 'internal'
+  | 'publish_request_inprogress'
+  | 'deletion_in_progress';
+
+export type SentryAppSchemaIssueLink = {
+  create: {
+    required_fields: any[];
+    uri: string;
+    optional_fields?: any[];
+  };
+  link: {
+    required_fields: any[];
+    uri: string;
+    optional_fields?: any[];
+  };
+  type: 'issue-link';
+};
+
+export type SentryAppSchemaStacktraceLink = {
+  type: 'stacktrace-link';
+  uri: string;
+  url: string;
+  params?: string[];
+};
+
+type SentryAppSchemaAlertRuleAction = {
+  settings: SentryAppSchemaAlertRuleActionSettings;
+  title: string;
+  type: 'alert-rule-action';
+};
+
+type SentryAppSchemaAlertRuleActionSettings = {
+  description: string;
+  // a list of FormFields
+  required_fields: any[];
+  type: 'alert-rule-settings';
+  uri: string;
+  optional_fields?: any[];
+};
+
+export interface StacktraceLinkResult {
+  integrations: Integration[];
+  attemptedUrl?: string;
+  config?: RepositoryProjectPathConfigWithIntegration;
+  error?: StacktraceErrorMessage;
+  sourceUrl?: string;
+}
+
+type StacktraceErrorMessage =
+  | 'file_not_found'
+  | 'stack_root_mismatch'
+  | 'integration_link_forbidden';
+
+export type SentryAppSchemaElement =
+  | SentryAppSchemaIssueLink
+  | SentryAppSchemaAlertRuleAction
+  | SentryAppSchemaStacktraceLink;
+
+export type SentryApp = {
+  // Null for internal integrations, which have no author.
+  author: string | null;
+  events: WebhookEvent[];
+  featureData: IntegrationFeature[];
+  isAlertable: boolean;
+  name: string;
+  overview: string | null;
+  // possible null params
+  popularity: number | null;
+  redirectUrl: string | null;
+  schema: {
+    elements?: SentryAppSchemaElement[];
+  };
+  scopes: Scope[];
+  slug: string;
+  status: SentryAppStatus;
+  uuid: string;
+  verifyInstall: boolean;
+  // The stored subscriptions as exact event tokens, where `events` consolidates
+  // them to resource names.
+  webhookEvents: string[];
+  webhookUrl: string | null;
+  allowedOrigins?: string[];
+  avatars?: SentryAppAvatar[];
+  clientId?: string;
+  clientSecret?: string;
+  // optional params below
+  datePublished?: string;
+  owner?: {
+    id: number;
+    slug: string;
+  };
+  // Each entry is a "Header-Name: value" line. Saved values are masked by the API
+  webhookHeaders?: string[];
+};
+
+// Minimal Sentry App representation for use with avatars
+export type AvatarSentryApp = {
+  name: string;
+  slug: string;
+  uuid: string;
+  avatars?: Avatar[];
+};
+
+export type SentryAppInstallation = {
+  app: {
+    slug: string;
+    uuid: string;
+  };
+  organization: {
+    slug: string;
+  };
+  status: 'installed' | 'pending' | 'pending_deletion';
+  uuid: string;
+  code?: string;
+};
+
+export type SentryAppComponent<
+  Schema extends SentryAppSchemaStacktraceLink | SentryAppSchemaElement =
+    | SentryAppSchemaStacktraceLink
+    | SentryAppSchemaElement,
+> = {
+  installationUuid: string;
+  schema: Schema;
+  sentryApp: {
+    avatars: Avatar[];
+    name: string;
+    slug: string;
+    uuid: string;
+  };
+  type: 'issue-link' | 'alert-rule-action' | 'issue-media' | 'stacktrace-link';
+  uuid: string;
+  /**
+   * Empty string when the component prepared successfully
+   */
+  error?: '' | {context?: Record<string, unknown>; detail?: string};
+};
+
+export type SentryAppAvatar = Avatar & {
+  photoType: SentryAppAvatarPhotoType;
+};
+
+export type SentryAppAvatarPhotoType = 'icon' | 'logo';
+
+export type SentryAppWebhookRequest = {
+  date: string;
+  eventType: string;
+  responseCode: number;
+  sentryAppSlug: string;
+  webhookUrl: string;
+  durationMs?: number | null;
+  error_id?: string | null;
+  organization?: {
+    id: number;
+    name: string;
+    slug: string;
+  };
+  project_id?: number | null;
+  requestId?: string | null;
+  request_body?: string | null;
+  /**
+   * Values of custom headers are masked before they reach the buffer, so only
+   * the header names are meaningful for those.
+   */
+  request_headers?: Record<string, string> | null;
+  response_body?: string | null;
+  subjectId?: string | null;
+  subjectType?: string | null;
+};
+
+/**
+ * Organization Integrations
+ */
+export type IntegrationType = 'document' | 'plugin' | 'first_party' | 'sentry_app';
+
+export type IntegrationFeature = {
+  description: string;
+  featureGate: string;
+  featureId: number;
+};
+
+export type IntegrationInstallationStatus =
+  | typeof INSTALLED
+  | typeof NOT_INSTALLED
+  | typeof PENDING
+  | typeof DISABLED_STATUS
+  | typeof PENDING_DELETION;
+
+type IntegrationDialog = {
+  actionText: string;
+  body: string;
+};
+
+export type DocIntegration = {
+  author: string;
+  description: string;
+  isDraft: boolean;
+  name: string;
+  popularity: number;
+  slug: string;
+  url: string;
+  avatar?: Avatar;
+  features?: IntegrationFeature[];
+  resources?: Array<{title: string; url: string}>;
+};
+
+type IntegrationAspects = {
+  // This was previously passed to us
+  alerts?: Array<
+    unknown & {
+      text: string;
+      icon?: string | React.ReactNode;
+      variant?: AlertProps['variant'];
+    }
+  >;
+  configure_integration?: {
+    title: string;
+  };
+  directEnable?: boolean;
+  disable_dialog?: IntegrationDialog;
+  externalInstall?: {
+    buttonText: string;
+    noticeText: string;
+    url: string;
+  };
+  removal_dialog?: IntegrationDialog;
+};
+
+interface BaseIntegrationProvider {
+  canAdd: boolean;
+  canDisable: boolean;
+  features: string[];
+  key: string;
+  name: string;
+  slug: string;
+}
+
+export interface IntegrationProvider extends BaseIntegrationProvider {
+  metadata: {
+    aspects: IntegrationAspects;
+    author: string;
+    description: string;
+    features: IntegrationFeature[];
+    issue_url: string;
+    noun: string;
+    source_url: string;
+  };
+}
+
+interface OrganizationIntegrationProvider extends BaseIntegrationProvider {
+  aspects: IntegrationAspects;
+}
+
+interface CommonIntegration {
+  accountType: string | null;
+  domainName: string | null;
+  gracePeriodEnd: string | null;
+  icon: string | null;
+  id: string;
+  name: string;
+  organizationIntegrationStatus: ObjectStatus;
+  provider: OrganizationIntegrationProvider;
+  status: ObjectStatus;
+  /** GitHub only: feature tiers this installation is missing, oldest first. */
+  missingFeatures?: Array<{description: string; key: string; name: string}> | null;
+  outOfDate?: boolean | null;
+}
+
+export interface Integration extends CommonIntegration {
+  /** OAuth scopes from provider metadata. Always sent; null when unused (e.g. GitHub). */
+  scopes: string[] | null;
+  dynamicDisplayInformation?: {
+    configure_integration?: {
+      instructions: string[];
+    };
+    integration_detail?: {
+      uninstallationUrl?: string;
+    };
+  };
+  // Present on OrganizationIntegration; for GitHub this is the App installation id.
+  externalId?: string;
+}
+
+type ConfigData = Record<string, unknown> & {
+  installationType?: string;
+};
+
+export interface OrganizationIntegration extends Integration {
+  configData: ConfigData | null;
+  externalId: string;
+  organizationId: number;
+  /** Omitted when the list endpoint is fetched with includeConfig=0. */
+  configOrganization?: JsonFormAdapterFieldConfig[];
+}
+
+// we include the configOrganization when we need it
+export interface IntegrationWithConfig extends Integration {
+  configData: ConfigData;
+  configOrganization: JsonFormAdapterFieldConfig[];
+}
+
+/**
+ * Integration & External issue links
+ */
+export type IntegrationExternalIssue = {
+  description: string;
+  displayName: string;
+  id: string;
+  key: string;
+  title: string;
+  url: string;
+};
+
+export interface GroupIntegration extends Integration {
+  externalIssues: IntegrationExternalIssue[];
+}
+
+export type PlatformExternalIssue = {
+  displayName: string;
+  id: string;
+  issueId: string;
+  serviceType: string;
+  webUrl: string;
+};
+
+export type ExternalIssue = {
+  description: string;
+  displayName: string;
+  id: string;
+  integrationKey: string;
+  integrationName: string;
+  key: string;
+  title: string;
+};
+
+export type IntegrationIssueConfig = {
+  domainName: string;
+  icon: string[];
+  name: string;
+  provider: IntegrationProvider;
+  status: ObjectStatus;
+  createIssueConfig?: JsonFormAdapterFieldConfig[];
+  linkIssueConfig?: JsonFormAdapterFieldConfig[];
+};
+
+export type AppOrProviderOrPlugin = SentryApp | IntegrationProvider | DocIntegration;
+
+export type WebhookEvent = 'issue' | 'error' | 'comment' | 'seer' | 'preprod_artifact';
+
+/**
+ * Codeowners and repository path mappings.
+ */
+export type CodeOwner = {
+  codeMappingId: string;
+  /**
+   * Link to the CODEOWNERS file in source control
+   * 'unknown' if the api fails to fetch the file
+   */
+  codeOwnersUrl: string | 'unknown';
+  dateCreated: string;
+  dateSynced: string | null;
+  dateUpdated: string;
+  errors: {
+    missing_external_teams: string[];
+    missing_external_users: string[];
+    missing_user_emails: string[];
+    teams_without_access: string[];
+    users_without_access: string[];
+  };
+  id: string;
+  provider: 'github' | 'gitlab' | 'perforce';
+  raw: string;
+  codeMapping?: RepositoryProjectPathConfig;
+  ownershipSyntax?: string;
+  schema?: {rules: ParsedOwnershipRule[]; version: number};
+};
+
+export type CodeownersFile = {
+  filepath: string;
+  html_url: string;
+  raw: string;
+};
+
+type RepoName = string;
+type FileName = string;
+export type FilesByRepository = Record<
+  RepoName,
+  Record<
+    FileName,
+    {
+      authors?: Record<string, CommitAuthor>;
+      types?: Set<string>;
+    }
+  >
+>;
+
+interface BaseRepositoryProjectPathConfig {
+  automaticallyGenerated: boolean;
+  hasCodeOwner: boolean;
+  id: string;
+  projectId: string;
+  projectSlug: string;
+  repoId: string;
+  repoName: string;
+  sourceRoot: string;
+  stackRoot: string;
+  defaultBranch?: string;
+}
+
+export interface RepositoryProjectPathConfig extends BaseRepositoryProjectPathConfig {
+  integrationId: string | null;
+  provider: BaseIntegrationProvider | null;
+}
+
+interface RepositoryProjectPathConfigWithIntegration extends BaseRepositoryProjectPathConfig {
+  integrationId: string;
+  provider: BaseIntegrationProvider;
+}
+
+export type ServerlessFunction = {
+  enabled: boolean;
+  name: string;
+  outOfDate: boolean;
+  runtime: string;
+  version: number;
+};

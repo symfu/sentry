@@ -1,0 +1,174 @@
+import {renderWithOnboardingLayout} from 'sentry-test/onboarding/renderWithOnboardingLayout';
+import {screen} from 'sentry-test/reactTestingLibrary';
+import {textWithMarkupMatcher} from 'sentry-test/utils';
+
+import {ProductSolution} from 'sentry/components/onboarding/gettingStartedDoc/types';
+
+import {CloudflareSetupType} from './utils';
+import {docs} from '.';
+
+describe('cloudflare onboarding docs', () => {
+  it('renders onboarding docs correctly', () => {
+    renderWithOnboardingLayout(docs);
+
+    // Renders main headings
+    expect(screen.getByRole('heading', {name: 'Install'})).toBeInTheDocument();
+    expect(screen.getByRole('heading', {name: 'Configure SDK'})).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', {name: /Upload Source Maps/i})
+    ).toBeInTheDocument();
+    expect(screen.getByRole('heading', {name: 'Verify'})).toBeInTheDocument();
+  });
+
+  it('sets up the Vite plugin by default', () => {
+    renderWithOnboardingLayout(docs);
+
+    expect(
+      screen.getByText(
+        textWithMarkupMatcher(
+          /import \{ sentryCloudflareVitePlugin \} from "@sentry\/cloudflare\/vite"/
+        )
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        textWithMarkupMatcher(/export default defineCloudflareOptions\(\(env\) => \(\{/)
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(textWithMarkupMatcher(/Sentry\.withSentry\(/))
+    ).not.toBeInTheDocument();
+  });
+
+  it('wraps the handler manually when the manual setup type is selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedOptions: {setupType: CloudflareSetupType.MANUAL},
+    });
+
+    expect(
+      screen.getByText(textWithMarkupMatcher(/Sentry\.withSentry\(/))
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        textWithMarkupMatcher(/import \* as Sentry from "@sentry\/cloudflare"/)
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(textWithMarkupMatcher(/sentryCloudflareVitePlugin/))
+    ).not.toBeInTheDocument();
+  });
+
+  it('sets up Pages middleware when the pages setup type is selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedOptions: {setupType: CloudflareSetupType.PAGES},
+    });
+
+    expect(
+      screen.getByText(textWithMarkupMatcher(/Sentry\.sentryPagesPlugin\(/))
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(textWithMarkupMatcher(/sentryCloudflareVitePlugin/))
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(textWithMarkupMatcher(/Sentry\.withSentry\(/))
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('link', {name: 'migrate to Workers'})).toBeInTheDocument();
+  });
+
+  it('tells Pages users where to put and how to trigger the verify snippet', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedOptions: {setupType: CloudflareSetupType.PAGES},
+    });
+
+    expect(
+      screen.getByText(
+        textWithMarkupMatcher(
+          /Add it to a functions\/customerror\.js file, then access the \/customerror path/
+        )
+      )
+    ).toBeInTheDocument();
+  });
+
+  it('displays sample rates by default', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [
+        ProductSolution.ERROR_MONITORING,
+        ProductSolution.PERFORMANCE_MONITORING,
+      ],
+    });
+
+    expect(
+      screen.getByText(textWithMarkupMatcher(/tracesSampleRate/))
+    ).toBeInTheDocument();
+  });
+
+  it('displays logs integration next step when logs are selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [ProductSolution.ERROR_MONITORING, ProductSolution.LOGS],
+    });
+
+    expect(screen.getByText('Logging Integrations')).toBeInTheDocument();
+  });
+
+  it('does not display logs integration next step when logs are not selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [ProductSolution.ERROR_MONITORING],
+    });
+
+    expect(screen.queryByText('Logging Integrations')).not.toBeInTheDocument();
+  });
+
+  it('displays logging code in verify section when logs are selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [ProductSolution.ERROR_MONITORING, ProductSolution.LOGS],
+    });
+
+    expect(
+      screen.getByText(
+        textWithMarkupMatcher(/Sentry\.logger\.info\('User triggered test error'/)
+      )
+    ).toBeInTheDocument();
+  });
+
+  it('does not display logging code in verify section when logs are not selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [ProductSolution.ERROR_MONITORING],
+    });
+
+    expect(
+      screen.queryByText(
+        textWithMarkupMatcher(/Sentry\.logger\.info\('User triggered test error'/)
+      )
+    ).not.toBeInTheDocument();
+  });
+
+  it('displays cloudflare features next step', () => {
+    renderWithOnboardingLayout(docs);
+
+    expect(screen.getByText('Cloudflare Features')).toBeInTheDocument();
+  });
+
+  it('displays metrics code in verify section when metrics are selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [ProductSolution.ERROR_MONITORING, ProductSolution.METRICS],
+    });
+
+    expect(
+      screen.getByText(
+        textWithMarkupMatcher(/Sentry\.metrics\.count\('test_counter', 1\)/)
+      )
+    ).toBeInTheDocument();
+  });
+
+  it('does not display metrics code in verify section when metrics are not selected', () => {
+    renderWithOnboardingLayout(docs, {
+      selectedProducts: [ProductSolution.ERROR_MONITORING],
+    });
+
+    expect(
+      screen.queryByText(
+        textWithMarkupMatcher(/Sentry\.metrics\.count\('test_counter', 1\)/)
+      )
+    ).not.toBeInTheDocument();
+  });
+});

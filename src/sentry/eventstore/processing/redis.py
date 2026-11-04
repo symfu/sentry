@@ -1,15 +1,4 @@
-import logging
+# Shim for backward compatibility with getsentry
+# The eventstore module has been moved to sentry.services.eventstore
 
-from .base import BaseEventProcessingStore
-from sentry.cache.redis import RedisClusterCache
-
-logger = logging.getLogger(__name__)
-
-
-class RedisClusterEventProcessingStore(BaseEventProcessingStore):
-    """
-    Processing store implementation using the redis cluster cache as a backend.
-    """
-
-    def __init__(self, **options):
-        super().__init__(inner=RedisClusterCache(**options))
+from sentry.services.eventstore.processing.redis import *  # noqa: F401, F403

@@ -1,63 +1,76 @@
-import responses
+from collections.abc import Mapping
+from functools import cached_property
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
+
+import orjson
 import pytest
+import responses
+from requests import PreparedRequest
 
-from exam import fixture
-
-
-from sentry.shared_integrations.exceptions import IntegrationError
+from fixtures.gitlab import COMMIT_DIFF_RESPONSE, COMMIT_LIST_RESPONSE, COMPARE_RESPONSE
+from sentry.constants import ObjectStatus
 from sentry.integrations.gitlab.repository import GitlabRepositoryProvider
-from sentry.models import Identity, IdentityProvider, Integration, PullRequest, Repository
-from sentry.testutils import IntegrationRepositoryTestCase
+from sentry.integrations.gitlab.tasks import update_all_project_webhooks
+from sentry.integrations.services.repository.serial import serialize_repository
+from sentry.models.pullrequest import PullRequest
+from sentry.models.repository import Repository
+from sentry.organizations.services.organization.serial import serialize_rpc_organization
+from sentry.shared_integrations.exceptions import IntegrationError
+from sentry.silo.base import SiloMode
 from sentry.testutils.asserts import assert_commit_shape
-from sentry.utils import json
-
-from .testutils import COMPARE_RESPONSE, COMMIT_LIST_RESPONSE, COMMIT_DIFF_RESPONSE
+from sentry.testutils.cases import IntegrationRepositoryTestCase
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.users.models.identity import Identity
 
 
 class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
     provider_name = "integrations:gitlab"
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
-        self.integration = Integration.objects.create(
-            provider="gitlab",
-            name="Example GitLab",
-            external_id="example.gitlab.com:getsentry",
-            metadata={
-                "instance": "example.gitlab.com",
-                "domain_name": "example.gitlab.com/getsentry",
-                "verify_ssl": False,
-                "base_url": "https://example.gitlab.com",
-                "webhook_secret": "secret-token-value",
-            },
-        )
-        identity = Identity.objects.create(
-            idp=IdentityProvider.objects.create(type="gitlab", config={}, external_id="1234567890"),
-            user=self.user,
-            external_id="example.gitlab.com:4",
-            data={"access_token": "1234567890"},
-        )
-        self.integration.add_organization(self.organization, self.user, identity.id)
-        self.integration.get_provider().setup()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.integration = self.create_provider_integration(
+                provider="gitlab",
+                name="Example GitLab",
+                external_id="example.gitlab.com:getsentry",
+                metadata={
+                    "instance": "example.gitlab.com",
+                    "domain_name": "example.gitlab.com/getsentry",
+                    "verify_ssl": False,
+                    "base_url": "https://example.gitlab.com",
+                    "webhook_secret": "secret-token-value",
+                },
+            )
+            identity = Identity.objects.create(
+                idp=self.create_identity_provider(
+                    type="gitlab", config={}, external_id="1234567890"
+                ),
+                user=self.user,
+                external_id="example.gitlab.com:4",
+                data={"access_token": "1234567890"},
+            )
+            self.integration.add_organization(self.organization, self.user, identity.id)
+            self.integration.get_provider().setup()
 
-        self.default_repository_config = {
-            "path_with_namespace": "getsentry/example-repo",
-            "name_with_namespace": "Get Sentry / Example Repo",
-            "path": "example-repo",
-            "id": "123",
-            "web_url": "https://example.gitlab.com/getsentry/projects/example-repo",
-        }
-        self.gitlab_id = 123
+            self.default_repository_config = {
+                "path_with_namespace": "getsentry/example-repo",
+                "name_with_namespace": "Get Sentry / Example Repo",
+                "path": "example-repo",
+                "id": "123",
+                "web_url": "https://example.gitlab.com/getsentry/projects/example-repo",
+            }
+            self.gitlab_id = 123
 
-    @fixture
-    def provider(self):
+    @cached_property
+    def provider(self) -> GitlabRepositoryProvider:
         return GitlabRepositoryProvider("gitlab")
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         super().tearDown()
         responses.reset()
 
-    def add_create_repository_responses(self, repository_config):
+    def add_create_repository_responses(self, repository_config: Mapping[str, Any]) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s" % self.gitlab_id,
@@ -69,11 +82,17 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             json={"id": 99},
         )
 
-    def assert_repository(self, repository_config, organization_id=None):
+    @assume_test_silo_mode(SiloMode.CELL)
+    def get_repository(self, **kwargs: Any) -> Repository:
+        return Repository.objects.get(**kwargs)
+
+    def assert_repository(
+        self, repository_config: dict[str, Any], organization_id: int | None = None
+    ) -> None:
         instance = self.integration.metadata["instance"]
 
         external_id = "{}:{}".format(instance, repository_config["id"])
-        repo = Repository.objects.get(
+        repo = self.get_repository(
             organization_id=organization_id or self.organization.id,
             provider=self.provider_name,
             external_id=external_id,
@@ -89,15 +108,17 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
         }
 
     @responses.activate
-    def test_create_repository(self):
+    @patch("sentry.integrations.gitlab.client.metrics.incr")
+    def test_create_repository(self, incr: MagicMock) -> None:
         response = self.create_repository(self.default_repository_config, self.integration.id)
         assert response.status_code == 201
         self.assert_repository(self.default_repository_config)
+        incr.assert_any_call("gitlab.project_webhook.reconcile", tags={"outcome": "created"})
 
     @responses.activate
-    def test_create_repository_verify_payload(self):
-        def request_callback(request):
-            payload = json.loads(request.body)
+    def test_create_repository_verify_payload(self) -> None:
+        def request_callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            payload = orjson.loads(cast(bytes, request.body))
             assert "url" in payload
             assert payload["push_events"]
             assert payload["merge_requests_events"]
@@ -106,7 +127,7 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             )
             assert payload["token"] == expected_token
 
-            return (201, {}, json.dumps({"id": 99}))
+            return 201, {}, orjson.dumps({"id": 99}).decode()
 
         responses.add_callback(
             responses.POST,
@@ -117,8 +138,220 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
         assert response.status_code == 201
         self.assert_repository(self.default_repository_config)
 
+    @assume_test_silo_mode(SiloMode.CELL)
+    def relink_repository(self, repo: Repository) -> None:
+        """Replay what the repo sync does when it reattaches an already-linked repository."""
+        self.provider.on_create_repository(
+            serialize_repository(repo), serialize_rpc_organization(self.organization)
+        )
+
+    def add_relink_responses(
+        self, update_status: int, alert_status: str | None = None, delete_status: int = 204
+    ) -> None:
+        hook: dict[str, int | str] = {"id": 99}
+        if alert_status:
+            hook["alert_status"] = alert_status
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks/99" % self.gitlab_id,
+            status=update_status,
+            json=hook,
+        )
+        responses.add(
+            responses.DELETE,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks/99" % self.gitlab_id,
+            status=delete_status,
+        )
+        responses.add(
+            responses.POST,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks" % self.gitlab_id,
+            json={"id": 100},
+        )
+
     @responses.activate
-    def test_create_repository_request_invalid_url(self):
+    def test_on_create_repository_relink_updates_webhook(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        responses.reset()
+
+        def request_callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            payload = orjson.loads(cast(bytes, request.body))
+            assert "url" in payload
+            assert payload["push_events"]
+            assert payload["merge_requests_events"]
+            expected_token = "{}:{}".format(
+                self.integration.external_id, self.integration.metadata["webhook_secret"]
+            )
+            assert payload["token"] == expected_token
+
+            return 200, {}, orjson.dumps({"id": 99}).decode()
+
+        responses.add_callback(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks/99" % self.gitlab_id,
+            callback=request_callback,
+        )
+        responses.add(
+            responses.POST,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks" % self.gitlab_id,
+            json={"id": 100},
+        )
+
+        repo = self.get_repository(pk=response.data["id"])
+        with (
+            patch("sentry.integrations.gitlab.client.metrics.incr") as incr,
+            patch(
+                "sentry.integrations.gitlab.repository.repository_service.update_repository"
+            ) as update,
+        ):
+            self.relink_repository(repo)
+        update.assert_not_called()
+        incr.assert_any_call("gitlab.project_webhook.reconcile", tags={"outcome": "updated"})
+
+        assert [call.request.method for call in responses.calls] == ["PUT"]
+        # An install-triggered task may run after sync has already repaired the hook.
+        with assume_test_silo_mode(SiloMode.CELL), self.tasks():
+            update_all_project_webhooks(
+                integration_id=self.integration.id, organization_id=self.organization.id
+            )
+        assert [call.request.method for call in responses.calls] == ["PUT", "PUT"]
+        assert self.get_repository(pk=repo.id).config["webhook_id"] == 99
+
+    @responses.activate
+    def test_on_create_repository_relink_recreates_missing_webhook(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        responses.reset()
+        self.add_relink_responses(update_status=404)
+
+        repo = self.get_repository(pk=response.data["id"])
+        self.relink_repository(repo)
+
+        assert [call.request.method for call in responses.calls] == ["PUT", "POST"]
+        assert self.get_repository(pk=repo.id).config["webhook_id"] == 100
+
+    def _on_create_repository_relink_discards_hook_when_repository_disabled(
+        self, delete_status: int
+    ) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        repo = self.get_repository(pk=response.data["id"])
+        responses.reset()
+
+        def create(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            with assume_test_silo_mode(SiloMode.CELL):
+                Repository.objects.filter(id=repo.id).update(status=ObjectStatus.DISABLED)
+            return 201, {}, '{"id": 100}'
+
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks/99" % self.gitlab_id,
+            status=404,
+        )
+        responses.add_callback(
+            responses.POST,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks" % self.gitlab_id,
+            callback=create,
+        )
+        responses.add(
+            responses.DELETE,
+            "https://example.gitlab.com/api/v4/projects/%s/hooks/100" % self.gitlab_id,
+            status=delete_status,
+        )
+
+        self.relink_repository(repo)
+
+        assert [call.request.method for call in responses.calls] == ["PUT", "POST", "DELETE"]
+        repo = self.get_repository(pk=repo.id)
+        assert repo.status == ObjectStatus.DISABLED
+        assert repo.config["webhook_id"] == 99
+
+    @responses.activate
+    def test_on_create_repository_relink_discards_hook_when_repository_disabled(self) -> None:
+        self._on_create_repository_relink_discards_hook_when_repository_disabled(delete_status=204)
+
+    @responses.activate
+    def test_on_create_repository_relink_discards_hook_when_repository_disabled_and_cleanup_fails(
+        self,
+    ) -> None:
+        self._on_create_repository_relink_discards_hook_when_repository_disabled(delete_status=500)
+
+    @responses.activate
+    def test_on_create_repository_relink_update_failure_creates_no_duplicate(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        responses.reset()
+        self.add_relink_responses(update_status=500)
+
+        repo = self.get_repository(pk=response.data["id"])
+        with pytest.raises(IntegrationError):
+            self.relink_repository(repo)
+
+        assert [call.request.method for call in responses.calls] == ["PUT"]
+        assert self.get_repository(pk=repo.id).config["webhook_id"] == 99
+
+    @responses.activate
+    def test_on_create_repository_relink_replaces_permanently_disabled_webhook(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        responses.reset()
+        self.add_relink_responses(update_status=200, alert_status="disabled")
+
+        repo = self.get_repository(pk=response.data["id"])
+        self.relink_repository(repo)
+
+        assert [call.request.method for call in responses.calls] == ["PUT", "DELETE", "POST"]
+        assert self.get_repository(pk=repo.id).config["webhook_id"] == 100
+
+    @responses.activate
+    def test_on_create_repository_relink_keeps_live_webhook(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        repo = self.get_repository(pk=response.data["id"])
+
+        for alert_status in ("executable", "temporarily_disabled"):
+            responses.reset()
+            self.add_relink_responses(update_status=200, alert_status=alert_status)
+
+            self.relink_repository(repo)
+
+            assert [call.request.method for call in responses.calls] == ["PUT"], alert_status
+            assert self.get_repository(pk=repo.id).config["webhook_id"] == 99
+
+    @responses.activate
+    def test_on_create_repository_relink_disabled_webhook_already_gone(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        responses.reset()
+        self.add_relink_responses(update_status=200, alert_status="disabled", delete_status=404)
+
+        repo = self.get_repository(pk=response.data["id"])
+        self.relink_repository(repo)
+
+        assert [call.request.method for call in responses.calls] == ["PUT", "DELETE", "POST"]
+        assert self.get_repository(pk=repo.id).config["webhook_id"] == 100
+
+    @responses.activate
+    def test_on_create_repository_relink_disabled_webhook_delete_failure(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        responses.reset()
+        self.add_relink_responses(update_status=200, alert_status="disabled", delete_status=403)
+
+        repo = self.get_repository(pk=response.data["id"])
+        with pytest.raises(IntegrationError):
+            self.relink_repository(repo)
+
+        assert [call.request.method for call in responses.calls] == ["PUT", "DELETE"]
+        assert self.get_repository(pk=repo.id).config["webhook_id"] == 99
+
+    @responses.activate
+    def test_on_delete_repository_without_webhook_does_not_call_gitlab(self) -> None:
+        response = self.create_repository(self.default_repository_config, self.integration.id)
+        repo = self.get_repository(pk=response.data["id"])
+        with assume_test_silo_mode(SiloMode.CELL):
+            del repo.config["webhook_id"]
+            repo.save()
+        responses.reset()
+
+        self.provider.on_delete_repository(repo)
+
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_create_repository_request_invalid_url(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s" % self.gitlab_id,
@@ -139,14 +372,15 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             response, "validation", "Error Communicating with GitLab (HTTP 422): Invalid url given"
         )
 
-    def test_create_repository_data_no_installation_id(self):
+    def test_create_repository_data_no_installation_id(self) -> None:
         response = self.create_repository(self.default_repository_config, None)
         assert response.status_code == 400
         self.assert_error_message(response, "validation", "requires an integration id")
 
-    def test_create_repository_data_integration_does_not_exist(self):
+    def test_create_repository_data_integration_does_not_exist(self) -> None:
         integration_id = self.integration.id
-        self.integration.delete()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.integration.delete()
 
         response = self.create_repository(self.default_repository_config, integration_id)
         assert response.status_code == 404
@@ -154,7 +388,7 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             response, "not found", "Integration matching query does not exist."
         )
 
-    def test_create_repository_org_given_has_no_installation(self):
+    def test_create_repository_org_given_has_no_installation(self) -> None:
         organization = self.create_organization(owner=self.user)
         response = self.create_repository(
             self.default_repository_config, self.integration.id, organization.slug
@@ -162,7 +396,7 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
         assert response.status_code == 404
 
     @responses.activate
-    def test_create_repository_get_project_request_fails(self):
+    def test_create_repository_get_project_request_fails(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s" % self.gitlab_id,
@@ -174,7 +408,7 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
         assert response.status_code == 503
 
     @responses.activate
-    def test_create_repository_integration_create_webhook_failure(self):
+    def test_create_repository_integration_create_webhook_failure(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s" % self.gitlab_id,
@@ -191,7 +425,7 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
         assert response.status_code == 503
 
     @responses.activate
-    def test_on_delete_repository_remove_webhook(self):
+    def test_on_delete_repository_remove_webhook(self) -> None:
         response = self.create_repository(self.default_repository_config, self.integration.id)
         responses.reset()
 
@@ -200,12 +434,12 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             "https://example.gitlab.com/api/v4/projects/%s/hooks/99" % self.gitlab_id,
             status=204,
         )
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         self.provider.on_delete_repository(repo)
         assert len(responses.calls) == 1
 
     @responses.activate
-    def test_on_delete_repository_remove_webhook_missing_hook(self):
+    def test_on_delete_repository_remove_webhook_missing_hook(self) -> None:
         response = self.create_repository(self.default_repository_config, self.integration.id)
         responses.reset()
 
@@ -214,39 +448,41 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             "https://example.gitlab.com/api/v4/projects/%s/hooks/99" % self.gitlab_id,
             status=404,
         )
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         self.provider.on_delete_repository(repo)
         assert len(responses.calls) == 1
 
     @responses.activate
-    def test_compare_commits_start_and_end(self):
+    def test_compare_commits_start_and_end(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/compare?from=abc&to=xyz"
             % self.gitlab_id,
-            json=json.loads(COMPARE_RESPONSE),
+            json=orjson.loads(COMPARE_RESPONSE),
         )
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits/12d65c8dd2b2676fa3ac47d955accc085a37a9c1/diff"
             % self.gitlab_id,
-            json=json.loads(COMMIT_DIFF_RESPONSE),
+            json=orjson.loads(COMMIT_DIFF_RESPONSE),
         )
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits/8b090c1b79a14f2bd9e8a738f717824ff53aebad/diff"
             % self.gitlab_id,
-            json=json.loads(COMMIT_DIFF_RESPONSE),
+            json=orjson.loads(COMMIT_DIFF_RESPONSE),
         )
         response = self.create_repository(self.default_repository_config, self.integration.id)
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         commits = self.provider.compare_commits(repo, "abc", "xyz")
         assert 2 == len(commits)
+        assert commits[0]["message"] == "JS fix\n\nFixes PROJ-1"
+        assert commits[1]["message"] == "Fix dmitriy mistake"
         for commit in commits:
             assert_commit_shape(commit)
 
     @responses.activate
-    def test_compare_commits_start_and_end_gitlab_failure(self):
+    def test_compare_commits_start_and_end_gitlab_failure(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/compare?from=abc&to=xyz"
@@ -254,12 +490,12 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             status=502,
         )
         response = self.create_repository(self.default_repository_config, self.integration.id)
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         with pytest.raises(IntegrationError):
             self.provider.compare_commits(repo, "abc", "xyz")
 
     @responses.activate
-    def test_compare_commits_no_start(self):
+    def test_compare_commits_no_start(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits/xyz" % self.gitlab_id,
@@ -269,43 +505,43 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits?until=2018-09-19T13:14:15Z"
             % self.gitlab_id,
-            json=json.loads(COMMIT_LIST_RESPONSE),
+            json=orjson.loads(COMMIT_LIST_RESPONSE),
         )
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits/ed899a2f4b50b4370feeea94676502b42383c746/diff"
             % self.gitlab_id,
-            json=json.loads(COMMIT_DIFF_RESPONSE),
+            json=orjson.loads(COMMIT_DIFF_RESPONSE),
         )
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits/6104942438c14ec7bd21c6cd5bd995272b3faff6/diff"
             % self.gitlab_id,
-            json=json.loads(COMMIT_DIFF_RESPONSE),
+            json=orjson.loads(COMMIT_DIFF_RESPONSE),
         )
 
         response = self.create_repository(self.default_repository_config, self.integration.id)
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         commits = self.provider.compare_commits(repo, None, "xyz")
         for commit in commits:
             assert_commit_shape(commit)
 
     @responses.activate
-    def test_compare_commits_no_start_gitlab_failure(self):
+    def test_compare_commits_no_start_gitlab_failure(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s/repository/commits/abc" % self.gitlab_id,
             status=502,
         )
         response = self.create_repository(self.default_repository_config, self.integration.id)
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         with pytest.raises(IntegrationError):
             self.provider.compare_commits(repo, None, "abc")
 
     @responses.activate
-    def test_pull_request_url(self):
+    def test_pull_request_url(self) -> None:
         response = self.create_repository(self.default_repository_config, self.integration.id)
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         pull = PullRequest(key=99)
         result = self.provider.pull_request_url(repo, pull)
         assert (
@@ -313,8 +549,8 @@ class GitLabRepositoryProviderTest(IntegrationRepositoryTestCase):
         )
 
     @responses.activate
-    def test_repository_external_slug(self):
+    def test_repository_external_slug(self) -> None:
         response = self.create_repository(self.default_repository_config, self.integration.id)
-        repo = Repository.objects.get(pk=response.data["id"])
+        repo = self.get_repository(pk=response.data["id"])
         result = self.provider.repository_external_slug(repo)
         assert result == repo.config["project_id"]

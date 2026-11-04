@@ -1,0 +1,178 @@
+import * as Sentry from '@sentry/react';
+import keyBy from 'lodash/keyBy';
+
+import {getContextMeta} from 'sentry/components/events/contexts/dataUtils';
+import type {
+  RawSpanType,
+  TraceContextSpanProxy,
+} from 'sentry/components/events/interfaces/spans/types';
+import {
+  type EntrySpans,
+  type EventTransaction,
+  EntryType,
+  type Event,
+} from 'sentry/types/event';
+import {getIssueTypeFromOccurrenceType, IssueType} from 'sentry/types/group';
+
+export const TRACE_WATERFALL_PREFERENCES_KEY =
+  'issue-details-trace-waterfall-preferences';
+
+/**
+ * Trace IDs are required for EAP occurrences, but some events will not have a trace (e.g. metric issues).
+ * Relay will synthesize a `trace_id` in this case and flags the field with a `trace_id.missing` remark in `_meta`.
+ */
+export function eventHasSyntheticTrace(event: Event): boolean {
+  const traceMeta = getContextMeta(event, 'trace');
+  return (traceMeta.trace_id?.['']?.err ?? []).some(
+    (err: unknown) => (Array.isArray(err) ? err[0] : err) === 'trace_id.missing'
+  );
+}
+
+/**
+ * Get Relay's span group value, which EAP indexes as `span.group`, for use in queries passed to
+ * features like Explore and Insights.
+ *
+ * Note that though the return values do *sometimes* match, this is not interchangeable with
+ * `getSpanHash`, which gets the results of our server-side span grouping algorithm, as EAP doesn't
+ * record the span `hash` value.
+ */
+export function getSpanSentryGroupValue(span: {
+  [key: string]: any;
+  data?: Record<string, any> | null;
+  sentry_tags?: Record<string, string>;
+}): string | undefined {
+  return (
+    // The location for segment-derived occurrences
+    span.data?.['sentry.group'] ??
+    // The location for transaction-derived occurrences
+    // TODO: once we fully switch to segment-based occurrence creation, and all transaction events
+    // have aged out, we can remove this half of expression
+    span.sentry_tags?.group
+  );
+}
+
+/**
+ * Get the span's grouping hash, used for visually grouping spans representing the same operation in
+ * the span evidence section of the issue details page and for explaining occurrence grouping in the
+ * grouping info section.
+ *
+ * Note that though the return values do *sometimes* match, this is not interchangeable with
+ * `getSpanSentryGroupValue`, which returns the `sentry.group` value added to some spans by Relay
+ * for use in queries to EAP.
+ */
+export function getSpanHash(span: {
+  [key: string]: any;
+  data?: Record<string, any> | null;
+  hash?: string;
+}): string | undefined {
+  return (
+    // The location for segment-derived occurrences
+    span.data?.hash ??
+    // The location for transaction-derived occurrences
+    // TODO: once we fully switch to segment-based occurrence creation, and all transaction events
+    // have aged out, we can remove this half of expression
+    span.hash
+  );
+}
+
+/**
+ * Get the span category, used to build the span summary link. Like the span hash, where it lives
+ * depends on which pipeline (transaction or segment processing) created the evidence span.
+ */
+export function getSpanCategory(span: {
+  [key: string]: any;
+  data?: Record<string, any> | null;
+  sentry_tags?: Record<string, string>;
+}): string | undefined {
+  return (
+    // The location for segment-derived occurrences
+    span.data?.['sentry.category'] ??
+    // The location for transaction-derived occurrences
+    // TODO: once we fully switch to segment-based occurrence creation, and all transaction events
+    // have aged out, we can remove this half of expression
+    span.sentry_tags?.category
+  );
+}
+
+export function getSpanInfoFromTransactionEvent(
+  event: Pick<
+    EventTransaction,
+    'entries' | 'issueCategory' | 'endTimestamp' | 'contexts' | 'occurrence'
+  >
+) {
+  const perfEvidenceData = event?.occurrence?.evidenceData;
+  if (!perfEvidenceData) {
+    Sentry.captureException(new Error('Span Evidence missing for performance issue.'));
+    return null;
+  }
+
+  // Let's dive into the event to pick off the span evidence data by using the IDs we know
+  const spanEntry = event.entries.find((entry: EntrySpans | any): entry is EntrySpans => {
+    return entry.type === EntryType.SPANS;
+  });
+
+  const spans: Array<RawSpanType | TraceContextSpanProxy> = spanEntry?.data
+    ? [...spanEntry.data]
+    : [];
+
+  if (event?.contexts?.trace?.span_id) {
+    // TODO: Fix this conditional and check if span_id is ever actually undefined.
+    spans.push(event.contexts.trace as TraceContextSpanProxy);
+  }
+  const spansById = keyBy(spans, 'span_id');
+  const parentSpanIDs = perfEvidenceData?.parentSpanIds ?? [];
+  const offendingSpanIDs = perfEvidenceData?.offenderSpanIds ?? [];
+  const causeSpanIDs = perfEvidenceData?.causeSpanIds ?? [];
+  return {
+    parentSpan: spansById[parentSpanIDs[0]],
+    offendingSpans: offendingSpanIDs.map((spanID: any) => spansById[spanID]),
+    causeSpans: causeSpanIDs.map((spanID: any) => spansById[spanID]),
+  };
+}
+
+/**
+ * Given an event for a performance issue, returns the `affectedSpanIds` and `focusedSpanIds`.
+ * Both of these subsets of spans are used to determine which spans are initially visible on the span tree on the issue details
+ * page. The main difference is that the former will be highlighted in red, these spans are intended to indicate the 'root cause' spans
+ * of the issue, with the latter being supplemental spans that are involved in the issue but not necessarily the cause of it.
+ *
+ * @param event
+ */
+export function getProblemSpansForSpanTree(event: EventTransaction): {
+  affectedSpanIds: string[];
+  focusedSpanIds: string[];
+} {
+  const perfEvidenceData = event?.occurrence?.evidenceData;
+
+  const issueType = getIssueTypeFromOccurrenceType(event?.occurrence?.type);
+  const affectedSpanIds: string[] = [];
+  const focusedSpanIds: string[] = [];
+
+  // By default, offender spans will always be `affected spans`
+  const offenderSpanIds = perfEvidenceData?.offenderSpanIds ?? [];
+  affectedSpanIds.push(...offenderSpanIds);
+
+  if (issueType !== IssueType.PERFORMANCE_N_PLUS_ONE_API_CALLS) {
+    const parentSpanIds = perfEvidenceData?.parentSpanIds ?? [];
+    affectedSpanIds.push(...parentSpanIds);
+  }
+
+  if (issueType === IssueType.PERFORMANCE_CONSECUTIVE_DB_QUERIES) {
+    const consecutiveSpanIds = perfEvidenceData?.causeSpanIds ?? [];
+
+    if (consecutiveSpanIds.length < 11) {
+      focusedSpanIds.push(...consecutiveSpanIds);
+    }
+  }
+
+  if (issueType === IssueType.PERFORMANCE_N_PLUS_ONE_DB_QUERIES) {
+    const precedingSpans = perfEvidenceData?.causeSpanIds ?? [];
+    focusedSpanIds.push(...precedingSpans);
+  }
+
+  return {affectedSpanIds, focusedSpanIds};
+}
+
+export const isWebVitalsEvent = (event: Event) => {
+  return getIssueTypeFromOccurrenceType(event.occurrence?.type) === IssueType.WEB_VITALS; // Web Vitals group type id
+};

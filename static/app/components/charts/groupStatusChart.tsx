@@ -1,0 +1,153 @@
+import {useMemo} from 'react';
+import {useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import {Stack} from '@sentry/scraps/layout';
+
+import {markLine as createMarkLine} from 'sentry/components/charts/components/markLine';
+import {MiniBarChart} from 'sentry/components/charts/miniBarChart';
+import {LazyRender} from 'sentry/components/lazyRender';
+import {t} from 'sentry/locale';
+import type {TimeseriesValue} from 'sentry/types/core';
+import type {Series} from 'sentry/types/echarts';
+import {formatAbbreviatedNumber} from 'sentry/utils/formatters';
+
+function asChartPoint(point: [number, number]): {name: number | string; value: number} {
+  return {
+    name: point[0] * 1000,
+    value: point[1],
+  };
+}
+
+const EMPTY_STATS: readonly TimeseriesValue[] = [];
+
+/**
+ * The chart is only 36px tall, so its tooltip always overhangs it. Portal it to
+ * the body so a clipping ancestor, such as a Seer issue embed's card, cannot
+ * cut it off.
+ */
+const TOOLTIP_OPTIONS = {appendToBody: true};
+
+type Props = {
+  stats: readonly TimeseriesValue[];
+  groupStatus?: string;
+  secondaryStats?: readonly TimeseriesValue[];
+  showSecondaryPoints?: boolean;
+};
+
+export function GroupStatusChart({
+  stats,
+  groupStatus,
+  secondaryStats = EMPTY_STATS,
+  showSecondaryPoints = false,
+}: Props) {
+  const theme = useTheme();
+  const graphOptions = useMemo<{
+    colors: [string, string] | undefined;
+    emphasisColors: [string] | undefined;
+    series: Series[];
+  }>(() => {
+    if (!stats?.length) {
+      return {colors: undefined, emphasisColors: undefined, series: []};
+    }
+    const max = Math.max(...stats.map(p => p[1]));
+
+    const formattedMarkLine = formatAbbreviatedNumber(max);
+
+    const markLine = createMarkLine({
+      silent: true,
+      lineStyle: {
+        color: theme.tokens.border.transparent.neutral.moderate,
+        type: [4, 3], // Sets line type to "dashed" with 4 length and 3 gap
+        opacity: 0.6,
+        cap: 'round', // Rounded edges for the dashes
+      },
+      data: [
+        {
+          type: 'max',
+        },
+      ],
+      animation: false,
+      label: {
+        show: true,
+        position: 'end',
+        opacity: 1,
+        color: theme.tokens.content.secondary,
+        fontFamily: 'Rubik',
+        fontSize: 10,
+        formatter: formattedMarkLine,
+      },
+    });
+
+    const series: Series[] =
+      showSecondaryPoints && secondaryStats?.length
+        ? [
+            {
+              seriesName: t('Total Events'),
+              data: secondaryStats.map(asChartPoint),
+              markLine: max > 0 ? markLine : undefined,
+            },
+            {
+              seriesName: t('Matching Events'),
+              data: stats.map(asChartPoint),
+            },
+          ]
+        : [
+            {
+              seriesName: t('Events'),
+              data: stats.map(asChartPoint),
+              markLine: max > 0 ? markLine : undefined,
+            },
+          ];
+
+    return {
+      colors: [theme.tokens.dataviz.semantic.other, theme.tokens.dataviz.semantic.accent],
+      emphasisColors: [theme.tokens.dataviz.semantic.other],
+      series,
+    };
+  }, [showSecondaryPoints, secondaryStats, stats, theme]);
+
+  return (
+    <LazyRender containerHeight={26}>
+      <Stack>
+        <ChartAnimationWrapper>
+          <MiniBarChart
+            animateBars
+            showXAxisLine
+            hideZeros
+            markLineLabelSide="right"
+            barOpacity={1}
+            height={36}
+            isGroupedByDate
+            showTimeInTooltip
+            series={graphOptions.series}
+            colors={graphOptions.colors}
+            emphasisColors={graphOptions.emphasisColors}
+            hideDelay={50}
+            showMarkLineLabel
+            tooltip={TOOLTIP_OPTIONS}
+          />
+        </ChartAnimationWrapper>
+        <GraphText>{groupStatus}</GraphText>
+      </Stack>
+    </LazyRender>
+  );
+}
+
+const ChartAnimationWrapper = styled('div')`
+  animation: fade-in 0.5s;
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 100;
+    }
+  }
+`;
+
+const GraphText = styled('div')`
+  font-size: ${p => p.theme.font.size.sm};
+  color: ${p => p.theme.tokens.content.secondary};
+`;

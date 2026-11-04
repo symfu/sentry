@@ -1,29 +1,30 @@
-from sentry.testutils import AcceptanceTestCase
+from selenium.webdriver.common.keys import Keys
+
+from sentry.testutils.cases import AcceptanceTestCase
+from sentry.testutils.silo import no_silo_test
 
 
+@no_silo_test
 class AuthTest(AcceptanceTestCase):
-    def enter_auth(self, username, password):
+    def enter_auth(self, username: str, password: str) -> None:
         self.browser.get("/auth/login/")
         self.browser.driver.execute_script(
             "document.addEventListener('invalid', function(e) { e.preventDefault(); }, true);"
         )
-        self.browser.find_element_by_id("id_username").send_keys(username)
-        self.browser.find_element_by_id("id_password").send_keys(password)
-        self.browser.find_element_by_xpath("//button[contains(text(), 'Continue')]").click()
+        self.browser.wait_until_clickable('[aria-label="Email"]')
+        self.browser.element('[aria-label="Email"]').send_keys(username)
+        self.browser.element('[aria-label="Password"]').send_keys(password, Keys.ENTER)
 
-    def test_renders(self):
+    def test_renders(self) -> None:
         self.browser.get("/auth/login/")
-        self.browser.snapshot(name="login")
 
-    def test_no_credentials(self):
+    def test_no_credentials(self) -> None:
         self.enter_auth("", "")
-        self.browser.snapshot(name="login fields required")
 
-    def test_invalid_credentials(self):
+    def test_invalid_credentials(self) -> None:
         self.enter_auth("bad-username", "bad-username")
-        self.browser.snapshot(name="login fields invalid")
 
-    def test_success(self):
+    def test_success(self) -> None:
         email = "dummy@example.com"
         password = "dummy"
         user = self.create_user(email=email)
@@ -31,5 +32,6 @@ class AuthTest(AcceptanceTestCase):
         user.save()
 
         self.enter_auth(email, password)
-        self.browser.wait_until_not(".loading")
-        self.browser.snapshot(name="login success")
+        self.browser.wait_until_script_execution(
+            "return window.location.pathname === '/organizations/new/'"
+        )

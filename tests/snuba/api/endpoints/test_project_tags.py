@@ -1,41 +1,99 @@
-from django.core.urlresolvers import reverse
-
-from sentry.testutils import APITestCase, SnubaTestCase
-from sentry.testutils.helpers.datetime import before_now, iso_format
+from sentry.testutils.cases import APITestCase, SnubaTestCase
+from sentry.testutils.helpers.datetime import before_now
 
 
 class ProjectTagsTest(APITestCase, SnubaTestCase):
-    def test_simple(self):
-        user = self.create_user()
-        org = self.create_organization()
-        team = self.create_team(organization=org)
-        self.create_member(organization=org, user=user, teams=[team])
+    endpoint = "sentry-api-0-project-tags"
 
-        project = self.create_project(organization=org, teams=[team])
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(user=self.user)
+
+    def test_simple(self) -> None:
         self.store_event(
             data={
                 "tags": {"foo": "oof", "bar": "rab"},
-                "timestamp": iso_format(before_now(minutes=1)),
+                "timestamp": before_now(minutes=1).isoformat(),
             },
-            project_id=project.id,
+            project_id=self.project.id,
         )
         self.store_event(
-            data={"tags": {"bar": "rab2"}, "timestamp": iso_format(before_now(minutes=1))},
-            project_id=project.id,
+            data={"tags": {"bar": "rab2"}, "timestamp": before_now(minutes=1).isoformat()},
+            project_id=self.project.id,
         )
 
-        self.login_as(user=user)
+        response = self.get_success_response(self.project.organization.slug, self.project.slug)
 
-        url = reverse(
-            "sentry-api-0-project-tags",
-            kwargs={"organization_slug": project.organization.slug, "project_slug": project.slug},
-        )
-        response = self.client.get(url, format="json")
-        assert response.status_code == 200, response.content
         data = {v["key"]: v for v in response.data}
-        assert len(data) == 3
+        assert len(data) == 4
 
         assert data["foo"]["canDelete"]
         assert data["foo"]["uniqueValues"] == 1
         assert data["bar"]["canDelete"]
         assert data["bar"]["uniqueValues"] == 2
+
+    def test_simple_without_values_seen(self) -> None:
+        self.store_event(
+            data={
+                "tags": {"foo": "oof", "bar": "rab"},
+                "timestamp": before_now(minutes=1).isoformat(),
+            },
+            project_id=self.project.id,
+        )
+        self.store_event(
+            data={"tags": {"bar": "rab2"}, "timestamp": before_now(minutes=1).isoformat()},
+            project_id=self.project.id,
+        )
+
+        response = self.get_success_response(
+            self.project.organization.slug, self.project.slug, includeValuesSeen=0
+        )
+
+        data = {v["key"]: v for v in response.data}
+        assert len(data) == 4
+
+        assert data["foo"]["canDelete"]
+        assert "uniqueValues" not in data["foo"]
+        assert data["bar"]["canDelete"]
+        assert "uniqueValues" not in data["bar"]
+
+    def test_simple_flags(self) -> None:
+        self.store_event(
+            data={
+                "contexts": {
+                    "flags": {
+                        "values": [
+                            {"flag": "abc", "result": True},
+                            {"flag": "def", "result": False},
+                        ]
+                    }
+                },
+                "timestamp": before_now(minutes=1).isoformat(),
+            },
+            project_id=self.project.id,
+        )
+        self.store_event(
+            data={
+                "contexts": {
+                    "flags": {
+                        "values": [
+                            {"flag": "abc", "result": False},
+                        ]
+                    }
+                },
+                "timestamp": before_now(minutes=1).isoformat(),
+            },
+            project_id=self.project.id,
+        )
+
+        response = self.get_success_response(
+            self.project.organization.slug, self.project.slug, useFlagsBackend="1"
+        )
+
+        data = {v["key"]: v for v in response.data}
+        assert len(data) == 2
+
+        assert data["def"]["canDelete"] is False
+        assert data["def"]["uniqueValues"] == 1
+        assert data["abc"]["canDelete"] is False
+        assert data["abc"]["uniqueValues"] == 2

@@ -1,0 +1,51 @@
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import {ContextCard} from 'sentry/components/events/contexts/contextCard';
+import {KeyValueTableCardGrid} from 'sentry/components/tables/keyValueTable';
+import {t} from 'sentry/locale';
+import type {Event} from 'sentry/types/event';
+import type {Project} from 'sentry/types/project';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+import {FoldSection} from 'sentry/views/issueDetails/foldSection';
+
+import {getOrderedContextItems} from './contextItems';
+
+interface ContextDataSectionProps {
+  event: Event;
+  disableCollapsePersistence?: boolean;
+  project?: Project;
+}
+
+export function ContextDataSection({
+  event,
+  project,
+  disableCollapsePersistence,
+}: ContextDataSectionProps) {
+  const cards = getOrderedContextItems(event).map(
+    ({alias, type, value: contextValue}) => (
+      <ContextCard
+        key={alias}
+        type={type}
+        alias={alias}
+        value={contextValue}
+        event={event}
+        project={project}
+      />
+    )
+  );
+
+  if (!cards.length) {
+    return null;
+  }
+
+  return (
+    <FoldSection
+      sectionKey={SectionKey.CONTEXTS}
+      title={t('Contexts')}
+      disableCollapsePersistence={disableCollapsePersistence}
+    >
+      <ErrorBoundary mini message={t('There was a problem loading event context.')}>
+        <KeyValueTableCardGrid>{cards}</KeyValueTableCardGrid>
+      </ErrorBoundary>
+    </FoldSection>
+  );
+}

@@ -1,0 +1,638 @@
+import type {Theme} from '@emotion/react';
+import {css} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import {Button} from '@sentry/scraps/button';
+import {Flex, type FlexProps, Stack} from '@sentry/scraps/layout';
+
+import {MultiHighlight} from 'sentry/components/highlight';
+import {PageFilterBar} from 'sentry/components/pageFilters/pageFilterBar';
+import {Panel} from 'sentry/components/panels/panel';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import type {ColumnAlign} from 'sentry/components/tables/sortableHeaderCell';
+import {NumberContainer} from 'sentry/utils/discover/styles';
+import {unreachable} from 'sentry/utils/unreachable';
+import {SeverityLevel} from 'sentry/views/explore/logs/utils';
+
+export const LOGS_GRID_BODY_ROW_HEIGHT = 26;
+
+interface LogTableRowProps {
+  error?: boolean;
+  highlighted?: boolean;
+  isClickable?: boolean;
+  pinned?: boolean;
+}
+
+const StyledPanel = styled(Panel)`
+  margin-bottom: 0;
+`;
+
+export const LogTableRow = styled(SimpleTable.Row)<LogTableRowProps>`
+  margin-right: -1rem;
+  padding-right: 1rem;
+
+  &:not(thead > &) {
+    cursor: ${p => (p.isClickable ? 'pointer' : 'default')};
+
+    &:hover {
+      background-color: ${p =>
+        p.theme.tokens.interactive.transparent.neutral.background.hover};
+    }
+
+    ${p =>
+      p.isClickable &&
+      css`
+        &:active {
+          background-color: ${
+            p.theme.tokens.interactive.transparent.neutral.background.active
+          };
+        }
+      `}
+
+    &:not(:last-child) {
+      border-bottom: 0;
+    }
+  }
+
+  .log-table-row-pseudo-row-chevron-replacement {
+    width: 23px;
+    height: 24px;
+  }
+
+  ${p =>
+    p.highlighted &&
+    css`
+      &:not(thead > &) {
+        background-color: ${p.theme.tokens.background.transparent.warning.muted};
+        color: ${p.theme.tokens.content.danger};
+
+        &:hover {
+          background-color: ${p.theme.tokens.background.transparent.warning.muted};
+        }
+      }
+    `}
+
+  ${p =>
+    p.error &&
+    css`
+      &:not(thead > &) {
+        background-color: ${p.theme.tokens.background.transparent.danger.muted};
+        color: ${p.theme.tokens.content.danger};
+
+        &:hover {
+          background-color: ${p.theme.tokens.background.transparent.danger.muted};
+        }
+      }
+    `}
+
+  ${p =>
+    p.pinned &&
+    css`
+      &:not(thead > &) {
+        background-color: ${p.theme.tokens.background.transparent.accent.muted};
+
+        &:hover {
+          background-color: ${
+            p.theme.tokens.interactive.transparent.accent.selected.background.active
+          };
+        }
+      }
+    `}
+
+  &[data-row-hover-linked='true']:not(thead > &),
+  &[data-row-linked='true']:not(thead > &) {
+    background-color: ${p =>
+      p.theme.tokens.interactive.transparent.accent.selected.background.active};
+
+    &:hover {
+      background-color: ${p =>
+        p.theme.tokens.interactive.transparent.accent.selected.background.active};
+    }
+  }
+
+  &.beforeHoverTime + &.afterHoverTime:before {
+    border-top: 1px solid ${p => p.theme.tokens.border.accent.moderate};
+    content: '';
+    left: 0;
+    position: absolute;
+    top: 0;
+    width: 100%;
+  }
+
+  &.beforeHoverTime:last-child:before {
+    border-bottom: 1px solid ${p => p.theme.tokens.border.accent.moderate};
+    content: '';
+    right: 0;
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+  }
+
+  &.beforeCurrentTime + &.afterCurrentTime:before {
+    border-top: 1px solid ${p => p.theme.tokens.border.accent.vibrant};
+    content: '';
+    left: 0;
+    position: absolute;
+    top: 0;
+    width: 100%;
+  }
+
+  &.beforeCurrentTime:last-child:before {
+    border-bottom: 1px solid ${p => p.theme.tokens.border.accent.vibrant};
+    content: '';
+    right: 0;
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+  }
+`;
+
+export const LogAttributeTreeWrapper = styled('div')`
+  padding: ${p => p.theme.space.md} ${p => p.theme.space.md};
+  border-bottom: 0px;
+`;
+
+export const LogTableBodyCell = styled(SimpleTable.RowCell)<{
+  reservePinGutter?: boolean;
+}>`
+  /* Field renderers size their content to the cell, as in right-aligned numbers. */
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  /* The issue details logs section's first column is narrower than its icons. */
+  overflow: visible;
+  /* With visible overflow, the grid would otherwise widen columns to fit long log lines. */
+  min-width: 0;
+  min-height: ${LOGS_GRID_BODY_ROW_HEIGHT}px;
+
+  padding: 2px ${p => p.theme.space.xl};
+
+  font-size: ${p => p.theme.font.size.md};
+
+  /* Need to select the 2nd child to select the first cell
+     as the first child is the interaction state layer */
+  &:nth-child(2) {
+    padding: 2px 0 2px ${p => p.theme.space['2xl']};
+  }
+
+  &:last-child {
+    padding: 0
+      ${p => (p.reservePinGutter ? 'var(--logsPinButtonArea)' : p.theme.space.md)} 0
+      ${p => p.theme.space.md};
+  }
+`;
+
+export const LogErrorLabelCell = styled(LogTableBodyCell)`
+  grid-column: 2 / -1;
+  align-items: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &:last-child {
+    padding: 2px 0 2px ${p => p.theme.space['2xl']};
+  }
+`;
+
+export const LogTable = styled(SimpleTable, {
+  shouldForwardProp: prop =>
+    prop !== 'hideBorder' && prop !== 'minWidth' && prop !== 'timestampWidth',
+})<{minWidth: string; timestampWidth: number; hideBorder?: boolean}>`
+  --logsPinEdgeGap: ${p => p.theme.space.sm};
+  --logsTimestampWidth: ${p => p.timestampWidth}ch;
+  --logsPinButtonArea: calc(2rem + var(--logsPinEdgeGap));
+  flex: 0 1 auto;
+  overflow-x: hidden;
+  min-width: ${p => p.minWidth};
+
+  ${p =>
+    p.hideBorder &&
+    css`
+      border-color: transparent;
+    `}
+`;
+
+export const LogTableBody = styled(SimpleTable.Body)<{
+  disableBodyPadding?: boolean;
+  showHeader?: boolean;
+}>`
+  ${p =>
+    p.showHeader
+      ? ''
+      : p.disableBodyPadding
+        ? ''
+        : css`
+            padding-top: ${p.theme.space.md};
+            padding-bottom: ${p.theme.space.md};
+          `}
+  align-content: start;
+  overflow-x: hidden;
+  overflow-anchor: none;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+
+  /* If a parent renderer bails out, the element might default to 0px: which causes Tanstack Virtual to stay at 0. */
+  min-height: 1px;
+`;
+
+export const LogDetailTableBodyCell = styled(SimpleTable.RowCell)`
+  flex-direction: column;
+  align-items: stretch;
+  padding: 0;
+  ${LogTableRow} & {
+    padding: 0;
+  }
+  &:last-child {
+    padding: 0;
+  }
+`;
+export const LogDetailTableActionsCell = styled(SimpleTable.RowCell)`
+  padding: ${p => p.theme.space.xs} ${p => p.theme.space.xl};
+  min-height: 0px;
+
+  ${LogTableRow} & {
+    padding: ${p => p.theme.space.xs} ${p => p.theme.space.xl};
+  }
+  &:last-child {
+    padding: ${p => p.theme.space.xs} 0;
+  }
+`;
+export function LogDetailTableActionsButtonBar(props: FlexProps) {
+  return <Flex gap="md" {...props} />;
+}
+
+export const DetailsWrapper = styled('tr')`
+  align-items: center;
+  background-color: ${p => p.theme.colors.gray100};
+  padding: ${p => p.theme.space.md} ${p => p.theme.space.md};
+  flex-direction: column;
+  white-space: nowrap;
+  grid-column: 1 / -1;
+  display: grid;
+  border-top: 1px solid ${p => p.theme.tokens.border.primary};
+  border-bottom: 1px solid ${p => p.theme.tokens.border.primary};
+  z-index: ${1 /* place above the grid resizing lines */};
+`;
+
+export const DetailsContent = styled(StyledPanel)`
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: ${p => p.theme.space.md} ${p => p.theme.space.xl};
+`;
+
+export function LogFirstCellContent(props: FlexProps) {
+  return <Flex align="center" {...props} />;
+}
+
+export const LogBasicRendererContainer = styled('span')<{align?: ColumnAlign}>`
+  ${NumberContainer} {
+    text-align: ${p => p.align || 'left'};
+  }
+`;
+
+export const DetailsBody = styled('div')`
+  display: flex;
+  border-bottom: 1px solid ${p => p.theme.tokens.border.secondary};
+  padding: ${p => p.theme.space.md} 0;
+  font-family: ${p => p.theme.font.family.mono};
+  font-size: ${p => p.theme.font.size.sm};
+
+  &:last-child {
+    border-bottom: 0;
+  }
+`;
+
+export const StyledChevronButton = styled(Button)`
+  margin-right: ${p => p.theme.space.xs};
+`;
+
+const DEFAULT_SIZE = '8px';
+
+export const ColoredLogCircle = styled('span')<{
+  logColors: ReturnType<typeof getLogColors>;
+  size?: string;
+}>`
+  padding: 0;
+  position: relative;
+  width: ${p => p.size || DEFAULT_SIZE};
+  height: ${p => p.size || DEFAULT_SIZE};
+  margin-right: ${p => p.theme.space.xs};
+  text-indent: -9999em;
+  display: inline-block;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background-color: ${p => p.logColors.background};
+`;
+
+export const ColoredLogText = styled('span')<{
+  logColors: ReturnType<typeof getLogColors>;
+}>`
+  color: ${p => p.logColors.color};
+  font-weight: ${p => p.theme.font.weight.sans.medium};
+  font-family: ${p => p.theme.font.family.mono};
+`;
+
+export const LogDate = styled('span')<{align?: 'left' | 'center' | 'right'}>`
+  color: ${p => p.theme.tokens.content.secondary};
+  text-align: ${p => p.align || 'left'};
+`;
+
+export const LogTimestamp = styled(LogDate)`
+  min-width: var(--logsTimestampWidth);
+`;
+
+export const LogsHighlight = styled(MultiHighlight)`
+  font-weight: ${p => p.theme.font.weight.sans.medium};
+  background-color: ${p => p.theme.colors.gray200};
+  margin-right: 2px;
+  margin-left: 2px;
+`;
+
+export const LogsFilteredHelperText = styled('span')`
+  margin-left: 4px;
+  font-size: ${p => p.theme.font.size.sm};
+  color: ${p => p.theme.tokens.content.secondary};
+  background-color: ${p => p.theme.colors.gray200};
+`;
+
+export const LogPinButton = styled(Button)<{isPinned: boolean | undefined}>`
+  position: absolute;
+  right: calc(-1 * var(--logsPinButtonArea) + var(--logsPinEdgeGap));
+  opacity: ${p => (p.isPinned ? 1 : 0)};
+  transition: opacity 0.1s;
+  z-index: 1;
+
+  ${LogTableRow}:focus-within &,
+  ${LogTableRow}:hover & {
+    background: none;
+    opacity: 1;
+  }
+
+  &:focus-within svg,
+  &:hover svg {
+    fill: ${p => p.theme.tokens.content.accent};
+    transition: fill ${p => p.theme.motion.smooth.fast};
+  }
+`;
+
+export const WrappingText = styled('div')<{wrapText?: boolean}>`
+  white-space: ${p => (p.wrapText ? 'pre-wrap' : 'nowrap')};
+  overflow: hidden;
+  text-overflow: ellipsis;
+`;
+
+export const AlignedCellContent = styled('div')<{
+  align?: 'left' | 'center' | 'right';
+}>`
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  justify-content: ${p => p.align || 'left'};
+  font-family: ${p => p.theme.font.family.mono};
+  font-size: ${p => p.theme.font.size.sm};
+`;
+
+export const FirstTableHeadCell = styled(SimpleTable.HeaderCell)`
+  padding-right: ${p => p.theme.space.md};
+  padding-left: ${p => p.theme.space.xl};
+`;
+
+export const LogTableHeadCell = styled(SimpleTable.HeaderCell)<{
+  reservePinGutter?: boolean;
+}>`
+  ${p =>
+    p.reservePinGutter &&
+    css`
+      padding-right: var(--logsPinButtonArea);
+    `}
+`;
+
+export const LogsTableBodyFirstCell = styled(LogTableBodyCell)`
+  padding-right: 0;
+  padding-left: ${p => p.theme.space.md};
+`;
+
+export function TableActionsContainer(props: FlexProps) {
+  return <Flex justify="end" align="center" gap="md" {...props} />;
+}
+
+export function LogsItemContainer(props: FlexProps) {
+  return <Stack minHeight="0" overflow="hidden" position="relative" {...props} />;
+}
+
+export function LogsTableActionsContainer(props: FlexProps) {
+  return (
+    <Flex
+      direction="row"
+      flex="0 0 auto"
+      overflow="visible"
+      justify="between"
+      {...props}
+    />
+  );
+}
+
+export function LogsGraphContainer(props: FlexProps) {
+  return <Stack flex="0 0 auto" overflow="visible" gap="md" {...props} />;
+}
+
+export const AutoRefreshLabel = styled('label')`
+  display: flex;
+  align-items: center;
+  gap: ${p => p.theme.space.xs};
+  margin-bottom: 0;
+`;
+
+export function getLogColors(level: SeverityLevel, theme: Theme) {
+  switch (level) {
+    case SeverityLevel.DEFAULT:
+      return {
+        background: theme.tokens.graphics.neutral.vibrant,
+        backgroundLight: theme.tokens.background.transparent.neutral.muted,
+        border: theme.tokens.border.neutral.moderate,
+        borderHover: theme.tokens.border.neutral.vibrant,
+        color: theme.tokens.content.secondary,
+      };
+    case SeverityLevel.TRACE:
+      return {
+        background: theme.tokens.graphics.accent.vibrant,
+        backgroundLight: theme.tokens.background.transparent.accent.muted,
+        border: theme.tokens.border.accent.moderate,
+        borderHover: theme.tokens.border.accent.vibrant,
+        color: theme.tokens.content.accent,
+      };
+    case SeverityLevel.WARN:
+      return {
+        background: theme.tokens.graphics.warning.vibrant,
+        backgroundLight: theme.tokens.background.transparent.warning.muted,
+        border: theme.tokens.border.warning.moderate,
+        borderHover: theme.tokens.border.warning.vibrant,
+        color: theme.tokens.content.warning,
+      };
+    case SeverityLevel.ERROR:
+      return {
+        background: theme.tokens.graphics.danger.vibrant,
+        backgroundLight: theme.tokens.background.transparent.danger.muted,
+        border: theme.tokens.border.danger.moderate,
+        borderHover: theme.tokens.border.danger.vibrant,
+        color: theme.tokens.content.danger,
+      };
+    case SeverityLevel.FATAL:
+      return {
+        background: theme.tokens.graphics.danger.vibrant,
+        backgroundLight: theme.tokens.background.transparent.danger.muted,
+        border: theme.tokens.border.danger.moderate,
+        borderHover: theme.tokens.border.danger.vibrant,
+        color: theme.tokens.content.danger,
+      };
+    case SeverityLevel.DEBUG:
+      return {
+        background: theme.tokens.graphics.neutral.vibrant,
+        backgroundLight: theme.tokens.background.transparent.neutral.muted,
+        border: theme.tokens.border.neutral.moderate,
+        borderHover: theme.tokens.border.neutral.vibrant,
+        color: theme.tokens.content.primary,
+      };
+    case SeverityLevel.INFO:
+      return {
+        background: theme.tokens.graphics.accent.vibrant,
+        backgroundLight: theme.tokens.background.transparent.accent.muted,
+        border: theme.tokens.border.transparent.accent.moderate,
+        borderHover: theme.tokens.border.transparent.accent.vibrant,
+        color: theme.tokens.content.accent,
+      };
+    case SeverityLevel.UNKNOWN:
+      return {
+        background: theme.tokens.graphics.neutral.vibrant,
+        backgroundLight: theme.tokens.background.transparent.neutral.muted,
+        border: theme.tokens.border.neutral.moderate,
+        borderHover: theme.tokens.border.neutral.vibrant,
+        color: theme.tokens.content.secondary,
+      };
+    default:
+      unreachable(level);
+      throw new Error(`Invalid log type, got ${level}`);
+  }
+}
+
+export const LogsSidebarCollapseButton = styled(Button)<{sidebarOpen: boolean}>`
+  ${p =>
+    p.sidebarOpen &&
+    css`
+      margin-left: -17px;
+      border-top-left-radius: 0;
+      border-bottom-left-radius: 0;
+
+      &::after {
+        border-left-color: ${p.theme.tokens.border.primary};
+        border-top-left-radius: 0;
+        border-bottom-left-radius: 0;
+      }
+    `}
+`;
+
+export const FloatingBackToTopContainer = styled('div')<{
+  inReplay?: boolean;
+  position?: 'absolute' | 'fixed';
+  tableWidth?: number;
+  topOffset?: number;
+}>`
+  --floatingWidth: ${p => (p.tableWidth ? `${p.tableWidth}px` : '100%')};
+  position: ${p => p.position};
+  z-index: 1;
+  opacity: ${p => (p.inReplay ? 1 : 0.9)};
+  top: ${p =>
+    p.inReplay ? p.theme.space.md : `calc(${p.topOffset ?? 65}px + ${p.theme.space.xl})`};
+  width: var(--floatingWidth);
+  display: flex;
+  justify-content: center;
+
+  pointer-events: none;
+
+  & > * {
+    pointer-events: auto;
+  }
+`;
+
+export const FloatingBottomContainer = styled('div')<{
+  tableWidth?: number;
+}>`
+  position: absolute;
+  bottom: 0;
+  width: ${p => (p.tableWidth ? `${p.tableWidth}px` : '100%')};
+  display: flex;
+  justify-content: center;
+`;
+
+export const HoveringRowLoadingRendererContainer = styled('div')<{
+  headerHeight: number;
+  height: number;
+  position: 'top' | 'bottom';
+}>`
+  position: absolute;
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  z-index: 1;
+  margin-top: ${p => (p.position === 'top' ? `${p.headerHeight + 1}px` : '0px')};
+  display: flex;
+  background: linear-gradient(
+    to ${p => (p.position === 'top' ? 'bottom' : 'top')},
+    rgb(from ${p => p.theme.tokens.background.tertiary} r g b / 75%),
+    rgb(from ${p => p.theme.tokens.background.secondary} r g b / 0%)
+  );
+  align-items: center;
+  justify-content: center;
+  height: ${p => p.height}px;
+  ${p => (p.position === 'top' ? 'top: 0px;' : 'bottom: 0px;')}
+`;
+
+export const StyledPageFilterBar = styled(PageFilterBar)`
+  width: auto;
+`;
+
+export const TraceIconStyleWrapper = styled(Flex)`
+  width: 18px;
+  height: 18px;
+
+  .TraceIcon {
+    background-color: ${p => p.theme.colors.red400};
+    position: absolute;
+    transform: translate(-50%, -50%) scaleX(var(--inverse-span-scale)) translateZ(0);
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+    margin-right: -2px;
+  }
+
+  .TraceIcon svg {
+    width: 12px;
+    height: 12px;
+    fill: #ffffff;
+  }
+`;
+
+// The flame indicator is wider than the severity dot it replaces on log rows,
+// so pull the group left to line up the error row's project badge with them.
+export const ErrorRowIconGroup = styled(Flex)`
+  margin-left: -7px;
+
+  .TraceIcon.warning {
+    background-color: ${p => p.theme.tokens.dataviz.semantic.meh};
+  }
+
+  .TraceIcon.info,
+  .TraceIcon.sample {
+    background-color: ${p => p.theme.tokens.dataviz.semantic.accent};
+  }
+
+  .TraceIcon.unknown {
+    background-color: ${p => p.theme.tokens.dataviz.semantic.other};
+  }
+`;

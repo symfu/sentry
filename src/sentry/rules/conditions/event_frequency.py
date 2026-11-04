@@ -1,127 +1,100 @@
-import re
+from __future__ import annotations
 
-from datetime import timedelta
-from django import forms
-from django.utils import timezone
+from typing import Any, Literal, NotRequired
 
-from sentry import tsdb
-from sentry.receivers.rules import DEFAULT_RULE_LABEL
-from sentry.rules.conditions.base import EventCondition
-from sentry.utils import metrics
-
-intervals = {
-    "1m": ("one minute", timedelta(minutes=1)),
-    "1h": ("one hour", timedelta(hours=1)),
-    "1d": ("one day", timedelta(hours=24)),
-    "1w": ("one week", timedelta(days=7)),
-    "30d": ("30 days", timedelta(days=30)),
-}
+from sentry.rules.base import RuleBase
+from sentry.rules.conditions.base import GenericCondition
+from sentry.workflow_engine.handlers.condition.utils.event_frequency import (
+    EVENT_UNIQUE_USER_FREQUENCY_WITH_CONDITIONS_ID,
+    PERCENT_INTERVALS,
+    PERCENT_INTERVALS_TO_DISPLAY,
+    STANDARD_INTERVALS,
+    ComparisonType,
+)
 
 
-class EventFrequencyForm(forms.Form):
-    interval = forms.ChoiceField(
-        choices=[
-            (key, label)
-            for key, (label, duration) in sorted(
-                intervals.items(), key=lambda key____label__duration: key____label__duration[1][1]
-            )
-        ]
-    )
-    value = forms.IntegerField(widget=forms.TextInput())
+class EventFrequencyConditionData(GenericCondition):
+    """
+    The base typed dict for all condition data representing EventFrequency issue
+    alert rule conditions
+    """
+
+    # Either the count or percentage.
+    value: int | float
+    # The interval to compare the value against such as 5m, 1h, 3w, etc.
+    # e.g. # of issues is more than {value} in {interval}.
+    interval: str
+    # NOTE: Some of the earliest COUNT conditions were created without the
+    # comparisonType field, although modern rules will always have it.
+    comparisonType: NotRequired[Literal[ComparisonType.COUNT, ComparisonType.PERCENT]]
+    # The previous interval to compare the curr interval against. This is only
+    # present in PERCENT conditions.
+    # e.g. # of issues is 50% higher in {interval} compared to {comparisonInterval}
+    comparisonInterval: NotRequired[str]
 
 
-class BaseEventFrequencyCondition(EventCondition):
-    form_cls = EventFrequencyForm
-    form_fields = {
-        "value": {"type": "number", "placeholder": 100},
-        "interval": {
+class BaseEventFrequencyCondition(RuleBase):
+    rule_type = "condition/event"
+    intervals = STANDARD_INTERVALS
+
+    def __init__(
+        self,
+        # Data specifically takes on this typeddict form for the
+        # Event Frequency condition classes.
+        data: EventFrequencyConditionData | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        self.form_fields = {
+            "value": {"type": "number", "placeholder": 100},
+            "interval": {
+                "type": "choice",
+                "choices": [
+                    (key, label)
+                    for key, (label, duration) in sorted(
+                        self.intervals.items(),
+                        key=lambda key____label__duration: key____label__duration[1][1],
+                    )
+                ],
+            },
+        }
+        kwargs["data"] = data
+
+        super().__init__(*args, **kwargs)
+
+
+class EventFrequencyCondition(BaseEventFrequencyCondition):
+    id = "sentry.rules.conditions.event_frequency.EventFrequencyCondition"
+    label = "The issue is seen more than {value} times in {interval}"
+
+
+class EventUniqueUserFrequencyCondition(BaseEventFrequencyCondition):
+    id = "sentry.rules.conditions.event_frequency.EventUniqueUserFrequencyCondition"
+    label = "The issue is seen by more than {value} users in {interval}"
+
+
+class EventUniqueUserFrequencyConditionWithConditions(EventUniqueUserFrequencyCondition):
+    id = EVENT_UNIQUE_USER_FREQUENCY_WITH_CONDITIONS_ID
+    label = "The issue is seen by more than {value} users in {interval} with conditions"
+
+
+class EventFrequencyPercentCondition(BaseEventFrequencyCondition):
+    id = "sentry.rules.conditions.event_frequency.EventFrequencyPercentCondition"
+    label = "The issue affects more than {value} percent of sessions in {interval}"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.intervals = PERCENT_INTERVALS
+        super().__init__(*args, **kwargs)
+
+        # Override form fields interval to hide 1 min option from ui, but leave
+        # it available to process existing 1m rules.
+        self.form_fields["interval"] = {
             "type": "choice",
             "choices": [
                 (key, label)
                 for key, (label, duration) in sorted(
-                    intervals.items(),
+                    PERCENT_INTERVALS_TO_DISPLAY.items(),
                     key=lambda key____label__duration: key____label__duration[1][1],
                 )
             ],
-        },
-    }
-
-    label = NotImplemented  # subclass must implement
-
-    def __init__(self, *args, **kwargs):
-        self.tsdb = kwargs.pop("tsdb", tsdb)
-
-        super().__init__(*args, **kwargs)
-
-    def passes(self, event, state):
-        interval = self.get_option("interval")
-        try:
-            value = int(self.get_option("value"))
-        except (TypeError, ValueError):
-            return False
-
-        if not interval:
-            return False
-
-        current_value = self.get_rate(event, interval, self.rule.environment_id)
-
-        return current_value > value
-
-    def query(self, event, start, end, environment_id):
-        query_result = self.query_hook(event, start, end, environment_id)
-        metrics.incr(
-            "rules.conditions.queried_snuba",
-            tags={
-                "condition": re.sub("(?!^)([A-Z]+)", r"_\1", self.__class__.__name__).lower(),
-                "is_created_on_project_creation": self.is_guessed_to_be_created_on_project_creation,
-            },
-        )
-        return query_result
-
-    def query_hook(self, event, start, end, environment_id):
-        """"""
-        raise NotImplementedError  # subclass must implement
-
-    def get_rate(self, event, interval, environment_id):
-        _, duration = intervals[interval]
-        end = timezone.now()
-        return self.query(event, end - duration, end, environment_id=environment_id)
-
-    @property
-    def is_guessed_to_be_created_on_project_creation(self):
-        """
-        Best effort approximation on whether a rule with this condition was created on project creation based on how
-        closely the rule and project are created; and if the label matches the default name used on project creation.
-        :return:
-            bool: True if rule is approximated to be created on project creation, False otherwise.
-        """
-        delta = abs(self.rule.date_added - self.project.date_added)
-        return delta.total_seconds() < 30 and self.rule.label == DEFAULT_RULE_LABEL
-
-
-class EventFrequencyCondition(BaseEventFrequencyCondition):
-    label = "The issue is seen more than {value} times in {interval}"
-
-    def query_hook(self, event, start, end, environment_id):
-        return self.tsdb.get_sums(
-            model=self.tsdb.models.group,
-            keys=[event.group_id],
-            start=start,
-            end=end,
-            environment_id=environment_id,
-            use_cache=True,
-        )[event.group_id]
-
-
-class EventUniqueUserFrequencyCondition(BaseEventFrequencyCondition):
-    label = "The issue is seen by more than {value} users in {interval}"
-
-    def query_hook(self, event, start, end, environment_id):
-        return self.tsdb.get_distinct_counts_totals(
-            model=self.tsdb.models.users_affected_by_group,
-            keys=[event.group_id],
-            start=start,
-            end=end,
-            environment_id=environment_id,
-            use_cache=True,
-        )[event.group_id]
+        }

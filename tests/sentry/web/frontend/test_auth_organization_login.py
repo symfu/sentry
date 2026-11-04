@@ -1,479 +1,198 @@
-from exam import fixture
-from django.core.urlresolvers import reverse
+from functools import cached_property
+from typing import Protocol
+from unittest import mock
+from urllib.parse import quote as urlquote
 
-from sentry.models import (
-    AuthIdentity,
-    AuthProvider,
-    OrganizationOption,
-    OrganizationMember,
-    UserEmail,
-)
-from sentry.testutils import AuthProviderTestCase
+from django.contrib.auth import get_user
+from django.contrib.messages import get_messages
+from django.test import override_settings
+from django.urls import reverse
+
+from sentry.auth.providers.dummy import PLACEHOLDER_TEMPLATE
+from sentry.models.authidentity import AuthIdentity
+from sentry.models.authprovider import AuthProvider
+from sentry.models.organization import Organization
+from sentry.models.organizationmember import OrganizationMember
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import AuthProviderTestCase
+from sentry.testutils.helpers import override_options, with_feature
+from sentry.testutils.silo import assume_test_silo_mode, control_silo_test
+from sentry.users.models.useremail import UserEmail
+
+
+class RedirectChainResponse(Protocol):
+    status_code: int
+    redirect_chain: list[tuple[str, int]]
 
 
 # TODO(dcramer): this is an integration test and repeats tests from
 # core auth_login
+@control_silo_test
 class OrganizationAuthLoginTest(AuthProviderTestCase):
-    @fixture
-    def organization(self):
+    @cached_property
+    def organization(self) -> Organization:
         return self.create_organization(name="foo", owner=self.user)
 
-    @fixture
-    def path(self):
+    @cached_property
+    def path(self) -> str:
         return reverse("sentry-auth-organization", args=[self.organization.slug])
 
-    def test_renders_basic(self):
-        self.login_as(self.user)
-        resp = self.client.get(self.path)
+    def test_link_identity_resumes_react_auth(self) -> None:
+        path = reverse("sentry-auth-link-identity", args=[self.organization.slug])
 
-        assert resp.status_code == 200
-        self.assertTemplateUsed(resp, "sentry/organization-login.html")
+        response = self.client.get(f"{path}?next=%2Fsettings%2Faccount%2F")
 
-        assert resp.context["login_form"]
-        assert resp.context["organization"] == self.organization
-        assert "provider_key" not in resp.context
-        assert resp.context["join_request_link"]
+        assert response.status_code == 302
+        assert response["Location"] == f"{self.path}?next=%2Fsettings%2Faccount%2F"
 
-    def test_cannot_get_request_join_link_with_setting_disabled(self):
-        OrganizationOption.objects.create(
-            organization_id=self.organization.id, key="sentry:join_requests", value=False
+    def test_unsupported_method(self) -> None:
+        response = self.client.delete(self.path)
+
+        assert response.status_code == 405
+        assert response["Allow"] == "GET, POST"
+
+    def test_renders_react_template_by_default(self) -> None:
+        response = self.client.get(self.path)
+
+        assert response.status_code == 200
+        self.assertTemplateUsed(response, "sentry/base-react.html")
+
+    @with_feature("system:multi-region")
+    def test_customer_domain_login_redirects_to_primary_domain(self) -> None:
+        response = self.client.get(
+            f"{self.path}?next=%2Fsettings%2Faccount%2F",
+            HTTP_HOST=f"{self.organization.slug}.testserver",
         )
 
-        self.login_as(self.user)
-        resp = self.client.get(self.path)
-
-        assert resp.status_code == 200
-        assert resp.context["join_request_link"] is None
-
-    def test_renders_session_expire_message(self):
-        self.client.cookies["session_expired"] = "1"
-        resp = self.client.get(self.path)
-
-        assert resp.status_code == 200
-        self.assertTemplateUsed(resp, "sentry/organization-login.html")
-        assert len(resp.context["messages"]) == 1
-
-    def test_flow_as_anonymous(self):
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
+        assert response.status_code == 302
+        assert response["Location"] == (
+            f"http://testserver/auth/login/{self.organization.slug}/?next=%2Fsettings%2Faccount%2F"
         )
+
+    def test_no_non_member_warning_on_post(self) -> None:
+        non_member = self.create_user("nonmember@example.com")
+        self.login_as(non_member)
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
         resp = self.client.post(self.path, {"init": True})
 
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert "is not a member of the" not in resp.content.decode("utf-8")
 
-        path = reverse("sentry-auth-sso")
-
-        resp = self.client.post(path, {"email": "foo@example.com"})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-
-        with self.settings(
-            TERMS_URL="https://example.com/terms", PRIVACY_URL="https://example.com/privacy"
-        ):
-            resp = self.client.post(path, {"op": "newuser"}, follow=True)
-            assert resp.redirect_chain == [
-                (reverse("sentry-login"), 302),
-                ("/organizations/foo/issues/", 302),
-            ]
-
-        auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
-
-        user = auth_identity.user
-        assert user.email == "foo@example.com"
-        assert not user.has_usable_password()
-        assert not user.is_managed
-        assert user.flags.newsletter_consent_prompt
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_existing_user_with_new_account(self):
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
-        user = self.create_user("bar@example.com")
-
-        self.login_as(user)
-        resp = self.client.post(self.path, {"init": True})
-
-        assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
-
-        path = reverse("sentry-auth-sso")
-
-        resp = self.client.post(path, {"email": "foo@example.com"})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-link.html")
-        assert resp.status_code == 200
-
-        resp = self.client.post(path, {"op": "confirm"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
-
-        auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
-        assert user == auth_identity.user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=user)
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_existing_identity(self):
+    def test_flow_as_existing_identity(self) -> None:
         user = self.create_user("bar@example.com")
         auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
+            organization_id=self.organization.id, provider="dummy"
         )
-        AuthIdentity.objects.create(auth_provider=auth_provider, user=user, ident="foo@example.com")
+        AuthIdentity.objects.create(
+            auth_provider=auth_provider, user_id=user.id, ident="foo@example.com"
+        )
 
         resp = self.client.post(self.path, {"init": True})
 
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
+
+        path = reverse("sentry-auth-sso")
+        resp = self.client.post(path, {"email": "foo@example.com"}, follow=True)
+        assert resp.redirect_chain == [("/organizations/foo/issues/", 302)]
+
+    def test_org_redirects_to_relative_next_url(self) -> None:
+        user = self.create_user("bar@example.com")
+        auth_provider = AuthProvider.objects.create(
+            organization_id=self.organization.id, provider="dummy"
+        )
+        AuthIdentity.objects.create(
+            auth_provider=auth_provider, user_id=user.id, ident="foo@example.com"
+        )
+        next = f"/organizations/{self.organization.slug}/releases/"
+        resp = self.client.post(self.path + "?next=" + next, {"init": True})
+        assert resp.status_code == 200
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
         resp = self.client.post(path, {"email": "foo@example.com"}, follow=True)
         assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
+            (next, 302),
         ]
 
-    def test_flow_as_unauthenticated_existing_matched_user_no_merge(self):
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
+    @with_feature("sytem:multi-region")
+    def test_org_redirects_to_next_url_customer_domain(self) -> None:
         user = self.create_user("bar@example.com")
+        auth_provider = AuthProvider.objects.create(
+            organization_id=self.organization.id, provider="dummy"
+        )
+        AuthIdentity.objects.create(
+            auth_provider=auth_provider, user_id=user.id, ident="foo@example.com"
+        )
 
-        resp = self.client.post(self.path, {"init": True})
-
+        next = f"/organizations/{self.organization.slug}/releases/"
+        resp = self.client.post(
+            self.path + "?next=" + self.organization.absolute_url(next), {"init": True}
+        )
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
-        resp = self.client.post(path, {"email": user.email})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-        assert resp.context["existing_user"] == user
-        assert resp.context["login_form"]
-
-        resp = self.client.post(path, {"op": "newuser"}, follow=True)
+        resp = self.client.post(path, {"email": "foo@example.com"}, follow=True)
         assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
+            (self.organization.absolute_url(next), 302),
         ]
 
-        auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
-        new_user = auth_identity.user
-        assert user.email == "bar@example.com"
-        assert new_user != user
-
-        # Without settings.TERMS_URL and settings.PRIVACY_URL, this should be
-        # unset following new user creation
-        assert not new_user.flags.newsletter_consent_prompt
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=new_user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_unauthenticated_existing_matched_user_with_merge(self):
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
+    def test_org_login_doesnt_redirect_external(self) -> None:
         user = self.create_user("bar@example.com")
-
-        email = user.emails.all()[:1].get()
-        email.is_verified = False
-        email.save()
-
-        resp = self.client.post(self.path, {"init": True})
-
-        assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
-
-        path = reverse("sentry-auth-sso")
-
-        resp = self.client.post(path, {"email": user.email})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-        assert resp.context["existing_user"] == user
-        assert resp.context["login_form"]
-
-        resp = self.client.post(
-            path, {"op": "login", "username": user.username, "password": "admin"}
-        )
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-link.html")
-        assert resp.status_code == 200
-
-        resp = self.client.post(path, {"op": "confirm"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
-        auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
-
-        new_user = auth_identity.user
-        assert new_user == user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_unauthenticated_existing_matched_user_via_secondary_email(self):
         auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
+            organization_id=self.organization.id, provider="dummy"
         )
-        user = self.create_user("foo@example.com")
-        UserEmail.objects.create(user=user, email="bar@example.com", is_verified=True)
+        AuthIdentity.objects.create(
+            auth_provider=auth_provider, user_id=user.id, ident="foo@example.com"
+        )
 
-        resp = self.client.post(self.path, {"init": True})
+        next = "http://example.com"
 
+        resp = self.client.post(self.path + "?next=" + urlquote(next), {"init": True})
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
-        resp = self.client.post(path, {"email": user.email})
+        resp = self.client.post(path, {"email": "foo@example.com"}, follow=True)
+        assert resp.redirect_chain == [("/organizations/foo/issues/", 302)]
 
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-        assert resp.context["existing_user"] == user
-        assert resp.context["login_form"]
+    @mock.patch("sentry.auth.helper.AuthIdentityHandler.warn_about_ambiguous_email")
+    def test_flow_as_unauthenticated_existing_matched_user_with_ambiguous_email(
+        self, mock_warning: mock.MagicMock
+    ) -> None:
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
 
-        resp = self.client.post(
-            path, {"op": "login", "username": user.username, "password": "admin"}
-        )
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-link.html")
-        assert resp.status_code == 200
-
-        resp = self.client.post(path, {"op": "confirm"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
-        auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
-
-        new_user = auth_identity.user
-        assert new_user == user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_unauthenticated_existing_unmatched_user_with_merge(self):
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
-        user = self.create_user("foo@example.com")
+        secondary_email = "foo@example.com"
+        users = {self.create_user() for _ in range(2)}
+        for user in users:
+            UserEmail.objects.create(user=user, email=secondary_email, is_verified=True)
 
         resp = self.client.post(self.path, {"init": True})
-
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
-
-        resp = self.client.post(path, {"email": "bar@example.com"})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-        assert not resp.context["existing_user"]
-        assert resp.context["login_form"]
-
-        resp = self.client.post(
-            path, {"op": "login", "username": user.username, "password": "admin"}
-        )
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-link.html")
+        resp = self.client.post(path, {"email": secondary_email})
         assert resp.status_code == 200
 
-        resp = self.client.post(path, {"op": "confirm"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
+        assert mock_warning.called
+        received_email, found_users, chosen_user = mock_warning.call_args.args
+        assert received_email == secondary_email
+        assert set(found_users) == users
+        assert chosen_user in users
 
-        auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
-
-        new_user = auth_identity.user
-        assert new_user == user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_unauthenticated_existing_matched_user_with_merge_and_existing_identity(self):
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
-        user = self.create_user("bar@example.com")
-
-        auth_identity = AuthIdentity.objects.create(
-            auth_provider=auth_provider, user=user, ident="adfadsf@example.com"
-        )
-
-        resp = self.client.post(self.path, {"init": True})
-
-        assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
-
-        path = reverse("sentry-auth-sso")
-
-        resp = self.client.post(path, {"email": user.email})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-        assert resp.context["existing_user"] == user
-        assert resp.context["login_form"]
-
-        resp = self.client.post(
-            path, {"op": "login", "username": user.username, "password": "admin"}
-        )
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-link.html")
-        assert resp.status_code == 200
-
-        resp = self.client.post(path, {"op": "confirm"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
-
-        auth_identity = AuthIdentity.objects.get(id=auth_identity.id)
-
-        assert auth_identity.ident == user.email
-
-        new_user = auth_identity.user
-        assert new_user == user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_as_unauthenticated_existing_inactive_user_with_merge_and_existing_identity(self):
-        """
-        Given an unauthenticated user, and an existing, inactive user account
-        with a linked identity, this should claim that identity and create
-        a new user account.
-        """
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
-        user = self.create_user("bar@example.com", is_active=False)
-
-        auth_identity = AuthIdentity.objects.create(
-            auth_provider=auth_provider, user=user, ident="adfadsf@example.com"
-        )
-
-        resp = self.client.post(self.path, {"init": True})
-
-        assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
-
-        path = reverse("sentry-auth-sso")
-
-        resp = self.client.post(path, {"email": "adfadsf@example.com"})
-
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
-        assert resp.status_code == 200
-        assert not resp.context["existing_user"]
-        assert resp.context["login_form"]
-
-        resp = self.client.post(path, {"op": "newuser"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
-
-        auth_identity = AuthIdentity.objects.get(id=auth_identity.id)
-
-        assert auth_identity.ident == "adfadsf@example.com"
-
-        new_user = auth_identity.user
-        assert new_user != user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=new_user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_duplicate_users_with_membership_and_verified(self):
+    def test_flow_duplicate_users_without_verified(self) -> None:
         """
         Given an existing authenticated user, and an updated identity (e.g.
         the ident changed from the SSO provider), we should be re-linking
         the identity automatically (without prompt) assuming the user is
         a member of the org.
 
-        This only works when the email is mapped to an identical identity.
+        Session ownership is sufficient — no IdP email_verified claim needed.
         """
         auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
-
-        # setup a 'previous' identity, such as when we migrated Google from
-        # the old idents to the new
-        user = self.create_user("bar@example.com", is_managed=True, is_active=False)
-        auth_identity = AuthIdentity.objects.create(
-            auth_provider=auth_provider, user=user, ident="bar@example.com"
-        )
-
-        # they must be a member for the auto merge to happen
-        self.create_member(organization=self.organization, user=user)
-
-        # user needs to be logged in
-        self.login_as(user)
-
-        resp = self.client.post(self.path, {"init": True})
-
-        assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
-
-        path = reverse("sentry-auth-sso")
-
-        # we're suggesting the identity changed (as if the Google ident was
-        # updated to be something else)
-        resp = self.client.post(
-            path, {"email": "bar@example.com", "id": "123", "email_verified": "1"}, follow=True
-        )
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-            ("/auth/login/foo/", 302),
-        ]
-        # there should be no prompt as we auto merge the identity
-
-        auth_identity = AuthIdentity.objects.get(id=auth_identity.id)
-
-        assert auth_identity.ident == "123"
-
-        new_user = auth_identity.user
-        assert new_user == user
-
-        member = OrganizationMember.objects.get(organization=self.organization, user=new_user)
-
-        assert getattr(member.flags, "sso:linked")
-        assert not getattr(member.flags, "sso:invalid")
-
-    def test_flow_duplicate_users_without_verified(self):
-        """
-        Given an existing authenticated user, and an updated identity (e.g.
-        the ident changed from the SSO provider), we should be re-linking
-        the identity automatically (without prompt) assuming the user is
-        a member of the org.
-        """
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
+            organization_id=self.organization.id, provider="dummy"
         )
 
         # setup a 'previous' identity, such as when we migrated Google from
@@ -482,7 +201,7 @@ class OrganizationAuthLoginTest(AuthProviderTestCase):
         AuthIdentity.objects.create(auth_provider=auth_provider, user=user, ident="bar@example.com")
 
         # they must be a member for the auto merge to happen
-        self.create_member(organization=self.organization, user=user)
+        self.create_member(organization=self.organization, user_id=user.id)
 
         # user needs to be logged in
         self.login_as(user)
@@ -490,7 +209,7 @@ class OrganizationAuthLoginTest(AuthProviderTestCase):
         resp = self.client.post(self.path, {"init": True})
 
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
 
@@ -498,45 +217,45 @@ class OrganizationAuthLoginTest(AuthProviderTestCase):
         # updated to be something else)
         resp = self.client.post(path, {"email": "adfadsf@example.com"})
 
-        # there should be no prompt as we auto merge the identity
-        assert resp.status_code == 200
+        # authenticated member auto-links without prompt
+        assert resp.status_code == 302
 
-    def test_flow_authenticated_without_verified_without_password(self):
+    def test_flow_authenticated_without_verified_without_password(self) -> None:
         """
         Given an existing authenticated user, and an updated identity (e.g.
         the ident changed from the SSO provider), we should be re-linking
-        the identity automatically as they dont have a password.
-
+        the identity automatically as they don't have a password.
         This is specifically testing an unauthenticated flow.
         """
-        AuthProvider.objects.create(organization=self.organization, provider="dummy")
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
 
         # setup a 'previous' identity, such as when we migrated Google from
         # the old idents to the new
         user = self.create_user("bar@example.com", is_managed=False, password="")
+        assert not user.has_usable_password()
         UserEmail.objects.filter(user=user, email="bar@example.com").update(is_verified=False)
-        self.create_member(organization=self.organization, user=user)
+        self.create_member(organization=self.organization, user_id=user.id)
 
         resp = self.client.post(self.path, {"init": True})
 
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
 
         resp = self.client.post(path, {"email": "bar@example.com"})
-        self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
+        self.assertTemplateUsed(resp, "sentry/auth-confirm-account.html")
         assert resp.status_code == 200
         assert resp.context["existing_user"] == user
 
-    def test_flow_managed_duplicate_users_without_membership(self):
+    def test_flow_managed_duplicate_users_without_membership(self) -> None:
         """
         Given an existing authenticated user, and an updated identity (e.g.
         the ident changed from the SSO provider), we should be prompting to
-        confirm their identity as they dont have membership.
+        confirm their identity as they don't have membership.
         """
         auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
+            organization_id=self.organization.id, provider="dummy"
         )
 
         # setup a 'previous' identity, such as when we migrated Google from
@@ -550,7 +269,7 @@ class OrganizationAuthLoginTest(AuthProviderTestCase):
         resp = self.client.post(self.path, {"init": True})
 
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
 
@@ -560,75 +279,12 @@ class OrganizationAuthLoginTest(AuthProviderTestCase):
 
         self.assertTemplateUsed(resp, "sentry/auth-confirm-link.html")
         assert resp.status_code == 200
-        assert resp.context["existing_user"] == user
+        assert resp.context["existing_user"].id == user.id
 
-    def test_swapped_identities(self):
-        """
-        Given two existing user accounts with mismatched identities, such as:
-
-        - foo SSO'd as bar@example.com
-        - bar SSO'd as foo@example.com
-
-        If bar is authenticating via SSO as bar@example.com, we should remove
-        the existing entry attached to bar, and re-bind the entry owned by foo.
-        """
-        auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
-        )
-
-        # setup a 'previous' identity, such as when we migrated Google from
-        # the old idents to the new
-        user = self.create_user("bar@example.com", is_managed=True, is_active=False)
-        identity1 = AuthIdentity.objects.create(
-            auth_provider=auth_provider, user=user, ident="bar@example.com"
-        )
-
-        # create another identity which is used, but not by the authenticating
-        # user
-        user2 = self.create_user("adfadsf@example.com", is_managed=True, is_active=False)
-        identity2 = AuthIdentity.objects.create(
-            auth_provider=auth_provider, user=user2, ident="adfadsf@example.com"
-        )
-        member2 = self.create_member(user=user2, organization=self.organization)
-
-        # user needs to be logged in
-        self.login_as(user)
-
-        resp = self.client.post(self.path, {"init": True})
-
-        assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
-
-        path = reverse("sentry-auth-sso")
-
-        # we're suggesting the identity changed (as if the Google ident was
-        # updated to be something else)
-        resp = self.client.post(path, {"email": "adfadsf@example.com"}, follow=True)
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-            ("/auth/login/foo/", 302),
-        ]
-
-        assert not AuthIdentity.objects.filter(id=identity1.id).exists()
-
-        identity2 = AuthIdentity.objects.get(id=identity2.id)
-
-        assert identity2.ident == "adfadsf@example.com"
-        assert identity2.user == user
-
-        member1 = OrganizationMember.objects.get(user=user, organization=self.organization)
-        assert getattr(member1.flags, "sso:linked")
-        assert not getattr(member1.flags, "sso:invalid")
-
-        member2 = OrganizationMember.objects.get(id=member2.id)
-        assert not getattr(member2.flags, "sso:linked")
-        assert getattr(member2.flags, "sso:invalid")
-
-    def test_flow_as_unauthenticated_existing_user_legacy_identity_migration(self):
+    def test_flow_as_unauthenticated_existing_user_legacy_identity_migration(self) -> None:
         user = self.create_user("bar@example.com")
         auth_provider = AuthProvider.objects.create(
-            organization=self.organization, provider="dummy"
+            organization_id=self.organization.id, provider="dummy"
         )
         user_ident = AuthIdentity.objects.create(
             auth_provider=auth_provider, user=user, ident="foo@example.com"
@@ -637,18 +293,256 @@ class OrganizationAuthLoginTest(AuthProviderTestCase):
         resp = self.client.post(self.path, {"init": True})
 
         assert resp.status_code == 200
-        assert self.provider.TEMPLATE in resp.content.decode("utf-8")
+        assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
 
         path = reverse("sentry-auth-sso")
 
         resp = self.client.post(
             path, {"email": "foo@new-domain.com", "legacy_email": "foo@example.com"}, follow=True
         )
-        assert resp.redirect_chain == [
-            (reverse("sentry-login"), 302),
-            ("/organizations/foo/issues/", 302),
-        ]
+        assert resp.redirect_chain == [("/organizations/foo/issues/", 302)]
 
         # Ensure the ident was migrated from the legacy identity
         updated_ident = AuthIdentity.objects.get(id=user_ident.id)
         assert updated_ident.ident == "foo@new-domain.com"
+
+    @override_settings(SENTRY_SINGLE_ORGANIZATION=True)
+    @with_feature({"organizations:create": False})
+    def test_password_login_post_resumes_react_auth(self) -> None:
+        self.session["_next"] = "/settings/account/"
+        self.save_session()
+
+        response = self.client.post(self.path, {"op": "login"})
+
+        assert response.status_code == 302
+        assert response["Location"] == self.path
+        assert self.client.session["_next"] == "/settings/account/"
+
+    def test_multiorg_login_correct_redirect_sso(self) -> None:
+        user = self.create_user("bar@example.com")
+        user.update(is_superuser=False)
+
+        org1 = self.create_organization(name="bar", owner=user)
+        path = reverse("sentry-auth-organization", args=[org1.slug])
+        # create a second org that the user belongs to, ensure they are redirected to correct
+        self.create_organization(name="zap", owner=user)
+
+        auth_provider = AuthProvider.objects.create(organization_id=org1.id, provider="dummy")
+        AuthIdentity.objects.create(auth_provider=auth_provider, user=user, ident="foo@example.com")
+
+        resp = self.client.post(path, {"init": True})
+
+        path = reverse("sentry-auth-sso")
+        resp = self.client.post(path, {"email": "foo@example.com"}, follow=True)
+        assert resp.redirect_chain == [(f"/organizations/{org1.slug}/issues/", 302)]
+
+    def test_anonymous_user_with_automatic_migration(self) -> None:
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
+        resp = self.client.post(self.path, {"init": True})
+        assert resp.status_code == 200
+
+        path = reverse("sentry-auth-sso")
+
+        # Check that we don't call send_one_time_account_confirm_link with an AnonymousUser
+        resp = self.client.post(path, {"email": "foo@example.com"})
+        assert resp.status_code == 200
+
+    def test_sso_pipeline_rejects_different_org(self) -> None:
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
+
+        other_org = self.create_organization(name="other-org")
+        AuthProvider.objects.create(organization_id=other_org.id, provider="dummy")
+        other_path = reverse("sentry-auth-organization", args=[other_org.slug])
+
+        resp = self.client.post(self.path, {"init": True})
+        assert resp.status_code == 200
+
+        resp = self.client.post(other_path)
+        assert resp.status_code == 302
+        assert resp["Location"] == other_path
+
+    def test_sso_pipeline_rejects_cross_org_newuser(self) -> None:
+        """Pipeline initialized for org A must not accept op=newuser
+        posted to org B."""
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
+
+        other_org = self.create_organization(name="other-org")
+        AuthProvider.objects.create(organization_id=other_org.id, provider="dummy")
+        other_path = reverse("sentry-auth-organization", args=[other_org.slug])
+
+        resp = self.client.post(self.path, {"init": True})
+        assert resp.status_code == 200
+
+        resp = self.client.post(other_path, {"op": "newuser"})
+        assert resp.status_code == 302
+        assert resp["Location"] == other_path
+
+    def test_sso_pipeline_rejects_cross_org_with_same_provider_type(self) -> None:
+        """Both orgs use the same provider type (identical pipeline signature)
+        but the org_id check must still reject."""
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
+
+        other_org = self.create_organization(name="other-org")
+        AuthProvider.objects.create(organization_id=other_org.id, provider="dummy")
+        other_path = reverse("sentry-auth-organization", args=[other_org.slug])
+
+        resp = self.client.post(self.path, {"init": True})
+        assert resp.status_code == 200
+
+        resp = self.client.post(other_path, {"op": "confirm"})
+        assert resp.status_code == 302
+        assert resp["Location"] == other_path
+
+    def test_sso_pipeline_valid_when_same_org(self) -> None:
+        """Normal flow: init and resume on the same org should work."""
+        AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
+
+        resp = self.client.post(self.path, {"init": True})
+        assert resp.status_code == 200
+
+        resp = self.client.post(self.path)
+        assert resp.status_code == 200
+
+
+@control_silo_test
+class OrganizationAuthLoginDemoModeTest(AuthProviderTestCase):
+    def setUp(self) -> None:
+        self.demo_user = self.create_user()
+        self.demo_org = self.create_organization(owner=self.demo_user)
+
+        self.normal_user = self.create_user()
+        self.normal_org = self.create_organization(owner=self.normal_user)
+
+    def is_logged_in_to_org(self, response: RedirectChainResponse, org: Organization) -> bool:
+        return response.status_code == 200 and response.redirect_chain == [
+            (reverse("sentry-login"), 302),
+            (f"/organizations/{org.slug}/issues/", 302),
+        ]
+
+    def fetch_org_login_page(self, org: Organization) -> RedirectChainResponse:
+        response: RedirectChainResponse = self.client.get(
+            reverse("sentry-auth-organization", args=[org.slug]),
+            follow=True,
+        )
+        return response
+
+    def test_auto_login_demo_mode_disabled(self) -> None:
+        with override_options(
+            {
+                "demo-mode.enabled": False,
+                "demo-mode.users": [self.demo_user.id],
+                "demo-mode.orgs": [self.demo_org.id],
+            }
+        ):
+            resp = self.fetch_org_login_page(self.demo_org)
+            assert not self.is_logged_in_to_org(resp, self.demo_org)
+
+            resp = self.fetch_org_login_page(self.normal_org)
+            assert not self.is_logged_in_to_org(resp, self.normal_org)
+
+    def test_auto_login_not_demo_org(self) -> None:
+        with override_options(
+            {"demo-mode.enabled": True, "demo-mode.users": [], "demo-mode.orgs": []}
+        ):
+            resp = self.fetch_org_login_page(self.demo_org)
+            assert not self.is_logged_in_to_org(resp, self.demo_org)
+
+            resp = self.fetch_org_login_page(self.normal_org)
+            assert not self.is_logged_in_to_org(resp, self.normal_org)
+
+    def test_no_non_member_warning_for_demo_org(self) -> None:
+        """
+        When demo mode is enabled and a Google OAuth user navigates to the demo org,
+        the "not a member" warning should not be shown.
+        """
+        external_user = self.create_user("external@example.com")
+        self.login_as(external_user)
+
+        with override_options(
+            {
+                "demo-mode.enabled": True,
+                "demo-mode.users": [self.demo_user.id],
+                "demo-mode.orgs": [self.demo_org.id],
+            }
+        ):
+            path = reverse("sentry-auth-organization", args=[self.demo_org.slug])
+            resp = self.client.get(path, follow=True)
+
+            # Demo mode auto-logs in and redirects, but no warning should be
+            # added to the messages framework for the demo org.
+            stored_messages = list(get_messages(resp.wsgi_request))
+            assert not any("is not a member of the" in str(m) for m in stored_messages)
+
+    def test_demo_user_joins_existing_sso_organization(self) -> None:
+        """
+        Test that when a demo user is logged in and tries to join an existing SSO organization,
+        they are logged in as a new user with a proper auth identity linked.
+
+        This can happen in production when a user visits the sandbox, gets logged in as a demo user,
+        and then attempts to join an organization that has SSO configured (e.g., via invite link).
+
+        The demo user's session is treated as unauthenticated for the SSO pipeline
+        but the user property still resolves to the demo user as a fallback.
+        When the user chooses "newuser", a completely new account is created with SSO identity.
+        """
+        with override_options(
+            {
+                "demo-mode.enabled": True,
+                "demo-mode.users": [self.demo_user.id],
+                "demo-mode.orgs": [self.demo_org.id],
+            }
+        ):
+            sso_org = self.create_organization(name="sso-org", owner=self.normal_user)
+            # Create an organization with SSO (not the demo org)
+            auth_provider = AuthProvider.objects.create(
+                organization_id=sso_org.id, provider="dummy"
+            )
+
+            # Log in as demo user
+            self.login_as(self.demo_user)
+
+            # Initiate SSO flow
+            path = reverse("sentry-auth-organization", args=[sso_org.slug])
+            resp = self.client.post(path, {"init": True})
+
+            assert resp.status_code == 200
+            assert PLACEHOLDER_TEMPLATE in resp.content.decode("utf-8")
+
+            # Complete SSO with a new email
+            sso_path = reverse("sentry-auth-sso")
+            new_email = "newuser@example.com"
+            resp = self.client.post(sso_path, {"email": new_email})
+
+            # Even though demo user is logged in, they're treated as unauthenticated in pipeline
+            # So we get auth-confirm-identity screen, but existing_user still shows the demo user
+            # as a fallback (because user property returns request.user when email doesn't match)
+            self.assertTemplateUsed(resp, "sentry/auth-confirm-identity.html")
+            assert resp.status_code == 200
+
+            # Create new user account
+            resp = self.client.post(sso_path, {"op": "newuser"}, follow=True)
+
+            # Should redirect and log in as the new user
+            assert resp.status_code == 200
+
+            # Verify a new user was created (not the demo user)
+            auth_identity = AuthIdentity.objects.get(auth_provider=auth_provider)
+            new_user = auth_identity.user
+
+            # Verify it's not the demo user
+            assert new_user.id != self.demo_user.id
+            assert new_user.email == new_email
+
+            logged_in_user = get_user(self.client)
+            assert logged_in_user.id == new_user.id
+
+            # Verify demo user has NO auth identity linked to this provider
+            assert not AuthIdentity.objects.filter(
+                auth_provider=auth_provider, user_id=self.demo_user.id
+            ).exists()
+
+            # Verify the new user has organization membership with SSO linked
+            with assume_test_silo_mode(SiloMode.CELL):
+                member = OrganizationMember.objects.get(organization=sso_org, user_id=new_user.id)
+            assert getattr(member.flags, "sso:linked")
+            assert not getattr(member.flags, "sso:invalid")

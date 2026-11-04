@@ -1,23 +1,33 @@
+from datetime import UTC, datetime
+
+from django.http import HttpRequest, HttpResponse
 from django.views.generic import View
 
-from sentry.models import Organization, Project
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.utils.http import absolute_uri
+from sentry.utils.samples import create_sample_event
+from sentry.web.frontend.base import internal_cell_silo_view
 
 from .mail import MailPreview
 
-from sentry.utils.http import absolute_uri
-from sentry.utils.samples import create_sample_event
 
-
+@internal_cell_silo_view
 class DebugNewUserFeedbackEmailView(View):
-    def get(self, request):
+    def get(self, request: HttpRequest) -> HttpResponse:
         org = Organization(id=1, slug="organization", name="My Company")
         project = Project(id=1, organization=org, slug="project", name="My Project")
 
         event = create_sample_event(
-            project=project, platform="python", event_id="595", timestamp=1452683305
+            project=project,
+            platform="python",
+            event_id="595",
+            timestamp=datetime.fromtimestamp(1452683305, tz=UTC),
         )
 
+        assert event is not None
         group = event.group
+        assert group is not None
         link = absolute_uri(
             f"/{project.organization.slug}/{project.slug}/issues/{group.id}/feedback/"
         )

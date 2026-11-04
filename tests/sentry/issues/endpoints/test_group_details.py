@@ -1,0 +1,1355 @@
+from datetime import timedelta
+from unittest import mock
+
+from django.core.cache import cache
+from django.test import override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from sentry import audit_log, buffer, tsdb
+from sentry.analytics.events.issue_viewed import IssueViewedEvent
+from sentry.buffer.redis import RedisBuffer
+from sentry.deletions.tasks.hybrid_cloud import schedule_hybrid_cloud_foreign_key_jobs
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.services.integration import integration_service
+from sentry.issues.action_log import action_context_scope
+from sentry.issues.action_log.types import (
+    ActionSource,
+    GroupActionActor,
+    GroupActionType,
+    GroupActorType,
+    ReconcileStatusAction,
+)
+from sentry.issues.constants import cache_key_for_issue_view
+from sentry.issues.derived.gate import GROUP_ACTION_LOG_BACKFILL_COMPLETED_OPTION
+from sentry.issues.grouptype import PerformanceSlowDBQueryGroupType
+from sentry.issues.models.groupactionlogentry import GroupActionLogEntry
+from sentry.models.activity import Activity
+from sentry.models.apikey import ApiKey
+from sentry.models.auditlogentry import AuditLogEntry
+from sentry.models.environment import Environment
+from sentry.models.group import Group, GroupStatus
+from sentry.models.groupassignee import GroupAssignee
+from sentry.models.groupbookmark import GroupBookmark
+from sentry.models.grouphash import GroupHash
+from sentry.models.groupresolution import GroupResolution
+from sentry.models.groupseen import GroupSeen
+from sentry.models.groupsnooze import GroupSnooze
+from sentry.models.groupsubscription import GroupSubscription
+from sentry.models.grouptombstone import GroupTombstone
+from sentry.models.project import Project
+from sentry.models.release import Release
+from sentry.seer import agent_token
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import APITestCase, SnubaTestCase
+from sentry.testutils.helpers.action_log import action_log_activity_enabled, capture_action_log
+from sentry.testutils.helpers.analytics import assert_any_analytics_event
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.outbox import outbox_runner
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.testutils.skips import requires_snuba
+from sentry.types.activity import ActivityType
+from sentry.types.group import GroupSubStatus
+
+pytestmark = [requires_snuba]
+
+SECRET = "test-seer-api-shared-secret-thirty-two-bytes!"
+FLAG = "organizations:seer-agent-token-flow"
+
+
+class GroupDetailsTest(APITestCase, SnubaTestCase):
+    def test_with_numerical_id(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+        assert response.data["id"] == str(group.id)
+
+    @override_settings(SEER_API_SHARED_SECRET=SECRET)
+    def test_agent_token_gets_issue_details(self) -> None:
+        group = self.create_group()
+        token, _ = agent_token.encode_agent_token(
+            user_id=self.user.id,
+            organization_id=group.organization.id,
+            scopes=["event:read", "org:read", "project:read"],
+            session_id="s1",
+        )
+        client = APIClient()
+
+        with self.feature(FLAG):
+            response = client.get(
+                f"/api/0/issues/{group.id}/",
+                HTTP_AUTHORIZATION=f"Bearer {token}",
+            )
+
+        assert response.status_code == 200, response.content
+        assert response.data["id"] == str(group.id)
+
+    def test_with_qualified_short_id(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+        assert group.qualified_short_id
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.qualified_short_id}/"
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+        assert response.data["id"] == str(group.id)
+
+    def test_with_first_release(self) -> None:
+        self.login_as(user=self.user)
+
+        event = self.store_event(data={"release": "1.0"}, project_id=self.project.id)
+        assert event.group is not None
+
+        group = event.group
+        assert group is not None
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.qualified_short_id}/"
+
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+        assert response.data["id"] == str(group.id)
+        assert response.data["firstRelease"]["version"] == "1.0"
+
+    def test_no_releases(self) -> None:
+        self.login_as(user=self.user)
+        event = self.store_event(data={}, project_id=self.project.id)
+        assert event.group is not None
+
+        group = event.group
+        assert group is not None
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.qualified_short_id}/"
+
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+        assert response.data["firstRelease"] is None
+        assert response.data["lastRelease"] is None
+
+    @action_log_activity_enabled()
+    def test_group_action_log_entry(self) -> None:
+        group = self.create_group()
+
+        # activity dual writes to GALE. use action context scope to attribute it to the user rather than system
+        data = {"assignee": str(self.user.id)}
+        with action_context_scope(
+            source=ActionSource.WEB, actor=GroupActionActor.user(self.user.id)
+        ):
+            Activity.objects.create(
+                group=group,
+                project=group.project,
+                type=ActivityType.ASSIGNED.value,
+                user_id=self.user.id,
+                data=data,
+            )
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+
+        activity = response.data["activity"]
+        assert len(activity) == 2  # first seen + assigned
+        entry = activity[0]
+        assert entry["type"] == "assigned"
+        assert entry["user"]["id"] == str(self.user.id)
+        assert entry["sentry_app"] is None
+        assert entry["data"] == {
+            "assignee": str(self.user.id),
+            "assigneeEmail": None,
+            "assigneeName": None,
+            "assigneeType": None,
+            "integration": None,
+            "rule": None,
+        }
+        assert entry["dateCreated"] is not None
+
+    @action_log_activity_enabled()
+    def test_group_action_log_comment_is_addressable(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+
+        comments_url = f"/api/0/issues/{group.id}/comments/"
+        response = self.client.post(comments_url, format="json", data={"text": "original"})
+        assert response.status_code == 201, response.content
+        comment_id = response.data["commentId"]
+        entry = GroupActionLogEntry.objects.get(
+            group_id=group.id, type=GroupActionType.COMMENT.value
+        )
+        assert response.data["id"] == comment_id
+        assert int(comment_id) == entry.data["comment_id"]
+
+        # Put the comment at the oldest edge of the 99-item mixed feed.
+        for _ in range(98):
+            self.create_group_action_log_entry(group=group, type=GroupActionType.RESOLVE)
+
+        details_url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(details_url, format="json")
+        assert response.status_code == 200, response.content
+        assert len(response.data["activity"]) == 100
+
+        notes = [item for item in response.data["activity"] if item["type"] == "note"]
+        assert len(notes) == 1
+        assert notes[0]["commentId"] == comment_id
+        assert notes[0]["id"] == comment_id
+
+        # the comment reference served by the feed round-trips through edit ...
+        response = self.client.put(
+            f"{comments_url}{comment_id}/", format="json", data={"text": "edited"}
+        )
+        assert response.status_code == 200, response.content
+        assert response.data["id"] == comment_id
+        assert response.data["commentId"] == comment_id
+        assert response.data["data"]["text"] == "edited"
+
+        # ... the feed reads the updated Activity without folding COMMENT_EDIT ...
+        response = self.client.get(details_url, format="json")
+        assert response.status_code == 200, response.content
+        assert len(response.data["activity"]) == 100
+        assert response.data["activity"][-2]["id"] == comment_id
+        notes = [item for item in response.data["activity"] if item["type"] == "note"]
+        assert len(notes) == 1
+        assert notes[0]["id"] == comment_id
+        assert notes[0]["commentId"] == comment_id
+        assert notes[0]["data"]["text"] == "edited"
+
+        # ... and delete
+        response = self.client.delete(f"{comments_url}{comment_id}/", format="json")
+        assert response.status_code == 204, response.status_code
+
+        # ... after which the deleted Activity is absent from the feed.
+        response = self.client.get(details_url, format="json")
+        assert response.status_code == 200, response.content
+        assert [item for item in response.data["activity"] if item["type"] == "note"] == []
+
+    @action_log_activity_enabled()
+    def test_group_action_log_served_when_enabled(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        with self.feature({"projects:issue-action-log-write-to-db": False}):
+            note = self.create_group_activity(
+                group=group,
+                type=ActivityType.NOTE.value,
+                user_id=self.user.id,
+                data={"text": "current text"},
+            )
+        self.create_group_action_log_entry(
+            group=group,
+            type=GroupActionType.COMMENT,
+            actor_type=GroupActorType.USER,
+            actor_id=self.user.id,
+            data={"comment_id": note.id, "text": "stale text"},
+            idempotency_key=f"activity:{note.id}",
+            source="web",
+        )
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        with mock.patch.object(Activity.objects, "get_activities_for_group") as get_activity:
+            response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+        get_activity.assert_not_called()
+
+        assert [item["type"] for item in response.data["activity"]] == ["note", "first_seen"]
+        assert response.data["activity"][0]["id"] == str(note.id)
+        assert response.data["activity"][0]["data"]["text"] == "current text"
+        assert response.data["activity"][0]["source"] == "web"
+
+    @action_log_activity_enabled()
+    def test_group_action_log_empty_falls_back_to_activity(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        with self.feature({"projects:issue-action-log-write-to-db": False}):
+            note = self.create_group_activity(
+                group=group,
+                type=ActivityType.NOTE.value,
+                user_id=self.user.id,
+                data={"text": "legacy comment"},
+            )
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+        assert [item["type"] for item in response.data["activity"]] == ["note", "first_seen"]
+        assert response.data["activity"][0]["commentId"] == str(note.id)
+        assert response.data["activity"][0]["data"]["text"] == "legacy comment"
+
+    def test_group_action_log_ignored_when_disabled(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        self.create_group_action_log_entry(
+            group=group,
+            type=GroupActionType.COMMENT,
+            actor_type=GroupActorType.USER,
+            actor_id=self.user.id,
+            data={"comment_id": 123, "text": "hello world"},
+        )
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+
+        # the COMMENT only exists in the log, so its absence means Activity was served
+        assert [item["type"] for item in response.data["activity"]] == ["first_seen"]
+
+    def test_pending_delete_pending_merge_excluded(self) -> None:
+        group1 = self.create_group(status=GroupStatus.PENDING_DELETION)
+        group2 = self.create_group(status=GroupStatus.DELETION_IN_PROGRESS)
+
+        group3 = self.create_group(status=GroupStatus.PENDING_MERGE)
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/organizations/{group1.organization.slug}/issues/{group1.id}/"
+
+        response = self.client.get(url, format="json")
+        assert response.status_code == 404
+
+        url = f"/api/0/organizations/{group2.organization.slug}/issues/{group2.id}/"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 404
+
+        url = f"/api/0/organizations/{group3.organization.slug}/issues/{group3.id}/"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 404
+
+    def test_environment(self) -> None:
+        group = self.create_group()
+        self.login_as(user=self.user)
+
+        environment = Environment.get_or_create(group.project, "production")
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        with mock.patch(
+            "sentry.tsdb.backend.get_range", side_effect=tsdb.backend.get_range
+        ) as get_range:
+            response = self.client.get(url, {"environment": "production"}, format="json")
+            assert response.status_code == 200
+            assert get_range.call_count == 2
+            for args, kwargs in get_range.call_args_list:
+                assert kwargs["environment_ids"] == [environment.id]
+
+        response = self.client.get(url, {"environment": "invalid"}, format="json")
+        assert response.status_code == 404
+
+    def test_platform_external_issue_annotation(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+        self.create_platform_external_issue(
+            group=group,
+            service_type="sentry-app",
+            web_url="https://example.com/issues/2",
+            display_name="Issue#2",
+        )
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+
+        assert response.data["annotations"] == [
+            {"url": "https://example.com/issues/2", "displayName": "Issue#2"}
+        ]
+
+    def _create_issue_tracking_integration(self, group: Group) -> Integration:
+        return self.create_integration(
+            organization=group.organization,
+            provider="jira",
+            external_id="some_id",
+            name="Hello world",
+            metadata={"base_url": "https://example.com"},
+        )
+
+    def test_integration_external_issue_annotation(self) -> None:
+        group = self.create_group()
+        integration = self._create_issue_tracking_integration(group)
+        self.create_integration_external_issue(group=group, integration=integration, key="api-123")
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        with mock.patch(
+            "sentry.api.serializers.models.group.integration_service",
+            wraps=integration_service,
+        ) as mock_integration_service:
+            response = self.client.get(url, format="json")
+
+        assert response.data["annotations"] == [
+            {"url": "https://example.com/browse/api-123", "displayName": "api-123"}
+        ]
+        mock_integration_service.get_integrations.assert_called_once_with(
+            organization_id=group.organization.id, integration_ids=[integration.id]
+        )
+
+    def test_permalink_superuser(self) -> None:
+        superuser = self.create_user(is_superuser=True)
+        self.login_as(user=superuser, superuser=True)
+
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+
+        result = response.data["permalink"]
+        assert "http://" in result
+        assert f"{group.organization.slug}/issues/{group.id}" in result
+
+    def test_permalink_sentry_app_installation_token(self) -> None:
+        project = self.create_project(organization=self.organization, teams=[self.team])
+        internal_app = self.create_internal_integration(
+            name="Internal app",
+            organization=self.organization,
+            scopes=("project:read", "org:read", "event:write"),
+        )
+        token = self.create_internal_integration_token(
+            user=self.user,
+            internal_integration=internal_app,
+        )
+
+        group = self.create_group(project=project)
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, HTTP_AUTHORIZATION=f"Bearer {token.token}", format="json")
+        result = response.data["permalink"]
+        assert "http://" in result
+        assert f"{group.organization.slug}/issues/{group.id}" in result
+
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_ratelimit(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        with freeze_time("2000-01-01"):
+            for i in range(5):
+                self.client.get(url, sort_by="date", limit=1)
+            response = self.client.get(url, sort_by="date", limit=1)
+            assert response.status_code == 429
+
+    def test_with_deleted_user_activity(self) -> None:
+        self.login_as(user=self.user)
+        user = self.create_user("foo@example.com")
+
+        group = self.create_group()
+        Activity.objects.create(
+            group=group,
+            project=self.project,
+            type=ActivityType.NOTE.value,
+            user_id=user.id,
+            data={"text": "This is bad"},
+            datetime=timezone.now(),
+        )
+
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            user.delete()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200, response.content
+
+    def test_collapse_tags(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        # Without collapse param, tags should be present
+        response = self.client.get(url)
+        assert response.status_code == 200
+        assert response.data["tags"] == []
+
+        # With collapse param, tags should not be present
+        response = self.client.get(url, {"collapse": ["tags"]})
+        assert "tags" not in response.data
+
+    def test_count_with_buffer(self) -> None:
+        """Test that group count includes the count from the buffer."""
+        self.login_as(user=self.user)
+
+        redis_buffer = RedisBuffer()
+        with (
+            mock.patch("sentry.buffer.backend.get", redis_buffer.get),
+            mock.patch("sentry.buffer.backend.incr", redis_buffer.incr),
+        ):
+            event = self.store_event(
+                data={"message": "testing", "fingerprint": ["group-1"]}, project_id=self.project.id
+            )
+            assert event.group is not None
+            group = event.group
+            assert group is not None
+            event.group.update(times_seen=1)
+            buffer.backend.incr(Group, {"times_seen": 15}, filters={"id": event.group.id})
+
+            url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+            response = self.client.get(url, format="json")
+            assert response.status_code == 200, response.content
+            assert response.data["id"] == str(group.id)
+            assert response.data["count"] == "16"
+
+            url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+            response = self.client.get(url, format="json")
+
+            assert response.status_code == 200, response.content
+            assert response.data["id"] == str(group.id)
+            assert response.data["count"] == "16"
+
+    def test_user_agent_mcp(self) -> None:
+        with (
+            mock.patch("sentry.analytics.record") as mock_record,
+            self.feature("organizations:mcp-issue-view-attribution"),
+        ):
+            self.login_as(user=self.user)
+            group = self.create_group()
+            url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+            response = self.client.get(
+                url,
+                headers={
+                    "user-agent": "sentry-mcp/0.35.0 (https://mcp.sentry.dev)",
+                    "X-Sentry-MCP-Client-Family": "cursor",
+                },
+            )
+            assert response.status_code == 200
+            assert_any_analytics_event(
+                mock_record,
+                IssueViewedEvent(
+                    organization_id=group.project.organization.id,
+                    project_id=group.project.id,
+                    group_id=group.id,
+                    client="mcp - cursor",
+                    user_id=self.user.id,
+                ),
+            )
+            assert cache.get(cache_key_for_issue_view(group.id, "mcp")) == "cursor"
+
+    def test_user_agent_mcp_no_cache_without_feature(self) -> None:
+        with mock.patch("sentry.analytics.record") as mock_record:
+            self.login_as(user=self.user)
+            group = self.create_group()
+            url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+            response = self.client.get(
+                url,
+                headers={
+                    "user-agent": "sentry-mcp/0.35.0 (https://mcp.sentry.dev)",
+                    "X-Sentry-MCP-Client-Family": "cursor",
+                },
+            )
+            assert response.status_code == 200
+            assert_any_analytics_event(
+                mock_record,
+                IssueViewedEvent(
+                    organization_id=group.project.organization.id,
+                    project_id=group.project.id,
+                    group_id=group.id,
+                    client="mcp - cursor",
+                    user_id=self.user.id,
+                ),
+            )
+            assert cache.get(cache_key_for_issue_view(group.id, "mcp")) is None
+
+
+class GroupDetailsReconcileStatusTest(APITestCase, SnubaTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._options_ctx = self.options(
+            {"issues.derived_data.status_reconciliation.enabled": True}
+        )
+        self._options_ctx.__enter__()
+        self.addCleanup(lambda: self._options_ctx.__exit__(None, None, None))
+        self.login_as(user=self.user)
+
+    def _get(self, group: Group) -> None:
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200, response.content
+
+    @mock.patch("sentry.issues.derived.check.metrics")
+    @mock.patch("sentry.issues.derived.check.logger")
+    @mock.patch("sentry.issues.derived.tasks.reconcile_group_status.apply_async")
+    def test_diverged_closed_logs_and_dispatches_reconcile(
+        self,
+        mock_apply_async: mock.MagicMock,
+        mock_logger: mock.MagicMock,
+        mock_metrics: mock.MagicMock,
+    ) -> None:
+        group = self.create_group(status=GroupStatus.IGNORED, substatus=GroupSubStatus.FOREVER)
+        self.create_group_derived_data(group=group, data={"status": "open"})
+
+        with capture_action_log() as log:
+            self._get(group)
+
+        log.assert_not_logged(ReconcileStatusAction)
+        mock_apply_async.assert_called_once_with(kwargs={"group_id": group.id}, countdown=5 * 60)
+        mock_logger.info.assert_called_once_with(
+            "issues.status_reconciliation.diverged",
+            extra={
+                "group_id": group.id,
+                "project_id": group.project_id,
+                "derived_status": "open",
+                "actual_status": "closed",
+                "source": "read_path",
+            },
+        )
+        mock_metrics.incr.assert_any_call(
+            "issues.status_reconciliation.checked",
+            sample_rate=1.0,
+            tags={
+                "result": "diverged",
+                "derived_status": "open",
+                "actual_status": "closed",
+                "source": "read_path",
+            },
+        )
+
+    @mock.patch("sentry.issues.derived.check.metrics")
+    @mock.patch("sentry.issues.derived.check.logger")
+    @mock.patch("sentry.issues.derived.tasks.reconcile_group_status.apply_async")
+    def test_diverged_open_logs_and_dispatches_reconcile(
+        self,
+        mock_apply_async: mock.MagicMock,
+        mock_logger: mock.MagicMock,
+        mock_metrics: mock.MagicMock,
+    ) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+        self.create_group_derived_data(group=group, data={"status": "closed"})
+
+        with capture_action_log() as log:
+            self._get(group)
+
+        log.assert_not_logged(ReconcileStatusAction)
+        mock_apply_async.assert_called_once_with(kwargs={"group_id": group.id}, countdown=5 * 60)
+        mock_logger.info.assert_called_once_with(
+            "issues.status_reconciliation.diverged",
+            extra={
+                "group_id": group.id,
+                "project_id": group.project_id,
+                "derived_status": "closed",
+                "actual_status": "open",
+                "source": "read_path",
+            },
+        )
+        mock_metrics.incr.assert_any_call(
+            "issues.status_reconciliation.checked",
+            sample_rate=1.0,
+            tags={
+                "result": "diverged",
+                "derived_status": "closed",
+                "actual_status": "open",
+                "source": "read_path",
+            },
+        )
+
+    @mock.patch("sentry.issues.derived.check.metrics")
+    @mock.patch("sentry.issues.derived.tasks.reconcile_group_status.apply_async")
+    def test_aligned_status_skips(
+        self, mock_apply_async: mock.MagicMock, mock_metrics: mock.MagicMock
+    ) -> None:
+        group = self.create_group(status=GroupStatus.RESOLVED, substatus=None)
+        self.create_group_derived_data(group=group, data={"status": "closed"})
+
+        with capture_action_log() as log:
+            self._get(group)
+
+        log.assert_not_logged(ReconcileStatusAction)
+        mock_apply_async.assert_not_called()
+        mock_metrics.incr.assert_any_call(
+            "issues.status_reconciliation.checked",
+            sample_rate=1.0,
+            tags={"result": "aligned", "source": "read_path"},
+        )
+
+    @override_options({"issues.derived_data.status_reconciliation.enabled": False})
+    @mock.patch("sentry.issues.derived.tasks.reconcile_group_status.apply_async")
+    def test_disabled_reconciliation_does_not_schedule(
+        self, mock_apply_async: mock.MagicMock
+    ) -> None:
+        group = self.create_group(status=GroupStatus.RESOLVED, substatus=None)
+        self.create_group_derived_data(group=group, data={"status": "open"})
+
+        self._get(group)
+
+        mock_apply_async.assert_not_called()
+
+    @mock.patch("sentry.issues.derived.tasks.reconcile_group_status.apply_async")
+    def test_derived_not_expected_correct_does_not_schedule(
+        self, mock_apply_async: mock.MagicMock
+    ) -> None:
+        group = self.create_group(status=GroupStatus.RESOLVED, substatus=None)
+        group.project.update_option(GROUP_ACTION_LOG_BACKFILL_COMPLETED_OPTION, False)
+        self.create_group_derived_data(group=group, data={"status": "open"})
+
+        self._get(group)
+
+        mock_apply_async.assert_not_called()
+
+    def test_no_derived_data_skips(self) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        with capture_action_log() as log:
+            self._get(group)
+
+        log.assert_not_logged(ReconcileStatusAction)
+
+    @with_feature({"projects:issue-action-log-write-to-db": False})
+    def test_feature_flag_off_skips(self) -> None:
+        group = self.create_group(status=GroupStatus.IGNORED, substatus=GroupSubStatus.FOREVER)
+        self.create_group_derived_data(group=group, data={"status": "open"})
+
+        with capture_action_log() as log:
+            self._get(group)
+
+        log.assert_not_logged(ReconcileStatusAction)
+
+    @override_options({"issues.derived_data.read_path_checks.killswitch": True})
+    @mock.patch("sentry.issues.derived.check.logger")
+    def test_read_path_checks_killswitch(self, mock_logger: mock.MagicMock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+        self.create_group_derived_data(group=group, data={"status": "closed"})
+
+        self._get(group)
+
+        mock_logger.info.assert_not_called()
+
+
+class GroupUpdateTest(APITestCase):
+    def test_invalid_request_body(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+
+        for url in (
+            f"/api/0/issues/{group.id}/",
+            f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/",
+        ):
+            for data in ("null", "[]", '"invalid"', "0", "false"):
+                response = self.client.put(url, data=data, content_type="application/json")
+
+                assert response.status_code == 400, response.content
+                assert "non_field_errors" in response.data
+                group.refresh_from_db()
+                assert group.status == GroupStatus.UNRESOLVED
+
+    def test_empty_request_body(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+
+        for url in (
+            f"/api/0/issues/{group.id}/",
+            f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/",
+        ):
+            for data in ("", "{}"):
+                response = self.client.put(url, data=data, content_type="application/json")
+
+                assert response.status_code == 200, response.content
+                group.refresh_from_db()
+                assert group.status == GroupStatus.UNRESOLVED
+
+    def test_resolve(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"status": "resolved"}, format="json")
+        assert response.status_code == 200, response.content
+
+        group = Group.objects.get(id=group.id, project=group.project.id)
+        assert group.status == GroupStatus.RESOLVED
+
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+    def test_resolved_in_next_release_non_semver(self) -> None:
+        self.login_as(user=self.user)
+        project = self.create_project_with_releases()
+        group = self.create_group_with_no_release(project)
+
+        # Two releases are created, the most recent one will be used for group resolution
+        Release.get_or_create(version="abcd", project=group.project)
+        most_recent_version = Release.get_or_create(version="def", project=group.project)
+        assert group.status == GroupStatus.UNRESOLVED
+        assert GroupResolution.objects.all().count() == 0
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.put(url, data={"status": "resolvedInNextRelease"})
+        assert response.status_code == 200, response.content
+
+        # Refetch from DB to ensure the latest state is fetched
+        group = Group.objects.get(id=group.id, project=group.project.id)
+        assert group.status == GroupStatus.RESOLVED
+
+        group_resolution = GroupResolution.objects.filter(group=group).first()
+        assert group_resolution is not None
+        assert group_resolution.group is not None
+        assert group_resolution.group == group
+        assert group_resolution.type == GroupResolution.Type.in_next_release
+        assert group_resolution.status == GroupResolution.Status.pending
+        assert group_resolution.release.version == most_recent_version.version
+
+    def create_project_with_releases(self) -> Project:
+        project = self.create_project()
+        project.flags.has_releases = True
+        project.save()
+        return project
+
+    def create_group_with_no_release(self, project: Project) -> Group:
+        # Using store_event() instead of create_group() produces GroupRelease objects
+        # which is considered during the update_groups() call
+        event = self.store_event(data={}, project_id=project.id)
+        assert event.group is not None
+        group = event.group
+        assert group is not None
+
+        return group
+
+    def resolved_in_next_release_helper(self, with_first_release: bool = True) -> None:
+        self.login_as(user=self.user)
+        project = self.create_project_with_releases()
+        releases = [
+            Release.get_or_create(version="com.foo.bar@1.0+0", project=project),
+            Release.get_or_create(version="com.foo.bar@2.0+0", project=project),
+            # We create this release last but it is not the greatest version, thus, it should not be picked up
+            Release.get_or_create(version="com.foo.bar@1.0+1", project=project),
+        ]
+        first_release = releases[0]
+        greatest_version = releases[1]
+
+        data = {}
+        if with_first_release:
+            data["release"] = first_release.version
+        # Using store_event() instead of create_group() produces GroupRelease objects
+        # which is considered during the update_groups() call
+        event = self.store_event(data=data, project_id=project.id)
+        assert event.group is not None
+        group = event.group
+        assert group is not None
+        assert group.status == GroupStatus.UNRESOLVED
+        assert group.substatus == GroupSubStatus.NEW
+        if with_first_release:
+            assert group.first_release == first_release
+        else:
+            assert group.first_release is None
+        assert GroupResolution.objects.all().count() == 0
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        data = {"status": "resolvedInNextRelease"}
+        response = self.client.put(url, data=data)
+        assert response.status_code == 200, response.content == {}
+
+        # Refetch from DB to ensure the latest state is fetched
+        group = Group.objects.get(id=group.id, project=project.id)
+        assert group.status == GroupStatus.RESOLVED
+
+        group_resolution = GroupResolution.objects.filter(group=group).first()
+        assert group_resolution is not None
+        assert group_resolution.group is not None
+        assert group_resolution.group == group
+        # For semver projects, we consider resolution based on an expression rather than a specific release,
+        # thus, it is considered resolved in the release that has the highest semver
+        assert group_resolution.type == GroupResolution.Type.in_release
+        assert group_resolution.status == GroupResolution.Status.resolved
+        assert group_resolution.release.version == greatest_version.version
+        assert response.data["statusDetails"]["inRelease"] == greatest_version.version
+
+        new_release = Release.get_or_create(version="com.foo.bar@3.0+0", project=project)
+        # A lesser release than 2.x but created more recently than 3.x
+        old_version = Release.get_or_create(version="com.foo.bar@1.1+0", project=project)
+
+        # Let's test that none of these releases regress the group
+        for release in releases + [old_version]:
+            event = self.store_event(data={"release": release.version}, project_id=project.id)
+            assert event.group is not None
+            assert event.group == group
+            # Refetch from DB to ensure the latest state is fetched
+            group = Group.objects.get(id=group.id, project=project.id)
+            assert group.status == GroupStatus.RESOLVED
+
+        # Let's test that the latest semver release regress the group
+        event = self.store_event(data={"release": new_release.version}, project_id=project.id)
+        group = Group.objects.get(id=group.id, project=project.id)
+        assert group.status == GroupStatus.UNRESOLVED
+        assert group.substatus == GroupSubStatus.REGRESSED
+
+    def test_resolved_in_next_release_semver_no_first_release(self) -> None:
+        self.resolved_in_next_release_helper(with_first_release=False)
+
+    def test_resolved_in_next_release_semver_and_first_release(self) -> None:
+        self.resolved_in_next_release_helper(with_first_release=True)
+
+    def test_resolved_in_next_release_no_release(self) -> None:
+        self.login_as(user=self.user)
+        project = self.create_project_with_releases()
+        group = self.create_group_with_no_release(project)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.put(url, data={"status": "resolvedInNextRelease"})
+        assert response.status_code == 200, response.content
+
+        # Refetch from DB to ensure the latest state is fetched
+        group = Group.objects.get(id=group.id, project=group.project.id)
+        assert group.status == GroupStatus.RESOLVED
+
+        # no GroupResolution because there is no release
+        assert not GroupResolution.objects.filter(group=group).exists()
+        assert response.data["statusDetails"] == {}
+
+    def test_snooze_duration(self) -> None:
+        group = self.create_group(status=GroupStatus.RESOLVED)
+
+        self.login_as(user=self.user)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(
+            url, data={"status": "ignored", "ignoreDuration": 30}, format="json"
+        )
+
+        assert response.status_code == 200
+
+        snooze = GroupSnooze.objects.get(group=group)
+
+        assert snooze.until is not None
+        assert snooze.until > timezone.now() + timedelta(minutes=29)
+        assert snooze.until < timezone.now() + timedelta(minutes=31)
+
+        assert response.data["statusDetails"]["ignoreUntil"] == snooze.until
+
+        group = Group.objects.get(id=group.id)
+        assert group.get_status() == GroupStatus.IGNORED
+
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+    def test_bookmark(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"isBookmarked": "1"}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        # ensure we've created the bookmark
+        assert GroupBookmark.objects.filter(group=group, user_id=self.user.id).exists()
+
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+    def test_assign_username(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"assignedTo": self.user.username}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+        assert (
+            Activity.objects.filter(
+                group=group, user_id=self.user.id, type=ActivityType.ASSIGNED.value
+            ).count()
+            == 1
+        )
+
+        response = self.client.put(url, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+        response = self.client.put(url, data={"assignedTo": ""}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert not GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+    def test_assign_id(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"assignedTo": self.user.id}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+        assert (
+            Activity.objects.filter(
+                group=group, user_id=self.user.id, type=ActivityType.ASSIGNED.value
+            ).count()
+            == 1
+        )
+
+        response = self.client.put(url, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+        response = self.client.put(url, data={"assignedTo": ""}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert not GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+    def test_assign_id_via_api_key(self) -> None:
+        # XXX: This test is written to verify that using api keys works when
+        # hitting an endpoint that uses `client.{get,put,post}` to redirect to
+        # another endpoint. This catches a regression that happened when
+        # migrating to DRF 3.x.
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            api_key = ApiKey.objects.create(
+                organization_id=self.organization.id, scope_list=["event:write"]
+            )
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(
+            url,
+            data={"assignedTo": self.user.id},
+            format="json",
+            HTTP_AUTHORIZATION=self.create_basic_auth_header(api_key.key),
+        )
+        assert response.status_code == 200, response.content
+        assert GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+    def test_assign_team(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+        team = self.create_team(organization=group.project.organization, members=[self.user])
+        group.project.add_team(team)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"assignedTo": f"team:{team.id}"}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert GroupAssignee.objects.filter(group=group, team=team).exists()
+
+        assert Activity.objects.filter(group=group, type=ActivityType.ASSIGNED.value).count() == 1
+
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+        response = self.client.put(url, data={"assignedTo": ""}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert Activity.objects.filter(group=group).count() == 2
+
+        assert not GroupAssignee.objects.filter(group=group, team=team).exists()
+
+    def test_assign_unavailable_team(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+        group.project.organization.flags.allow_joinleave = False
+        group.project.organization.save()
+        team = self.create_team(organization=group.project.organization, members=[self.user])
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.put(url, data={"assignedTo": f"team:{team.id}"}, format="json")
+
+        assert response.status_code == 400, response.content
+
+    def test_mark_seen(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"hasSeen": "1"}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert GroupSeen.objects.filter(group=group, user_id=self.user.id).exists()
+
+        response = self.client.put(url, data={"hasSeen": "0"}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert not GroupSeen.objects.filter(group=group, user_id=self.user.id).exists()
+
+    def test_mark_seen_as_non_member(self) -> None:
+        user = self.create_user("foo@example.com", is_superuser=True)
+        self.login_as(user=user, superuser=True)
+
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.put(url, data={"hasSeen": "1"}, format="json")
+
+        assert response.status_code == 200, response.content
+
+        assert not GroupSeen.objects.filter(group=group, user_id=self.user.id).exists()
+
+    def test_seen_by_deleted_user(self) -> None:
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        self.login_as(user=self.user)
+        # Create a stale GroupSeen referencing a user that no longer exists
+        GroupSeen.objects.create(group=group, user_id=424242, project_id=self.project.id)
+
+        response = self.client.get(url)
+        assert response.status_code == 200, response.content
+        # Assert empty set for single invalid GroupSeen
+        assert response.data["seenBy"] == []
+
+        has_seen_response = self.client.put(url, data={"hasSeen": "1"}, format="json")
+        assert has_seen_response.status_code == 200
+
+        response = self.client.get(url)
+        assert response.status_code == 200, response.content
+        # Assert only valid GroupSeens are serialized
+        last_seen_data = response.data["seenBy"]
+        assert len(last_seen_data) == 1
+        assert last_seen_data[0]["id"] == str(self.user.id)
+
+    def test_subscription(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        resp = self.client.put(url, data={"isSubscribed": "true"})
+        assert resp.status_code == 200, resp.content
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=True
+        ).exists()
+
+        resp = self.client.get(url)
+        assert resp.status_code == 200, resp.content
+        assert [(user["id"], user["type"]) for user in resp.data["participants"]] == [
+            (str(self.user.id), "user")
+        ]
+
+        resp = self.client.put(url, data={"isSubscribed": "false"})
+        assert resp.status_code == 200, resp.content
+        assert GroupSubscription.objects.filter(
+            user_id=self.user.id, group=group, is_active=False
+        ).exists()
+
+        resp = self.client.get(url)
+        assert resp.status_code == 200, resp.content
+        assert resp.data["participants"] == []
+
+    def test_discard(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+
+        group_hash = GroupHash.objects.create(hash="x" * 32, project=group.project, group=group)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        with self.tasks():
+            with self.feature("projects:discard-groups"):
+                resp = self.client.put(url, data={"discard": True})
+
+        assert resp.status_code == 204
+        assert not Group.objects.filter(id=group.id).exists()
+        assert GroupHash.objects.filter(id=group_hash.id).exists()
+        group_tombstone_id = GroupHash.objects.get(id=group_hash.id).group_tombstone_id
+        assert group_tombstone_id is not None
+        tombstone = GroupTombstone.objects.get(id=group_tombstone_id)
+        assert tombstone.message == group.message
+        assert tombstone.culprit == group.culprit
+        assert tombstone.project == group.project
+        assert tombstone.data == group.data
+
+    def test_discard_performance_issue(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group(type=PerformanceSlowDBQueryGroupType.type_id)
+        GroupHash.objects.create(hash="x" * 32, project=group.project, group=group)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        with self.tasks():
+            with self.feature("projects:discard-groups"):
+                response = self.client.put(url, data={"discard": True})
+
+        assert response.status_code == 400, response.content
+
+        # Ensure it's still there
+        assert Group.objects.filter(id=group.id).exists()
+        assert GroupHash.objects.filter(group_id=group.id).exists()
+
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_ratelimit(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        with freeze_time("2000-01-01"):
+            for i in range(10):
+                self.client.put(url, sort_by="date", limit=1)
+            response = self.client.put(url, sort_by="date", limit=1)
+            assert response.status_code == 429
+
+
+class GroupDeleteTest(APITestCase):
+    def test_delete_as_member_respects_organization_setting(self) -> None:
+        group = self.create_group()
+        member = self.create_user()
+        self.create_member(
+            user=member, organization=self.organization, role="member", teams=[self.team]
+        )
+        self.login_as(user=member)
+        url = f"/api/0/organizations/{self.organization.slug}/issues/{group.id}/"
+
+        self.organization.update_option("sentry:events_member_admin", False)
+        response = self.client.delete(url)
+
+        assert response.status_code == 403, response.content
+        assert Group.objects.get(id=group.id).status == GroupStatus.UNRESOLVED
+
+        self.organization.update_option("sentry:events_member_admin", True)
+        response = self.client.delete(url)
+
+        assert response.status_code == 202, response.content
+        assert Group.objects.get(id=group.id).status == GroupStatus.PENDING_DELETION
+
+    def test_delete_with_write_only_token(self) -> None:
+        group = self.create_group()
+        token = self.create_user_auth_token(user=self.user, scope_list=["event:write"])
+
+        response = self.client.delete(
+            f"/api/0/organizations/{self.organization.slug}/issues/{group.id}/",
+            HTTP_AUTHORIZATION=f"Bearer {token.token}",
+        )
+
+        assert response.status_code == 403
+        assert Group.objects.get(id=group.id).status == GroupStatus.UNRESOLVED
+
+    def test_delete_deferred(self) -> None:
+        token = self.create_user_auth_token(user=self.user, scope_list=["event:admin"])
+
+        group = self.create_group()
+        hash = "x" * 32
+        GroupHash.objects.create(project=group.project, hash=hash, group=group)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        response = self.client.delete(url, HTTP_AUTHORIZATION=f"Bearer {token.token}")
+        assert response.status_code == 202, response.content
+
+        # Deletion was deferred, so it should still exist
+        assert Group.objects.get(id=group.id).status == GroupStatus.PENDING_DELETION
+        assert GroupHash.objects.filter(group_id=group.id).exists()
+
+    def test_delete_and_tasks_run(self) -> None:
+        self.login_as(user=self.user)
+
+        group = self.create_group()
+        hash = "x" * 32
+        GroupHash.objects.create(project=group.project, hash=hash, group=group)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        with self.tasks():
+            response = self.client.delete(url, format="json")
+
+        assert response.status_code == 202, response.content
+
+        # Now we killed everything with fire
+        assert not Group.objects.filter(id=group.id).exists()
+        assert not GroupHash.objects.filter(group_id=group.id).exists()
+        with self.tasks(), outbox_runner():
+            schedule_hybrid_cloud_foreign_key_jobs()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            assert (
+                AuditLogEntry.objects.get(
+                    event=audit_log.get_event_id("ISSUE_DELETE"),
+                ).data["issue_id"]
+                == group.id
+            )
+
+    def test_delete_performance_issue(self) -> None:
+        """Test that a performance issue can be deleted"""
+        self.login_as(user=self.user)
+
+        group = self.create_group(type=PerformanceSlowDBQueryGroupType.type_id)
+        GroupHash.objects.create(project=group.project, hash="x" * 32, group=group)
+
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+
+        with self.tasks():
+            response = self.client.delete(url, format="json")
+            assert response.status_code == 202, response.content
+
+        assert not Group.objects.filter(id=group.id).exists()
+        assert not GroupHash.objects.filter(group_id=group.id).exists()
+
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_ratelimit(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        with freeze_time("2000-01-01"):
+            for i in range(10):
+                self.client.delete(url, sort_by="date", limit=1)
+            response = self.client.delete(url, sort_by="date", limit=1)
+            assert response.status_code == 429
+
+    def test_collapse_release(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group()
+        url = f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/"
+        response = self.client.get(url)
+        assert response.status_code == 200
+        assert response.data["firstRelease"] is None
+        response = self.client.get(url, {"collapse": ["release"]})
+        assert "firstRelease" not in response.data
+
+
+class GroupDetailsCorruptDerivedDataTest(APITestCase):
+    @with_feature("projects:issue-status-reconciliation")
+    def test_corrupt_derived_status_does_not_break_details_or_reconcile(self) -> None:
+        self.login_as(user=self.user)
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        derived = self.create_group_derived_data(group, data={"status": "invalid"})
+        with (
+            capture_action_log() as log,
+            mock.patch("sentry.issues.derived.check.metrics.incr") as incr,
+        ):
+            response = self.client.get(
+                f"/api/0/organizations/{group.organization.slug}/issues/{group.id}/",
+                {"expand": "derivedData"},
+            )
+        assert response.status_code == 200, response.content
+        assert response.data["status"] == "unresolved"
+        assert "derivedData" not in response.data
+        log.assert_not_logged(ReconcileStatusAction)
+        incr.assert_any_call(
+            "issues.status_reconciliation.error", sample_rate=1.0, tags={"source": "read_path"}
+        )
+        derived.refresh_from_db()
+        assert derived.data == {"status": "invalid"}

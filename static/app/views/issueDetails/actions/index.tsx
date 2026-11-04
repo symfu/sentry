@@ -1,0 +1,660 @@
+import type {MouseEvent} from 'react';
+import {Fragment, useMemo} from 'react';
+import {useTheme} from '@emotion/react';
+import {IconCheckmark} from '@sentry/icons/checkmark';
+import {IconClock} from '@sentry/icons/clock';
+import {IconCopy} from '@sentry/icons/copy';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+import {IconSubscribed} from '@sentry/icons/subscribed';
+import {IconUnsubscribed} from '@sentry/icons/unsubscribed';
+import {IconUpload} from '@sentry/icons/upload';
+import {useMutation, useQueryClient} from '@tanstack/react-query';
+
+import {Button} from '@sentry/scraps/button';
+import {DropdownMenu} from '@sentry/scraps/dropdownMenu';
+import {Flex} from '@sentry/scraps/layout';
+import {useModal} from '@sentry/scraps/modal';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+
+import {bulkDelete, bulkUpdate} from 'sentry/actionCreators/group';
+import {
+  addLoadingMessage,
+  addSuccessMessage,
+  clearIndicators,
+} from 'sentry/actionCreators/indicator';
+import type {ModalRenderProps} from 'sentry/actionCreators/modal';
+import {openReprocessEventModal} from 'sentry/actionCreators/modal';
+import Feature from 'sentry/components/acl/feature';
+import {FeatureDisabled} from 'sentry/components/acl/featureDisabled';
+import {ArchiveActions} from 'sentry/components/actions/archive';
+import {ResolveActions} from 'sentry/components/actions/resolve';
+import {CMDKAction} from 'sentry/components/commandPalette/ui/cmdk';
+import {CommandPaletteSlot} from 'sentry/components/commandPalette/ui/commandPaletteSlot';
+import {openConfirmModal} from 'sentry/components/confirm';
+import ProjectBadge from 'sentry/components/idBadge/projectBadge';
+import {t} from 'sentry/locale';
+import {IssueListCacheStore} from 'sentry/stores/IssueListCacheStore';
+import type {Event} from 'sentry/types/event';
+import type {Group, GroupStatusResolution, MarkReviewed} from 'sentry/types/group';
+import {GroupStatus, GroupSubstatus} from 'sentry/types/group';
+import type {Project} from 'sentry/types/project';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {stripAnsi} from 'sentry/utils/ansiEscapeCodes';
+import {getUtcDateString} from 'sentry/utils/dates';
+import {displayReprocessEventAction} from 'sentry/utils/displayReprocessEventAction';
+import {getAnalyticsDataForGroup, getMessage, getTitle} from 'sentry/utils/events';
+import {getStacktraceBody} from 'sentry/utils/getStacktraceBody';
+import {getConfigForIssueType} from 'sentry/utils/issueTypeConfig';
+import {getAnalyicsDataForProject} from 'sentry/utils/projects';
+import {useApi} from 'sentry/utils/useApi';
+import {copyToClipboard} from 'sentry/utils/useCopyToClipboard';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {isVersionInfoSemver} from 'sentry/views/explore/releases/utils';
+import {SeerCommandPaletteActions} from 'sentry/views/issueDetails/actions/seerCommandPaletteActions';
+import {ShareIssueModal} from 'sentry/views/issueDetails/actions/shareModal';
+import {StatusBanner} from 'sentry/views/issueDetails/actions/statusBanner';
+import {SubscribeAction} from 'sentry/views/issueDetails/actions/subscribeAction';
+import {discardIssueMutationOptions} from 'sentry/views/issueDetails/discardIssueMutationOptions';
+import {Divider} from 'sentry/views/issueDetails/divider';
+import {GroupPriorityCommandPaletteAction} from 'sentry/views/issueDetails/groupPriority';
+import {GroupHeaderAssigneeCommandPaletteAction} from 'sentry/views/issueDetails/header/assigneeSelector';
+import {groupQueryKey} from 'sentry/views/issueDetails/useGroup';
+import {useProjectReleaseVersionIsSemver} from 'sentry/views/issueDetails/useProjectReleaseVersionIsSemver';
+import {
+  getGroupReprocessingStatus,
+  ReprocessingStatus,
+} from 'sentry/views/issueDetails/utils';
+
+type UpdateData =
+  | {isBookmarked: boolean; inbox?: boolean}
+  | {isSubscribed: boolean; inbox?: boolean}
+  | MarkReviewed
+  | GroupStatusResolution;
+
+const isResolutionStatus = (data: UpdateData): data is GroupStatusResolution => {
+  return (data as GroupStatusResolution).status !== undefined;
+};
+
+const getUpdateSuccessMessage = (group: Group, data: UpdateData) => {
+  if (isResolutionStatus(data)) {
+    switch (data.status) {
+      case GroupStatus.RESOLVED:
+        return t('Issue resolved');
+      case GroupStatus.IGNORED:
+        return t('Issue archived');
+      case GroupStatus.UNRESOLVED:
+        return group.status === GroupStatus.IGNORED
+          ? t('Issue unarchived')
+          : t('Issue marked unresolved');
+      default:
+        return;
+    }
+  }
+
+  if (data.inbox === false) {
+    return t('Issue marked reviewed');
+  }
+
+  return;
+};
+
+interface GroupActionsProps {
+  event: Event | null;
+  group: Group;
+  project: Project;
+}
+
+interface GroupResolutionActionsProps extends GroupActionsProps {
+  disabled: boolean;
+  onUpdate: (data: GroupStatusResolution) => void;
+  variant?: 'primary' | 'secondary';
+}
+
+export function GroupResolutionActions({
+  disabled,
+  event,
+  group,
+  onUpdate,
+  project,
+  variant = 'primary',
+}: GroupResolutionActionsProps) {
+  const hasRelease = !!project.features?.includes('releases');
+  const eventReleaseVersion = event?.release?.versionInfo?.version;
+  const projectHasSemverRelease = useProjectReleaseVersionIsSemver({
+    version: project.latestRelease?.version,
+    enabled: !eventReleaseVersion,
+  });
+  const hasSemverReleaseFeature = eventReleaseVersion
+    ? isVersionInfoSemver(eventReleaseVersion)
+    : projectHasSemverRelease;
+  const config = useMemo(() => getConfigForIssueType(group, project), [group, project]);
+  const {resolve: resolveCap, resolveInRelease: resolveInReleaseCap} = config.actions;
+
+  if (group.status === GroupStatus.RESOLVED) {
+    return resolveCap.enabled ? (
+      <Button
+        size="sm"
+        disabled={disabled}
+        onClick={() =>
+          onUpdate({
+            status: GroupStatus.UNRESOLVED,
+            statusDetails: {},
+            substatus: GroupSubstatus.ONGOING,
+          })
+        }
+      >
+        {t('Unresolve')}
+      </Button>
+    ) : null;
+  }
+
+  if (group.status === GroupStatus.IGNORED) {
+    return (
+      <Button
+        size="sm"
+        disabled={disabled}
+        onClick={() =>
+          onUpdate({
+            status: GroupStatus.UNRESOLVED,
+            statusDetails: {},
+            substatus: GroupSubstatus.ONGOING,
+          })
+        }
+      >
+        {t('Unarchive')}
+      </Button>
+    );
+  }
+
+  if (!resolveCap.enabled) {
+    return null;
+  }
+
+  return (
+    <ResolveActions
+      disableResolveInRelease={!resolveInReleaseCap.enabled}
+      disabled={disabled}
+      disableDropdown={disabled}
+      hasRelease={hasRelease}
+      latestRelease={project.latestRelease}
+      hasSemverReleaseFeature={hasSemverReleaseFeature}
+      onUpdate={onUpdate}
+      project={project}
+      size="sm"
+      variant={variant}
+    />
+  );
+}
+
+export function GroupActions({
+  group,
+  project,
+  event,
+  onUpdateSuccess,
+  resolveVariant = 'primary',
+}: GroupActionsProps & {
+  onUpdateSuccess?: () => void;
+  resolveVariant?: 'primary' | 'secondary';
+}) {
+  const disabled = [
+    ReprocessingStatus.REPROCESSING,
+    ReprocessingStatus.REPROCESSED_AND_HASNT_EVENT,
+  ].includes(getGroupReprocessingStatus(group));
+  const {openModal} = useModal();
+
+  const theme = useTheme();
+  const api = useApi({persistInFlight: true});
+  const organization = useOrganization();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const queryClient = useQueryClient();
+  const {mutate: discardIssue} = useMutation(discardIssueMutationOptions({navigate}));
+
+  const bookmarkKey = group.isBookmarked ? 'unbookmark' : 'bookmark';
+  const bookmarkTitle = group.isBookmarked ? t('Remove bookmark') : t('Bookmark');
+  const isResolved = group.status === 'resolved';
+  const isIgnored = group.status === 'ignored';
+  const hasDeleteAccess = organization.access.includes('event:admin');
+
+  const config = useMemo(() => getConfigForIssueType(group, project), [group, project]);
+  const issueCommandLabel = useMemo(() => {
+    const title = stripAnsi(getTitle(group).title ?? '');
+    const message = stripAnsi(getMessage(group) ?? '');
+    return message && message !== title ? `${title}: ${message}` : title;
+  }, [group]);
+
+  const stacktraceBody = useMemo(() => {
+    if (!event) {
+      return '';
+    }
+    const result = getStacktraceBody({event});
+    return result && Array.isArray(result) ? result.join('\n\n') : '';
+  }, [event]);
+
+  const {
+    actions: {
+      archiveUntilOccurrence: archiveUntilOccurrenceCap,
+      delete: deleteCap,
+      deleteAndDiscard: deleteDiscardCap,
+      resolve: resolveCap,
+      share: shareCap,
+    },
+    customCopy: {resolution: resolvedCopyCap},
+  } = config;
+
+  const trackIssueAction = (
+    action:
+      | 'shared'
+      | 'deleted'
+      | 'bookmarked'
+      | 'subscribed'
+      | 'mark_reviewed'
+      | 'discarded'
+      | GroupStatus,
+    substatus?: GroupSubstatus | null,
+    statusDetailsKey?: string
+  ) => {
+    const {alert_date, alert_rule_id, alert_type} = location.query;
+    trackAnalytics('issue_details.action_clicked', {
+      organization,
+      action_type: action,
+      action_substatus: substatus ?? undefined,
+      action_status_details: statusDetailsKey,
+      // Alert properties track if the user came from email/slack alerts
+      alert_date:
+        typeof alert_date === 'string' ? getUtcDateString(Number(alert_date)) : undefined,
+      alert_rule_id: typeof alert_rule_id === 'string' ? alert_rule_id : undefined,
+      alert_type: typeof alert_type === 'string' ? alert_type : undefined,
+      ...getAnalyticsDataForGroup(group),
+      ...getAnalyicsDataForProject(project),
+      org_streamline_only: organization.streamlineOnly ?? undefined,
+    });
+  };
+
+  const onDelete = async () => {
+    addLoadingMessage(t('Delete event\u2026'));
+    trackIssueAction('deleted');
+    IssueListCacheStore.reset();
+
+    try {
+      await bulkDelete(api, {
+        orgId: organization.slug,
+        projectId: project.slug,
+        itemIds: [group.id],
+      });
+      clearIndicators();
+
+      addSuccessMessage(t('Issue deleted'));
+      navigate({
+        pathname: `/organizations/${organization.slug}/issues/`,
+        query: {project: project.id},
+      });
+    } catch {
+      // GroupStore already shows the error
+    }
+  };
+
+  const onUpdate = async (data: UpdateData, onComplete?: () => void) => {
+    const successMessage = getUpdateSuccessMessage(group, data);
+
+    if (isResolutionStatus(data)) {
+      trackIssueAction(
+        data.status,
+        data.substatus,
+        Object.keys(data.statusDetails || {})[0]
+      );
+    }
+    if ((data as {inbox: boolean}).inbox !== undefined) {
+      trackIssueAction('mark_reviewed');
+    }
+    IssueListCacheStore.reset();
+
+    try {
+      await bulkUpdate(api, {
+        orgId: organization.slug,
+        projectId: project.slug,
+        itemIds: [group.id],
+        data,
+      });
+      clearIndicators();
+      if (successMessage) {
+        addSuccessMessage(successMessage);
+      }
+      onComplete?.();
+      onUpdateSuccess?.();
+    } catch {
+      // GroupStore already shows the error
+      // oxlint-disable-next-line react/todo
+    } finally {
+      queryClient.invalidateQueries({
+        queryKey: groupQueryKey({
+          organizationSlug: organization.slug,
+          groupId: group.id,
+        }),
+      });
+    }
+  };
+
+  const onReprocessEvent = () => {
+    openReprocessEventModal({organization, groupId: group.id});
+  };
+
+  const onTogglePublicShare = () => {
+    const newIsPublic = !group.isPublic;
+    if (newIsPublic) {
+      trackAnalytics('issue.shared_publicly', {
+        organization,
+      });
+    }
+    trackIssueAction('shared');
+  };
+
+  const onToggleBookmark = () => {
+    onUpdate({isBookmarked: !group.isBookmarked}, () => {
+      trackIssueAction('bookmarked');
+      addSuccessMessage(
+        group.isBookmarked ? t('Issue bookmark removed') : t('Issue bookmarked')
+      );
+    });
+  };
+
+  const onToggleSubscribe = () => {
+    onUpdate({isSubscribed: !group.isSubscribed}, () => {
+      trackIssueAction('subscribed');
+      addSuccessMessage(
+        group.isSubscribed ? t('Unsubscribed from issue') : t('Subscribed to issue')
+      );
+    });
+  };
+
+  const onDiscard = () => {
+    trackIssueAction('discarded');
+    discardIssue({
+      groupId: group.id,
+      orgSlug: organization.slug,
+      projectId: project.id,
+    });
+  };
+
+  const renderDiscardModal = ({Body, Footer, closeModal}: ModalRenderProps) => {
+    function renderDiscardDisabled({children, ...innerProps}: any) {
+      return children({
+        ...innerProps,
+        renderDisabled: ({features}: {features: string[]}) => (
+          <FeatureDisabled
+            alert
+            featureName={t('Discard and Delete')}
+            features={features}
+          />
+        ),
+      });
+    }
+
+    return (
+      <Feature
+        features="projects:discard-groups"
+        overrideName="feature-disabled:discard-groups"
+        organization={organization}
+        project={project}
+        renderDisabled={renderDiscardDisabled}
+      >
+        {({hasFeature, renderDisabled, ...innerProps}) => (
+          <Fragment>
+            <Body>
+              {!hasFeature &&
+                typeof renderDisabled === 'function' &&
+                renderDisabled({...innerProps, hasFeature, children: null})}
+              {t(
+                'Discarding this event will result in the deletion of most data associated with this issue and future events being discarded before reaching your stream. Are you sure you wish to continue?'
+              )}
+            </Body>
+            <Footer>
+              <Button onClick={closeModal}>{t('Cancel')}</Button>
+              <Button
+                style={{marginLeft: theme.space.md}}
+                variant="primary"
+                onClick={onDiscard}
+                disabled={!hasFeature}
+              >
+                {t('Discard Future Events')}
+              </Button>
+            </Footer>
+          </Fragment>
+        )}
+      </Feature>
+    );
+  };
+
+  const openDeleteModal = () =>
+    openConfirmModal({
+      message: t('Deleting this issue is permanent. Are you sure you wish to continue?'),
+      priority: 'danger',
+      confirmText: t('Delete'),
+      onConfirm: onDelete,
+    });
+
+  const openDiscardModal = () => {
+    openModal(renderDiscardModal);
+  };
+
+  const openShareModal = () => {
+    openModal(modalProps => (
+      <ShareIssueModal
+        {...modalProps}
+        organization={organization}
+        groupId={group.id}
+        event={event}
+        onToggle={onTogglePublicShare}
+        projectSlug={project.slug}
+        hasIssueShare={shareCap.enabled}
+      />
+    ));
+  };
+
+  const handleClick = (onClick: (event?: MouseEvent) => void) => {
+    return function (innerEvent: MouseEvent) {
+      if (disabled) {
+        innerEvent.preventDefault();
+        innerEvent.stopPropagation();
+        return;
+      }
+
+      onClick(innerEvent);
+    };
+  };
+
+  return (
+    <Fragment>
+      {!disabled && (
+        <CommandPaletteSlot name="page">
+          <CMDKAction
+            display={{
+              label: issueCommandLabel,
+              icon: (
+                <ProjectBadge project={project} avatarSize={16} hideName disableLink />
+              ),
+            }}
+          >
+            {resolveCap.enabled && !isResolved && !isIgnored && (
+              <CMDKAction
+                display={{
+                  label: t('Resolve'),
+                  icon: <IconCheckmark />,
+                }}
+                onAction={() =>
+                  onUpdate({
+                    status: GroupStatus.RESOLVED,
+                    statusDetails: {},
+                    substatus: null,
+                  })
+                }
+              />
+            )}
+            {!isResolved && !isIgnored && (
+              <CMDKAction
+                display={{label: t('Archive'), icon: <IconClock />}}
+                onAction={() =>
+                  onUpdate({
+                    status: GroupStatus.IGNORED,
+                    statusDetails: {},
+                    substatus: GroupSubstatus.ARCHIVED_UNTIL_ESCALATING,
+                  })
+                }
+              />
+            )}
+            {isResolved && resolveCap.enabled && (
+              <CMDKAction
+                display={{label: t('Unresolve'), icon: <IconCheckmark />}}
+                onAction={() =>
+                  onUpdate({
+                    status: GroupStatus.UNRESOLVED,
+                    statusDetails: {},
+                    substatus: GroupSubstatus.ONGOING,
+                  })
+                }
+              />
+            )}
+            {isIgnored && (
+              <CMDKAction
+                display={{label: t('Unarchive'), icon: <IconClock />}}
+                onAction={() =>
+                  onUpdate({
+                    status: GroupStatus.UNRESOLVED,
+                    statusDetails: {},
+                    substatus: GroupSubstatus.ONGOING,
+                  })
+                }
+              />
+            )}
+            {stacktraceBody && (
+              <CMDKAction
+                display={{
+                  label: t('Copy Stack Trace'),
+                  icon: <IconCopy />,
+                }}
+                keywords={['stacktrace', 'exception', 'error', 'trace', 'copy']}
+                onAction={() => copyToClipboard(stacktraceBody)}
+              />
+            )}
+            <GroupPriorityCommandPaletteAction group={group} />
+            <GroupHeaderAssigneeCommandPaletteAction
+              event={event}
+              group={group}
+              project={project}
+            />
+            <SeerCommandPaletteActions event={event} group={group} project={project} />
+          </CMDKAction>
+        </CommandPaletteSlot>
+      )}
+      <Flex align="center" gap="xs">
+        {isResolved || isIgnored ? (
+          <Flex align="center" gap="md">
+            <StatusBanner
+              group={group}
+              project={project}
+              resolvedCopy={resolvedCopyCap}
+            />
+
+            <Divider />
+            <GroupResolutionActions
+              disabled={disabled}
+              event={event}
+              group={group}
+              onUpdate={onUpdate}
+              project={project}
+              variant={resolveVariant}
+            />
+          </Flex>
+        ) : (
+          <Fragment>
+            <GroupResolutionActions
+              disabled={disabled}
+              event={event}
+              group={group}
+              onUpdate={onUpdate}
+              project={project}
+              variant={resolveVariant}
+            />
+            <ArchiveActions
+              size="sm"
+              isArchived={isIgnored}
+              onUpdate={onUpdate}
+              disabled={disabled}
+              disableArchiveUntilOccurrence={!archiveUntilOccurrenceCap.enabled}
+            />
+          </Fragment>
+        )}
+        <SubscribeAction
+          disabled={disabled}
+          disablePriority
+          group={group}
+          onClick={handleClick(onToggleSubscribe)}
+          icon={group.isSubscribed ? <IconSubscribed /> : <IconUnsubscribed />}
+          size="sm"
+        />
+        <Button
+          size="sm"
+          onClick={openShareModal}
+          icon={<IconUpload />}
+          aria-label={t('Share')}
+          tooltipProps={{title: t('Share Issue')}}
+          disabled={disabled}
+          analyticsEventKey="issue_details.share_action_clicked"
+          analyticsEventName="Issue Details: Share Action Clicked"
+        />
+        <DropdownMenu
+          trigger={triggerProps => (
+            <OverlayTrigger.IconButton
+              {...triggerProps}
+              aria-label={t('More Actions')}
+              icon={<IconEllipsis />}
+              size="sm"
+            />
+          )}
+          items={[
+            {
+              key: 'mark-review',
+              label: t('Mark reviewed'),
+              disabled: !group.inbox || disabled,
+              details:
+                !group.inbox || disabled ? t('Issue has been reviewed') : undefined,
+              onAction: () => onUpdate({inbox: false}),
+            },
+            {
+              key: bookmarkKey,
+              label: bookmarkTitle,
+              onAction: onToggleBookmark,
+            },
+            {
+              key: 'reprocess',
+              label: t('Reprocess events'),
+              hidden: !displayReprocessEventAction(event),
+              onAction: onReprocessEvent,
+            },
+            {
+              key: 'delete-issue',
+              priority: 'danger',
+              label: t('Delete'),
+              disabled: !hasDeleteAccess || !deleteCap.enabled,
+              details: hasDeleteAccess
+                ? deleteCap.disabledReason
+                : t('Only admins can delete issues'),
+              onAction: openDeleteModal,
+            },
+            {
+              key: 'delete-and-discard',
+              priority: 'danger',
+              label: t('Delete and discard future events'),
+              hidden: !hasDeleteAccess,
+              disabled: !deleteDiscardCap.enabled,
+              details: deleteDiscardCap.disabledReason,
+              onAction: openDiscardModal,
+            },
+          ]}
+        />
+      </Flex>
+    </Fragment>
+  );
+}

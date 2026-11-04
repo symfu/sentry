@@ -1,0 +1,170 @@
+import {useCallback} from 'react';
+import {mutationOptions} from '@tanstack/react-query';
+
+import {useAnalyticsArea} from 'sentry/components/analyticsArea';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {useAiQueryContext} from 'sentry/components/searchQueryBuilder/askSeerCombobox/aiQueryContext';
+import {AskSeerPollingComboBox} from 'sentry/components/searchQueryBuilder/askSeerCombobox/askSeerPollingComboBox';
+import type {
+  AskSeerSearchQuery,
+  SeerRawResponse,
+} from 'sentry/components/searchQueryBuilder/askSeerCombobox/types';
+import {
+  buildSeerMutationResult,
+  mapSeerResponseItem,
+  transformSeerResponse,
+  useInitialSeerQuery,
+  useSelectedProjectIds,
+  useSelectedProjectIdsForMutation,
+} from 'sentry/components/searchQueryBuilder/askSeerCombobox/useSeerComboBoxSetup';
+import {
+  mergeSeerExtraFields,
+  resolveSeerProjectSelection,
+} from 'sentry/components/searchQueryBuilder/askSeerCombobox/utils';
+import {useSearchQueryBuilderAI} from 'sentry/components/searchQueryBuilder/context';
+import {useCaseInsensitivity} from 'sentry/components/searchQueryBuilder/hooks';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {fetchMutation} from 'sentry/utils/queryClient';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {useQueryParamsFields} from 'sentry/views/explore/queryParams/context';
+import {getSeerExploreQuery} from 'sentry/views/explore/seerQuery';
+import {getExploreUrl} from 'sentry/views/explore/utils';
+
+export function SpansTabSeerComboBox() {
+  const navigate = useNavigate();
+  const pageFilters = usePageFilters();
+  const currFields = useQueryParamsFields();
+  const [caseInsensitive] = useCaseInsensitivity();
+  const organization = useOrganization();
+  const {projects} = useProjects();
+  const analyticsArea = useAnalyticsArea();
+  const {setRunId} = useAiQueryContext();
+  const {askSeerSuggestedQueryRef} = useSearchQueryBuilderAI();
+
+  const initialSeerQuery = useInitialSeerQuery();
+  const selectedProjectIds = useSelectedProjectIds();
+  const selectedProjectIdsForMutation = useSelectedProjectIdsForMutation();
+
+  const spansTabAskSeerMutationOptions = mutationOptions({
+    mutationFn: async (queryToSubmit: string) => {
+      const data = await fetchMutation<SeerRawResponse>({
+        url: getApiUrl('/organizations/$organizationIdOrSlug/search-agent/translate/', {
+          path: {organizationIdOrSlug: organization.slug},
+        }),
+        method: 'POST',
+        data: {
+          natural_language_query: queryToSubmit,
+          project_ids: selectedProjectIdsForMutation,
+        },
+      });
+
+      return buildSeerMutationResult(data, selectedProjectIds, response =>
+        mapSeerResponseItem(response, 'spans')
+      );
+    },
+  });
+
+  const applySeerSearchQuery = useCallback(
+    (result: AskSeerSearchQuery, runId?: number | string) => {
+      if (!result) {
+        return;
+      }
+      const seerQuery = getSeerExploreQuery({
+        result,
+        pageDatetime: pageFilters.selection.datetime,
+      });
+
+      // Move any `project:` filter Seer put in the query onto the page-level
+      // project selector so it isn't duplicated in the search bar.
+      const {query: cleanedQuery, projectIds} = resolveSeerProjectSelection(
+        seerQuery.query,
+        projects,
+        result.expandedProjectIds
+      );
+
+      const selection = {
+        ...pageFilters.selection,
+        ...(projectIds?.length ? {projects: projectIds} : {}),
+        datetime: seerQuery.datetime,
+      };
+
+      // Keep the table's current columns and append any extras Seer asked for.
+      // Passing them explicitly also stops getExploreUrl from dropping the
+      // user's columns back to the defaults.
+      const fields = mergeSeerExtraFields(currFields, result.extraFields);
+
+      // TODO: Include traces mode once we can switch the table in getExploreUrl
+      const url = getExploreUrl({
+        organization,
+        selection,
+        query: cleanedQuery,
+        visualize: seerQuery.visualizes,
+        groupBy: seerQuery.groupBys,
+        sort: seerQuery.sort,
+        mode: seerQuery.mode,
+        interval: seerQuery.interval,
+        field: fields,
+        caseInsensitive,
+        ...(result.crossEvents?.length ? {crossEvents: result.crossEvents} : {}),
+      });
+
+      askSeerSuggestedQueryRef.current = JSON.stringify({
+        selection,
+        query: cleanedQuery,
+        visualize: seerQuery.visualizes,
+        groupBy: seerQuery.groupBys,
+        sort: seerQuery.sort,
+        mode: seerQuery.mode,
+        interval: seerQuery.interval,
+        field: fields,
+        ...(result.crossEvents?.length ? {crossEvents: result.crossEvents} : {}),
+      });
+      trackAnalytics('ai_query.applied', {
+        organization,
+        area: analyticsArea,
+        query: cleanedQuery,
+        group_by_count: seerQuery.groupBys.length,
+        visualize_count: seerQuery.visualizes.length,
+      });
+      if (runId !== undefined) {
+        setRunId(runId);
+      }
+      navigate(url, {replace: true, preventScrollReset: true});
+    },
+    [
+      analyticsArea,
+      askSeerSuggestedQueryRef,
+      caseInsensitive,
+      currFields,
+      navigate,
+      organization,
+      pageFilters.selection,
+      projects,
+      setRunId,
+    ]
+  );
+
+  const transformResponse = useCallback(
+    (response: AskSeerSearchQuery): AskSeerSearchQuery[] =>
+      transformSeerResponse(
+        response,
+        responseItem => mapSeerResponseItem(responseItem, 'spans'),
+        selectedProjectIds
+      ),
+    [selectedProjectIds]
+  );
+
+  return (
+    <AskSeerPollingComboBox<AskSeerSearchQuery>
+      initialQuery={initialSeerQuery}
+      projectIds={selectedProjectIds}
+      strategy="Traces"
+      applySeerSearchQuery={applySeerSearchQuery}
+      transformResponse={transformResponse}
+      fallbackMutationOptions={spansTabAskSeerMutationOptions}
+    />
+  );
+}

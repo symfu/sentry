@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import logging
+
+from sentry.api.serializers import EventSerializer, serialize
+from sentry.eventstore import backend as eventstore
+from sentry.models.group import Group
+from sentry.seer.models import SeerApiError
+from sentry.seer.signed_seer_api import (
+    LightweightRCAClusterRequest,
+    SeerViewerContext,
+    make_lightweight_rca_cluster_request,
+)
+from sentry.seer.similarity.utils import (
+    SEER_INELIGIBLE_EVENT_PLATFORMS,
+    event_content_has_stacktrace,
+)
+from sentry.utils import metrics
+
+logger = logging.getLogger(__name__)
+
+# Seconds. Must stay below the task's processing deadline (default 10s).
+LIGHTWEIGHT_RCA_CLUSTER_SEER_TIMEOUT = 5
+
+
+def trigger_lightweight_rca_cluster(group: Group, event_id: str | None = None) -> None:
+    """
+    Call Seer's lightweight RCA clustering endpoint for the given group.
+
+    Sends issue event data to Seer, which generates a lightweight root cause analysis
+    and clusters the issue into supergroups based on embedding similarity.
+    """
+    if event_id is None:
+        # Fallback for tasks enqueued without an event_id. Prefer passing the
+        # event_id from post_process to avoid an unbounded Snuba latest-event query.
+        event = group.get_latest_event()
+        if not event:
+            logger.info(
+                "lightweight_rca_cluster.no_event",
+                extra={"group_id": group.id},
+            )
+            return
+        event_id = event.event_id
+
+    ready_event = eventstore.get_event_by_id(group.project.id, event_id, group_id=group.id)
+    if not ready_event:
+        logger.info(
+            "lightweight_rca_cluster.event_not_ready",
+            extra={"group_id": group.id, "event_id": event_id},
+        )
+        return
+
+    if not event_content_has_stacktrace(ready_event):
+        logger.info(
+            "lightweight_rca_cluster.event_not_eligible",
+            extra={
+                "group_id": group.id,
+                "event_id": ready_event.event_id,
+                "reason": "no_stacktrace",
+            },
+        )
+        metrics.incr("seer.lightweight_rca_cluster.skipped", tags={"reason": "no_stacktrace"})
+        return
+
+    if ready_event.platform in SEER_INELIGIBLE_EVENT_PLATFORMS:
+        logger.info(
+            "lightweight_rca_cluster.event_not_eligible",
+            extra={
+                "group_id": group.id,
+                "event_id": ready_event.event_id,
+                "reason": "unsupported_platform",
+            },
+        )
+        metrics.incr(
+            "seer.lightweight_rca_cluster.skipped", tags={"reason": "unsupported_platform"}
+        )
+        return
+
+    serialized_event = serialize(ready_event, None, EventSerializer())
+
+    body = LightweightRCAClusterRequest(
+        group_id=group.id,
+        issue={
+            "id": group.id,
+            "title": group.title,
+            "short_id": group.qualified_short_id,
+            "events": [serialized_event],
+        },
+        organization_slug=group.organization.slug,
+        organization_id=group.organization.id,
+        project_id=group.project.id,
+    )
+    viewer_context = SeerViewerContext(organization_id=group.organization.id)
+
+    # Keep the Seer timeout well under the task's processing deadline so a slow
+    # Seer response fails fast with a clear error instead of being killed by the
+    # taskworker deadline.
+    response = make_lightweight_rca_cluster_request(
+        body, timeout=LIGHTWEIGHT_RCA_CLUSTER_SEER_TIMEOUT, viewer_context=viewer_context
+    )
+    if response.status >= 400:
+        raise SeerApiError("Lightweight RCA cluster request failed", response.status)
+
+    logger.info(
+        "lightweight_rca_cluster.success",
+        extra={
+            "group_id": group.id,
+            "project_id": group.project.id,
+            "organization_id": group.organization.id,
+        },
+    )

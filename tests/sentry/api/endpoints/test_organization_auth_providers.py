@@ -1,34 +1,36 @@
-from django.core.urlresolvers import reverse
+from django.urls import reverse
 
-from sentry.testutils import APITestCase, PermissionTestCase
+from sentry.auth.partnership_configs import ChannelName
+from sentry.testutils.cases import APITestCase, PermissionTestCase
 
 
 class OrganizationAuthProvidersPermissionTest(PermissionTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.path = reverse(
             "sentry-api-0-organization-auth-providers", args=[self.organization.slug]
         )
 
-    def test_owner_can_load(self):
+    def test_owner_can_load(self) -> None:
         with self.feature("organizations:sso-basic"):
             self.assert_owner_can_access(self.path)
 
-    def test_member_can_get(self):
+    def test_member_can_get(self) -> None:
         with self.feature("organizations:sso-basic"):
             self.assert_member_can_access(self.path)
 
 
 class OrganizationAuthProviders(APITestCase):
-    def test_get_list_of_auth_providers(self):
-        organization = self.create_organization(name="foo", owner=self.user)
+    endpoint = "sentry-api-0-organization-auth-providers"
 
-        path = reverse("sentry-api-0-organization-auth-providers", args=[organization.slug])
-
+    def setUp(self) -> None:
+        super().setUp()
         self.login_as(self.user)
 
+    def test_get_list_of_auth_providers(self) -> None:
         with self.feature("organizations:sso-basic"):
-            resp = self.client.get(path)
-
-        assert resp.status_code == 200
-        assert any(d["key"] == "dummy" for d in resp.data)
+            response = self.get_success_response(self.organization.slug)
+        providers = {d["key"] for d in response.data}
+        assert "dummy" in providers
+        assert ChannelName.FLY_IO.value not in providers
+        assert ChannelName.FLY_NON_PARTNER.value not in providers

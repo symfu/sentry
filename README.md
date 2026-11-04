@@ -1,7 +1,11 @@
 <p align="center">
   <p align="center">
     <a href="https://sentry.io/?utm_source=github&utm_medium=logo" target="_blank">
-      <img src="https://sentry-brand.storage.googleapis.com/sentry-logo-black.png" alt="Sentry" height="72">
+      <picture>
+        <source srcset="https://sentry-brand.storage.googleapis.com/sentry-logo-white.png" media="(prefers-color-scheme: dark)" />
+        <source srcset="https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png" media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)" />
+        <img src="https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png" alt="Sentry" width="280">
+      </picture>
     </a>
   </p>
   <p align="center">
@@ -11,45 +15,54 @@
 
 # What's Sentry?
 
-Sentry is a service that helps you monitor and fix crashes
-in realtime. The server is in Python, but it contains a full API for
-sending events from any language, in any application.
+Sentry is the debugging platform that helps every developer detect, trace, and fix issues. Code breaks, fix it faster.
 
 <p align="center">
-  <img src="https://github.com/getsentry/sentry/raw/master/src/sentry/static/sentry/images/screenshots/thumb-1.png" width="290">
-  <img src="https://github.com/getsentry/sentry/raw/master/src/sentry/static/sentry/images/screenshots/thumb-2.png" width="290">
-  <img src="https://github.com/getsentry/sentry/raw/master/src/sentry/static/sentry/images/screenshots/thumb-3.png" width="290">
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/issue-details.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/seer.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/traces.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/trace-explorer.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/replays.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/logs.png" width="270" />
+  <img src="https://github.com/getsentry/sentry/raw/master/.github/screenshots/uptime.png" width="270" />
 </p>
 
 ## Official Sentry SDKs
 
-  - [JavaScript](https://github.com/getsentry/sentry-javascript)
-  - [React-Native](https://github.com/getsentry/sentry-react-native)
-  - [Python](https://github.com/getsentry/sentry-python)
-  - [Ruby](https://github.com/getsentry/raven-ruby)
-  - [PHP](https://github.com/getsentry/sentry-php)
-  - [Go](https://github.com/getsentry/sentry-go)
-  - [Rust](https://github.com/getsentry/sentry-rust)
-  - [Java/Kotlin](https://github.com/getsentry/sentry-java)
-  - [Objective-C/Swift](https://github.com/getsentry/sentry-cocoa)
-  - [C\#/F\#](https://github.com/getsentry/sentry-dotnet)
-  - [C/C++](https://github.com/getsentry/sentry-native)
-  - [Dart](https://github.com/getsentry/sentry-dart)
-  - [Perl](https://github.com/getsentry/perl-raven)
-  - [Clojure](https://github.com/getsentry/sentry-clj/)
-  - [Elixir](https://github.com/getsentry/sentry-elixir)
-  - [Unity](https://github.com/getsentry/sentry-unity)
-  - [Laravel](https://github.com/getsentry/sentry-laravel)
-  - [Electron](https://github.com/getsentry/sentry-electron/)
+<p align="center">
+  <a href="https://github.com/getsentry/sentry-javascript"><img src=".github/sdk-pills/javascript.svg" height="40" alt="JavaScript" /></a>
+  <a href="https://github.com/getsentry/sentry-electron"><img src=".github/sdk-pills/electron.svg" height="40" alt="Electron" /></a>
+  <a href="https://github.com/getsentry/sentry-react-native"><img src=".github/sdk-pills/react-native.svg" height="40" alt="React Native" /></a>
+  <a href="https://github.com/getsentry/sentry-python"><img src=".github/sdk-pills/python.svg" height="40" alt="Python" /></a>
+  <a href="https://github.com/getsentry/sentry-ruby"><img src=".github/sdk-pills/ruby.svg" height="40" alt="Ruby" /></a>
+  <a href="https://github.com/getsentry/sentry-php"><img src=".github/sdk-pills/php.svg" height="40" alt="PHP" /></a>
+  <a href="https://github.com/getsentry/sentry-laravel"><img src=".github/sdk-pills/laravel.svg" height="40" alt="Laravel" /></a>
+  <a href="https://github.com/getsentry/sentry-go"><img src=".github/sdk-pills/go.svg" height="40" alt="Go" /></a>
+  <a href="https://github.com/getsentry/sentry-rust"><img src=".github/sdk-pills/rust.svg" height="40" alt="Rust" /></a>
+  <a href="https://github.com/getsentry/sentry-java"><img src=".github/sdk-pills/java.svg" height="40" alt="Java / Kotlin" /></a>
+  <a href="https://github.com/getsentry/sentry-cocoa"><img src=".github/sdk-pills/apple.svg" height="40" alt="Objective-C / Swift" /></a>
+  <a href="https://github.com/getsentry/sentry-dotnet"><img src=".github/sdk-pills/dotnet.svg" height="40" alt="C# / F#" /></a>
+  <a href="https://github.com/getsentry/sentry-native"><img src=".github/sdk-pills/cpp.svg" height="40" alt="C / C++" /></a>
+  <a href="https://github.com/getsentry/sentry-dart"><img src=".github/sdk-pills/flutter.svg" height="40" alt="Dart / Flutter" /></a>
+  <a href="https://github.com/getsentry/perl-raven"><img src=".github/sdk-pills/perl.svg" height="40" alt="Perl" /></a>
+  <a href="https://github.com/getsentry/sentry-clj"><img src=".github/sdk-pills/clojure.svg" height="40" alt="Clojure" /></a>
+  <a href="https://github.com/getsentry/sentry-elixir"><img src=".github/sdk-pills/elixir.svg" height="40" alt="Elixir" /></a>
+  <a href="https://github.com/getsentry/sentry-unity"><img src=".github/sdk-pills/unity.svg" height="40" alt="Unity" /></a>
+  <a href="https://github.com/getsentry/sentry-unreal"><img src=".github/sdk-pills/unreal.svg" height="40" alt="Unreal Engine" /></a>
+  <a href="https://github.com/getsentry/sentry-godot"><img src=".github/sdk-pills/godot.svg" height="40" alt="Godot Engine" /></a>
+  <a href="https://github.com/getsentry/sentry-powershell"><img src=".github/sdk-pills/powershell.svg" height="40" alt="PowerShell" /></a>
+</p>
 
 # Resources
 
-  - [Documentation](https://docs.sentry.io/)
-  - [Community](https://forum.sentry.io/) (Bugs, feature requests,
-    general questions)
-  - [Discord](https://discord.gg/PXa5Apfe7K)
-  - [Contributing](https://docs.sentry.io/internal/contributing/)
-  - [Bug Tracker](https://github.com/getsentry/sentry/issues)
-  - [Code](https://github.com/getsentry/sentry)
-  - [Transifex](https://www.transifex.com/getsentry/sentry/) (Translate
-    Sentry\!)
+- [Documentation](https://docs.sentry.io/)
+- [Discussions](https://github.com/getsentry/sentry/discussions) (Bugs, feature requests,
+  general questions)
+- [Discord](https://discord.gg/PXa5Apfe7K)
+- [Contributing](https://docs.sentry.io/internal/contributing/)
+- [Bug Tracker](https://github.com/getsentry/sentry/issues)
+- [Code](https://github.com/getsentry/sentry)
+- [Transifex](https://explore.transifex.com/getsentry/sentry/) (Translate
+  Sentry\!)

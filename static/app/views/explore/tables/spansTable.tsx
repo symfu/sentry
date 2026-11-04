@@ -1,0 +1,387 @@
+import {Fragment, useEffect, useMemo, useRef, useState} from 'react';
+import styled from '@emotion/styled';
+import {IconChevron} from '@sentry/icons/chevron';
+
+import {Button} from '@sentry/scraps/button';
+import {Flex} from '@sentry/scraps/layout';
+import {Pagination} from '@sentry/scraps/pagination';
+import {Text} from '@sentry/scraps/text';
+
+import {addErrorMessage} from 'sentry/actionCreators/indicator';
+import {LoadingError} from 'sentry/components/loadingError';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {Placeholder} from 'sentry/components/placeholder';
+import {getNextDirection} from 'sentry/components/tables/getNextSort';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {COLUMN_ALIGN_JUSTIFY} from 'sentry/components/tables/sortableHeaderCell';
+import {t} from 'sentry/locale';
+import type {TagCollection} from 'sentry/types/group';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import type {EventData, MetaType} from 'sentry/utils/discover/eventView';
+import {fieldAlignment} from 'sentry/utils/discover/fields';
+import {getQueryErrorMessage} from 'sentry/utils/discover/genericDiscoverQuery';
+import {FieldValueType, getFieldDefinition, prettifyTagKey} from 'sentry/utils/fields';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import type {TableColumn} from 'sentry/views/discover/table/types';
+import type {SpansTableResult} from 'sentry/views/explore/hooks/useExploreSpansTable';
+import {usePaginationAnalytics} from 'sentry/views/explore/hooks/usePaginationAnalytics';
+import {
+  useQueryParamsCursor,
+  useQueryParamsFields,
+  useQueryParamsQuery,
+  useQueryParamsSortBys,
+  useSetQueryParamsFields,
+  useSetQueryParamsSortBys,
+} from 'sentry/views/explore/queryParams/context';
+
+import {FieldRenderer} from './fieldRenderer';
+import {SpanItemDetails} from './spanItemDetails';
+
+const SPAN_DETAILS_COLUMN_WIDTH = 40;
+
+interface SpansTableProps {
+  booleanTags: TagCollection;
+  numberTags: TagCollection;
+  spansTableResult: SpansTableResult;
+  stringTags: TagCollection;
+  validatedFieldTypes: Partial<Record<string, FieldValueType>>;
+  emptyMessage?: React.ReactNode;
+}
+
+interface ResolvedSpanTable {
+  data: EventData[];
+  dataUpdatedAt: number;
+  fields: readonly string[];
+  identityKey: string;
+  meta: MetaType;
+  pageLinks: string | undefined;
+}
+
+export function SpansTable({
+  booleanTags,
+  emptyMessage,
+  numberTags,
+  spansTableResult,
+  stringTags,
+  validatedFieldTypes,
+}: SpansTableProps) {
+  const fields = useQueryParamsFields();
+  const query = useQueryParamsQuery();
+  const cursor = useQueryParamsCursor();
+  const sortBys = useQueryParamsSortBys();
+  const setFields = useSetQueryParamsFields();
+  const setSortBys = useSetQueryParamsSortBys();
+
+  const visibleFields = useMemo(
+    () => (fields.includes('id') ? [...fields] : ['id', ...fields]),
+    [fields]
+  );
+
+  const {eventView, requestIdentityKey, result} = spansTableResult;
+
+  const tableIdentityKey = useMemo(
+    () =>
+      JSON.stringify([
+        requestIdentityKey ?? cursor,
+        eventView.dataset,
+        eventView.end,
+        eventView.environment,
+        eventView.project,
+        query,
+        sortBys,
+        eventView.start,
+        eventView.statsPeriod,
+        eventView.utc,
+      ]),
+    [cursor, eventView, query, requestIdentityKey, sortBys]
+  );
+  const resolvedTable = useMemo<Omit<ResolvedSpanTable, 'fields'> | null>(() => {
+    if (result.isSuccess && !result.isPlaceholderData && result.data) {
+      return {
+        data: result.data,
+        dataUpdatedAt: result.dataUpdatedAt,
+        identityKey: tableIdentityKey,
+        meta: result.meta ?? {},
+        pageLinks: result.pageLinks,
+      };
+    }
+    return null;
+  }, [result, tableIdentityKey]);
+  const [lastResolvedTable, setLastResolvedTable] = useState<ResolvedSpanTable | null>(
+    resolvedTable ? {...resolvedTable, fields} : null
+  );
+  const rolledBackErrorRef = useRef<SpansTableResult['result']['error']>(null);
+
+  if (
+    resolvedTable &&
+    (resolvedTable.data !== lastResolvedTable?.data ||
+      resolvedTable.dataUpdatedAt !== lastResolvedTable?.dataUpdatedAt ||
+      resolvedTable.identityKey !== lastResolvedTable?.identityKey)
+  ) {
+    setLastResolvedTable({...resolvedTable, fields});
+  }
+
+  const canRetainLastResolvedTable = lastResolvedTable?.identityKey === tableIdentityKey;
+  const isLoadingDifferentTable = result.isPlaceholderData && !canRetainLastResolvedTable;
+  const displayedData =
+    !result.isPending && !result.isPlaceholderData && result.data
+      ? result.data
+      : canRetainLastResolvedTable
+        ? lastResolvedTable.data
+        : undefined;
+  const displayedMeta =
+    (isLoadingDifferentTable ? undefined : result.meta) ??
+    (canRetainLastResolvedTable ? lastResolvedTable.meta : undefined);
+  const routingHint =
+    !result.isPending && !result.isPlaceholderData && result.data
+      ? result.meta?.routingHint
+      : canRetainLastResolvedTable
+        ? lastResolvedTable.meta.routingHint
+        : undefined;
+  const displayedPageLinks =
+    (result.isPlaceholderData || result.isError) && canRetainLastResolvedTable
+      ? lastResolvedTable.pageLinks
+      : result.pageLinks;
+  const addedFields = useMemo(
+    () =>
+      canRetainLastResolvedTable
+        ? fields.filter(field => !lastResolvedTable.fields.includes(field))
+        : [],
+    [canRetainLastResolvedTable, fields, lastResolvedTable]
+  );
+  const isRetainedError =
+    result.isError && canRetainLastResolvedTable && Boolean(displayedData?.length);
+  const isFieldAdditionError = result.isError && addedFields.length > 0;
+  const pendingFields = new Set(result.isFetching ? addedFields : []);
+
+  useEffect(() => {
+    if (
+      !result.isError ||
+      !lastResolvedTable ||
+      addedFields.length === 0 ||
+      rolledBackErrorRef.current === result.error
+    ) {
+      return;
+    }
+
+    rolledBackErrorRef.current = result.error;
+    setFields([...lastResolvedTable.fields], {replace: true});
+    addErrorMessage(t('Failed to add column'));
+  }, [addedFields, lastResolvedTable, result.error, result.isError, setFields]);
+
+  const meta = useMemo(
+    () =>
+      addValidatedFieldTypesToMeta({
+        meta: displayedMeta ?? {},
+        validatedFieldTypes,
+      }),
+    [displayedMeta, validatedFieldTypes]
+  );
+  const columnsFromEventView = useMemo(
+    () => eventView.getColumns(meta),
+    [eventView, meta]
+  );
+  const paginationAnalyticsEvent = usePaginationAnalytics(
+    'samples',
+    displayedData?.length ?? 0
+  );
+
+  return (
+    <Fragment>
+      <SimpleTable
+        aria-busy={result.isFetching}
+        columns={visibleFields.map(field => ({key: field, resizable: true}))}
+        data-test-id="spans-table"
+        minimumColumnWidth={50}
+        prependColumnWidths={[`${SPAN_DETAILS_COLUMN_WIDTH}px`]}
+        scrollable
+        header={
+          <SimpleTable.HeaderRow>
+            <SpanDetailsToggleHeadCell aria-label={t('Span details')} />
+            {visibleFields.map((field, i) => {
+              // Hide column names before alignment is determined
+              if (result.isPending || isLoadingDifferentTable) {
+                return <SimpleTable.HeaderCell key={i} />;
+              }
+
+              const fieldType = meta.fields?.[field];
+              const align = fieldAlignment(field, fieldType);
+              const tag =
+                stringTags[field] ?? numberTags[field] ?? booleanTags[field] ?? null;
+
+              const direction = sortBys.find(s => s.field === field)?.kind;
+
+              function updateSort() {
+                setSortBys([{field, kind: getNextDirection(direction)}]);
+              }
+
+              const label = tag?.name ?? prettifyTagKey(field);
+
+              return (
+                <SimpleTable.HeaderCell
+                  align={align}
+                  columnIndex={i}
+                  key={i}
+                  handleSortClick={updateSort}
+                  sort={direction}
+                >
+                  <Flex
+                    align="center"
+                    gap="xs"
+                    justify={COLUMN_ALIGN_JUSTIFY[align]}
+                    minWidth="0"
+                  >
+                    <Text as="span" ellipsis size="sm" variant="inherit">
+                      {label}
+                    </Text>
+                    {pendingFields.has(field) ? (
+                      <LoadingIndicator
+                        data-test-id="column-loading-indicator"
+                        size={12}
+                        style={{margin: 0}}
+                      />
+                    ) : null}
+                  </Flex>
+                </SimpleTable.HeaderCell>
+              );
+            })}
+          </SimpleTable.HeaderRow>
+        }
+      >
+        {result.isError && !isRetainedError ? (
+          <SimpleTable.Error message={getQueryErrorMessage(result.error)} />
+        ) : (result.isPending || isLoadingDifferentTable) && !displayedData ? (
+          <SimpleTable.Loading />
+        ) : displayedData?.length ? (
+          displayedData.map((row, i) => (
+            <SpanSampleRow
+              key={`${tableIdentityKey}:${getSpanKey(row, i)}`}
+              columns={columnsFromEventView}
+              data={row}
+              fields={visibleFields}
+              pendingFields={pendingFields}
+              meta={meta}
+              routingHint={routingHint}
+            />
+          ))
+        ) : (
+          <SimpleTable.Empty>{emptyMessage ?? t('No spans found')}</SimpleTable.Empty>
+        )}
+      </SimpleTable>
+      {isRetainedError && !isFieldAdditionError ? (
+        <LoadingError
+          message={
+            getQueryErrorMessage(result.error) ?? t('Failed to update span samples')
+          }
+          onRetry={() => void result.refetch()}
+        />
+      ) : null}
+      <Pagination
+        pageLinks={displayedPageLinks}
+        paginationAnalyticsEvent={paginationAnalyticsEvent}
+      />
+    </Fragment>
+  );
+}
+
+function SpanSampleRow({
+  columns,
+  data,
+  fields,
+  pendingFields,
+  meta,
+  routingHint,
+}: {
+  columns: Array<TableColumn<string>>;
+  data: EventData;
+  fields: readonly string[];
+  meta: MetaType;
+  pendingFields: ReadonlySet<string>;
+  routingHint?: string;
+}) {
+  const organization = useOrganization();
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  return (
+    <Fragment>
+      <SimpleTable.Row>
+        <SpanDetailsToggleCell>
+          <Button
+            aria-expanded={isExpanded}
+            aria-label={isExpanded ? t('Hide span details') : t('Show span details')}
+            icon={<IconChevron size="xs" direction={isExpanded ? 'down' : 'right'} />}
+            size="zero"
+            variant="transparent"
+            onClick={() => {
+              setIsExpanded(e => !e);
+              trackAnalytics('trace_explorer.toggle_span_details', {
+                organization,
+                expanded: !isExpanded,
+              });
+            }}
+          />
+        </SpanDetailsToggleCell>
+        {fields.map((field, index) => (
+          <SimpleTable.RowCell key={field}>
+            {pendingFields.has(field) ? (
+              <Placeholder height="14px" width="60%" />
+            ) : (
+              <FieldRenderer
+                column={columns[index]}
+                data={data}
+                unit={meta.units?.[field]}
+                meta={meta}
+              />
+            )}
+          </SimpleTable.RowCell>
+        ))}
+      </SimpleTable.Row>
+      {isExpanded ? (
+        <SimpleTable.Row>
+          <SpanDetailsCell>
+            <SpanItemDetails dataRow={data} routingHint={routingHint} />
+          </SpanDetailsCell>
+        </SimpleTable.Row>
+      ) : null}
+    </Fragment>
+  );
+}
+
+function getSpanKey(row: EventData, index: number) {
+  return (
+    [row.project, row.trace, row.id, row.timestamp].filter(Boolean).join(':') || index
+  );
+}
+
+const SpanDetailsToggleHeadCell = styled(SimpleTable.HeaderCell)`
+  align-items: center;
+  padding: 0;
+`;
+
+const SpanDetailsToggleCell = styled(SimpleTable.RowCell)`
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+`;
+
+const SpanDetailsCell = styled(SimpleTable.FullWidthCell)`
+  background-color: ${p => p.theme.colors.gray100};
+  padding: ${p => p.theme.space.md};
+`;
+
+export function addValidatedFieldTypesToMeta({
+  meta,
+  validatedFieldTypes,
+}: {
+  meta: MetaType;
+  validatedFieldTypes: Partial<Record<string, FieldValueType>>;
+}): MetaType {
+  const fields = {...meta?.fields};
+
+  for (const [field, validatedType] of Object.entries(validatedFieldTypes)) {
+    fields[field] =
+      getFieldDefinition(field, 'span')?.valueType ?? fields[field] ?? validatedType;
+  }
+
+  return {...meta, fields};
+}

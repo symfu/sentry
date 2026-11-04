@@ -1,54 +1,69 @@
-from django.http import HttpRequest
-
 from unittest import TestCase
-from sentry.utils.session_store import RedisSessionStore
+
+from django.test import Client, RequestFactory
+
+from sentry.utils.session_store import RedisSessionStore, redis_property
 
 
 class RedisSessionStoreTestCase(TestCase):
-    def test_store_values(self):
-        request = HttpRequest()
-        request.session = {}
+    class TestRedisSessionStore(RedisSessionStore):
+        some_value = redis_property("some_value")
 
-        store = RedisSessionStore(request, "test-store")
-        store.regenerate()
+    def setUp(self) -> None:
+        self.request = RequestFactory().get("")
+        self.request.session = Client().session
 
-        assert "store:test-store" in request.session
+        self.store = self.TestRedisSessionStore(self.request, "test-store")
 
-        store.some_value = "test_value"
-        store2 = RedisSessionStore(request, "test-store")
+    def test_store_values(self) -> None:
+        self.store.regenerate()
+
+        assert "store:test-store" in self.request.session
+
+        self.store.some_value = "test_value"
+        assert self.store.get_state()
+        store2 = self.TestRedisSessionStore(self.request, "test-store")
 
         assert store2.is_valid()
+        assert store2.get_state()
         assert store2.some_value == "test_value"
 
-        with self.assertRaises(AttributeError):
-            store.missing_key
+        assert not hasattr(self.store, "missing_key")
 
-        store.clear()
+        self.store.clear()
+        assert self.request.session.modified
 
-    def test_store_complex_object(self):
-        request = HttpRequest()
-        request.session = {}
+    def test_store_complex_object(self) -> None:
+        self.store.regenerate({"some_value": {"deep_object": "value"}})
 
-        store = RedisSessionStore(request, "test-store")
-        store.regenerate({"some_value": {"deep_object": "value"}})
-
-        store2 = RedisSessionStore(request, "test-store")
+        store2 = self.TestRedisSessionStore(self.request, "test-store")
 
         assert store2.some_value["deep_object"] == "value"
 
-        store.clear()
+        self.store.clear()
 
-    def test_uninitialized_store(self):
-        request = HttpRequest()
-        request.session = {}
+    def test_uninitialized_store(self) -> None:
+        assert self.store.is_valid() is False
+        assert self.store.get_state() is None
+        assert self.store.some_value is None
 
-        store = RedisSessionStore(request, "test-store")
+        self.store.clear()
 
-        assert not store.is_valid()
-        assert store.get_state() is None
-        assert store.some_key is None
+    def test_malformed_state(self) -> None:
+        self.store.regenerate()
+        client = self.store._client
 
-        store.setting_but_no_state = "anything"
-        assert store.setting_but_no_state is None
+        assert "store:test-store" in self.request.session
+        self.store.some_value = "test_value"
 
-        store.clear()
+        assert self.store.is_valid()
+        assert self.store.get_state()
+
+        # Redis session store should be bulletproof in case redis state values are invalid json.
+        # For example, random bit flips caused by cosmic rays.
+        redis_key = self.store.redis_key
+        assert redis_key is not None
+        client.setex(redis_key, self.store.ttl, "invalid json")
+
+        assert self.store.is_valid() is False
+        assert self.store.get_state() is None

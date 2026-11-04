@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from typing import Any
+
+from django.http import HttpResponse
+from django.http.response import HttpResponseBase
+from rest_framework import status
+
+from sentry.hybridcloud.outbox.category import WebhookProviderIdentifier
+from sentry.integrations.jira_server.webhooks import (
+    JiraServerIssueUpdatedWebhook,
+    get_integration_from_token,
+)
+from sentry.integrations.middleware.hybrid_cloud.parser import BaseRequestParser
+from sentry.integrations.types import IntegrationProviderSlug
+
+logger = logging.getLogger(__name__)
+
+
+class JiraServerRequestParser(BaseRequestParser):
+    provider = IntegrationProviderSlug.JIRA_SERVER.value
+    webhook_identifier = WebhookProviderIdentifier.JIRA_SERVER
+
+    def get_response_from_issue_update_webhook(self) -> HttpResponseBase:
+        token = self.match.kwargs.get("token")
+        try:
+            integration = get_integration_from_token(token)
+        except ValueError as e:
+            logger.info("%s.no_integration", self.provider, extra={"error": str(e)})
+            return HttpResponse(status=status.HTTP_200_OK)
+
+        data = self.get_request_body()
+
+        # We only process webhooks with changelogs. Above the org and cell lookups a
+        # dropped payload never needs; below the token lookup so the log can name it.
+        if not data.get("changelog"):
+            logger.info("missing-changelog", extra={"integration_id": integration.id})
+            return HttpResponse(status=status.HTTP_200_OK)
+
+        shed_response = self.get_shed_response(integration_id=integration.id)
+        if shed_response is not None:
+            return shed_response
+
+        organizations = self.get_organizations_from_integration(integration=integration)
+
+        if len(organizations) == 0:
+            return HttpResponse(status=status.HTTP_400_BAD_REQUEST)
+
+        cells = self.get_cells_from_organizations(organizations=organizations)
+
+        return self.get_response_from_webhookpayload(
+            cells=cells,
+            mailbox=self.get_mailbox(integration, data),
+            integration_id=integration.id,
+        )
+
+    def mailbox_bucket_id(self, data: Mapping[str, Any]) -> int | None:
+        """Only changelog webhooks reach a cell, and each names its issue."""
+        return self.bucket_key_at(data, "issue", "id")
+
+    def get_response(self) -> HttpResponseBase:
+        if self.view_class == JiraServerIssueUpdatedWebhook:
+            return self.get_response_from_issue_update_webhook()
+
+        return self.get_response_from_control_silo()

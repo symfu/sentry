@@ -1,0 +1,810 @@
+import {RawReplayErrorFixture} from 'sentry-fixture/replay/error';
+import {
+  ReplayClickEventFixture,
+  ReplayConsoleEventFixture,
+  ReplayDeadClickEventFixture,
+  ReplayMemoryEventFixture,
+  ReplayNavigateEventFixture,
+} from 'sentry-fixture/replay/helpers';
+import {ReplayNavFrameFixture} from 'sentry-fixture/replay/replayBreadcrumbFrameData';
+import {
+  ReplayBreadcrumbFrameEventFixture,
+  ReplayOptionFrameEventFixture,
+  ReplayOptionFrameFixture,
+  ReplaySpanFrameEventFixture,
+} from 'sentry-fixture/replay/replayFrameEvents';
+import {ReplayRequestFrameFixture} from 'sentry-fixture/replay/replaySpanFrameData';
+import {
+  RRWebDOMFrameFixture,
+  RRWebFullSnapshotFrameEventFixture,
+  RRWebIncrementalSnapshotFrameEventFixture,
+  RRWebInitFrameEventsFixture,
+} from 'sentry-fixture/replay/rrweb';
+import {ReplayRecordFixture} from 'sentry-fixture/replayRecord';
+
+import {BreadcrumbType} from 'sentry/types/breadcrumbs';
+import {parseEventTimestampMs} from 'sentry/utils/date/eventTimestampMs';
+import {ReplayReader} from 'sentry/utils/replays/replayReader';
+import {EventType, IncrementalSource} from 'sentry/utils/replays/types';
+
+describe('ReplayReader', () => {
+  const replayRecord = ReplayRecordFixture();
+
+  it('Should return null if there are missing arguments', () => {
+    const missingAttachments = ReplayReader.factory({
+      attachments: undefined,
+      errors: [],
+      fetching: false,
+      replayRecord,
+    });
+    expect(missingAttachments).toBeNull();
+
+    const missingErrors = ReplayReader.factory({
+      attachments: [],
+      errors: undefined,
+      fetching: false,
+      replayRecord,
+    });
+    expect(missingErrors).toBeNull();
+
+    const missingRecord = ReplayReader.factory({
+      attachments: [],
+      errors: [],
+      fetching: false,
+      replayRecord: undefined,
+    });
+    expect(missingRecord).toBeNull();
+  });
+
+  it('should calculate started_at/finished_at/duration based on first/last events', () => {
+    const minuteZero = new Date('2023-12-25T00:00:00');
+    const minuteTen = new Date('2023-12-25T00:10:00');
+    const originalStartedAt = new Date('2023-12-25T00:01:00');
+    const originalFinishedAt = new Date('2023-12-25T00:09:00');
+    const inputReplayRecord = ReplayRecordFixture({
+      started_at: originalStartedAt,
+      finished_at: originalFinishedAt,
+      duration: undefined, // will be calculated on the adjusted copy
+    });
+
+    const replay = ReplayReader.factory({
+      attachments: [
+        ReplayConsoleEventFixture({timestamp: minuteZero}),
+        ReplayConsoleEventFixture({timestamp: minuteTen}),
+      ],
+      errors: [],
+      fetching: false,
+      replayRecord: inputReplayRecord,
+    });
+
+    const expectedDuration = 10 * 60 * 1000; // 10 minutes, in ms
+    expect(replay?.getReplay().started_at).toEqual(minuteZero);
+    expect(replay?.getReplay().finished_at).toEqual(minuteTen);
+    expect(replay?.getReplay().duration.asMilliseconds()).toEqual(expectedDuration);
+    expect(replay?.getDurationMs()).toEqual(expectedDuration);
+    expect(inputReplayRecord.started_at).toEqual(originalStartedAt);
+    expect(inputReplayRecord.finished_at).toEqual(originalFinishedAt);
+    expect(inputReplayRecord.duration).toBeUndefined();
+  });
+
+  it('should make the replayRecord available through a getter method', () => {
+    const replay = ReplayReader.factory({
+      attachments: [],
+      errors: [],
+      fetching: false,
+      replayRecord,
+    });
+
+    expect(replay?.getReplay()).toEqual(replayRecord);
+  });
+
+  describe('attachment splitting', () => {
+    const timestamp = new Date('2023-12-25T00:02:00');
+    const secondTimestamp = new Date('2023-12-25T00:04:00');
+    const thirdTimestamp = new Date('2023-12-25T00:05:00');
+
+    const optionsFrame = ReplayOptionFrameFixture();
+    const optionsEvent = ReplayOptionFrameEventFixture({
+      timestamp,
+      data: {payload: optionsFrame},
+    });
+    const firstDiv = RRWebFullSnapshotFrameEventFixture({timestamp});
+    const secondDiv = RRWebFullSnapshotFrameEventFixture({timestamp});
+    const clickEvent = ReplayClickEventFixture({timestamp});
+    const secondClickEvent = ReplayClickEventFixture({timestamp: secondTimestamp});
+    const thirdClickEvent = ReplayClickEventFixture({timestamp: thirdTimestamp});
+    const deadClickEvent = ReplayDeadClickEventFixture({timestamp});
+    const firstMemory = ReplayMemoryEventFixture({
+      startTimestamp: timestamp,
+      endTimestamp: timestamp,
+    });
+    const secondMemory = ReplayMemoryEventFixture({
+      startTimestamp: timestamp,
+      endTimestamp: timestamp,
+    });
+    const navigationEvent = ReplayNavigateEventFixture({
+      startTimestamp: new Date('2023-12-25T00:03:00'),
+      endTimestamp: new Date('2023-12-25T00:03:30'),
+    });
+    const navCrumb = ReplayBreadcrumbFrameEventFixture({
+      timestamp: new Date('2023-12-25T00:03:00'),
+      data: {
+        payload: ReplayNavFrameFixture({
+          timestamp: new Date('2023-12-25T00:03:00'),
+        }),
+      },
+    });
+    const consoleEvent = ReplayConsoleEventFixture({timestamp});
+    const customEvent = ReplayBreadcrumbFrameEventFixture({
+      timestamp: new Date('2023-12-25T00:02:30'),
+      data: {
+        payload: {
+          category: 'redux.action',
+          data: {
+            action: 'save.click',
+          },
+          message: '',
+          timestamp: new Date('2023-12-25T00:02:30').getTime() / 1000,
+          type: BreadcrumbType.DEFAULT,
+        },
+      },
+    });
+    const attachments = [
+      clickEvent,
+      secondClickEvent,
+      thirdClickEvent,
+      consoleEvent,
+      firstDiv,
+      firstMemory,
+      navigationEvent,
+      navCrumb,
+      optionsEvent,
+      secondDiv,
+      secondMemory,
+      customEvent,
+      deadClickEvent,
+    ];
+
+    it.each([
+      {
+        method: 'getRRWebFrames',
+        expected: [
+          firstDiv,
+          secondDiv,
+          {
+            type: EventType.Custom,
+            timestamp: expect.any(Number),
+            data: {tag: 'replay.end', payload: {}},
+          },
+        ],
+      },
+      {
+        method: 'getConsoleFrames',
+        expected: [expect.objectContaining({category: 'console'})],
+      },
+      {
+        method: 'getCustomFrames',
+        expected: [expect.objectContaining({category: 'redux.action'})],
+      },
+      {
+        method: 'getNetworkFrames',
+        expected: [expect.objectContaining({op: 'navigation.navigate'})],
+      },
+      {
+        method: 'getDOMFrames',
+        expected: [
+          expect.objectContaining({category: 'ui.slowClickDetected'}),
+          expect.objectContaining({category: 'ui.click'}),
+          expect.objectContaining({category: 'ui.click'}),
+        ],
+      },
+      {
+        method: 'getMemoryFrames',
+        expected: [
+          expect.objectContaining({op: 'memory'}),
+          expect.objectContaining({op: 'memory'}),
+        ],
+      },
+      {
+        method: 'getChapterFrames',
+        expected: [
+          expect.objectContaining({category: 'replay.init'}),
+          expect.objectContaining({category: 'ui.slowClickDetected'}),
+          expect.objectContaining({category: 'redux.action'}),
+          expect.objectContaining({op: 'navigation.navigate'}), // prefer the nav span over the breadcrumb
+          expect.objectContaining({category: 'ui.click'}),
+          expect.objectContaining({category: 'ui.click'}),
+        ],
+      },
+      {
+        method: 'getSDKOptions',
+        expected: optionsFrame,
+      },
+    ] as const)('Calling $method will filter frames', ({method, expected}) => {
+      const replay = ReplayReader.factory({
+        attachments,
+        errors: [],
+        fetching: false,
+        replayRecord,
+      });
+
+      const exec = replay?.[method];
+      expect(exec?.()).toStrictEqual(expected);
+    });
+  });
+
+  it('excludes a slow click from the chapter frames when its node has no tagName', () => {
+    const timestamp = new Date('2023-12-25T00:02:00');
+
+    const scrubbedSlowClick = {
+      type: EventType.Custom,
+      timestamp: timestamp.getTime(),
+      data: {
+        tag: 'breadcrumb',
+        payload: {
+          category: 'ui.slowClickDetected',
+          message: 'div',
+          timestamp: timestamp.getTime() / 1000,
+          type: BreadcrumbType.DEFAULT,
+          data: {
+            node: {id: 42},
+            nodeId: 42,
+            url: '',
+            timeAfterClickMs: 7000,
+            endReason: 'timeout',
+          },
+        },
+      },
+    };
+
+    const replay = ReplayReader.factory({
+      attachments: [scrubbedSlowClick],
+      errors: [],
+      fetching: false,
+      replayRecord,
+    });
+
+    expect(replay?.getChapterFrames()).toStrictEqual([
+      expect.objectContaining({category: 'replay.init'}),
+    ]);
+  });
+
+  it('shoud return the SDK config if there is a RecordingOptions event found', () => {
+    const timestamp = new Date();
+    const optionsFrame = ReplayOptionFrameFixture();
+
+    const replay = ReplayReader.factory({
+      attachments: [
+        ReplayOptionFrameEventFixture({
+          timestamp,
+          data: {payload: optionsFrame},
+        }),
+      ],
+      errors: [],
+      fetching: false,
+      replayRecord,
+    });
+
+    expect(replay?.getSDKOptions()).toBe(optionsFrame);
+  });
+
+  describe('isNetworkDetailsSetup', () => {
+    it('should have isNetworkDetailsSetup=true if sdkConfig says so', () => {
+      const timestamp = new Date();
+
+      const replay = ReplayReader.factory({
+        attachments: [
+          ReplayOptionFrameEventFixture({
+            timestamp,
+            data: {
+              payload: ReplayOptionFrameFixture({
+                networkDetailHasUrls: true,
+              }),
+            },
+          }),
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord,
+      });
+
+      expect(replay?.isNetworkDetailsSetup()).toBeTruthy();
+    });
+
+    it.each([
+      {
+        data: {
+          method: 'GET',
+          request: {headers: {accept: 'application/json'}},
+        },
+        expected: true,
+      },
+      {
+        data: {
+          method: 'GET',
+        },
+        expected: false,
+      },
+    ])('should have isNetworkDetailsSetup=$expected', ({data, expected}) => {
+      const startTimestamp = new Date();
+      const endTimestamp = new Date();
+      const replay = ReplayReader.factory({
+        attachments: [
+          ReplaySpanFrameEventFixture({
+            timestamp: startTimestamp,
+            data: {
+              payload: ReplayRequestFrameFixture({
+                op: 'resource.fetch',
+                startTimestamp,
+                endTimestamp,
+                description: '/api/0/organizations/1/issues/',
+                data,
+              }),
+            },
+          }),
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord,
+      });
+
+      expect(replay?.isNetworkDetailsSetup()).toBe(expected);
+    });
+  });
+
+  it('detects canvas element from full snapshot', () => {
+    const timestamp = new Date('2023-12-25T00:02:00');
+
+    const firstDiv = RRWebFullSnapshotFrameEventFixture({
+      timestamp,
+      childNodes: [
+        RRWebDOMFrameFixture({
+          tagName: 'div',
+          childNodes: [
+            RRWebDOMFrameFixture({
+              tagName: 'canvas',
+            }),
+          ],
+        }),
+      ],
+    });
+    const attachments = [firstDiv];
+
+    const replay = ReplayReader.factory({
+      attachments,
+      errors: [],
+      fetching: false,
+      replayRecord,
+    });
+
+    expect(replay?.hasCanvasElementInReplay()).toBe(true);
+  });
+
+  it('detects canvas element from dom mutations', () => {
+    const timestamp = new Date('2023-12-25T00:02:00');
+
+    const snapshot = RRWebFullSnapshotFrameEventFixture({timestamp});
+    const increment = RRWebIncrementalSnapshotFrameEventFixture({
+      timestamp,
+      data: {
+        source: IncrementalSource.Mutation,
+        adds: [
+          {
+            node: RRWebDOMFrameFixture({
+              tagName: 'canvas',
+            }),
+            parentId: 0,
+            nextId: null,
+          },
+        ],
+        removes: [],
+        texts: [],
+        attributes: [],
+      },
+    });
+
+    const replay = ReplayReader.factory({
+      attachments: [snapshot, increment],
+      errors: [],
+      fetching: false,
+      replayRecord,
+    });
+
+    expect(replay?.hasCanvasElementInReplay()).toBe(true);
+  });
+
+  describe('processingErrors', () => {
+    const timestamp = new Date('2023-12-25T00:02:00');
+
+    it('reports no errors when the replay has both a meta frame and a full snapshot', () => {
+      const replay = ReplayReader.factory({
+        attachments: [
+          ...RRWebInitFrameEventsFixture({timestamp}),
+          RRWebFullSnapshotFrameEventFixture({timestamp}),
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord,
+      });
+
+      expect(replay?.processingErrors()).toEqual([]);
+    });
+
+    it('reports a missing full snapshot when the replay only has a meta frame', () => {
+      const replay = ReplayReader.factory({
+        attachments: RRWebInitFrameEventsFixture({timestamp}),
+        errors: [],
+        fetching: false,
+        replayRecord,
+      });
+
+      expect(replay?.processingErrors()).toEqual(['Missing Full Snapshot Frame']);
+    });
+
+    it('reports no missing full snapshot when the replay is a video replay', () => {
+      const replay = ReplayReader.factory({
+        attachments: [
+          ...RRWebInitFrameEventsFixture({timestamp}),
+          {
+            type: EventType.Custom,
+            timestamp: timestamp.getTime(),
+            data: {
+              tag: 'video',
+              payload: {
+                duration: 5000,
+                segmentId: 0,
+                timestamp: timestamp.getTime(),
+              },
+            },
+          },
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord,
+      });
+
+      expect(replay?.processingErrors()).toEqual([]);
+    });
+  });
+
+  describe('clip window', () => {
+    const replayStartedAt = new Date('2024-01-01T00:02:00');
+    const replayFinishedAt = new Date('2024-01-01T00:04:00');
+
+    const clipStartTimestamp = new Date('2024-01-01T00:03:00');
+    const clipEndTimestamp = new Date('2024-01-01T00:03:10');
+
+    const rrwebFrame1 = RRWebFullSnapshotFrameEventFixture({
+      timestamp: new Date('2024-01-01T00:02:30'),
+    });
+    const rrwebFrame2 = RRWebFullSnapshotFrameEventFixture({
+      timestamp: new Date('2024-01-01T00:03:09'),
+    });
+    const rrwebFrame3 = RRWebFullSnapshotFrameEventFixture({
+      timestamp: new Date('2024-01-01T00:03:30'),
+    });
+
+    const breadcrumbAttachment1 = ReplayBreadcrumbFrameEventFixture({
+      timestamp: new Date('2024-01-01T00:02:30'),
+      data: {
+        payload: ReplayNavFrameFixture({
+          timestamp: new Date('2024-01-01T00:02:30'),
+        }),
+      },
+    });
+    const breadcrumbAttachment2 = ReplayBreadcrumbFrameEventFixture({
+      timestamp: new Date('2024-01-01T00:03:05'),
+      data: {
+        payload: ReplayNavFrameFixture({
+          timestamp: new Date('2024-01-01T00:03:05'),
+        }),
+      },
+    });
+    const breadcrumbAttachment3 = ReplayBreadcrumbFrameEventFixture({
+      timestamp: new Date('2024-01-01T00:03:30'),
+      data: {
+        payload: ReplayNavFrameFixture({
+          timestamp: new Date('2024-01-01T00:03:30'),
+        }),
+      },
+    });
+
+    const error1 = RawReplayErrorFixture({
+      id: '1',
+      issue: '100',
+      timestamp: new Date('2024-01-01T00:02:30'),
+    });
+    const error2 = RawReplayErrorFixture({
+      id: '2',
+      issue: '200',
+      timestamp: new Date('2024-01-01T00:03:06'),
+    });
+    const error3 = RawReplayErrorFixture({
+      id: '1',
+      issue: '100',
+      timestamp: new Date('2024-01-01T00:03:30'),
+    });
+
+    const replay = ReplayReader.factory({
+      attachments: [
+        rrwebFrame1,
+        rrwebFrame2,
+        rrwebFrame3,
+        breadcrumbAttachment1,
+        breadcrumbAttachment2,
+        breadcrumbAttachment3,
+      ],
+      errors: [error1, error2, error3],
+      fetching: false,
+      replayRecord: ReplayRecordFixture({
+        started_at: replayStartedAt,
+        finished_at: replayFinishedAt,
+      }),
+      clipWindow: {
+        startTimestampMs: clipStartTimestamp.getTime(),
+        endTimestampMs: clipEndTimestamp.getTime(),
+      },
+    });
+
+    it('should adjust the end time and duration for the clip window', () => {
+      // Duration should be between the clip start time and end time
+      expect(replay?.getDurationMs()).toBe(10_000);
+      // Start offset should be set
+      expect(replay?.getStartOffsetMs()).toEqual(
+        clipStartTimestamp.getTime() - replayStartedAt.getTime()
+      );
+      expect(replay?.getStartTimestampMs()).toEqual(clipStartTimestamp.getTime());
+    });
+
+    it('should trim rrweb frames from the end but not the beginning', () => {
+      expect(replay?.getRRWebFrames()).toEqual([
+        expect.objectContaining({
+          type: EventType.FullSnapshot,
+          timestamp: rrwebFrame1.timestamp,
+        }),
+        expect.objectContaining({
+          type: EventType.FullSnapshot,
+          timestamp: rrwebFrame2.timestamp,
+        }),
+        expect.objectContaining({
+          type: EventType.Custom,
+          data: {tag: 'replay.clip_end', payload: {}},
+          timestamp: clipEndTimestamp.getTime(),
+        }),
+        // rrwebFrame3 should not be returned
+      ]);
+    });
+
+    it('should only return chapter frames within window and shift their clipOffsets', () => {
+      expect(replay?.getChapterFrames()).toEqual([
+        // Only breadcrumb2 and error2 should be included
+        expect.objectContaining({
+          category: 'navigation',
+          timestampMs: breadcrumbAttachment2.timestamp,
+          // offset is relative to the start of the clip window
+          offsetMs: 5_000,
+        }),
+        expect.objectContaining({
+          category: 'issue',
+          timestampMs: parseEventTimestampMs(error2.timestamp_ms).getTime(),
+          offsetMs: 6_000,
+        }),
+      ]);
+    });
+  });
+
+  describe('clip window outside the replay', () => {
+    const replayStartedAt = new Date('2024-01-01T00:02:00');
+    const replayFinishedAt = new Date('2024-01-01T00:04:00');
+
+    function readerWithClipWindow(clipWindow: {
+      endTimestampMs: number;
+      startTimestampMs: number;
+    }) {
+      return ReplayReader.factory({
+        attachments: [
+          RRWebFullSnapshotFrameEventFixture({
+            timestamp: new Date('2024-01-01T00:02:30'),
+          }),
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord: ReplayRecordFixture({
+          started_at: replayStartedAt,
+          finished_at: replayFinishedAt,
+        }),
+        clipWindow,
+      });
+    }
+
+    const replayDurationMs = replayFinishedAt.getTime() - replayStartedAt.getTime();
+
+    it('plays the whole replay when the window starts after it ended', () => {
+      // A timestamp well past `finished_at` clamps both edges of the window onto
+      // the same instant, which used to leave the reader with no duration at all.
+      const eventTimestampMs = replayFinishedAt.getTime() + 60_000;
+      const replay = readerWithClipWindow({
+        startTimestampMs: eventTimestampMs - 5_000,
+        endTimestampMs: eventTimestampMs + 5_000,
+      });
+
+      expect(replay?.getDurationMs()).toBe(replayDurationMs);
+      expect(replay?.getStartTimestampMs()).toBe(replayStartedAt.getTime());
+      expect(replay?.getStartOffsetMs()).toBe(0);
+    });
+
+    it('plays the whole replay when the window ends before it started', () => {
+      const replay = readerWithClipWindow({
+        startTimestampMs: replayStartedAt.getTime() - 70_000,
+        endTimestampMs: replayStartedAt.getTime() - 60_000,
+      });
+
+      expect(replay?.getDurationMs()).toBe(replayDurationMs);
+      expect(replay?.getStartTimestampMs()).toBe(replayStartedAt.getTime());
+    });
+
+    it('still clips a window that only overhangs the end', () => {
+      // The overlap is real here, so it is a real clip and must not widen to the
+      // whole replay.
+      const replay = readerWithClipWindow({
+        startTimestampMs: replayFinishedAt.getTime() - 3_000,
+        endTimestampMs: replayFinishedAt.getTime() + 60_000,
+      });
+
+      expect(replay?.getDurationMs()).toBe(3_000);
+      expect(replay?.getStartTimestampMs()).toBe(replayFinishedAt.getTime() - 3_000);
+    });
+
+    it('keeps showing the head of the replay for an event before it started', () => {
+      // Pre-existing behaviour: this event does describe a moment in the replay,
+      // so it clips rather than widening to the whole thing.
+      const eventTimestampMs = replayStartedAt.getTime() - 60_000;
+      const replay = ReplayReader.factory({
+        attachments: [
+          RRWebFullSnapshotFrameEventFixture({
+            timestamp: new Date('2024-01-01T00:02:30'),
+          }),
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord: ReplayRecordFixture({
+          started_at: replayStartedAt,
+          finished_at: replayFinishedAt,
+        }),
+        clipWindow: {
+          startTimestampMs: eventTimestampMs - 5_000,
+          endTimestampMs: eventTimestampMs + 5_000,
+        },
+        eventTimestampMs,
+      });
+
+      expect(replay?.getDurationMs()).toBe(10_000);
+      expect(replay?.getStartTimestampMs()).toBe(replayStartedAt.getTime());
+      expect(replay?.getErrorBeforeReplayStart()).toBe(true);
+    });
+
+    it('falls back to the whole replay when the window is not a real time', () => {
+      // `new Date('nonsense').getTime()` is NaN, and NaN survives `clamp`.
+      const replay = readerWithClipWindow({
+        startTimestampMs: NaN,
+        endTimestampMs: NaN,
+      });
+
+      expect(replay?.getDurationMs()).toBe(
+        replayFinishedAt.getTime() - replayStartedAt.getTime()
+      );
+      expect(replay?.getStartTimestampMs()).toBe(replayStartedAt.getTime());
+    });
+  });
+
+  describe('getRRWebFramesWithoutStyles', () => {
+    it('should remove style nodes and their content', () => {
+      const reader = ReplayReader.factory({
+        attachments: [
+          {
+            type: EventType.FullSnapshot,
+            data: {
+              node: {
+                type: 1,
+                tagName: 'html',
+                childNodes: [],
+              },
+            },
+            timestamp: 0,
+          },
+          {
+            type: EventType.IncrementalSnapshot,
+            data: {
+              source: IncrementalSource.Mutation,
+              adds: [
+                {
+                  parentId: 4,
+                  nextId: 21,
+                  node: {
+                    type: 2,
+                    tagName: 'style',
+                    attributes: {
+                      'data-emotion': 'css',
+                      'data-s': '',
+                      _cssText: '.css {...} ',
+                    },
+                    childNodes: [],
+                    id: 47,
+                  },
+                },
+                {
+                  parentId: 414,
+                  nextId: null,
+                  node: {
+                    type: 3,
+                    textContent: '.css {...}',
+                    isStyle: true,
+                    id: 427,
+                  },
+                },
+                {
+                  parentId: 5,
+                  nextId: 22,
+                  node: {
+                    type: 1,
+                    tagName: 'div',
+                    attributes: {
+                      class: 'test',
+                    },
+                    childNodes: [],
+                    id: 48,
+                  },
+                },
+              ],
+            },
+            timestamp: 0,
+          },
+        ],
+        errors: [],
+        fetching: false,
+        replayRecord: ReplayRecordFixture(),
+      });
+
+      if (!reader) {
+        throw new Error('Failed to create ReplayReader instance');
+      }
+
+      const result = reader.getRRWebFramesForDomExtraction();
+
+      expect(result).toEqual([
+        {data: {node: {childNodes: [], tagName: 'html', type: 1}}, timestamp: 0, type: 2},
+        {
+          data: {
+            adds: [
+              {
+                nextId: 21,
+                node: {attributes: {}, childNodes: [], id: 47, tagName: 'style', type: 2},
+                parentId: 4,
+              },
+              {
+                nextId: null,
+                node: {id: 427, isStyle: true, textContent: '', type: 3},
+                parentId: 414,
+              },
+              {
+                nextId: 22,
+                node: {
+                  attributes: {class: 'test'},
+                  childNodes: [],
+                  id: 48,
+                  tagName: 'div',
+                  type: 1,
+                },
+                parentId: 5,
+              },
+            ],
+            source: 0,
+          },
+          timestamp: 0,
+          type: 3,
+        },
+        {data: {payload: {}, tag: 'replay.end'}, timestamp: expect.any(Number), type: 5},
+      ]);
+    });
+  });
+});

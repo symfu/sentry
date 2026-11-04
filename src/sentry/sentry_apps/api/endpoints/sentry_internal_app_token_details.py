@@ -1,0 +1,103 @@
+from django.db import router, transaction
+from django.http import Http404
+from rest_framework import status
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry import analytics, audit_log, deletions
+from sentry.analytics.events.sentry_app_installation_token_deleted import (
+    SentryAppInstallationTokenDeleted,
+)
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.authentication import SessionNoAuthTokenAuthentication
+from sentry.api.base import control_silo_endpoint
+from sentry.api.permissions import DisallowImpersonatedTokenCreation
+from sentry.auth.principal import acting_user_id
+from sentry.models.apitoken import ApiToken
+from sentry.sentry_apps.api.bases.sentryapps import (
+    SentryAppBaseEndpoint,
+    SentryInternalAppTokenPermission,
+)
+from sentry.sentry_apps.api.endpoints.sentry_app_details import PARTNERSHIP_RESTRICTED_ERROR_MESSAGE
+from sentry.sentry_apps.models.sentry_app import SentryApp
+from sentry.sentry_apps.models.sentry_app_installation_token import SentryAppInstallationToken
+from sentry.utils.audit import create_audit_entry
+
+
+@control_silo_endpoint
+class SentryInternalAppTokenDetailsEndpoint(SentryAppBaseEndpoint):
+    owner = ApiOwner.INTEGRATION_PLATFORM
+    publish_status = {
+        "DELETE": ApiPublishStatus.PRIVATE,
+    }
+    authentication_classes = (SessionNoAuthTokenAuthentication,)
+    permission_classes = (SentryInternalAppTokenPermission, DisallowImpersonatedTokenCreation)
+    allow_disabled_sentry_app_for_methods = {"DELETE"}
+
+    def convert_args(
+        self,
+        request: Request,
+        sentry_app_id_or_slug: int | str,
+        api_token_id: int | str,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
+        # get the sentry_app from the SentryAppBaseEndpoint class
+        (args, kwargs) = super().convert_args(request, sentry_app_id_or_slug, *args, **kwargs)
+
+        try:
+            kwargs["api_token"] = ApiToken.objects.get(id=api_token_id)
+        except (ApiToken.DoesNotExist, ValueError):
+            raise Http404
+
+        return (args, kwargs)
+
+    def delete(self, request: Request, sentry_app: SentryApp, api_token: ApiToken) -> Response:
+        # Validate the token is associated with the application
+        if api_token.application_id != sentry_app.application_id:
+            raise Http404
+
+        if not sentry_app.is_internal:
+            return Response(
+                "This route is limited to internal integrations only",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if sentry_app.metadata.get("partnership_restricted", False):
+            return Response(
+                {"detail": PARTNERSHIP_RESTRICTED_ERROR_MESSAGE},
+                status=403,
+            )
+
+        with transaction.atomic(using=router.db_for_write(SentryAppInstallationToken)):
+            try:
+                install_token = SentryAppInstallationToken.objects.get(api_token=api_token)
+                sentry_app_installation = install_token.sentry_app_installation
+            except SentryAppInstallationToken.DoesNotExist:
+                raise Http404
+
+            deletions.exec_sync(install_token)
+
+        user_id = acting_user_id(request.user)
+        if user_id is not None:
+            analytics.record(
+                SentryAppInstallationTokenDeleted(
+                    user_id=user_id,
+                    organization_id=sentry_app_installation.organization_id,
+                    sentry_app_installation_id=sentry_app_installation.id,
+                    sentry_app=sentry_app.slug,
+                )
+            )
+            create_audit_entry(
+                request=request,
+                organization_id=sentry_app_installation.organization_id,
+                target_object=api_token.id,
+                event=audit_log.get_event_id("INTERNAL_INTEGRATION_REMOVE_TOKEN"),
+                data={
+                    "sentry_app": sentry_app.name,
+                    "sentry_app_installation_uuid": sentry_app_installation.uuid,
+                },
+            )
+
+        return Response(status=204)

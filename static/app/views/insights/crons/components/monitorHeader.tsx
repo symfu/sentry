@@ -1,0 +1,51 @@
+import {Breadcrumbs} from 'sentry/components/breadcrumbs';
+import {IdBadge} from 'sentry/components/idBadge';
+import * as Layout from 'sentry/components/layouts/thirds';
+import {t} from 'sentry/locale';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {makeMonitorBasePathname} from 'sentry/views/detectors/pathnames';
+import type {Monitor} from 'sentry/views/insights/crons/types';
+import {TopBar} from 'sentry/views/navigation/topBar';
+
+import {MonitorHeaderActions} from './monitorHeaderActions';
+
+interface Props {
+  monitor: Monitor;
+  onUpdate: (data: Monitor) => void;
+  orgSlug: string;
+}
+
+export function MonitorHeader({monitor, orgSlug, onUpdate}: Props) {
+  const organization = useOrganization();
+  const crumbs = [
+    {
+      label: t('Monitors'),
+      to: makeMonitorBasePathname(organization.slug),
+      preservePageFilters: true,
+    },
+    {
+      label: t('Cron Monitor'),
+    },
+  ];
+
+  return (
+    <Layout.Header>
+      <Layout.HeaderContent>
+        <Breadcrumbs crumbs={crumbs} />
+        <TopBar.Slot
+          name="breadcrumbs"
+          title={{
+            type: 'page-title',
+            label: monitor.name,
+            leadingGraphic: (
+              <IdBadge project={monitor.project} avatarSize={16} hideName />
+            ),
+          }}
+        />
+      </Layout.HeaderContent>
+      <TopBar.Slot name="actions">
+        <MonitorHeaderActions orgSlug={orgSlug} monitor={monitor} onUpdate={onUpdate} />
+      </TopBar.Slot>
+    </Layout.Header>
+  );
+}

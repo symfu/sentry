@@ -1,62 +1,82 @@
-__all__ = [
-    "IntegrationInstallation",
-    "IntegrationFeatures",
-    "IntegrationProvider",
-    "IntegrationMetadata",
-    "FeatureDescription",
-]
+from __future__ import annotations
 
+import abc
 import logging
 import sys
+from collections.abc import Mapping, MutableMapping, Sequence
+from enum import StrEnum
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, NotRequired, TypedDict
 
-from collections import namedtuple
-from enum import Enum
+import sentry_sdk
+from django.http.request import HttpRequest
+from rest_framework.exceptions import NotFound
 
+from sentry import audit_log
 from sentry.exceptions import InvalidIdentity
-from sentry.pipeline import PipelineProvider
-
+from sentry.integrations.errors import OrganizationIntegrationNotFound
+from sentry.integrations.models.external_actor import ExternalActor
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.types import HaltReason, IntegrationProviderSlug
+from sentry.models.team import Team
+from sentry.organizations.services.organization import (
+    RpcOrganization,
+    RpcOrganizationSummary,
+    organization_service,
+)
+from sentry.pipeline.provider import PipelineProvider
+from sentry.pipeline.views.base import ApiPipelineSteps, PipelineView
+from sentry.shared_integrations.constants import (
+    ERR_INTERNAL,
+    ERR_UNAUTHORIZED,
+    ERR_UNSUPPORTED_RESPONSE_TYPE,
+)
 from sentry.shared_integrations.exceptions import (
-    ApiHostError,
     ApiError,
+    ApiHostError,
+    ApiInvalidRequestError,
     ApiUnauthorized,
     IntegrationError,
     IntegrationFormError,
     UnsupportedResponseType,
 )
-from sentry.shared_integrations.constants import (
-    ERR_UNAUTHORIZED,
-    ERR_INTERNAL,
-    ERR_UNSUPPORTED_RESPONSE_TYPE,
-)
-from sentry.models import AuditLogEntryEvent, Identity, OrganizationIntegration
+from sentry.users.models.identity import Identity
 from sentry.utils.audit import create_audit_entry
 
-FeatureDescription = namedtuple(
-    "FeatureDescription",
-    [
-        "description",  # A markdown description of the feature
-        "featureGate",  # A IntegrationFeature that gates this feature
-    ],
-)
+if TYPE_CHECKING:
+    from django.utils.functional import _StrPromise
+
+    from sentry.auth.principal import RequestPrincipal
+    from sentry.identity.services.identity.model import RpcIdentity
+    from sentry.integrations.pipeline import IntegrationPipeline  # noqa: F401
+    from sentry.integrations.services.integration import RpcOrganizationIntegration
+    from sentry.integrations.services.integration.model import RpcIntegration
+    from sentry.models.organization import Organization
 
 
-IntegrationMetadata = namedtuple(
-    "IntegrationMetadata",
-    [
-        "description",  # A markdown description of the integration
-        "features",  # A list of FeatureDescriptions
-        "author",  # The integration author's name
-        "noun",  # The noun used to identify the integration
-        "issue_url",  # URL where issues should be opened
-        "source_url",  # URL to view the source
-        "aspects",  # A map of integration specific 'aspects' to the aspect config.
-    ],
-)
+logger = logging.getLogger(__name__)
 
 
-class IntegrationMetadata(IntegrationMetadata):
+class IntegrationFeatureNotImplementedError(Exception):
+    pass
+
+
+class FeatureDescription(NamedTuple):
+    description: str  # A markdown description of the feature
+    featureGate: IntegrationFeatures  # A IntegrationFeature that gates this feature
+
+
+class IntegrationMetadata(NamedTuple):
+    description: str | _StrPromise  # A markdown description of the integration
+    features: Sequence[FeatureDescription]  # A list of FeatureDescriptions
+    author: str  # The integration author's name
+    noun: str | _StrPromise  # The noun used to identify the integration
+    issue_url: str  # URL where issues should be opened
+    source_url: str  # URL to view the source
+    aspects: dict[str, Any]  # A map of integration specific 'aspects' to the aspect config.
+
     @staticmethod
-    def feature_flag_name(f):
+    def feature_flag_name(f: str | None) -> str | None:
         """
         FeatureDescriptions are set using the IntegrationFeatures constants,
         however we expose them here as mappings to organization feature flags, thus
@@ -64,20 +84,21 @@ class IntegrationMetadata(IntegrationMetadata):
         """
         if f is not None:
             return f"integrations-{f}"
+        return None
 
-    def _asdict(self):
-        metadata = super()._asdict()
+    def asdict(self) -> dict[str, Any]:
+        metadata = self._asdict()
         metadata["features"] = [
             {
                 "description": f.description.strip(),
                 "featureGate": self.feature_flag_name(f.featureGate.value),
             }
-            for f in metadata["features"]
+            for f in self.features
         ]
         return metadata
 
 
-class IntegrationFeatures(Enum):
+class IntegrationFeatures(StrEnum):
     """
     IntegrationFeatures are used for marking supported features on an
     integration. Features are marked on the IntegrationProvider itself, as well
@@ -90,12 +111,22 @@ class IntegrationFeatures(Enum):
     ALERT_RULE = "alert-rule"
     CHAT_UNFURL = "chat-unfurl"
     COMMITS = "commits"
+    ENTERPRISE_ALERT_RULE = "enterprise-alert-rule"
+    ENTERPRISE_INCIDENT_MANAGEMENT = "enterprise-incident-management"
     INCIDENT_MANAGEMENT = "incident-management"
     ISSUE_BASIC = "issue-basic"
     ISSUE_SYNC = "issue-sync"
     MOBILE = "mobile"
     SERVERLESS = "serverless"
     TICKET_RULES = "ticket-rules"
+    STACKTRACE_LINK = "stacktrace-link"
+    CODEOWNERS = "codeowners"
+    USER_MAPPING = "user-mapping"
+    CODING_AGENT = "coding-agent"
+    # Adding this to IntegrationProvider.features lists the provider on Seer's
+    # connectors page, which is intended for infrastructure telemetry (e.g. Datadog
+    # and GCP).
+    SEER_CONTEXT = "seer-context"
 
     # features currently only existing on plugins:
     DATA_FORWARDING = "data-forwarding"
@@ -103,7 +134,63 @@ class IntegrationFeatures(Enum):
     DEPLOYMENT = "deployment"
 
 
-class IntegrationProvider(PipelineProvider):
+# Integration Types
+class IntegrationDomain(StrEnum):
+    MESSAGING = "messaging"
+    PROJECT_MANAGEMENT = "project_management"
+    SOURCE_CODE_MANAGEMENT = "source_code_management"
+    ON_CALL_SCHEDULING = "on_call_scheduling"
+    IDENTITY = "identity"  # for identity pipelines
+    GENERAL = "general"  # for processes that span multiple integration domains
+
+
+INTEGRATION_TYPE_TO_PROVIDER = {
+    IntegrationDomain.MESSAGING: [
+        IntegrationProviderSlug.SLACK,
+        IntegrationProviderSlug.DISCORD,
+        IntegrationProviderSlug.MSTEAMS,
+    ],
+    IntegrationDomain.PROJECT_MANAGEMENT: [
+        IntegrationProviderSlug.JIRA,
+        IntegrationProviderSlug.JIRA_SERVER,
+    ],
+    IntegrationDomain.SOURCE_CODE_MANAGEMENT: [
+        IntegrationProviderSlug.GITHUB,
+        IntegrationProviderSlug.GITHUB_ENTERPRISE,
+        IntegrationProviderSlug.GITLAB,
+        IntegrationProviderSlug.BITBUCKET,
+        IntegrationProviderSlug.BITBUCKET_SERVER,
+        IntegrationProviderSlug.AZURE_DEVOPS,
+        IntegrationProviderSlug.PERFORCE,
+        IntegrationProviderSlug.CURSOR_ORIGIN,
+    ],
+    IntegrationDomain.ON_CALL_SCHEDULING: [
+        IntegrationProviderSlug.PAGERDUTY,
+        IntegrationProviderSlug.OPSGENIE,
+    ],
+}
+
+
+class _UserIdentity(TypedDict):
+    type: str
+    external_id: str
+    data: dict[str, str]
+    scopes: list[str]
+
+
+class IntegrationData(TypedDict):
+    external_id: str
+    name: NotRequired[str]
+    metadata: NotRequired[dict[str, Any]]
+    post_install_data: NotRequired[dict[str, Any]]
+    expect_exists: NotRequired[bool]
+    idp_external_id: NotRequired[str]
+    idp_config: NotRequired[dict[str, Any]]
+    user_identity: NotRequired[_UserIdentity]
+    provider: NotRequired[str]  # maybe unused ???
+
+
+class IntegrationProvider(PipelineProvider["IntegrationPipeline"], abc.ABC):
     """
     An integration provider describes a third party that can be registered within Sentry.
 
@@ -117,73 +204,116 @@ class IntegrationProvider(PipelineProvider):
     it provides (such as extensions provided).
     """
 
-    # a unique identifier (e.g. 'slack').
-    # Used to lookup sibling classes and the ``key`` used when creating
-    # Integration objects.
-    key = None
+    _integration_key: str | None = None
+    """
+    a unique identifier to use when creating the ``Integration`` object.
+    Only needed when you want to create the above object with something other
+    than ``key`` (e.g. a provider variant that stores its ``Integration`` under
+    a shared provider key).
+    """
 
-    # a unique identifier to use when creating the ``Integration`` object.
-    # Only needed when you want to create the above object with something other
-    # than ``key``. See: VstsExtensionIntegrationProvider.
-    _integration_key = None
-
-    # Whether this integration should show up in the list on the Organization
-    # Integrations page.
     visible = True
+    """
+    Whether this integration should show up in the list on the Organization
+    Integrations page.
+    """
 
-    # a human readable name (e.g. 'Slack')
-    name = None
+    metadata: IntegrationMetadata | None = None
+    """
+    an IntegrationMetadata object, used to provide extra details in the
+    configuration interface of the integration.
+    """
 
-    # an IntegrationMetadata object, used to provide extra details in the
-    # configuration interface of the integration.
-    metadata = None
+    integration_cls: type[IntegrationInstallation] | None = None
+    """an Integration class that will manage the functionality once installed"""
 
-    # an Integration class that will manage the functionality once installed
-    integration_cls = None
+    """configuration for the setup dialog"""
 
-    # configuration for the setup dialog
-    setup_dialog_config = {"width": 600, "height": 600}
-
-    # whether or not the integration installation be initiated from Sentry
     can_add = True
+    """whether or not the integration installation be initiated from Sentry"""
 
-    # if the integration can be uninstalled in Sentry, set to False
-    # if True, the integration must be uninstalled from the other platform
-    # which is uninstalled/disabled via wehbook
+    can_add_externally = False
+    """
+    Marks providers whose install is initiated from the third party's app
+    directory or marketplace (e.g. Discord's App Directory, the GitHub App
+    listing, the Teams Marketplace) and completed through the pipeline modal.
+
+    For providers that also set `can_add = False`, hiding the in-app install
+    button because the install can only start from the third party, this is
+    what lets the pipeline endpoint accept the externally-initiated install.
+    """
+
+    allow_multiple = True
+    """whether multiple installations of this integration are allowed per organization"""
+
+    overwrite_existing_integration = True
+    """
+    whether installation refreshes an existing Integration's global fields. When
+    False, fields are still refreshed if no organization has the integration
+    installed, e.g. when reinstalling after an uninstall.
+    """
+
     can_disable = False
+    """
+    if the integration can be uninstalled in Sentry, set to False
+    if True, the integration must be uninstalled from the other platform
+    which is uninstalled/disabled via webhook
+    """
 
-    # if the integration has no application-style access token, associate
-    # the installer's identity to the organization integration
     needs_default_identity = False
+    """
+    if the integration has no application-style access token, associate
+    the installer's identity to the organization integration
+    """
 
-    # can be any number of IntegrationFeatures
-    features = frozenset()
+    reject_pending_deletion_reinstall = False
+    """
+    Reject an installation when its existing organization link is pending deletion.
+    """
 
-    # if this is hidden without the feature flag
+    features: frozenset[IntegrationFeatures] = frozenset()
+    """can be any number of IntegrationFeatures"""
+
     requires_feature_flag = False
+    """if this is hidden without the feature flag"""
 
-    # whether this integration can be used for stacktrace linking
-    # will eventually be replaced with a feature flag
-    has_stacktrace_linking = False
+    feature_flag_name: str | None = None
+    """override the feature flag checked when requires_feature_flag is True"""
 
     @classmethod
-    def get_installation(cls, model, organization_id, **kwargs):
+    def get_installation(
+        cls, model: RpcIntegration | Integration, organization_id: int, **kwargs: Any
+    ) -> IntegrationInstallation:
         if cls.integration_cls is None:
             raise NotImplementedError
 
+        assert isinstance(organization_id, int)
         return cls.integration_cls(model, organization_id, **kwargs)
 
     @property
-    def integration_key(self):
+    def integration_key(self) -> str:
         return self._integration_key or self.key
 
-    def get_logger(self):
+    def get_logger(self) -> logging.Logger:
         return logging.getLogger(f"sentry.integration.{self.key}")
 
-    def post_install(self, integration, organization, extra=None):
+    def post_install(
+        self,
+        integration: Integration,
+        organization: RpcOrganization,
+        *,
+        extra: dict[str, Any],
+    ) -> None:
         pass
 
-    def create_audit_log_entry(self, integration, organization, request, action, extra=None):
+    def create_audit_log_entry(
+        self,
+        integration: Integration,
+        organization: RpcOrganizationSummary,
+        request: HttpRequest,
+        action: str,
+        extra: Any | None = None,
+    ) -> None:
         """
         Creates an audit log entry for the newly installed integration.
         """
@@ -192,21 +322,29 @@ class IntegrationProvider(PipelineProvider):
                 request=request,
                 organization=organization,
                 target_object=integration.id,
-                event=AuditLogEntryEvent.INTEGRATION_ADD,
+                event=audit_log.get_event_id("INTEGRATION_ADD"),
                 data={"provider": integration.provider, "name": integration.name},
             )
 
-    def get_pipeline_views(self):
+    def get_pipeline_views(self) -> Sequence[PipelineView[IntegrationPipeline]]:
         """
-        Return a list of ``View`` instances describing this integration's
-        configuration pipeline.
-
-        >>> def get_pipeline_views(self):
-        >>>    return []
+        Do NOT override this for an integration. Integrations install through
+        the API-driven pipeline (``get_pipeline_api_steps``) and have no
+        server-rendered pipeline views -- the legacy web-view setup flow has
+        been removed. This empty implementation exists only to satisfy the
+        abstract ``PipelineProvider`` interface for every integration provider.
         """
-        raise NotImplementedError
+        return []
 
-    def build_integration(self, state):
+    def get_pipeline_api_steps(self) -> ApiPipelineSteps[IntegrationPipeline] | None:
+        """
+        Return API step objects for this provider's pipeline, or None if API
+        mode is not supported. Override to enable the pipeline API for this
+        integration.
+        """
+        return None
+
+    def build_integration(self, state: Mapping[str, Any]) -> IntegrationData:
         """
         Given state captured during the setup pipeline, return a dictionary
         of configuration and metadata to store with this integration.
@@ -225,7 +363,7 @@ class IntegrationProvider(PipelineProvider):
         >>>     return {
         >>>         'external_id': state['id'],
         >>>         'name': state['name'],
-        >>>         'metadata': {url': state['url']},
+        >>>         'metadata': {'url': state['url']},
         >>>     }
 
         This can return the 'expect_exists' flag, and this method  will expect
@@ -241,7 +379,7 @@ class IntegrationProvider(PipelineProvider):
         """
         raise NotImplementedError
 
-    def setup(self):
+    def setup(self) -> None:
         """
         Executed once Sentry has been initialized at runtime.
 
@@ -249,11 +387,11 @@ class IntegrationProvider(PipelineProvider):
         >>>     bindings.add('repository.provider', GitHubRepositoryProvider, key='github')
         """
 
-    def has_feature(self, feature):
+    def has_feature(self, feature: IntegrationFeatures) -> bool:
         return feature in self.features
 
 
-class IntegrationInstallation:
+class IntegrationInstallation(abc.ABC):
     """
     An IntegrationInstallation represents an installed integration and manages the
     core functionality of the integration.
@@ -261,20 +399,37 @@ class IntegrationInstallation:
 
     logger = logging.getLogger("sentry.integrations")
 
-    def __init__(self, model, organization_id):
+    def is_broken_integration_error(self, exc: Exception) -> HaltReason | None:
+        return None
+
+    def __init__(self, model: RpcIntegration | Integration, organization_id: int) -> None:
         self.model = model
         self.organization_id = organization_id
-        self._org_integration = None
 
-    @property
-    def org_integration(self):
-        if self._org_integration is None:
-            self._org_integration = OrganizationIntegration.objects.get(
-                organization_id=self.organization_id, integration_id=self.model.id
-            )
-        return self._org_integration
+    @cached_property
+    def org_integration(self) -> RpcOrganizationIntegration:
+        from sentry.integrations.services.integration import integration_service
 
-    def get_organization_config(self):
+        integration = integration_service.get_organization_integration(
+            integration_id=self.model.id,
+            organization_id=self.organization_id,
+        )
+        if integration is None:
+            sentry_sdk.set_tag("integration_id", self.model.id)
+            sentry_sdk.set_attribute("integration_id", self.model.id)
+            sentry_sdk.set_tag("organization_id", self.organization_id)
+            sentry_sdk.set_attribute("organization_id", self.organization_id)
+            raise OrganizationIntegrationNotFound("missing org_integration")
+        return integration
+
+    @cached_property
+    def organization(self) -> RpcOrganization:
+        organization = organization_service.get(id=self.organization_id)
+        if organization is None:
+            raise NotFound("organization_id not found")
+        return organization
+
+    def get_organization_config(self) -> Sequence[Any]:
         """
         Returns a list of JSONForm configuration object descriptors used to
         configure the integration per-organization. This simply represents the
@@ -284,36 +439,106 @@ class IntegrationInstallation:
         """
         return []
 
-    def update_organization_config(self, data):
+    def update_organization_config(
+        self, data: MutableMapping[str, Any]
+    ) -> Mapping[str, Any] | None:
         """
         Update the configuration field for an organization integration.
+
+        May return per-config-field detail for the caller to record on an audit log entry,
+        keyed by the config field it describes. `None` means there is nothing extra to record.
         """
+        from sentry.integrations.services.integration import integration_service
+
+        if not self.org_integration:
+            return None
+
         config = self.org_integration.config
         config.update(data)
-        self.org_integration.update(config=config)
+        org_integration = integration_service.update_organization_integration(
+            org_integration_id=self.org_integration.id,
+            config=config,
+        )
+        if org_integration is not None:
+            self.org_integration = org_integration
 
-    def get_config_data(self):
-        return self.org_integration.config
-
-    def get_dynamic_display_information(self):
         return None
 
-    def get_client(self):
-        # Return the api client for a given provider
+    def get_config_data(self) -> Mapping[str, Any]:
+        if not self.org_integration:
+            return {}
+        return self.org_integration.config
+
+    def get_dynamic_display_information(self) -> Mapping[str, Any] | None:
+        return None
+
+    def _get_debug_metadata_keys(self) -> list[str]:
+        """
+        Override this method in integration subclasses to expose additional
+        non-sensitive metadata fields via admin endpoints and logging.
+
+        Returns:
+            A list of keys that are safe to expose for debugging purposes.
+        """
+        return []
+
+    def get_debug_metadata(self) -> dict[str, Any]:
+        """
+        Returns a dictionary containing key value pairs of metadata useful for
+        debugging. These fields should be safe to log.
+
+        Returns:
+            A dictionary containing only the allowlisted metadata fields.
+        """
+        allowed_keys = self._get_debug_metadata_keys()
+        return {key: self.model.metadata.get(key) for key in allowed_keys}
+
+    @abc.abstractmethod
+    def get_client(self) -> Any:
+        """
+        Return an API client for the integration provider
+
+        Use this method if the integration uses a single API key for all
+        configurations and usage of the integration.
+        """
         raise NotImplementedError
 
-    def get_default_identity(self):
+    def get_keyring_client(self, keyid: int | str) -> Any:
         """
-        For Integrations that rely solely on user auth for authentication
-        """
+        Return an API client with a scoped key based on the key_name.
 
-        identity = Identity.objects.get(id=self.org_integration.default_auth_id)
+        Use this method if your integration supports a 'keyring' of keys
+        like opsgenie or pagerduty.
+        """
+        raise NotImplementedError
+
+    @cached_property
+    def default_identity(self) -> RpcIdentity:
+        """For Integrations that rely solely on user auth for authentication."""
+        from sentry.identity.services.identity import identity_service
+
+        try:
+            org_integration = self.org_integration
+        except OrganizationIntegrationNotFound:
+            raise Identity.DoesNotExist
+        else:
+            if org_integration.default_auth_id is None:
+                raise Identity.DoesNotExist
+        identity = identity_service.get_identity(filter={"id": org_integration.default_auth_id})
+        if identity is None:
+            sentry_sdk.set_tag("integration_provider", self.model.get_provider().name)
+            sentry_sdk.set_attribute("integration_provider", self.model.get_provider().name)
+            sentry_sdk.set_tag("org_integration_id", org_integration.id)
+            sentry_sdk.set_attribute("org_integration_id", org_integration.id)
+            sentry_sdk.set_tag("default_auth_id", org_integration.default_auth_id)
+            sentry_sdk.set_attribute("default_auth_id", org_integration.default_auth_id)
+            raise Identity.DoesNotExist
         return identity
 
-    def error_message_from_json(self, data):
+    def error_message_from_json(self, data: Mapping[str, Any]) -> Any:
         return data.get("message", "unknown error")
 
-    def error_fields_from_json(self, data):
+    def error_fields_from_json(self, data: Mapping[str, Any]) -> Any | None:
         """
         If we can determine error fields from the response JSON this should
         format and return them, allowing an IntegrationFormError to be raised.
@@ -323,7 +548,7 @@ class IntegrationInstallation:
         """
         return None
 
-    def message_from_error(self, exc):
+    def message_from_error(self, exc: Exception) -> str:
         if isinstance(exc, ApiUnauthorized):
             return ERR_UNAUTHORIZED
         elif isinstance(exc, ApiHostError):
@@ -331,7 +556,7 @@ class IntegrationInstallation:
         elif isinstance(exc, UnsupportedResponseType):
             return ERR_UNSUPPORTED_RESPONSE_TYPE.format(content_type=exc.content_type)
         elif isinstance(exc, ApiError):
-            if exc.json:
+            if exc.json and isinstance(exc.json, dict):
                 msg = self.error_message_from_json(exc.json) or "unknown error"
             else:
                 msg = "unknown error"
@@ -339,12 +564,12 @@ class IntegrationInstallation:
         else:
             return ERR_INTERNAL
 
-    def raise_error(self, exc, identity=None):
+    def raise_error(self, exc: Exception, identity: Identity | None = None) -> NoReturn:
         if isinstance(exc, ApiUnauthorized):
             raise InvalidIdentity(self.message_from_error(exc), identity=identity).with_traceback(
                 sys.exc_info()[2]
             )
-        elif isinstance(exc, ApiError):
+        elif isinstance(exc, ApiInvalidRequestError):
             if exc.json:
                 error_fields = self.error_fields_from_json(exc.json)
                 if error_fields is not None:
@@ -354,17 +579,58 @@ class IntegrationInstallation:
         elif isinstance(exc, IntegrationError):
             raise
         else:
-            self.logger.exception(str(exc))
             raise IntegrationError(self.message_from_error(exc)).with_traceback(sys.exc_info()[2])
 
+    def is_rate_limited_error(self, exc: ApiError) -> bool:
+        return False
+
     @property
-    def metadata(self):
+    def metadata(self) -> dict[str, Any]:
         return self.model.metadata
 
-    def uninstall(self):
+    def uninstall(self) -> None:
         """
         For integrations that need additional steps for uninstalling
-        that are not covered in the `delete_organization_integration`
+        that are not covered by the deletion task for OrganizationIntegration
         task.
         """
+
+    # NotifyBasicMixin noops
+
+    def notify_remove_external_team(self, external_team: ExternalActor, team: Team) -> None:
         pass
+
+
+def is_response_success(resp: Any) -> bool:
+    if resp.status_code and resp.status_code < 300:
+        return True
+    return False
+
+
+def is_response_error(resp: Any) -> bool:
+    if not resp.status_code:
+        return False
+    return resp.status_code >= 400 and resp.status_code != 429 and resp.status_code < 500
+
+
+def get_integration_types(provider: str) -> list[IntegrationDomain]:
+    types = []
+    for integration_type, providers in INTEGRATION_TYPE_TO_PROVIDER.items():
+        if provider in providers:
+            types.append(integration_type)
+    return types
+
+
+def is_provider_enabled(
+    provider: IntegrationProvider,
+    organization: Organization | RpcOrganization,
+    actor: RequestPrincipal | None = None,
+) -> bool:
+    from sentry import features
+
+    if not provider.requires_feature_flag:
+        return True
+    flag = provider.feature_flag_name or "organizations:integrations-%s" % provider.key.replace(
+        "_", "-"
+    )
+    return features.has(flag, organization, actor=actor)

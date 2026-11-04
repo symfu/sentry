@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel
+
+from sentry.notifications.platform.registry import template_registry
+from sentry.notifications.platform.types import (
+    NotificationCategory,
+    NotificationData,
+    NotificationRenderedTemplate,
+    NotificationSource,
+    NotificationTemplate,
+)
+from sentry.notifications.types import NotificationActionContext, NotificationOrigin
+
+
+class SerializableRuleProxy(BaseModel):
+    """
+    A pydantic-serializable representation of a rule for notification render code.
+    """
+
+    class Config:
+        frozen = True
+
+    label: str
+    environment_id: int | None = None
+    workflow_id: int | None = None
+    legacy_rule_id: int | None = None
+    # Nothing reads these, but producers still set them: during a deploy, task workers
+    # on the previous release declare them required and would fail to parse payloads
+    # that omit them. Stop setting and remove them once this release is fully rolled out.
+    id: int | None = None
+    data: dict[str, Any] = {}
+    project_id: int | None = None
+
+    @classmethod
+    def from_origin(
+        cls,
+        origin: NotificationOrigin,
+        *,
+        action_id: int,
+        data: dict[str, Any],
+        project_id: int,
+    ) -> SerializableRuleProxy:
+        return cls(
+            id=action_id,
+            label=origin.label,
+            data=data,
+            environment_id=origin.environment_id,
+            project_id=project_id,
+            workflow_id=origin.workflow_id,
+            legacy_rule_id=origin.legacy_rule_id,
+        )
+
+    @classmethod
+    def from_action_context(
+        cls,
+        context: NotificationActionContext,
+        *,
+        data: dict[str, Any],
+    ) -> SerializableRuleProxy:
+        return cls.from_origin(
+            context.origin,
+            action_id=context.action_id,
+            data=data,
+            project_id=context.project.id,
+        )
+
+    def to_notification_origin(self) -> NotificationOrigin:
+        return NotificationOrigin(
+            label=self.label,
+            environment_id=self.environment_id,
+            workflow_id=self.workflow_id,
+            legacy_rule_id=self.legacy_rule_id,
+        )
+
+
+class IssueNotificationData(NotificationData):
+    source: NotificationSource = NotificationSource.ISSUE
+
+    group_id: int
+    integration_id: int | None = None
+    event_id: str | None = None
+    occurrence_id: str | None = None
+    tags: list[str] | None = None
+    notes: str | None = None
+    rule: SerializableRuleProxy
+    notification_uuid: str = ""
+
+
+@template_registry.register(NotificationSource.ISSUE)
+class IssueNotificationTemplate(NotificationTemplate[IssueNotificationData]):
+    category = NotificationCategory.ISSUE
+    example_data = IssueNotificationData(
+        organization_id=1,
+        group_id=1,
+        event_id="abc123",
+        notification_uuid="test-uuid",
+        tags=["environment", "level"],
+        notes="example note",
+        rule=SerializableRuleProxy(label="Example Rule", workflow_id=3),
+    )
+    hide_from_debugger = True
+
+    def render(self, data: IssueNotificationData) -> NotificationRenderedTemplate:
+        return NotificationRenderedTemplate(subject="Issue Alert", body=[])

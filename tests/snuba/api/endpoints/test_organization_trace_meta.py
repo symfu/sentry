@@ -1,0 +1,361 @@
+from uuid import uuid4
+
+import pytest
+from django.urls import NoReverseMatch, reverse
+from sentry_protos.snuba.v1.trace_item_pb2 import TraceItem
+
+from sentry.search.eap.occurrences.rollout_utils import (
+    EAP_OCCURRENCES_SHOULD_RUN_EXPERIMENT_OPTION,
+    EAP_OCCURRENCES_USE_EXPERIMENTAL_DATA_ALLOWLIST_OPTION,
+)
+from sentry.testutils.cases import OccurrenceTestCase, TraceMetricsTestCase, UptimeResultEAPTestCase
+from sentry.testutils.helpers.datetime import before_now
+from tests.snuba.api.endpoints.test_organization_events_trace import (
+    OrganizationEventsTraceEndpointBase,
+)
+
+
+class OrganizationEventsTraceMetaEndpointTest(
+    OrganizationEventsTraceEndpointBase, OccurrenceTestCase, TraceMetricsTestCase
+):
+    url_name = "sentry-api-0-organization-trace-meta"
+
+    def test_no_projects(self) -> None:
+        user = self.create_user()
+        org = self.create_organization(owner=user)
+        self.login_as(user=user)
+
+        url = reverse(
+            self.url_name,
+            kwargs={"organization_id_or_slug": org.slug, "trace_id": uuid4().hex},
+        )
+
+        with self.feature(self.FEATURES):
+            response = self.client_get(url=url)
+
+        assert response.status_code == 404, response.content
+
+    def test_bad_ids(self) -> None:
+        # Fake trace id
+        self.url = reverse(
+            self.url_name,
+            kwargs={
+                "organization_id_or_slug": self.project.organization.slug,
+                "trace_id": uuid4().hex,
+            },
+        )
+
+        with self.feature(self.FEATURES):
+            response = self.client_get(url=self.url)
+
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 0
+        assert data["spansCount"] == 0
+        assert data["spansCountMap"] == {}
+        assert data["metricsCount"] == 0
+        assert "uptimeCount" not in data  # Should not be present without include_uptime param
+
+        # Invalid trace id
+        with pytest.raises(NoReverseMatch):
+            self.url = reverse(
+                self.url_name,
+                kwargs={
+                    "organization_id_or_slug": self.project.organization.slug,
+                    "trace_id": "not-a-trace",
+                },
+            )
+
+    def test_simple(self) -> None:
+        self.load_trace()
+        with self.feature(self.FEATURES):
+            response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+
+    def test_simple_with_eap_as_source_of_truth(self) -> None:
+        self.load_trace()
+        first_group = self.create_group(project=self.project)
+        second_group = self.create_group(project=self.project)
+        self.store_eap_items(
+            [
+                self.create_eap_occurrence(
+                    project=self.project,
+                    group_id=first_group.id,
+                    trace_id=self.trace_id,
+                    issue_occurrence_id=uuid4().hex,
+                ),
+                self.create_eap_occurrence(
+                    project=self.project,
+                    group_id=second_group.id,
+                    trace_id=self.trace_id,
+                    issue_occurrence_id=uuid4().hex,
+                ),
+            ]
+        )
+        with self.options(
+            {
+                EAP_OCCURRENCES_SHOULD_RUN_EXPERIMENT_OPTION: True,
+                EAP_OCCURRENCES_USE_EXPERIMENTAL_DATA_ALLOWLIST_OPTION: [
+                    "api.trace.count_performance_issues"
+                ],
+            }
+        ):
+            with self.feature(self.FEATURES):
+                response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+
+    def test_no_team(self) -> None:
+        self.load_trace()
+        self.team.delete()
+        with self.feature(self.FEATURES):
+            response = self.client_get(url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+
+    def test_with_errors(self) -> None:
+        self.load_trace()
+        self.load_errors(self.gen1_project, self.gen1_span_ids[0])
+        with self.feature(self.FEATURES):
+            response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 3
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+
+    def test_with_errors_eap_eval_not_allowlisted_uses_snuba(self) -> None:
+        self.load_trace()
+        self.load_errors(self.gen1_project, self.gen1_span_ids[0])
+        group = self.create_group(project=self.gen1_project)
+        self.store_eap_items(
+            [
+                self.create_eap_occurrence(
+                    project=self.gen1_project,
+                    group_id=group.id,
+                    trace_id=self.trace_id,
+                ),
+            ]
+        )
+        with self.options(
+            {
+                EAP_OCCURRENCES_SHOULD_RUN_EXPERIMENT_OPTION: True,
+                EAP_OCCURRENCES_USE_EXPERIMENTAL_DATA_ALLOWLIST_OPTION: [],
+            }
+        ):
+            with self.feature(self.FEATURES):
+                response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 3
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+
+    def test_with_errors_eap_allowlisted_uses_eap(self) -> None:
+        self.load_trace()
+        self.load_errors(self.gen1_project, self.gen1_span_ids[0])
+        group = self.create_group(project=self.gen1_project)
+        self.store_eap_items(
+            [
+                self.create_eap_occurrence(
+                    project=self.gen1_project,
+                    group_id=group.id,
+                    trace_id=self.trace_id,
+                ),
+            ]
+        )
+        with self.options(
+            {
+                EAP_OCCURRENCES_SHOULD_RUN_EXPERIMENT_OPTION: True,
+                EAP_OCCURRENCES_USE_EXPERIMENTAL_DATA_ALLOWLIST_OPTION: ["api.trace.count_errors"],
+            }
+        ):
+            with self.feature(self.FEATURES):
+                response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 1
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+
+    def test_with_default(self) -> None:
+        self.load_trace()
+        self.load_default()
+        with self.feature(self.FEATURES):
+            response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["errorsCount"] == 1
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+        assert data["spansCountMap"]["http.server"] == 8
+        assert len(data["transactionChildCountMap"]) == 8
+
+    def test_with_invalid_date(self) -> None:
+        self.load_trace()
+        self.load_default()
+        with self.options({"system.event-retention-days": 10}):
+            with self.feature(self.FEATURES):
+                response = self.client_get(
+                    data={"project": -1, "timestamp": before_now(days=120).timestamp()},
+                    url=self.url,
+                )
+        assert response.status_code == 400, response.content
+
+    def test_trace_metrics_excludes_span_metrics(self) -> None:
+        self.load_trace()
+        self.load_errors(self.gen1_project, self.gen1_span_ids[0])
+        self.store_eap_items(
+            [
+                self.create_trace_metric(
+                    metric_name="foo",
+                    metric_value=1,
+                    metric_type="counter",
+                    trace_id=self.trace_id,
+                ),
+                self.create_trace_metric(
+                    metric_name="other_source",
+                    metric_value=1,
+                    metric_type="counter",
+                    trace_id=self.trace_id,
+                    attributes={"sentry.metric.source": "other"},
+                ),
+                self.create_trace_metric(
+                    metric_name="span_source",
+                    metric_value=1000,
+                    metric_type="counter",
+                    trace_id=self.trace_id,
+                    attributes={"sentry.metric.source": "span"},
+                ),
+            ]
+        )
+        with self.feature(self.FEATURES):
+            response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["metricsCount"] == 2
+
+    def test_trace_metrics_excludes_span_only_metrics(self) -> None:
+        self.load_trace()
+        self.load_errors(self.gen1_project, self.gen1_span_ids[0])
+        self.store_eap_items(
+            [
+                self.create_trace_metric(
+                    metric_name="span_source",
+                    metric_value=1,
+                    metric_type="counter",
+                    trace_id=self.trace_id,
+                    attributes={"sentry.metric.source": "span"},
+                ),
+            ]
+        )
+        with self.feature(self.FEATURES):
+            response = self.client_get(data={"project": -1}, url=self.url)
+        assert response.status_code == 200, response.content
+        data = response.data
+        assert data["metricsCount"] == 0
+
+
+class OrganizationTraceMetaUptimeTest(OrganizationEventsTraceEndpointBase, UptimeResultEAPTestCase):
+    url_name = "sentry-api-0-organization-trace-meta"
+
+    def create_uptime_check(
+        self, trace_id: str | None = None, check_status: str = "success"
+    ) -> TraceItem:
+        return self.create_eap_uptime_result(
+            trace_id=trace_id or self.trace_id,
+            scheduled_check_time=self.day_ago,
+            check_status=check_status,
+        )
+
+    def test_trace_meta_without_uptime_param(self) -> None:
+        """Test that uptimeCount field is NOT present when include_uptime is not set"""
+        self.load_trace()
+        uptime_result = self.create_uptime_check()
+        self.store_eap_items([uptime_result])
+        with self.feature(self.FEATURES):
+            response = self.client_get(data={"project": -1}, url=self.url)
+
+        assert response.status_code == 200
+        data = response.data
+        assert "uptimeCount" not in data
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+
+    def test_trace_meta_with_uptime_param(self) -> None:
+        """Test that uptimeCount shows correct count when include_uptime=1"""
+        self.load_trace()
+
+        uptime_results = [
+            self.create_uptime_check(check_status="success"),
+            self.create_uptime_check(check_status="failure"),
+            self.create_uptime_check(check_status="success"),
+        ]
+        self.store_eap_items(uptime_results)
+
+        with self.feature(self.FEATURES):
+            response = self.client_get(
+                data={"project": "-1", "include_uptime": "1"},
+                url=self.url,
+            )
+
+        assert response.status_code == 200
+        data = response.data
+        assert "uptimeCount" in data
+        assert data["uptimeCount"] == 3
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+
+    def test_trace_meta_no_uptime_results(self) -> None:
+        """Test that uptimeCount is 0 when there are no uptime results"""
+        self.load_trace()
+
+        with self.feature(self.FEATURES):
+            response = self.client_get(
+                data={"project": "-1", "include_uptime": "1"},
+                url=self.url,
+            )
+
+        assert response.status_code == 200
+        data = response.data
+        assert "uptimeCount" in data
+        assert data["uptimeCount"] == 0
+        assert data["errorsCount"] == 0
+        assert data["performanceIssuesCount"] == 2
+        assert data["spansCount"] == 19
+
+    def test_trace_meta_different_trace_id(self) -> None:
+        """Test that uptime results from different traces are not counted"""
+        self.load_trace()
+        other_trace_id = uuid4().hex
+        uptime_result = self.create_uptime_check(trace_id=other_trace_id)
+        self.store_eap_items([uptime_result])
+
+        with self.feature(self.FEATURES):
+            response = self.client_get(
+                data={"project": "-1", "include_uptime": "1"},
+                url=self.url,
+            )
+        assert response.status_code == 200
+        data = response.data
+        assert "uptimeCount" in data
+        assert data["uptimeCount"] == 0

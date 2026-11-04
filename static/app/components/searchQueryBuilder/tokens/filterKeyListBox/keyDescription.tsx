@@ -1,0 +1,96 @@
+import styled from '@emotion/styled';
+
+import {AttributeDetails} from 'sentry/components/attributes/attributeDetails';
+import {useSearchQueryBuilderConfig} from 'sentry/components/searchQueryBuilder/context';
+import {getKeyLabel} from 'sentry/components/searchQueryBuilder/tokens/filterKeyListBox/getKeyLabel';
+import {t} from 'sentry/locale';
+import type {Tag} from 'sentry/types/group';
+import {
+  DEFAULT_ATTRIBUTE_DESCRIPTION,
+  DEFAULT_TAG_DESCRIPTION,
+  FieldKind,
+  FieldValueType,
+  type FieldDefinition,
+} from 'sentry/utils/fields';
+import {toTitleCase} from 'sentry/utils/string/toTitleCase';
+
+type KeyDescriptionProps = {
+  tag: Tag;
+  linksAsText?: boolean;
+  size?: 'sm' | 'md';
+};
+
+export function ValueType({
+  fieldDefinition,
+  fieldKind,
+}: {
+  fieldDefinition: FieldDefinition | null;
+  fieldKind?: FieldKind;
+}) {
+  const defaultType =
+    fieldKind === FieldKind.FEATURE_FLAG ? FieldValueType.BOOLEAN : FieldValueType.STRING;
+
+  if (fieldKind === FieldKind.ARRAY) {
+    return toTitleCase(FieldValueType.ARRAY);
+  }
+
+  if (!fieldDefinition) {
+    return toTitleCase(defaultType);
+  }
+
+  if (fieldDefinition.parameterDependentValueType) {
+    return t('Dynamic');
+  }
+
+  return toTitleCase(fieldDefinition?.valueType ?? defaultType);
+}
+
+export function KeyDescription({linksAsText, size = 'sm', tag}: KeyDescriptionProps) {
+  return (
+    <DescriptionWrapper size={size}>
+      <KeyDetails tag={tag} linksAsText={linksAsText} />
+    </DescriptionWrapper>
+  );
+}
+
+export function KeyDetails({tag, linksAsText}: {tag: Tag; linksAsText?: boolean}) {
+  const {getFieldDefinition} = useSearchQueryBuilderConfig();
+
+  const fieldDefinition = getFieldDefinition(tag.key);
+
+  const sentryDescription = fieldDefinition?.desc;
+
+  const description = sentryDescription ?? getFallbackDescription(tag);
+
+  const defaultValueType =
+    tag.kind === FieldKind.FEATURE_FLAG ? FieldValueType.BOOLEAN : FieldValueType.STRING;
+
+  return (
+    <AttributeDetails
+      description={description}
+      isAddedBySentry={Boolean(sentryDescription)}
+      kind={fieldDefinition?.kind ?? tag.kind}
+      linksAsText={linksAsText}
+      name={getKeyLabel(tag, fieldDefinition, {includeAggregateArgs: true})}
+      valueType={fieldDefinition?.valueType ?? defaultValueType}
+    />
+  );
+}
+
+function getFallbackDescription(tag: Tag) {
+  if (tag.kind === FieldKind.FEATURE_FLAG) {
+    return t('A feature flag evaluated before an error event');
+  }
+
+  // Sentry's own string attributes are typed as tags, but no user sent them.
+  if (tag.kind === FieldKind.TAG && tag.attributeSource !== 'sentry') {
+    return DEFAULT_TAG_DESCRIPTION;
+  }
+
+  return DEFAULT_ATTRIBUTE_DESCRIPTION;
+}
+
+const DescriptionWrapper = styled('div')<Pick<KeyDescriptionProps, 'size'>>`
+  max-width: ${p => (p.size === 'sm' ? '220px' : 'none')};
+  font-size: ${p => (p.size === 'sm' ? p.theme.font.size.sm : p.theme.font.size.md)};
+`;

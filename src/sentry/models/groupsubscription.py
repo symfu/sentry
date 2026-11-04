@@ -1,101 +1,118 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, ClassVar
+
 from django.conf import settings
-from django.db import IntegrityError, models, transaction
-from django.db.models import Q
+from django.db import IntegrityError, OperationalError, models, router, transaction
 from django.utils import timezone
 
+from sentry.backup.scopes import RelocationScope
 from sentry.db.models import (
-    BaseManager,
     BoundedPositiveIntegerField,
     FlexibleForeignKey,
     Model,
+    cell_silo_model,
     sane_repr,
 )
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
+from sentry.db.models.manager.base import BaseManager
+from sentry.integrations.types import ExternalProviders
+from sentry.notifications.services import notifications_service
+from sentry.notifications.types import (
+    GroupSubscriptionReason,
+    NotificationSettingEnum,
+    NotificationSettingsOptionEnum,
+)
+from sentry.types.actor import Actor
+from sentry.users.services.user import RpcUser
+
+if TYPE_CHECKING:
+    from sentry.models.group import Group
+    from sentry.models.team import Team
+    from sentry.notifications.utils.participants import ParticipantMap
+    from sentry.users.models.user import User
 
 
-class GroupSubscriptionReason:
-    implicit = -1  # not for use as a persisted field value
-    committed = -2  # not for use as a persisted field value
-    processing_issue = -3  # not for use as a persisted field value
-
-    unknown = 0
-    comment = 1
-    assigned = 2
-    bookmark = 3
-    status_change = 4
-    deploy_setting = 5
-    mentioned = 6
-    team_mentioned = 7
-
-    descriptions = {
-        implicit: "have opted to receive updates for all issues within "
-        "projects that you are a member of",
-        committed: "were involved in a commit that is part of this release",
-        processing_issue: "are subscribed to alerts for this project",
-        comment: "have commented on this issue",
-        assigned: "have been assigned to this issue",
-        bookmark: "have bookmarked this issue",
-        status_change: "have changed the resolution status of this issue",
-        deploy_setting: "opted to receive all deploy notifications for this organization",
-        mentioned: "have been mentioned in this issue",
-        team_mentioned: "are a member of a team mentioned in this issue",
-    }
-
-
-def get_user_options(key, user_ids, project, default):
-    from sentry.models import UserOption
-
-    options = {
-        (option.user_id, option.project_id): option.value
-        for option in UserOption.objects.filter(
-            Q(project__isnull=True) | Q(project=project),
-            user_id__in=user_ids,
-            key="workflow:notifications",
-        )
-    }
-
-    return {
-        user_id: options.get((user_id, project.id), options.get((user_id, None), default))
-        for user_id in user_ids
-    }
-
-
-class GroupSubscriptionManager(BaseManager):
-    def subscribe(self, group, user, reason=GroupSubscriptionReason.unknown):
+class GroupSubscriptionManager(BaseManager["GroupSubscription"]):
+    def subscribe(
+        self,
+        group: Group,
+        subscriber: User | RpcUser | Team,
+        reason: int = GroupSubscriptionReason.unknown,
+    ) -> bool:
         """
-        Subscribe a user to an issue, but only if the user has not explicitly
+        Subscribe a user or team to an issue, but only if that user or team has not explicitly
         unsubscribed.
         """
+        from sentry.models.team import Team
+        from sentry.users.models.user import User
+
         try:
-            with transaction.atomic():
-                self.create(
-                    user=user, group=group, project=group.project, is_active=True, reason=reason
-                )
+            with transaction.atomic(router.db_for_write(GroupSubscription)):
+                if isinstance(subscriber, (User, RpcUser)):
+                    self.create(
+                        user_id=subscriber.id,
+                        group=group,
+                        project=group.project,
+                        is_active=True,
+                        reason=reason,
+                    )
+                elif isinstance(subscriber, Team):
+                    self.create(
+                        team=subscriber,
+                        group=group,
+                        project=group.project,
+                        is_active=True,
+                        reason=reason,
+                    )
         except IntegrityError:
             pass
+        return True
 
-    def subscribe_actor(self, group, actor, reason=GroupSubscriptionReason.unknown):
-        from sentry.models import User, Team
+    def subscribe_actor(
+        self,
+        group: Group,
+        actor: Team | User | RpcUser,
+        reason: int = GroupSubscriptionReason.unknown,
+    ) -> bool | None:
+        from sentry.models.team import Team
+        from sentry.users.models.user import User
 
-        if isinstance(actor, User):
+        if isinstance(actor, (RpcUser, User)):
             return self.subscribe(group, actor, reason)
         if isinstance(actor, Team):
             # subscribe the members of the team
-            team_users_ids = list(actor.member_set.values_list("user_id", flat=True))
-            return self.bulk_subscribe(group, team_users_ids, reason)
+            team_user_ids = actor.member_set.values_list("user_id", flat=True)
+            return self.bulk_subscribe(
+                group=group,
+                user_ids=[user_id for user_id in team_user_ids if user_id is not None],
+                reason=reason,
+            )
 
         raise NotImplementedError("Unknown actor type: %r" % type(actor))
 
-    def bulk_subscribe(self, group, user_ids, reason=GroupSubscriptionReason.unknown):
+    def bulk_subscribe(
+        self,
+        group: Group,
+        user_ids: Iterable[int] | None = None,
+        team_ids: Iterable[int] | None = None,
+        reason: int = GroupSubscriptionReason.unknown,
+    ) -> bool:
         """
-        Subscribe a list of user ids to an issue, but only if the users are not explicitly
+        Subscribe a list of user ids and/or teams to an issue, but only if the users/teams are not explicitly
         unsubscribed.
         """
-        user_ids = set(user_ids)
+
+        # Unique the IDs.
+        user_ids = set(user_ids) if user_ids else set()
+
+        # Unique the teams.
+        team_ids = set(team_ids) if team_ids else set()
 
         # 5 retries for race conditions where
         # concurrent subscription attempts cause integrity errors
         for i in range(4, -1, -1):  # 4 3 2 1 0
-
             existing_subscriptions = set(
                 GroupSubscription.objects.filter(
                     user_id__in=user_ids, group=group, project=group.project
@@ -110,83 +127,143 @@ class GroupSubscriptionManager(BaseManager):
                     is_active=True,
                     reason=reason,
                 )
-                for user_id in user_ids
-                if user_id not in existing_subscriptions
+                for user_id in user_ids.difference(existing_subscriptions)
             ]
 
             try:
-                with transaction.atomic():
-                    self.bulk_create(subscriptions)
+                with transaction.atomic(router.db_for_write(GroupSubscription)):
+                    self.bulk_create(subscriptions, ignore_conflicts=True)
                     return True
-            except IntegrityError as e:
+            except (IntegrityError, OperationalError):
                 if i == 0:
-                    raise e
+                    raise
+        return False
 
-    def get_participants(self, group):
+    def get_participants(self, group: Group) -> ParticipantMap:
         """
         Identify all users who are participating with a given issue.
+        :param group: Group object
         """
-        from sentry.models import User, UserOptionValue
+        from sentry.notifications.utils.participants import ParticipantMap
 
-        users = {
-            user.id: user
-            for user in User.objects.filter(
-                sentry_orgmember_set__teams__in=group.project.teams.all(), is_active=True
-            )
-        }
-
-        subscriptions = {
-            subscription.user_id: subscription
-            for subscription in GroupSubscription.objects.filter(
-                group=group, user_id__in=users.keys()
-            )
-        }
-
-        options = get_user_options(
-            "workflow:notifications",
-            list(users.keys()),
-            group.project,
-            UserOptionValue.participating_only,
+        all_possible_actors = Actor.many_from_object(group.project.get_members_as_rpc_users())
+        active_and_disabled_subscriptions = self.filter(
+            group=group, user_id__in=[u.id for u in all_possible_actors]
         )
-
-        excluded_ids = {
-            user_id for user_id, subscription in subscriptions.items() if not subscription.is_active
+        subscriptions_by_user_id = {
+            subscription.user_id: subscription for subscription in active_and_disabled_subscriptions
         }
 
-        for user_id, option in options.items():
-            if option == UserOptionValue.no_conversations:
-                excluded_ids.add(user_id)
-            elif option == UserOptionValue.participating_only:
-                if user_id not in subscriptions:
-                    excluded_ids.add(user_id)
+        if not all_possible_actors:  # no actors, no notifications
+            return ParticipantMap()
 
+        providers_by_recipient = notifications_service.get_participants(
+            recipients=all_possible_actors,
+            project_ids=[group.project_id],
+            organization_id=group.organization.id,
+            type=NotificationSettingEnum.WORKFLOW,
+        )
+        result = ParticipantMap()
+        for user in all_possible_actors:
+            if user.id not in providers_by_recipient:
+                continue
+
+            subscription_option = subscriptions_by_user_id.get(user.id)
+
+            for provider_str, val in providers_by_recipient[user.id].items():
+                value = NotificationSettingsOptionEnum(val)
+                is_subscribed = (
+                    subscription_option
+                    and subscription_option.is_active
+                    and value
+                    in [
+                        NotificationSettingsOptionEnum.ALWAYS,
+                        NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                    ]
+                )
+                is_implicit = (
+                    not subscription_option and value == NotificationSettingsOptionEnum.ALWAYS
+                )
+                if is_subscribed or is_implicit:
+                    reason = (
+                        subscription_option
+                        and subscription_option.reason
+                        or GroupSubscriptionReason.implicit
+                    )
+                    provider = ExternalProviders(provider_str)
+                    result.add(provider, user, reason)
+        return result
+
+    def get_possible_team_actors(self, group: Group) -> list[Actor]:
+        from sentry.models.team import Team
+
+        possible_teams_ids = Team.objects.filter(id__in=self.get_participating_team_ids(group))
+        return Actor.many_from_object(possible_teams_ids)
+
+    def get_subscriptions_by_team_id(
+        self, group: Group, possible_team_actors: list[Actor]
+    ) -> dict[int, GroupSubscription]:
+        active_and_disabled_team_subscriptions = self.filter(
+            group=group, team_id__in=[t.id for t in possible_team_actors]
+        )
         return {
-            user: getattr(subscriptions.get(user_id), "reason", GroupSubscriptionReason.implicit)
-            for user_id, user in users.items()
-            if user_id not in excluded_ids
+            subscription.team_id: subscription
+            for subscription in active_and_disabled_team_subscriptions
         }
 
+    @staticmethod
+    def get_participating_user_ids(group: Group) -> list[int]:
+        """Return the list of user ids participating in this issue."""
 
+        return [
+            user_id
+            for user_id in GroupSubscription.objects.filter(
+                group=group, is_active=True, team=None
+            ).values_list("user_id", flat=True)
+            if user_id is not None
+        ]
+
+    @staticmethod
+    def get_participating_team_ids(group: Group) -> list[int]:
+        """Return the list of team ids participating in this issue."""
+
+        return [
+            team_id
+            for team_id in GroupSubscription.objects.filter(
+                group=group, is_active=True, user_id=None
+            ).values_list("team_id", flat=True)
+            if team_id is not None
+        ]
+
+
+@cell_silo_model
 class GroupSubscription(Model):
     """
-    Identifies a subscription relationship between a user and an issue.
+    Identifies a subscription relationship between a user / team and an issue.
     """
 
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Excluded
 
     project = FlexibleForeignKey("sentry.Project", related_name="subscription_set")
     group = FlexibleForeignKey("sentry.Group", related_name="subscription_set")
-    # namespace related_name on User since we don't own the model
-    user = FlexibleForeignKey(settings.AUTH_USER_MODEL)
+    user_id = HybridCloudForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete="CASCADE")
+    team = FlexibleForeignKey("sentry.Team", null=True, db_index=True, on_delete=models.CASCADE)
     is_active = models.BooleanField(default=True)
     reason = BoundedPositiveIntegerField(default=GroupSubscriptionReason.unknown)
     date_added = models.DateTimeField(default=timezone.now, null=True)
 
-    objects = GroupSubscriptionManager()
+    objects: ClassVar[GroupSubscriptionManager] = GroupSubscriptionManager()
 
     class Meta:
         app_label = "sentry"
         db_table = "sentry_groupsubscription"
-        unique_together = (("group", "user"),)
+        unique_together = (("group", "user_id"), ("group", "team"))
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(team_id__isnull=False, user_id__isnull=True)
+                | models.Q(team_id__isnull=True, user_id__isnull=False),
+                name="subscription_team_or_user_check",
+            )
+        ]
 
     __repr__ = sane_repr("project_id", "group_id", "user_id")

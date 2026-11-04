@@ -1,21 +1,67 @@
+"""
+Adapted from https://github.com/lukesneeringer/django-pgfields/blob/master/django_pg/models/fields/uuid.py
+
+Copyright (c) 2013, Luke Sneeringer
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the django-pgfields nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL AUTHORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+from __future__ import annotations
+
 import importlib
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
+from uuid import UUID, uuid4
+
+from django.db import models
+from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.models.fields import NOT_PROVIDED
+from psycopg2.extensions import register_adapter
 
 from sentry.db.models.utils import Creator
 
-from django.db import models
-from django.db.models.fields import NOT_PROVIDED
-from psycopg2.extensions import register_adapter
-from uuid import uuid4, UUID
-
-
 # Adapted from django-pgfields
 # https://github.com/lukesneeringer/django-pgfields/blob/master/django_pg/models/fields/uuid.py
-class UUIDField(models.Field):
+_SetType = TypeVar("_SetType", default=UUID)
+_GetType = TypeVar("_GetType", default=UUID)
+
+
+class UUIDField(models.Field[_SetType, _GetType]):
     """Field for storing UUIDs."""
 
     description = "Universally unique identifier."
 
-    def __init__(self, auto_add=False, coerce_to=UUID, **kwargs):
+    _auto_add: bool | Callable[[], UUID]
+    _coerce_to: type[UUID]
+
+    def __init__(
+        self,
+        auto_add: bool | str | Callable[[], UUID] = False,
+        coerce_to: type[UUID] = UUID,
+        **kwargs: Any,
+    ) -> None:
         """Instantiate the field."""
 
         # If the `auto_add` argument is specified as True, substitute an
@@ -32,7 +78,7 @@ class UUIDField(models.Field):
             auto_add = getattr(module, member)
 
         # Save the `auto_add` and `coerce_to` rules.
-        self._auto_add = auto_add
+        self._auto_add = cast("bool | Callable[[], UUID]", auto_add)
         self._coerce_to = coerce_to
 
         # If `auto_add` is enabled, it should imply that the field
@@ -57,13 +103,13 @@ class UUIDField(models.Field):
         # Now pass the rest of the work to CharField.
         super().__init__(**kwargs)
 
-    def db_type(self, connection):
+    def db_type(self, connection: BaseDatabaseWrapper) -> str:
         return "uuid"
 
-    def get_internal_type(self):
+    def get_internal_type(self) -> str:
         return "CharField"
 
-    def get_prep_value(self, value):
+    def get_prep_value(self, value: object) -> UUID | None:
         """Return a wrapped, valid UUID value."""
 
         # If the value is None, return None.
@@ -71,7 +117,7 @@ class UUIDField(models.Field):
             if self.null or self._auto_add or (self.default != NOT_PROVIDED):
                 return None
             raise ValueError(
-                "Explicit UUID required unless either `null` is " "True or `auto_add` is given."
+                "Explicit UUID required unless either `null` is True or `auto_add` is given."
             )
 
         # If we already have a UUID, pass it through.
@@ -79,16 +125,17 @@ class UUIDField(models.Field):
             return value
 
         # Convert our value to a UUID.
-        return UUID(value)
+        return UUID(cast("str | None", value))
 
-    def pre_save(self, instance, add):
+    def pre_save(self, instance: models.Model, add: bool) -> UUID | None:
         """If auto is set, generate a UUID at random."""
 
         # If the `auto_add` option was set, and there is no value
         # on the model instance, then generate a UUID using the given
         # callable.
-        if self._auto_add and add and not getattr(instance, self.attname):
-            uuid_value = self._auto_add()
+        auto_add = self._auto_add
+        if callable(auto_add) and add and not getattr(instance, self.attname):
+            uuid_value = auto_add()
 
             # Save the UUID to the model instance
             setattr(instance, self.attname, uuid_value)
@@ -97,18 +144,20 @@ class UUIDField(models.Field):
         # This is the standard case; just use the superclass logic.
         return super().pre_save(instance, add)
 
-    def contribute_to_class(self, cls, name):
-        super().contribute_to_class(cls, name)
+    def contribute_to_class(
+        self, cls: type[models.Model], name: str, private_only: bool = False
+    ) -> None:
+        super().contribute_to_class(cls, name, private_only=private_only)
         setattr(cls, name, Creator(self))
 
-    def to_python(self, value):
+    def to_python(self, value: object) -> object:
         """Return a UUID object."""
         if isinstance(value, self._coerce_to) or not value:
             return value
-        return self._coerce_to(value)
+        return self._coerce_to(cast("str | None", value))
 
     @property
-    def _auto_add_str(self):
+    def _auto_add_str(self) -> bool | str:
         """Return a dot path, as a string, of the `_auto_add` callable.
         If `_auto_add` is a boolean, return it unchanged.
         """
@@ -118,12 +167,12 @@ class UUIDField(models.Field):
 
 
 class UUIDAdapter:
-    def __init__(self, value):
+    def __init__(self, value: object) -> None:
         if not isinstance(value, UUID):
             raise TypeError("UUIDAdapter only understands UUID objects.")
         self.value = value
 
-    def getquoted(self):
+    def getquoted(self) -> bytes:
         return ("'%s'" % self.value).encode("utf8")
 
 

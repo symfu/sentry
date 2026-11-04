@@ -1,11 +1,57 @@
 from collections import defaultdict
+from collections.abc import Collection, Mapping, Sequence
+from datetime import datetime
+from typing import NotRequired, TypedDict, cast
+
+from django.contrib.auth.models import AnonymousUser
 
 from sentry.api.serializers import Serializer, register, serialize
-from sentry.models import Commit, Repository
-from sentry.api.serializers.models.release import get_users_for_authors, CommitAuthor
+from sentry.api.serializers.models.pullrequest import PullRequestSerializerResponse
+from sentry.api.serializers.models.release import get_users_for_authors
+from sentry.api.serializers.models.repository import RepositorySerializerResponse
+from sentry.api.serializers.release_details_types import Author
+from sentry.models.commit import Commit
+from sentry.models.commitauthor import CommitAuthor
+from sentry.models.pullrequest import PullRequest
+from sentry.models.release import Release
+from sentry.models.repository import Repository
+from sentry.users.models.user import User
+from sentry.users.services.user.model import RpcUser
 
 
-def get_users_for_commits(item_list, user=None):
+class EmptyAuthor(TypedDict):
+    """The commit serializer emits ``{}`` for ``author`` when the commit has no
+    mapped author, so the published schema must allow an empty object alongside a
+    populated ``Author``."""
+
+
+class CommitSerializerResponse(TypedDict):
+    id: str
+    message: str | None
+    dateCreated: datetime
+    pullRequest: PullRequestSerializerResponse | None
+    suspectCommitType: str
+
+    repository: NotRequired[RepositorySerializerResponse]
+    author: NotRequired[Author | EmptyAuthor]
+
+
+class CommitReleaseSerializerResponse(TypedDict):
+    version: str
+    shortVersion: str
+    ref: str | None
+    url: str | None
+    dateReleased: datetime | None
+    dateCreated: datetime
+
+
+class CommitSerializerResponseWithReleases(CommitSerializerResponse):
+    releases: list[CommitReleaseSerializerResponse]
+
+
+def get_users_for_commits(
+    item_list: Sequence[Commit], user: User | RpcUser | AnonymousUser | None = None
+) -> Mapping[str, Author]:
     authors = list(
         CommitAuthor.objects.get_many_from_cache([i.author_id for i in item_list if i.author_id])
     )
@@ -18,12 +64,25 @@ def get_users_for_commits(item_list, user=None):
 
 
 @register(Commit)
-class CommitSerializer(Serializer):
-    def __init__(self, exclude=None, include=None, *args, **kwargs):
+class CommitSerializer(Serializer[CommitSerializerResponse]):
+    def __init__(
+        self,
+        exclude: Collection[str] | None = None,
+        include: Collection[str] | None = None,
+        type: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
         Serializer.__init__(self, *args, **kwargs)
         self.exclude = frozenset(exclude if exclude else ())
+        self.type = type or ""
 
-    def get_attrs(self, item_list, user):
+    def get_attrs(
+        self,
+        item_list: Sequence[Commit],
+        user: User | RpcUser | AnonymousUser,
+        **kwargs: object,
+    ) -> dict[Commit, dict[str, object]]:
         if "author" not in self.exclude:
             users_by_author = get_users_for_commits(item_list, user)
         else:
@@ -38,32 +97,71 @@ class CommitSerializer(Serializer):
 
         repository_objs = {repository["id"]: repository for repository in repositories}
 
+        pull_requests = list(
+            PullRequest.objects.filter(
+                merge_commit_sha__in=[c.key for c in item_list],
+                organization_id=item_list[0].organization_id,
+            )
+        )
+
+        pull_request_by_commit = {
+            pr.merge_commit_sha: serialized_pr
+            for (pr, serialized_pr) in zip(pull_requests, serialize(pull_requests))
+        }
+
         result = {}
         for item in item_list:
             result[item] = {
                 "repository": repository_objs.get(str(item.repository_id), {}),
                 "user": users_by_author.get(str(item.author_id), {}) if item.author_id else {},
+                "pull_request": pull_request_by_commit.get(item.key, None),
+                "suspect_commit_type": self.type,
             }
 
         return result
 
-    def serialize(self, obj, attrs, user):
-        d = {"id": obj.key, "message": obj.message, "dateCreated": obj.date_added}
+    def serialize(
+        self,
+        obj: Commit,
+        attrs: Mapping[str, object],
+        user: User | RpcUser | AnonymousUser,
+        **kwargs: object,
+    ) -> CommitSerializerResponse:
+        d: CommitSerializerResponse = {
+            "id": obj.key,
+            "message": obj.message,
+            "dateCreated": obj.date_added,
+            "pullRequest": cast(PullRequestSerializerResponse | None, attrs["pull_request"]),
+            "suspectCommitType": cast(str, attrs["suspect_commit_type"]),
+        }
         if "repository" not in self.exclude:
-            d["repository"] = attrs["repository"]
+            d["repository"] = cast(RepositorySerializerResponse, attrs["repository"])
         if "author" not in self.exclude:
-            d["author"] = attrs["user"]
+            d["author"] = cast(Author | EmptyAuthor, attrs["user"])
         return d
 
 
 @register(Commit)
 class CommitWithReleaseSerializer(CommitSerializer):
-    def __init__(self, exclude=None, include=None, *args, **kwargs):
+    def __init__(
+        self,
+        exclude: Collection[str] | None = None,
+        include: Collection[str] | None = None,
+        type: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
         Serializer.__init__(self, *args, **kwargs)
         self.exclude = frozenset(exclude if exclude else ())
+        self.type = type or ""
 
-    def get_attrs(self, item_list, user):
-        from sentry.models import ReleaseCommit
+    def get_attrs(
+        self,
+        item_list: Sequence[Commit],
+        user: User | RpcUser | AnonymousUser,
+        **kwargs: object,
+    ) -> dict[Commit, dict[str, object]]:
+        from sentry.models.releasecommit import ReleaseCommit
 
         attrs = super().get_attrs(item_list, user)
         releases_by_commit = defaultdict(list)
@@ -76,17 +174,35 @@ class CommitWithReleaseSerializer(CommitSerializer):
             attrs[item]["releases"] = releases_by_commit[item.id]
         return attrs
 
-    def serialize(self, obj, attrs, user):
+    def serialize(
+        self,
+        obj: Commit,
+        attrs: Mapping[str, object],
+        user: User | RpcUser | AnonymousUser,
+        **kwargs: object,
+    ) -> CommitSerializerResponseWithReleases:
         data = super().serialize(obj, attrs, user)
-        data["releases"] = [
-            {
-                "version": r.version,
-                "shortVersion": r.version,
-                "ref": r.ref,
-                "url": r.url,
-                "dateReleased": r.date_released,
-                "dateCreated": r.date_added,
-            }
-            for r in attrs["releases"]
-        ]
-        return data
+        ret: CommitSerializerResponseWithReleases = {
+            "id": data["id"],
+            "message": data["message"],
+            "dateCreated": data["dateCreated"],
+            "pullRequest": data["pullRequest"],
+            "suspectCommitType": data["suspectCommitType"],
+            "releases": [
+                {
+                    "version": r.version,
+                    "shortVersion": r.version,
+                    "ref": r.ref,
+                    "url": r.url,
+                    "dateReleased": r.date_released,
+                    "dateCreated": r.date_added,
+                }
+                for r in cast(Sequence[Release], attrs["releases"])
+            ],
+        }
+        if "repository" in data:
+            ret["repository"] = cast(RepositorySerializerResponse, attrs["repository"])
+        if "author" in data:
+            ret["author"] = cast(Author | EmptyAuthor, attrs["user"])
+
+        return ret

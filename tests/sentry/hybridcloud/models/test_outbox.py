@@ -1,0 +1,1254 @@
+import functools
+import threading
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from unittest.mock import Mock, call, patch
+
+import pytest
+from django.db import InterfaceError, OperationalError, connections, router, transaction
+from pytest import raises
+
+from sentry.hybridcloud.models import ApiTokenReplica
+from sentry.hybridcloud.models.outbox import (
+    CellOutbox,
+    ControlOutbox,
+    OutboxDatabaseError,
+    OutboxFlushError,
+    outbox_context,
+)
+from sentry.hybridcloud.outbox.category import OutboxCategory, OutboxScope
+from sentry.hybridcloud.tasks.deliver_from_outbox import enqueue_outbox_jobs, schedule_outbox_model
+from sentry.models.apiapplication import ApiApplication
+from sentry.models.apigrant import ApiGrant
+from sentry.models.apitoken import ApiToken
+from sentry.models.organization import Organization
+from sentry.models.organizationmember import OrganizationMember
+from sentry.models.projectkey import ProjectKey
+from sentry.silo.base import SiloMode
+from sentry.silo.safety import unguarded_write
+from sentry.testutils.cases import TestCase, TransactionTestCase
+from sentry.testutils.factories import Factories
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.outbox import outbox_runner
+from sentry.testutils.silo import assume_test_silo_mode, control_silo_test
+from sentry.types.cell import Cell, get_local_cell
+from sentry.users.models.user import User
+
+
+def wrap_with_connection_closure(c: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapper(*args: Any, **kwds: Any) -> Any:
+        try:
+            return c(*args, **kwds)
+        finally:
+            for connection in connections.all():
+                connection.close()
+
+    functools.update_wrapper(wrapper, c)
+    return wrapper
+
+
+@pytest.fixture(autouse=True, scope="function")
+def setup_clear_fixture_outbox_messages() -> None:
+    with outbox_runner():
+        pass
+
+
+@control_silo_test
+class ControlOutboxTest(TestCase):
+    region = Cell("eu", 1, "http://eu.testserver")
+    region_config = (region,)
+
+    def test_skip_shards(self) -> None:
+        with self.options({"hybrid_cloud.authentication.disabled_user_shards": [100]}):
+            assert ControlOutbox(
+                shard_scope=OutboxScope.USER_SCOPE, shard_identifier=100
+            ).should_skip_shard()
+            assert not ControlOutbox(
+                shard_scope=OutboxScope.USER_SCOPE, shard_identifier=101
+            ).should_skip_shard()
+
+        assert not ControlOutbox(
+            shard_scope=OutboxScope.USER_SCOPE, shard_identifier=100
+        ).should_skip_shard()
+
+    def test_control_sharding_keys(self) -> None:
+        with assume_test_silo_mode(SiloMode.CELL):
+            org = Factories.create_organization()
+
+        user1 = Factories.create_user()
+        user2 = Factories.create_user()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            expected_region_name = get_local_cell().name
+            om = OrganizationMember.objects.create(
+                organization_id=org.id,
+                user_id=user1.id,
+                role=org.default_role,
+            )
+            om.outbox_for_update().drain_shard()
+
+            om = OrganizationMember.objects.create(
+                organization_id=org.id,
+                user_id=user2.id,
+                role=org.default_role,
+            )
+            om.outbox_for_update().drain_shard()
+
+        with outbox_context(flush=False):
+            for inst in User.outboxes_for_user_update(user1.id):
+                inst.save()
+            for inst in User.outboxes_for_user_update(user2.id):
+                inst.save()
+
+        shards = {
+            (row["shard_scope"], row["shard_identifier"], row["cell_name"])
+            for row in ControlOutbox.find_scheduled_shards()
+        }
+
+        assert shards == {
+            (OutboxScope.USER_SCOPE.value, user1.id, expected_region_name),
+            (OutboxScope.USER_SCOPE.value, user2.id, expected_region_name),
+        }
+
+    def test_prepare_next_from_shard_no_conflict_with_processing(self) -> None:
+        with outbox_runner():
+            org = Factories.create_organization()
+            user1 = Factories.create_user()
+            Factories.create_member(organization_id=org.id, user_id=user1.id)
+
+        with outbox_context(flush=False):
+            outbox = user1.outboxes_for_update()[0]
+            outbox.save()
+            with outbox.process_shard(None) as next_shard_row:
+                assert next_shard_row is not None
+
+                def test_with_other_connection() -> None:
+                    try:
+                        assert (
+                            ControlOutbox.prepare_next_from_shard(
+                                {
+                                    k: getattr(next_shard_row, k)
+                                    for k in ControlOutbox.sharding_columns
+                                }
+                            )
+                            is None
+                        )
+                    finally:
+                        for c in connections.all():
+                            c.close()
+
+                t = threading.Thread(target=test_with_other_connection)
+                t.start()
+                t.join()
+
+
+@control_silo_test
+class ControlOutboxDrainTest(TransactionTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.outbox = ControlOutbox(
+            cell_name="eu",
+            shard_scope=OutboxScope.API_TOKEN_SCOPE,
+            shard_identifier=1,
+            category=OutboxCategory.API_TOKEN_UPDATE,
+            object_identifier=1,
+        )
+        with outbox_context(flush=False):
+            self.outbox.save()
+        self.connection = connections[router.db_for_write(ControlOutbox)]
+
+    def terminate_connection(self, **kwargs: Any) -> None:
+        assert self.connection.in_atomic_block
+        assert self.connection.connection is not None
+        backend_pid = self.connection.connection.get_backend_pid()
+        terminator = self.connection.copy()
+        try:
+            with terminator.cursor() as cursor:
+                # Wait for termination to complete before the next database operation.
+                termination_timeout_ms = 5_000
+                cursor.execute(
+                    "SELECT pg_terminate_backend(%s, %s)", [backend_pid, termination_timeout_ms]
+                )
+                assert cursor.fetchone()[0]
+        finally:
+            terminator.close()
+
+    def _save_outbox(self, shard_scope: OutboxScope, category: OutboxCategory) -> ControlOutbox:
+        outbox = ControlOutbox(
+            cell_name="us",
+            shard_scope=shard_scope,
+            shard_identifier=42,
+            category=category,
+            object_identifier=42,
+        )
+        with outbox_context(flush=False):
+            outbox.save()
+        return outbox
+
+    def test_reconnects_after_successful_token_replication(self) -> None:
+        self.outbox.delete()
+        with outbox_runner():
+            user = self.create_user()
+            application = ApiApplication(owner=user, redirect_uris="https://example.com")
+            application.save()
+        grant = ApiGrant(user=user, application=application, redirect_uri="https://example.com")
+        grant.save()
+        following_callback = Mock()
+        original_replication = ApiToken.handle_async_replication
+
+        with patch.object(ApiToken, "handle_async_replication", autospec=True) as mock_replication:
+
+            def disconnect_once(token: ApiToken, cell_name: str, shard_identifier: int) -> None:
+                mock_replication.side_effect = original_replication
+                original_replication(token, cell_name, shard_identifier)
+                self.terminate_connection()
+
+            mock_replication.side_effect = disconnect_once
+            with transaction.atomic(using=self.connection.alias):
+                token = ApiToken.objects.create(
+                    application=grant.application,
+                    user=grant.user,
+                    scope_list=grant.get_scopes(),
+                    scoping_organization_id=grant.organization_id,
+                )
+                with unguarded_write(using=router.db_for_write(ApiGrant)):
+                    grant.delete()
+                transaction.on_commit(following_callback, using=self.connection.alias)
+
+        assert mock_replication.call_count == 2
+        assert mock_replication.call_args_list[0] == mock_replication.call_args_list[1]
+        following_callback.assert_called_once_with()
+        assert not ApiGrant.objects.filter(id=grant.id).exists()
+        assert ApiToken.objects.filter(application=application).count() == 1
+        assert token.plaintext_token == token.token
+        assert not ControlOutbox.objects.filter(
+            category=OutboxCategory.API_TOKEN_UPDATE, object_identifier=token.id
+        ).exists()
+        with assume_test_silo_mode(SiloMode.CELL):
+            replica = ApiTokenReplica.objects.get(apitoken_id=token.id)
+            assert replica.token == token.token
+
+    @patch("sentry.hybridcloud.models.outbox.process_control_outbox.send")
+    def test_reconnects_after_interface_error(self, mock_send: Mock) -> None:
+        original_process = ControlOutbox.process
+        with patch.object(ControlOutbox, "process", autospec=True) as mock_process:
+
+            def fail_once(outbox: ControlOutbox, is_synchronous_flush: bool) -> bool:
+                mock_process.side_effect = original_process
+                raise InterfaceError("connection already closed")
+
+            mock_process.side_effect = fail_once
+            self.outbox.drain_shard()
+
+        assert mock_process.call_count == 2
+        mock_send.assert_called_once()
+        assert not ControlOutbox.objects.filter(id=self.outbox.id).exists()
+
+    def test_wraps_interface_error_after_retry(self) -> None:
+        retry_error = InterfaceError("connection already closed")
+        with (
+            patch.object(
+                ControlOutbox,
+                "process",
+                side_effect=[
+                    OperationalError("server closed the connection unexpectedly"),
+                    retry_error,
+                ],
+            ) as mock_process,
+            pytest.raises(OutboxDatabaseError) as exc_info,
+        ):
+            self.outbox.drain_shard()
+
+        assert exc_info.value.__cause__ is retry_error
+        assert mock_process.call_count == 2
+        assert not self.connection.in_atomic_block
+        assert ControlOutbox.objects.filter(id=self.outbox.id).exists()
+
+    @patch("sentry.hybridcloud.models.outbox.process_control_outbox.send")
+    def test_retries_disconnection_only_once(self, mock_send: Mock) -> None:
+        mock_send.side_effect = self.terminate_connection
+
+        with pytest.raises(OutboxDatabaseError):
+            self.outbox.drain_shard()
+
+        assert mock_send.call_count == 2
+        assert not self.connection.in_atomic_block
+        assert ControlOutbox.objects.filter(id=self.outbox.id).exists()
+
+    @patch("sentry.hybridcloud.models.outbox.process_control_outbox.send")
+    def test_does_not_retry_async_drain(self, mock_send: Mock) -> None:
+        mock_send.side_effect = self.terminate_connection
+
+        with pytest.raises(OutboxDatabaseError):
+            self.outbox.drain_shard(flush_all=True)
+
+        mock_send.assert_called_once()
+        assert ControlOutbox.objects.filter(id=self.outbox.id).exists()
+
+    def test_does_not_retry_other_shards(self) -> None:
+        disconnect_error = OperationalError("server closed the connection unexpectedly")
+
+        # ORGANIZATION_SCOPE holds POST_ORGANIZATION_PROVISION, which is deliberately not
+        # covered by the PROVISION_SCOPE retry.
+        for shard_scope, category in (
+            (OutboxScope.USER_SCOPE, OutboxCategory.USER_UPDATE),
+            (OutboxScope.ORGANIZATION_SCOPE, OutboxCategory.ORGANIZATION_UPDATE),
+        ):
+            outbox = self._save_outbox(shard_scope, category)
+
+            # Inject at the drain boundary so database-level auto-reconnect cannot hide the error.
+            with (
+                patch.object(
+                    ControlOutbox, "process", side_effect=disconnect_error
+                ) as mock_process,
+                pytest.raises(OutboxDatabaseError) as exc_info,
+            ):
+                outbox.drain_shard()
+
+            assert exc_info.value.__cause__ is disconnect_error
+            mock_process.assert_called_once_with(is_synchronous_flush=True)
+            assert not self.connection.in_atomic_block
+            assert ControlOutbox.objects.filter(id=outbox.id).exists()
+
+    @patch.object(
+        ControlOutbox, "process", side_effect=OperationalError("unrelated database error")
+    )
+    def test_does_not_retry_other_database_errors(self, mock_process: Mock) -> None:
+        with pytest.raises(OutboxDatabaseError):
+            self.outbox.drain_shard()
+
+        mock_process.assert_called_once()
+        assert ControlOutbox.objects.filter(id=self.outbox.id).exists()
+
+    @patch("sentry.hybridcloud.models.outbox.process_control_outbox.send")
+    def test_reconnects_after_disconnect_during_organization_provisioning(
+        self, mock_send: Mock
+    ) -> None:
+        outbox = self._save_outbox(
+            OutboxScope.PROVISION_SCOPE, OutboxCategory.PROVISION_ORGANIZATION
+        )
+
+        def disconnect_once(**kwargs: Any) -> None:
+            mock_send.side_effect = None
+            self.terminate_connection()
+
+        mock_send.side_effect = disconnect_once
+        outbox.drain_shard()
+
+        assert mock_send.call_count == 2
+        assert mock_send.call_args_list[0] == mock_send.call_args_list[1]
+        assert not self.connection.in_atomic_block
+        assert not ControlOutbox.objects.filter(id=outbox.id).exists()
+
+    @patch("sentry.hybridcloud.models.outbox.process_control_outbox.send")
+    def test_retries_organization_provisioning_disconnect_only_once(self, mock_send: Mock) -> None:
+        outbox = self._save_outbox(
+            OutboxScope.PROVISION_SCOPE, OutboxCategory.PROVISION_ORGANIZATION
+        )
+        mock_send.side_effect = self.terminate_connection
+
+        with pytest.raises(OutboxDatabaseError):
+            outbox.drain_shard()
+
+        assert mock_send.call_count == 2
+        assert not self.connection.in_atomic_block
+        assert ControlOutbox.objects.filter(id=outbox.id).exists()
+
+
+class OutboxDrainTest(TransactionTestCase):
+    @patch("sentry.hybridcloud.models.outbox.process_cell_outbox.send")
+    def test_draining_with_disabled_shards(self, mock_send: Mock) -> None:
+        outbox1 = Organization(id=1).outbox_for_update()
+        outbox2 = Organization(id=1).outbox_for_update()
+        outbox3 = Organization(id=2).outbox_for_update()
+
+        with outbox_context(flush=False):
+            outbox1.save()
+            outbox2.save()
+            outbox3.save()
+
+        with self.options({"hybrid_cloud.authentication.disabled_organization_shards": [1]}):
+            outbox1.drain_shard()
+            with pytest.raises(CellOutbox.DoesNotExist):
+                outbox1.refresh_from_db()
+            outbox2.refresh_from_db()  # still exists
+
+            assert mock_send.call_count == 0
+
+            outbox3.drain_shard()
+            with pytest.raises(CellOutbox.DoesNotExist):
+                outbox3.refresh_from_db()
+
+            assert mock_send.call_count == 1
+
+    def test_drain_shard_not_flush_all__upper_bound(self) -> None:
+        outbox1 = Organization(id=1).outbox_for_update()
+        outbox2 = Organization(id=1).outbox_for_update()
+
+        with outbox_context(flush=False):
+            outbox1.save()
+        barrier: threading.Barrier = threading.Barrier(2, timeout=10)
+        processing_thread = threading.Thread(
+            target=wrap_with_connection_closure(
+                lambda: outbox1.drain_shard(_test_processing_barrier=barrier)
+            )
+        )
+        processing_thread.start()
+
+        barrier.wait()
+
+        # Does not include outboxes created after starting process.
+        with outbox_context(flush=False):
+            outbox2.save()
+        barrier.wait()
+
+        processing_thread.join(timeout=1)
+        assert not CellOutbox.objects.filter(id=outbox1.id).first()
+        assert CellOutbox.objects.filter(id=outbox2.id).first()
+
+    @patch("sentry.hybridcloud.models.outbox.process_cell_outbox.send")
+    def test_drain_shard_not_flush_all__concurrent_processing(
+        self, mock_process_cell_outbox: Mock
+    ) -> None:
+        outbox1 = OrganizationMember(id=1, organization_id=3, user_id=1).outbox_for_update()
+        outbox2 = OrganizationMember(id=2, organization_id=3, user_id=2).outbox_for_update()
+
+        with outbox_context(flush=False):
+            outbox1.save()
+            outbox2.save()
+
+        barrier: threading.Barrier = threading.Barrier(2, timeout=1)
+        processing_thread_1 = threading.Thread(
+            target=wrap_with_connection_closure(
+                lambda: outbox1.drain_shard(_test_processing_barrier=barrier)
+            )
+        )
+        processing_thread_1.start()
+
+        # This concurrent process will block on, and not duplicate, the effort of the first thread.
+        processing_thread_2 = threading.Thread(
+            target=wrap_with_connection_closure(
+                lambda: outbox2.drain_shard(_test_processing_barrier=barrier)
+            )
+        )
+
+        barrier.wait()
+        processing_thread_2.start()
+        barrier.wait()
+        barrier.wait()
+        barrier.wait()
+
+        processing_thread_1.join()
+        processing_thread_2.join()
+
+        assert not CellOutbox.objects.filter(id=outbox1.id).first()
+        assert not CellOutbox.objects.filter(id=outbox2.id).first()
+
+        assert mock_process_cell_outbox.call_count == 2
+
+    def test_drain_shard_flush_all__upper_bound(self) -> None:
+        outbox1 = Organization(id=1).outbox_for_update()
+        outbox2 = Organization(id=1).outbox_for_update()
+
+        with outbox_context(flush=False):
+            outbox1.save()
+        barrier: threading.Barrier = threading.Barrier(2, timeout=10)
+        processing_thread = threading.Thread(
+            target=wrap_with_connection_closure(
+                lambda: outbox1.drain_shard(flush_all=True, _test_processing_barrier=barrier)
+            )
+        )
+        processing_thread.start()
+
+        barrier.wait()
+
+        # Does include outboxes created after starting process.
+        with outbox_context(flush=False):
+            outbox2.save()
+        barrier.wait()
+
+        # Next iteration
+        barrier.wait()
+        barrier.wait()
+
+        processing_thread.join(timeout=1)
+        assert not CellOutbox.objects.filter(id=outbox1.id).first()
+        assert not CellOutbox.objects.filter(id=outbox2.id).first()
+
+    @patch("sentry.hybridcloud.models.outbox.process_cell_outbox.send")
+    def test_drain_shard_flush_all__concurrent_processing__cooperation(
+        self, mock_process_cell_outbox: Mock
+    ) -> None:
+        outbox1 = OrganizationMember(id=1, organization_id=3, user_id=1).outbox_for_update()
+        outbox2 = OrganizationMember(id=2, organization_id=3, user_id=2).outbox_for_update()
+
+        with outbox_context(flush=False):
+            outbox1.save()
+            outbox2.save()
+
+        barrier: threading.Barrier = threading.Barrier(2, timeout=1)
+        processing_thread_1 = threading.Thread(
+            target=wrap_with_connection_closure(
+                lambda: outbox1.drain_shard(_test_processing_barrier=barrier)
+            )
+        )
+        processing_thread_1.start()
+
+        processing_thread_2 = threading.Thread(
+            target=wrap_with_connection_closure(
+                lambda: outbox2.drain_shard(flush_all=True, _test_processing_barrier=barrier)
+            )
+        )
+
+        barrier.wait()
+        processing_thread_2.start()
+        barrier.wait()
+        barrier.wait()
+        barrier.wait()
+
+        processing_thread_1.join()
+        processing_thread_2.join()
+
+        assert not CellOutbox.objects.filter(id=outbox1.id).first()
+        assert not CellOutbox.objects.filter(id=outbox2.id).first()
+
+        assert mock_process_cell_outbox.call_count == 2
+
+
+class CellOutboxTest(TestCase):
+    @patch.object(CellOutbox, "drain_shard")
+    @patch("sentry.hybridcloud.models.outbox.metrics.timer")
+    def test_sync_shard_drain_records_duration(
+        self, mock_timer: Mock, mock_drain_shard: Mock
+    ) -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            with outbox_context(transaction.atomic(router.db_for_write(CellOutbox))):
+                Organization(id=10).outbox_for_update().save()
+
+        mock_timer.assert_called_once_with(
+            "outbox.sync_shard_drain.duration",
+            tags={
+                "category": "ORGANIZATION_UPDATE",
+                "outbox_name": "sentry.CellOutbox",
+            },
+        )
+        mock_drain_shard.assert_called_once_with()
+
+    def test_creating_org_outboxes(self) -> None:
+        with outbox_context(flush=False):
+            Organization(id=10).outbox_for_update().save()
+            OrganizationMember(organization_id=12, id=15).outbox_for_update().save()
+        assert CellOutbox.objects.count() == 2
+
+        with outbox_runner():
+            # drain outboxes
+            pass
+        assert CellOutbox.objects.count() == 0
+
+    def test_skip_shards(self) -> None:
+        with self.options({"hybrid_cloud.authentication.disabled_organization_shards": [100]}):
+            assert Organization(id=100).outbox_for_update().should_skip_shard()
+            assert not Organization(id=101).outbox_for_update().should_skip_shard()
+
+        assert not Organization(id=100).outbox_for_update().should_skip_shard()
+
+    @patch("sentry.hybridcloud.models.outbox.metrics")
+    def test_concurrent_coalesced_object_processing(self, mock_metrics: Mock) -> None:
+        # Two objects coalesced
+        outbox = OrganizationMember(id=1, organization_id=1).outbox_for_update()
+        with outbox_context(flush=False):
+            outbox.save()
+            OrganizationMember(id=1, organization_id=1).outbox_for_update().save()
+
+            # Unrelated
+            OrganizationMember(organization_id=1, id=2).outbox_for_update().save()
+            OrganizationMember(organization_id=2, id=2).outbox_for_update().save()
+
+        assert len(list(CellOutbox.find_scheduled_shards())) == 2
+
+        ctx = outbox.process_coalesced(is_synchronous_flush=True)
+        try:
+            ctx.__enter__()
+            assert CellOutbox.objects.count() == 4
+            assert outbox.select_coalesced_messages().count() == 2
+
+            # concurrent write of coalesced object update.
+            with outbox_context(flush=False):
+                OrganizationMember(organization_id=1, id=1).outbox_for_update().save()
+            assert CellOutbox.objects.count() == 5
+            assert outbox.select_coalesced_messages().count() == 3
+
+            ctx.__exit__(None, None, None)
+
+            # does not remove the concurrent write, which is still going to update.
+            assert CellOutbox.objects.count() == 3
+            assert outbox.select_coalesced_messages().count() == 1
+            assert len(list(CellOutbox.find_scheduled_shards())) == 2
+
+            saved_tags = {
+                "category": "ORGANIZATION_MEMBER_UPDATE",
+                "silo": "region",
+                "type": "CellOutbox",
+            }
+            expected = [
+                call("outbox.saved", 1, tags=saved_tags),
+                call("outbox.saved", 1, tags=saved_tags),
+                call("outbox.saved", 1, tags=saved_tags),
+                call("outbox.saved", 1, tags=saved_tags),
+                call("outbox.saved", 1, tags=saved_tags),
+                call(
+                    "outbox.processed",
+                    2,
+                    tags={
+                        "category": "ORGANIZATION_MEMBER_UPDATE",
+                        "synchronous": 1,
+                        "silo": "region",
+                        "type": "CellOutbox",
+                    },
+                ),
+            ]
+            assert mock_metrics.incr.mock_calls == expected
+        except Exception as e:
+            ctx.__exit__(type(e), e, None)
+            raise
+
+    def test_outbox_rescheduling(self) -> None:
+        with patch(
+            "sentry.hybridcloud.models.outbox.process_cell_outbox.send"
+        ) as mock_process_cell_outbox:
+
+            def raise_exception(**kwargs: Any) -> None:
+                raise ValueError("This is just a test mock exception")
+
+            def run_with_error(concurrency: int = 1) -> None:
+                mock_process_cell_outbox.side_effect = raise_exception
+                mock_process_cell_outbox.reset_mock()
+                with self.tasks():
+                    with raises(OutboxFlushError):
+                        enqueue_outbox_jobs(concurrency=concurrency, process_outbox_backfills=False)
+                    assert mock_process_cell_outbox.call_count == 1
+
+            def ensure_converged() -> None:
+                mock_process_cell_outbox.reset_mock()
+                with self.tasks():
+                    enqueue_outbox_jobs(process_outbox_backfills=False)
+                    assert mock_process_cell_outbox.call_count == 0
+
+            def assert_called_for_org(org: int) -> None:
+                mock_process_cell_outbox.assert_called_with(
+                    sender=OutboxCategory.ORGANIZATION_UPDATE,
+                    payload=None,
+                    object_identifier=org,
+                    shard_identifier=org,
+                    shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+                )
+
+            with outbox_context(flush=False):
+                Organization(id=10001).outbox_for_update().save()
+                Organization(id=10002).outbox_for_update().save()
+
+            start_time = datetime(2022, 10, 1, 0)
+            with freeze_time(start_time):
+                run_with_error()
+                assert_called_for_org(10001)
+
+            # Runs things in ascending order of the scheduled_for
+            with freeze_time(start_time + timedelta(minutes=10)):
+                run_with_error()
+                assert_called_for_org(10002)
+
+            # Has rescheduled all objects into the future.
+            with freeze_time(start_time):
+                ensure_converged()
+
+            # Next would run the original rescheduled org1 entry
+            with freeze_time(start_time + timedelta(minutes=10)):
+                run_with_error()
+                assert_called_for_org(10001)
+                ensure_converged()
+
+                # Concurrently added items will favor a newer scheduling time,
+                # but eventually converges.
+                with outbox_context(flush=False):
+                    Organization(id=10002).outbox_for_update().save()
+                run_with_error()
+                ensure_converged()
+
+    def test_outbox_converges(self) -> None:
+        with (
+            patch(
+                "sentry.hybridcloud.models.outbox.process_cell_outbox.send"
+            ) as mock_process_cell_outbox,
+            outbox_context(flush=False),
+        ):
+            Organization(id=10001).outbox_for_update().save()
+            Organization(id=10001).outbox_for_update().save()
+
+            Organization(id=10002).outbox_for_update().save()
+            Organization(id=10002).outbox_for_update().save()
+
+            last_call_count = 0
+            while True:
+                with self.tasks():
+                    enqueue_outbox_jobs(process_outbox_backfills=False)
+                    if last_call_count == mock_process_cell_outbox.call_count:
+                        break
+                    last_call_count = mock_process_cell_outbox.call_count
+
+            assert last_call_count == 2
+
+    def test_cell_sharding_keys(self) -> None:
+        org1 = Factories.create_organization()
+        org2 = Factories.create_organization()
+
+        with outbox_context(flush=False):
+            Organization(id=org1.id).outbox_for_update().save()
+            Organization(id=org2.id).outbox_for_update().save()
+
+            OrganizationMember(organization_id=org1.id, id=1).outbox_for_update().save()
+            OrganizationMember(organization_id=org2.id, id=2).outbox_for_update().save()
+
+        shards = {
+            (row["shard_scope"], row["shard_identifier"])
+            for row in CellOutbox.find_scheduled_shards()
+        }
+        assert shards == {
+            (OutboxScope.ORGANIZATION_SCOPE.value, org1.id),
+            (OutboxScope.ORGANIZATION_SCOPE.value, org2.id),
+        }
+
+    def test_scheduling_with_future_outbox_time(self) -> None:
+        with outbox_runner():
+            pass
+
+        start_time = datetime(year=2022, month=10, day=1, second=0, tzinfo=timezone.utc)
+        with freeze_time(start_time):
+            future_scheduled_outbox = Organization(id=10001).outbox_for_update()
+            future_scheduled_outbox.scheduled_for = start_time + timedelta(hours=1)
+            future_scheduled_outbox.save()
+            assert future_scheduled_outbox.scheduled_for > start_time
+            assert CellOutbox.objects.count() == 1
+
+            assert len(CellOutbox.find_scheduled_shards()) == 0
+
+            with outbox_runner():
+                pass
+
+            # Since the event is sometime in the future, we expect the single
+            #  outbox message not to be processed
+            assert CellOutbox.objects.count() == 1
+
+    def test_scheduling_with_past_and_future_outbox_times(self) -> None:
+        with outbox_runner():
+            pass
+
+        start_time = datetime(year=2022, month=10, day=1, second=0, tzinfo=timezone.utc)
+        with freeze_time(start_time):
+            future_scheduled_outbox = Organization(id=10001).outbox_for_update()
+            future_scheduled_outbox.scheduled_for = start_time + timedelta(hours=1)
+            future_scheduled_outbox.save()
+            assert future_scheduled_outbox.scheduled_for > start_time
+
+            past_scheduled_outbox = Organization(id=10001).outbox_for_update()
+            past_scheduled_outbox.save()
+            assert past_scheduled_outbox.scheduled_for < start_time
+            assert CellOutbox.objects.count() == 2
+
+            assert len(CellOutbox.find_scheduled_shards()) == 1
+
+            with outbox_runner():
+                pass
+
+            # We expect the shard to be drained if at *least* one scheduled
+            # message is in the past.
+            assert CellOutbox.objects.count() == 0
+
+    @patch("sentry.hybridcloud.models.outbox.OutboxBase.process_coalesced")
+    def test_catches_random_database_errors(self, mock_process: Mock) -> None:
+        mock_process.side_effect = OperationalError("ruh roh")
+
+        with pytest.raises(OutboxDatabaseError) as e:
+            with outbox_context(flush=False):
+                Organization(id=10).outbox_for_update().save()
+            assert CellOutbox.objects.count() == 1
+
+            with outbox_runner():
+                # drain outboxes
+                pass
+
+        outbox_category = OutboxCategory(Organization(id=10).outbox_for_update().category)
+        assert (
+            str(e.value)
+            == f"Failed to process Outbox, {outbox_category.name} due to database error"
+        )
+
+        assert CellOutbox.objects.count() == 1
+
+
+def outboxed_ids() -> set[int]:
+    """The rows currently carrying an outbox, by object identifier.
+
+    Asserted as a set rather than a count because a model may register its own
+    delete-time outbox hook on top of the manager's, so the row count is not
+    one-per-object for every model.
+    """
+    return set[int](CellOutbox.objects.values_list("object_identifier", flat=True))
+
+
+class TestOutboxesManager(TestCase):
+    def test_bulk_operations(self) -> None:
+        project = self.create_project()
+        do_not_touch = ProjectKey.objects.create(project=project, label="untouched")
+        # Drain the outboxes produced by the fixtures above, so each assertion below
+        # counts only the outboxes from the bulk operation it follows.
+        with outbox_runner():
+            pass
+
+        managed = ProjectKey.objects.bulk_create(
+            [
+                ProjectKey(
+                    project=project,
+                    label=f"key-{i}",
+                    public_key=ProjectKey.generate_api_key(),
+                    secret_key=ProjectKey.generate_api_key(),
+                )
+                for i in range(0, 10)
+            ]
+        )
+        managed_ids = {key.id for key in managed}
+
+        with outbox_runner():
+            assert outboxed_ids() == managed_ids
+            assert ProjectKey.objects.filter(id__in=managed_ids).count() == 10
+
+        assert CellOutbox.objects.count() == 0
+
+        existing = list[Any](ProjectKey.objects.filter(id__in=managed_ids))
+        for obj in existing:
+            obj.label = "cow"
+        ProjectKey.objects.bulk_update(existing, ["label"])
+
+        with outbox_runner():
+            assert outboxed_ids() == managed_ids
+
+        assert CellOutbox.objects.count() == 0
+        assert ProjectKey.objects.filter(label="cow").count() == 10
+
+        ProjectKey.objects.bulk_delete(existing)
+
+        with outbox_runner():
+            assert outboxed_ids() == managed_ids
+            assert ProjectKey.objects.filter(id__in=managed_ids).count() == 0
+
+        assert CellOutbox.objects.count() == 0
+        assert ProjectKey.objects.filter(id=do_not_touch.id).exists()
+
+
+@control_silo_test
+class OutboxAggregationTest(TestCase):
+    def setUp(self) -> None:
+        shard_counts = {1: (4, "eu"), 2: (7, "us"), 3: (1, "us")}
+        with outbox_runner():
+            pass
+
+        for shard_id, (shard_count, region_name) in shard_counts.items():
+            for i in range(shard_count):
+                ControlOutbox(
+                    cell_name=region_name,
+                    shard_scope=OutboxScope.AUDIT_LOG_SCOPE,
+                    shard_identifier=shard_id,
+                    category=OutboxCategory.AUDIT_LOG_EVENT,
+                    object_identifier=shard_id * 10000 + i,
+                    payload={"foo": "bar"},
+                ).save()
+
+    def test_calculate_sharding_depths(self) -> None:
+        shard_depths = ControlOutbox.get_shard_depths_descending()
+
+        assert shard_depths == [
+            dict(
+                shard_identifier=2,
+                cell_name="us",
+                shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                depth=7,
+            ),
+            dict(
+                shard_identifier=1,
+                cell_name="eu",
+                shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                depth=4,
+            ),
+            dict(
+                shard_identifier=3,
+                cell_name="us",
+                shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                depth=1,
+            ),
+        ]
+
+        # Test limiting the query to a single entry
+        shard_depths = ControlOutbox.get_shard_depths_descending(limit=1)
+        assert shard_depths == [
+            dict(
+                shard_identifier=2,
+                cell_name="us",
+                shard_scope=OutboxScope.AUDIT_LOG_SCOPE.value,
+                depth=7,
+            )
+        ]
+
+    def test_calculate_sharding_depths_empty(self) -> None:
+        ControlOutbox.objects.all().delete()
+        assert ControlOutbox.objects.count() == 0
+        assert ControlOutbox.get_shard_depths_descending() == []
+
+    def test_get_shard_category_breakdown(self) -> None:
+        # AUDIT_LOG_SCOPE only permits a single category, so use ORGANIZATION_SCOPE
+        # (a shard identifier not otherwise used in setUp) to exercise a shard with
+        # more than one category.
+        for i in range(3):
+            ControlOutbox(
+                cell_name="us",
+                shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+                shard_identifier=99,
+                category=OutboxCategory.ORGANIZATION_UPDATE,
+                object_identifier=999900 + i,
+                payload={"foo": "bar"},
+            ).save()
+        ControlOutbox(
+            cell_name="us",
+            shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+            shard_identifier=99,
+            category=OutboxCategory.PROJECT_UPDATE,
+            object_identifier=999910,
+            payload={"foo": "bar"},
+        ).save()
+
+        breakdown = ControlOutbox.get_shard_category_breakdown(
+            {
+                "shard_identifier": 99,
+                "cell_name": "us",
+                "shard_scope": OutboxScope.ORGANIZATION_SCOPE.value,
+            }
+        )
+
+        assert breakdown == [
+            dict(category=OutboxCategory.ORGANIZATION_UPDATE.value, depth=3),
+            dict(category=OutboxCategory.PROJECT_UPDATE.value, depth=1),
+        ]
+
+    def test_get_shard_category_breakdown_empty(self) -> None:
+        breakdown = ControlOutbox.get_shard_category_breakdown(
+            {
+                "shard_identifier": 404,
+                "cell_name": "us",
+                "shard_scope": OutboxScope.AUDIT_LOG_SCOPE.value,
+            }
+        )
+        assert breakdown == []
+
+    def test_get_shard_category_breakdown_requires_full_shard_key(self) -> None:
+        with raises(AssertionError):
+            ControlOutbox.get_shard_category_breakdown(
+                {
+                    "shard_identifier": 99,
+                    "shard_scope": OutboxScope.ORGANIZATION_SCOPE.value,
+                }
+            )
+
+    def test_total_count(self) -> None:
+        assert ControlOutbox.get_total_outbox_count() == 7 + 4 + 1
+
+    def test_get_category_depths(self) -> None:
+        ControlOutbox(
+            cell_name="us",
+            shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+            shard_identifier=99,
+            category=OutboxCategory.ORGANIZATION_UPDATE,
+            object_identifier=999999,
+            payload={"foo": "bar"},
+        ).save()
+
+        assert ControlOutbox.get_category_depths() == {
+            OutboxCategory.AUDIT_LOG_EVENT.value: 12,
+            OutboxCategory.ORGANIZATION_UPDATE.value: 1,
+        }
+
+    @patch("sentry.hybridcloud.tasks.deliver_from_outbox.metrics")
+    def test_category_shard_depth_gauge(self, mock_metrics: Mock) -> None:
+        ControlOutbox(
+            cell_name="us",
+            shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+            shard_identifier=99,
+            category=OutboxCategory.ORGANIZATION_UPDATE,
+            object_identifier=999999,
+            payload={"foo": "bar"},
+        ).save()
+
+        schedule_outbox_model(
+            silo_mode=SiloMode.CONTROL,
+            outbox_model=ControlOutbox,
+            drain_task=Mock(),
+        )
+
+        gauge_calls_by_category = {
+            gauge_call.kwargs["tags"]["category"]: gauge_call
+            for gauge_call in mock_metrics.gauge.mock_calls
+            if gauge_call.args and gauge_call.args[0] == "deliver_from_outbox.category_shard_depth"
+        }
+
+        assert gauge_calls_by_category[OutboxCategory.AUDIT_LOG_EVENT.name].kwargs == dict(
+            value=12,
+            tags={
+                "silo": "control",
+                "type": "ControlOutbox",
+                "category": OutboxCategory.AUDIT_LOG_EVENT.name,
+            },
+            sample_rate=1.0,
+        )
+        assert gauge_calls_by_category[OutboxCategory.ORGANIZATION_UPDATE.name].kwargs == dict(
+            value=1,
+            tags={
+                "silo": "control",
+                "type": "ControlOutbox",
+                "category": OutboxCategory.ORGANIZATION_UPDATE.name,
+            },
+            sample_rate=1.0,
+        )
+
+    @override_options({"hybridcloud.outbox.deep_shard_logging.threshold": 5})
+    @patch("sentry.hybridcloud.tasks.deliver_from_outbox.logger")
+    def test_deep_shard_log_attributes_dominant_category(self, mock_logger: Mock) -> None:
+        # Add a second deep shard (shard_identifier=99, depth 6) with multiple
+        # categories so we can confirm the log attributes it to the dominant
+        # one, not just any row. AUDIT_LOG_SCOPE only permits a single
+        # category, so this shard uses ORGANIZATION_SCOPE instead.
+        for i in range(4):
+            ControlOutbox(
+                cell_name="us",
+                shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+                shard_identifier=99,
+                category=OutboxCategory.ORGANIZATION_UPDATE,
+                object_identifier=999900 + i,
+                payload={"foo": "bar"},
+            ).save()
+        for i in range(2):
+            ControlOutbox(
+                cell_name="us",
+                shard_scope=OutboxScope.ORGANIZATION_SCOPE,
+                shard_identifier=99,
+                category=OutboxCategory.PROJECT_UPDATE,
+                object_identifier=999910 + i,
+                payload={"foo": "bar"},
+            ).save()
+
+        schedule_outbox_model(
+            silo_mode=SiloMode.CONTROL,
+            outbox_model=ControlOutbox,
+            drain_task=Mock(),
+        )
+
+        deep_shard_calls = {
+            warning_call.kwargs["extra"]["shard_identifier"]: warning_call
+            for warning_call in mock_logger.warning.mock_calls
+            if warning_call.args and warning_call.args[0] == "deliver_from_outbox.deep_shard"
+        }
+        assert set(deep_shard_calls) == {2, 99}
+        assert deep_shard_calls[2].kwargs["extra"]["depth"] == 7
+        assert (
+            deep_shard_calls[2].kwargs["extra"]["category"] == OutboxCategory.AUDIT_LOG_EVENT.name
+        )
+        assert deep_shard_calls[99].kwargs["extra"]["depth"] == 6
+        assert (
+            deep_shard_calls[99].kwargs["extra"]["category"]
+            == OutboxCategory.ORGANIZATION_UPDATE.name
+        )
+
+    @override_options({"hybridcloud.outbox.category_depth_metric.enabled": False})
+    @patch("sentry.hybridcloud.tasks.deliver_from_outbox.metrics")
+    def test_category_shard_depth_gauge_disabled(self, mock_metrics: Mock) -> None:
+        with patch.object(ControlOutbox, "get_category_depths") as mock_depths:
+            schedule_outbox_model(
+                silo_mode=SiloMode.CONTROL,
+                outbox_model=ControlOutbox,
+                drain_task=Mock(),
+            )
+
+        mock_depths.assert_not_called()
+        assert not any(
+            gauge_call.args and gauge_call.args[0] == "deliver_from_outbox.category_shard_depth"
+            for gauge_call in mock_metrics.gauge.mock_calls
+        )
+        # The pre-existing gauges are unaffected by the kill switch.
+        assert any(
+            gauge_call.args and gauge_call.args[0] == "deliver_from_outbox.maximum_shard_depth"
+            for gauge_call in mock_metrics.gauge.mock_calls
+        )
+
+    @override_options(
+        {
+            "hybridcloud.outbox.deep_shard_logging.enabled": False,
+            "hybridcloud.outbox.deep_shard_logging.threshold": 5,
+        }
+    )
+    @patch("sentry.hybridcloud.tasks.deliver_from_outbox.logger")
+    def test_deep_shard_log_disabled(self, mock_logger: Mock) -> None:
+        with patch.object(ControlOutbox, "get_shard_category_breakdown") as mock_breakdown:
+            schedule_outbox_model(
+                silo_mode=SiloMode.CONTROL,
+                outbox_model=ControlOutbox,
+                drain_task=Mock(),
+            )
+
+        mock_breakdown.assert_not_called()
+        assert not any(
+            warning_call.args and warning_call.args[0] == "deliver_from_outbox.deep_shard"
+            for warning_call in mock_logger.warning.mock_calls
+        )
+
+    @patch("sentry.hybridcloud.tasks.deliver_from_outbox.metrics")
+    def test_total_outbox_count_derived_from_category_depths(self, mock_metrics: Mock) -> None:
+        with patch.object(
+            ControlOutbox, "get_total_outbox_count", wraps=ControlOutbox.get_total_outbox_count
+        ) as mock_count:
+            schedule_outbox_model(
+                silo_mode=SiloMode.CONTROL,
+                outbox_model=ControlOutbox,
+                drain_task=Mock(),
+            )
+
+        mock_count.assert_not_called()
+        total_calls = [
+            gauge_call
+            for gauge_call in mock_metrics.gauge.mock_calls
+            if gauge_call.args and gauge_call.args[0] == "deliver_from_outbox.total_outbox_count"
+        ]
+        assert len(total_calls) == 1
+        assert total_calls[0].kwargs["value"] == 7 + 4 + 1
+
+    @override_options({"hybridcloud.outbox.category_depth_metric.enabled": False})
+    @patch("sentry.hybridcloud.tasks.deliver_from_outbox.metrics")
+    def test_total_outbox_count_falls_back_when_category_metric_disabled(
+        self, mock_metrics: Mock
+    ) -> None:
+        with patch.object(
+            ControlOutbox, "get_total_outbox_count", wraps=ControlOutbox.get_total_outbox_count
+        ) as mock_count:
+            schedule_outbox_model(
+                silo_mode=SiloMode.CONTROL,
+                outbox_model=ControlOutbox,
+                drain_task=Mock(),
+            )
+
+        mock_count.assert_called_once()
+        total_calls = [
+            gauge_call
+            for gauge_call in mock_metrics.gauge.mock_calls
+            if gauge_call.args and gauge_call.args[0] == "deliver_from_outbox.total_outbox_count"
+        ]
+        assert len(total_calls) == 1
+        assert total_calls[0].kwargs["value"] == 7 + 4 + 1
+
+
+class NonCoalescingCategoryTest(TestCase):
+    """Non-coalescing OutboxCategory error log."""
+
+    def test_group_action_log_event_is_non_coalescing(self) -> None:
+        assert OutboxCategory.GROUP_ACTION_LOG_EVENT.is_non_coalescing()
+        assert not OutboxCategory.ORGANIZATION_MEMBER_UPDATE.is_non_coalescing()
+        assert not OutboxCategory.ORGANIZATION_UPDATE.is_non_coalescing()
+
+    @patch("sentry.hybridcloud.models.outbox.logger")
+    def test_non_coalescing_category_logs_error_when_coalesced(self, mock_logger: Mock) -> None:
+        non_coalescing_category = OutboxCategory.ORGANIZATION_MEMBER_UPDATE
+        outbox = OrganizationMember(id=1, organization_id=1).outbox_for_update()
+        with (
+            patch.object(
+                OutboxCategory,
+                "is_non_coalescing",
+                lambda self: self is non_coalescing_category,
+            ),
+            outbox_context(flush=False),
+        ):
+            outbox.save()
+            OrganizationMember(id=1, organization_id=1).outbox_for_update().save()
+            latest_outbox = OrganizationMember(id=1, organization_id=1).outbox_for_update()
+            latest_outbox.save()
+            latest_outbox_id = latest_outbox.id
+
+            with outbox.process_coalesced(is_synchronous_flush=True):
+                pass
+
+        error_calls = [
+            c
+            for c in mock_logger.error.mock_calls
+            if c.args and c.args[0] == "outbox.unexpected_coalescing"
+        ]
+        assert len(error_calls) == 1
+        extra = error_calls[0].kwargs["extra"]
+        assert extra["category"] == non_coalescing_category.name
+        assert extra["category_value"] == int(non_coalescing_category)
+        assert extra["shard_identifier"] == 1
+        assert extra["object_identifier"] == 1
+        assert extra["coalesced_count"] == 2
+        assert extra["coalesced_id"] == latest_outbox_id
+        assert extra["outbox_type"] == "CellOutbox"
+
+    @patch("sentry.hybridcloud.models.outbox.logger")
+    def test_non_coalescing_category_no_log_when_not_coalesced(self, mock_logger: Mock) -> None:
+        non_coalescing_category = OutboxCategory.ORGANIZATION_MEMBER_UPDATE
+        outbox = OrganizationMember(id=1, organization_id=1).outbox_for_update()
+        with (
+            patch.object(
+                OutboxCategory,
+                "is_non_coalescing",
+                lambda self: self is non_coalescing_category,
+            ),
+            outbox_context(flush=False),
+        ):
+            outbox.save()
+
+            with outbox.process_coalesced(is_synchronous_flush=True):
+                pass
+
+        error_calls = [
+            c
+            for c in mock_logger.error.mock_calls
+            if c.args and c.args[0] == "outbox.unexpected_coalescing"
+        ]
+        assert error_calls == []
+
+    @patch("sentry.hybridcloud.models.outbox.logger")
+    def test_coalescing_category_does_not_log_when_coalesced(self, mock_logger: Mock) -> None:
+        outbox = OrganizationMember(id=1, organization_id=1).outbox_for_update()
+        with (
+            patch.object(OutboxCategory, "is_non_coalescing", lambda self: False),
+            outbox_context(flush=False),
+        ):
+            outbox.save()
+            OrganizationMember(id=1, organization_id=1).outbox_for_update().save()
+
+            with outbox.process_coalesced(is_synchronous_flush=True):
+                pass
+
+        error_calls = [
+            c
+            for c in mock_logger.error.mock_calls
+            if c.args and c.args[0] == "outbox.unexpected_coalescing"
+        ]
+        assert error_calls == []
+
+    @patch("sentry.hybridcloud.models.outbox.logger")
+    def test_unknown_category_logs_warning(self, mock_logger: Mock) -> None:
+        outbox = OrganizationMember(id=1, organization_id=1).outbox_for_update()
+        outbox.category = 99999
+        outbox._maybe_log_unexpected_coalescing(coalesced_id=1, coalesced_count=2)
+        warn_calls = [
+            c
+            for c in mock_logger.warning.mock_calls
+            if c.args and c.args[0] == "outbox.unknown_category"
+        ]
+        assert len(warn_calls) == 1
+        assert warn_calls[0].kwargs["extra"]["category_value"] == 99999

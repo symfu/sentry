@@ -1,0 +1,153 @@
+from unittest.mock import MagicMock, patch
+
+from sentry.incidents.grouptype import MetricIssue
+from sentry.models.group import DEFAULT_TYPE_ID, Group, GroupStatus
+from sentry.models.groupopenperiod import GroupOpenPeriod
+from sentry.testutils.helpers.options import override_options
+from sentry.types.group import PriorityLevel
+from sentry.workflow_engine.handlers.condition.issue_priority_deescalating_handler import (
+    IssuePriorityDeescalatingConditionHandler,
+)
+from sentry.workflow_engine.models import DataConditionGroup
+from sentry.workflow_engine.models.data_condition import Condition
+from sentry.workflow_engine.preview import ActionFilterPreviewPlan
+from sentry.workflow_engine.types import ConditionError, DetectorPriorityLevel, WorkflowEventData
+from tests.sentry.workflow_engine.handlers.condition.test_base import ConditionTestCase
+
+
+class TestIssuePriorityDeescalatingCondition(ConditionTestCase):
+    condition = Condition.ISSUE_PRIORITY_DEESCALATING
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.group, self.event, self.group_event = self.create_group_event(
+            group_type_id=MetricIssue.type_id
+        )
+        self.event_data = WorkflowEventData(event=self.group_event, group=self.group_event.group)
+        self.deescalating_dc_warning = self.create_data_condition(
+            comparison=DetectorPriorityLevel.MEDIUM,
+            type=self.condition,
+            condition_result=True,
+        )
+
+        self.deescalating_dc_critical = self.create_data_condition(
+            comparison=DetectorPriorityLevel.HIGH,
+            type=self.condition,
+            condition_result=True,
+        )
+
+    def update_group_and_open_period(self, priority: PriorityLevel) -> None:
+        self.group.update(priority=priority)
+        open_period = (
+            GroupOpenPeriod.objects.filter(group=self.group).order_by("-date_started").first()
+        )
+        assert open_period is not None
+        highest_seen_priority = open_period.data.get("highest_seen_priority", priority)
+        open_period.data["highest_seen_priority"] = max(highest_seen_priority, priority)
+        open_period.save()
+
+    def test_warning(self) -> None:
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        self.assert_does_not_pass(self.deescalating_dc_warning, self.event_data)
+
+        self.update_group_and_open_period(priority=PriorityLevel.HIGH)
+        self.assert_does_not_pass(self.deescalating_dc_warning, self.event_data)
+
+        self.group.update(status=GroupStatus.RESOLVED)
+        self.assert_passes(self.deescalating_dc_warning, self.event_data)
+
+    def test_critical_threshold_not_breached(self) -> None:
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        self.assert_does_not_pass(self.deescalating_dc_critical, self.event_data)
+
+        self.group.update(status=GroupStatus.RESOLVED)
+        self.assert_does_not_pass(self.deescalating_dc_critical, self.event_data)
+
+    def test_critical(self) -> None:
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        self.assert_does_not_pass(self.deescalating_dc_critical, self.event_data)
+
+        self.update_group_and_open_period(priority=PriorityLevel.HIGH)
+        self.assert_does_not_pass(self.deescalating_dc_critical, self.event_data)
+
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        self.assert_passes(self.deescalating_dc_critical, self.event_data)
+
+        self.group.update(status=GroupStatus.RESOLVED)
+        self.assert_passes(self.deescalating_dc_critical, self.event_data)
+
+    def test_preview_filters_groups_by_deescalation(self) -> None:
+        plan = ActionFilterPreviewPlan(DataConditionGroup.Type.ALL)
+        IssuePriorityDeescalatingConditionHandler.preview_behavior.filter_preview(
+            plan, PriorityLevel.HIGH
+        )
+
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        assert not Group.objects.filter(id=self.group.id).filter(*plan.group_filters).exists()
+
+        self.update_group_and_open_period(priority=PriorityLevel.HIGH)
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        assert Group.objects.filter(id=self.group.id).filter(*plan.group_filters).exists()
+
+    @override_options(
+        {"workflow_engine.group.type_id.open_periods_type_denylist": [MetricIssue.type_id]}
+    )
+    def test_preview_behavior_excludes_types_without_open_periods(self) -> None:
+        self.update_group_and_open_period(priority=PriorityLevel.HIGH)
+        self.group.update(status=GroupStatus.RESOLVED)
+        plan = ActionFilterPreviewPlan(DataConditionGroup.Type.ALL)
+
+        IssuePriorityDeescalatingConditionHandler.preview_behavior.filter_preview(
+            plan, PriorityLevel.HIGH
+        )
+
+        assert not Group.objects.filter(id=self.group.id).filter(*plan.group_filters).exists()
+
+    def test_preview_behavior_preserves_boolean_comparison(self) -> None:
+        plan = ActionFilterPreviewPlan(DataConditionGroup.Type.ALL)
+        IssuePriorityDeescalatingConditionHandler.preview_behavior.filter_preview(plan, True)
+
+        self.group.update(status=GroupStatus.RESOLVED)
+
+        assert Group.objects.filter(id=self.group.id).filter(*plan.group_filters).exists()
+
+    def test_boolean_comparison_preserves_existing_behavior(self) -> None:
+        boolean_condition = self.create_data_condition(
+            comparison=DetectorPriorityLevel.HIGH,
+            type=self.condition,
+            condition_result=True,
+            condition_group=self.deescalating_dc_critical.condition_group,
+        )
+        type(boolean_condition).objects.filter(id=boolean_condition.id).update(comparison=True)
+        boolean_condition.refresh_from_db()
+
+        self.update_group_and_open_period(priority=PriorityLevel.HIGH)
+        self.update_group_and_open_period(priority=PriorityLevel.MEDIUM)
+        self.assert_does_not_pass(boolean_condition, self.event_data)
+
+        self.group.update(status=GroupStatus.RESOLVED)
+        self.assert_passes(boolean_condition, self.event_data)
+
+    @override_options(
+        {"workflow_engine.group.type_id.open_periods_type_denylist": [DEFAULT_TYPE_ID]}
+    )
+    def test_error_group_does_not_pass(self) -> None:
+        error_group, _, error_group_event = self.create_group_event()
+        error_event_data = WorkflowEventData(event=error_group_event, group=error_group_event.group)
+        self.assert_does_not_pass(self.deescalating_dc_warning, error_event_data)
+
+    @override_options(
+        {"workflow_engine.group.type_id.open_periods_type_denylist": [DEFAULT_TYPE_ID]}
+    )
+    @patch("sentry.workflow_engine.models.data_condition.logger")
+    def test_error_group_does_not_log(self, mock_logger: MagicMock) -> None:
+        error_group, _, error_group_event = self.create_group_event()
+        error_event_data = WorkflowEventData(event=error_group_event, group=error_group_event.group)
+        self.deescalating_dc_warning.evaluate_value(error_event_data)
+        mock_logger.info.assert_not_called()
+
+    def test_missing_open_period_for_supported_type(self) -> None:
+        GroupOpenPeriod.objects.filter(group=self.group).delete()
+        evaluation = self.deescalating_dc_warning.evaluate_value(self.event_data)
+        assert evaluation.result is None
+        assert isinstance(evaluation.error, ConditionError)

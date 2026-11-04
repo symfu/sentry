@@ -1,206 +1,162 @@
 from django.core import mail
-from django.utils import timezone
 
-from sentry.models import (
-    Activity,
-    Commit,
-    CommitAuthor,
-    Deploy,
-    Environment,
+from sentry.integrations.types import ExternalProviderEnum, ExternalProviders
+from sentry.mail.notifications import build_subject_prefix
+from sentry.models.activity import Activity
+from sentry.models.environment import Environment
+from sentry.models.release import Release
+from sentry.models.repository import Repository
+from sentry.notifications.models.notificationsettingoption import NotificationSettingOption
+from sentry.notifications.models.notificationsettingprovider import NotificationSettingProvider
+from sentry.notifications.notifications.activity.release import ReleaseActivityNotification
+from sentry.notifications.types import (
     GroupSubscriptionReason,
-    Release,
-    ReleaseCommit,
-    Repository,
-    UserEmail,
-    UserOption,
-    UserOptionValue,
+    NotificationScopeEnum,
+    NotificationSettingEnum,
+    NotificationSettingsOptionEnum,
 )
-from sentry.mail.activity.release import ReleaseActivityEmail
-from sentry.testutils import TestCase
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import ActivityTestCase
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.types.activity import ActivityType
+from sentry.types.actor import Actor
+from sentry.users.services.user.service import user_service
 
 
-class ReleaseTestCase(TestCase):
-    def setUp(self):
+class ReleaseTestCase(ActivityTestCase):
+    def get_prefixed_subject(self, subject: str) -> str:
+        return f"{build_subject_prefix(self.project).rstrip()} {subject}"
+
+    def setUp(self) -> None:
         super().setUp()
-        self.user = self.create_user("foo@example.com")
 
-        assert UserEmail.objects.filter(user=self.user, email=self.user.email).update(
-            is_verified=True
-        )
-
-        self.user2 = self.create_user("bar@example.com")
-        assert UserEmail.objects.filter(user=self.user2, email=self.user2.email).update(
-            is_verified=True
-        )
-
-        self.user3 = self.create_user("baz@example.com")
-        assert UserEmail.objects.filter(user=self.user3, email=self.user3.email).update(
-            is_verified=True
-        )
-
-        self.user4 = self.create_user("floop@example.com")
-        assert UserEmail.objects.filter(user=self.user4, email=self.user4.email).update(
-            is_verified=True
-        )
-
-        self.user5 = self.create_user("companyemail@example.com")
-        user5_alt_email = "privateEmail@gmail.com"
-        UserEmail.objects.create(email=user5_alt_email, user=self.user5)
-
-        assert UserEmail.objects.filter(user=self.user5, email=self.user5.email).update(
-            is_verified=True
-        )
-
-        assert UserEmail.objects.filter(user=self.user5, email=user5_alt_email).update(
-            is_verified=True
-        )
+        self.user5_alt_email = "privateEmail@gmail.com"
 
         self.org = self.create_organization(owner=None)
         self.org.flags.allow_joinleave = False
         self.org.save()
+
         self.team = self.create_team(organization=self.org)
         self.team2 = self.create_team(organization=self.org)
-        self.create_member(user=self.user, organization=self.org, teams=[self.team])
-        self.create_member(user=self.user2, organization=self.org)
-        self.create_member(user=self.user3, organization=self.org, teams=[self.team])
-        self.create_member(user=self.user4, organization=self.org, teams=[self.team])
-        self.create_member(user=self.user5, organization=self.org, teams=[self.team])
+
+        self.user1 = self.another_user("user1@example.com", self.team)
+        self.user2 = self.another_user("user2@example.com")
+        self.user3 = self.another_user("user3@example.com", self.team)
+        self.user4 = self.another_user("user4@example.com", self.team)
+        self.user5 = self.another_user("companyemail@example.com", self.team, self.user5_alt_email)
 
         self.project = self.create_project(organization=self.org, teams=[self.team])
         self.project2 = self.create_project(organization=self.org, teams=[self.team2])
-        self.release = Release.objects.create(
-            version="a" * 40,
-            organization_id=self.project.organization_id,
-            date_released=timezone.now(),
-        )
-        self.release.add_project(self.project)
-        self.release.add_project(self.project2)
+
         self.environment = Environment.objects.create(
             name="production", organization_id=self.org.id
         )
-        self.deploy = Deploy.objects.create(
-            release=self.release, organization_id=self.org.id, environment_id=self.environment.id
-        )
+
+        self.release, self.deploy = self.another_release("a")
+
         repository = Repository.objects.create(organization_id=self.org.id, name=self.project.name)
 
-        self.commit = Commit.objects.create(
-            key="a" * 40,
-            repository_id=repository.id,
-            organization_id=self.org.id,
-            author=CommitAuthor.objects.create(
-                organization_id=self.org.id, name=self.user.name, email=self.user.email
-            ),
-        )
-        self.commit2 = Commit.objects.create(
-            key="b" * 40,
-            repository_id=repository.id,
-            organization_id=self.org.id,
-            author=CommitAuthor.objects.create(
-                organization_id=self.org.id, name=self.user2.name, email=self.user2.email
-            ),
-        )
-        self.commit3 = Commit.objects.create(
-            key="c" * 40,
-            repository_id=repository.id,
-            organization_id=self.org.id,
-            author=CommitAuthor.objects.create(
-                organization_id=self.org.id, name=self.user4.name, email=self.user4.email
-            ),
-        )
-        self.commit4 = Commit.objects.create(
-            key="e" * 40,
-            repository_id=repository.id,
-            organization_id=self.org.id,
-            author=CommitAuthor.objects.create(
-                organization_id=self.org.id, name=self.user5.name, email=user5_alt_email
-            ),
-        )
+        # The commits are intentionally out of order to test commit `order`.
+        self.commit4 = self.another_commit(3, "e", self.user5, repository, self.user5_alt_email)
+        self.commit1 = self.another_commit(0, "a", self.user1, repository)
+        self.commit2 = self.another_commit(1, "b", self.user2, repository)
+        self.commit3 = self.another_commit(2, "c", self.user4, repository)
 
-        ReleaseCommit.objects.create(
-            organization_id=self.project.organization_id,
-            release=self.release,
-            commit=self.commit,
-            order=0,
-        )
-        ReleaseCommit.objects.create(
-            organization_id=self.project.organization_id,
-            release=self.release,
-            commit=self.commit2,
-            order=1,
-        )
-        ReleaseCommit.objects.create(
-            organization_id=self.project.organization_id,
-            release=self.release,
-            commit=self.commit3,
-            order=2,
-        )
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            # added to make sure org default above takes precedent
+            NotificationSettingOption.objects.create(
+                scope_type=NotificationScopeEnum.ORGANIZATION.value,
+                scope_identifier=self.org.id,
+                user_id=self.user3.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                value=NotificationSettingsOptionEnum.ALWAYS.value,
+            )
+            NotificationSettingProvider.objects.create(
+                scope_type=NotificationScopeEnum.ORGANIZATION.value,
+                scope_identifier=self.org.id,
+                user_id=self.user3.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                provider=ExternalProviderEnum.EMAIL.value,
+                value=NotificationSettingsOptionEnum.ALWAYS.value,
+            )
 
-        ReleaseCommit.objects.create(
-            organization_id=self.project.organization_id,
-            release=self.release,
-            commit=self.commit4,
-            order=3,
-        )
+            NotificationSettingOption.objects.create(
+                scope_type=NotificationScopeEnum.ORGANIZATION.value,
+                scope_identifier=self.org.id,
+                user_id=self.user4.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                value=NotificationSettingsOptionEnum.NEVER.value,
+            )
+            NotificationSettingProvider.objects.create(
+                scope_type=NotificationScopeEnum.ORGANIZATION.value,
+                scope_identifier=self.org.id,
+                user_id=self.user4.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                provider=ExternalProviderEnum.EMAIL.value,
+                value=NotificationSettingsOptionEnum.NEVER.value,
+            )
 
-        UserOption.objects.set_value(
-            user=self.user3,
-            organization=self.org,
-            key="deploy-emails",
-            value=UserOptionValue.all_deploys,
-        )
+            # added to make sure org default above takes precedent
+            NotificationSettingOption.objects.create(
+                scope_type=NotificationScopeEnum.USER.value,
+                scope_identifier=self.user4.id,
+                user_id=self.user4.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                value=NotificationSettingsOptionEnum.ALWAYS.value,
+            )
+            NotificationSettingProvider.objects.create(
+                scope_type=NotificationScopeEnum.USER.value,
+                scope_identifier=self.user4.id,
+                user_id=self.user4.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                provider=ExternalProviderEnum.EMAIL.value,
+                value=NotificationSettingsOptionEnum.ALWAYS.value,
+            )
 
-        UserOption.objects.set_value(
-            user=self.user4,
-            organization=self.org,
-            key="deploy-emails",
-            value=UserOptionValue.no_deploys,
-        )
-
-        # added to make sure org default above takes precedent
-        UserOption.objects.set_value(
-            user=self.user4,
-            organization=None,
-            key="deploy-emails",
-            value=UserOptionValue.all_deploys,
-        )
-
-    def test_simple(self):
-        email = ReleaseActivityEmail(
+    def test_simple(self) -> None:
+        mail.outbox.clear()
+        email = ReleaseActivityNotification(
             Activity(
                 project=self.project,
-                user=self.user,
-                type=Activity.RELEASE,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
                 data={"version": self.release.version, "deploy_id": self.deploy.id},
             )
         )
-        # user is included because they committed
+        # user1 is included because they committed
         # user2 committed but isn't in a team associated with the project.
         # user3 is included because they oped into all deploy emails
         # user4 committed but isn't included because they opted out of all deploy emails
         # for that org -- also tests to make sure org overrides default preference
         # user5 committed with another email address and is still included.
 
-        assert len(email.get_participants()) == 3
-
-        assert email.get_participants() == {
-            self.user: GroupSubscriptionReason.committed,
-            self.user3: GroupSubscriptionReason.deploy_setting,
-            self.user5: GroupSubscriptionReason.committed,
+        participants = (
+            email.get_participants_with_group_subscription_reason().get_participants_by_provider(
+                ExternalProviders.EMAIL
+            )
+        )
+        assert participants == {
+            (Actor.from_orm_user(self.user1), GroupSubscriptionReason.committed),
+            (Actor.from_orm_user(self.user3), GroupSubscriptionReason.deploy_setting),
+            (Actor.from_orm_user(self.user5), GroupSubscriptionReason.committed),
         }
 
         context = email.get_context()
         assert context["environment"] == "production"
+        rpc_user_5 = user_service.get_user(user_id=self.user5.id)
+        assert rpc_user_5 is not None
         assert context["repos"][0]["commits"] == [
-            (self.commit, self.user),
-            (self.commit2, self.user2),
-            (self.commit3, self.user4),
-            (self.commit4, self.user5),
+            (self.commit4, rpc_user_5.by_email(self.user5_alt_email)),
+            (self.commit3, user_service.get_user(user_id=self.user4.id)),
+            (self.commit2, user_service.get_user(user_id=self.user2.id)),
+            (self.commit1, user_service.get_user(user_id=self.user1.id)),
         ]
 
-        user_context = email.get_user_context(self.user)
+        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
         # make sure this only includes projects user has access to
         assert len(user_context["projects"]) == 1
         assert user_context["projects"][0][0] == self.project
+        assert email.title == f"Deployed version {email.version_parsed} to {self.environment.name}"
 
         with self.tasks():
             email.send()
@@ -209,52 +165,147 @@ class ReleaseTestCase(TestCase):
 
         sent_email_addresses = {msg.to[0] for msg in mail.outbox}
 
-        assert sent_email_addresses == {self.user.email, self.user3.email, self.user5.email}
+        assert sent_email_addresses == {
+            self.user1.email,
+            self.user3.email,
+            self.user5.email,
+        }
+        expected_subject = self.get_prefixed_subject(
+            f"Deployed {self.project.slug} version {email.version_parsed} to {self.environment.name}"
+        )
+        assert {msg.subject for msg in mail.outbox} == {expected_subject}
+        assert all(not msg.subject.startswith("Re:") for msg in mail.outbox)
 
-    def test_doesnt_generate_on_no_release(self):
-        email = ReleaseActivityEmail(
+    def test_prevent_duplicate_projects(self) -> None:
+        email = ReleaseActivityNotification(
             Activity(
                 project=self.project,
-                user=self.user,
-                type=Activity.RELEASE,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
+                data={"version": self.release.version, "deploy_id": self.deploy.id},
+            )
+        )
+        self.team3 = self.create_team(organization=self.org)
+        self.project.add_team(self.team3)
+        self.create_team_membership(user=self.user1, team=self.team3)
+
+        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
+        # This project exists in multiple teams. Make sure we correctly de-dupe these and don't show
+        # the same project twice
+        assert len(user_context["projects"]) == 1
+        assert user_context["projects"][0][0] == self.project
+
+    def test_subject_uses_recipient_visible_projects(self) -> None:
+        mail.outbox.clear()
+        self.create_team_membership(user=self.user1, team=self.team2)
+
+        email = ReleaseActivityNotification(
+            Activity(
+                project=self.project,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
+                data={"version": self.release.version, "deploy_id": self.deploy.id},
+            )
+        )
+
+        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
+        expected_project_slugs = sorted([self.project.slug, self.project2.slug])
+
+        assert [
+            project.slug for project, _, _ in user_context["projects"]
+        ] == expected_project_slugs
+        assert user_context["subject_project_slugs"] == expected_project_slugs
+
+        with self.tasks():
+            email.send()
+
+        subjects_by_recipient = {message.to[0]: message.subject for message in mail.outbox}
+
+        assert subjects_by_recipient[self.user1.email] == self.get_prefixed_subject(
+            f"Deployed {', '.join(expected_project_slugs)} version {email.version_parsed} to {self.environment.name}"
+        )
+        assert subjects_by_recipient[self.user3.email] == self.get_prefixed_subject(
+            f"Deployed {self.project.slug} version {email.version_parsed} to {self.environment.name}"
+        )
+        assert all(not subject.startswith("Re:") for subject in subjects_by_recipient.values())
+
+    def test_subject_caps_projects_at_two(self) -> None:
+        mail.outbox.clear()
+        team3 = self.create_team(organization=self.org)
+        project3 = self.create_project(
+            organization=self.org,
+            teams=[team3],
+            name="AAA Third",
+            slug="aaa-third",
+        )
+        self.release.add_project(project3)
+        self.create_team_membership(user=self.user1, team=self.team2)
+        self.create_team_membership(user=self.user1, team=team3)
+
+        email = ReleaseActivityNotification(
+            Activity(
+                project=self.project,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
+                data={"version": self.release.version, "deploy_id": self.deploy.id},
+            )
+        )
+
+        expected_project_slugs = sorted([self.project.slug, self.project2.slug, project3.slug])
+        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
+
+        assert user_context["subject_project_slugs"] == expected_project_slugs
+
+        with self.tasks():
+            email.send()
+
+        subjects_by_recipient = {message.to[0]: message.subject for message in mail.outbox}
+
+        assert subjects_by_recipient[self.user1.email] == self.get_prefixed_subject(
+            f"Deployed {expected_project_slugs[0]}, {expected_project_slugs[1]} +1 more version {email.version_parsed} to {self.environment.name}"
+        )
+
+    def test_does_not_generate_on_no_release(self) -> None:
+        email = ReleaseActivityNotification(
+            Activity(
+                project=self.project,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
                 data={"version": "a", "deploy_id": 5},
             )
         )
 
         assert email.release is None
-        assert not email.should_email()
 
-    def test_no_committers(self):
-        release = Release.objects.create(
-            version="b" * 40,
-            organization_id=self.project.organization_id,
-            date_released=timezone.now(),
-        )
-        release.add_project(self.project)
-        release.add_project(self.project2)
-        deploy = Deploy.objects.create(
-            release=release, organization_id=self.org.id, environment_id=self.environment.id
-        )
+    def test_no_committers(self) -> None:
+        mail.outbox.clear()
+        Release.objects.all().delete()
+        release, deploy = self.another_release("b")
 
-        email = ReleaseActivityEmail(
+        email = ReleaseActivityNotification(
             Activity(
                 project=self.project,
-                user=self.user,
-                type=Activity.RELEASE,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
                 data={"version": release.version, "deploy_id": deploy.id},
             )
         )
 
-        # only user3 is included because they oped into all deploy emails
-        assert len(email.get_participants()) == 1
-
-        assert email.get_participants() == {self.user3: GroupSubscriptionReason.deploy_setting}
+        # only user3 is included because they opted into all deploy emails
+        participants = (
+            email.get_participants_with_group_subscription_reason().get_participants_by_provider(
+                ExternalProviders.EMAIL
+            )
+        )
+        assert participants == {
+            (Actor.from_orm_user(self.user3), GroupSubscriptionReason.deploy_setting)
+        }
 
         context = email.get_context()
         assert context["environment"] == "production"
         assert context["repos"] == []
 
-        user_context = email.get_user_context(self.user)
+        user_context = email.get_recipient_context(Actor.from_orm_user(self.user1), {})
         # make sure this only includes projects user has access to
         assert len(user_context["projects"]) == 1
         assert user_context["projects"][0][0] == self.project
@@ -268,48 +319,48 @@ class ReleaseTestCase(TestCase):
 
         assert sent_email_addresses == {self.user3.email}
 
-    def test_uses_default(self):
+    def test_uses_default(self) -> None:
         user6 = self.create_user()
         self.create_member(user=user6, organization=self.org, teams=[self.team])
 
-        UserOption.objects.set_value(
-            user=user6, organization=None, key="deploy-emails", value=UserOptionValue.all_deploys
-        )
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            NotificationSettingOption.objects.create(
+                scope_type=NotificationScopeEnum.USER.value,
+                scope_identifier=user6.id,
+                user_id=user6.id,
+                type=NotificationSettingEnum.DEPLOY.value,
+                value=NotificationSettingsOptionEnum.ALWAYS.value,
+            )
 
-        release = Release.objects.create(
-            version="b" * 40,
-            organization_id=self.project.organization_id,
-            date_released=timezone.now(),
-        )
-        release.add_project(self.project)
-        release.add_project(self.project2)
-        deploy = Deploy.objects.create(
-            release=release, organization_id=self.org.id, environment_id=self.environment.id
-        )
+        release, deploy = self.another_release("b")
 
-        email = ReleaseActivityEmail(
+        email = ReleaseActivityNotification(
             Activity(
                 project=self.project,
-                user=self.user,
-                type=Activity.RELEASE,
+                user_id=self.user1.id,
+                type=ActivityType.RELEASE.value,
                 data={"version": release.version, "deploy_id": deploy.id},
             )
         )
-
+        mail.outbox.clear()
         # user3 and user 6 are included because they oped into all deploy emails
         # (one on an org level, one as their default)
-        assert len(email.get_participants()) == 2
-
-        assert email.get_participants() == {
-            user6: GroupSubscriptionReason.deploy_setting,
-            self.user3: GroupSubscriptionReason.deploy_setting,
+        participants = (
+            email.get_participants_with_group_subscription_reason().get_participants_by_provider(
+                ExternalProviders.EMAIL
+            )
+        )
+        assert len(participants) == 2
+        assert participants == {
+            (Actor.from_orm_user(user6), GroupSubscriptionReason.deploy_setting),
+            (Actor.from_orm_user(self.user3), GroupSubscriptionReason.deploy_setting),
         }
 
         context = email.get_context()
         assert context["environment"] == "production"
         assert context["repos"] == []
 
-        user_context = email.get_user_context(user6)
+        user_context = email.get_recipient_context(Actor.from_orm_user(user6), {})
         # make sure this only includes projects user has access to
         assert len(user_context["projects"]) == 1
         assert user_context["projects"][0][0] == self.project

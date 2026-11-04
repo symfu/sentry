@@ -1,0 +1,263 @@
+import {uuid4} from '@sentry/core';
+
+import type {FieldValue} from 'sentry/components/forms/model';
+import {t} from 'sentry/locale';
+import {ActionType, type Action} from 'sentry/types/workflowEngine/actions';
+import type {
+  Automation,
+  NewAutomation,
+  NewAutomationAction,
+  NewAutomationDataCondition,
+  NewAutomationDataConditionGroup,
+} from 'sentry/types/workflowEngine/automations';
+import type {
+  DataCondition,
+  DataConditionGroup,
+  Subfilter,
+} from 'sentry/types/workflowEngine/dataConditions';
+import {actionNodesMap} from 'sentry/views/automations/components/actionNodes';
+import type {AutomationBuilderState} from 'sentry/views/automations/components/automationBuilderContext';
+import {dataConditionNodesMap} from 'sentry/views/automations/components/dataConditionNodes';
+import {CONNECTED_MONITORS_ERROR_ID} from 'sentry/views/automations/components/editConnectedMonitors';
+import type {AlertPreviewRequest} from 'sentry/views/automations/utils/alertPreviewQueryOptions';
+
+export interface AutomationFormData {
+  allProjects: boolean;
+  detectorIds: string[];
+  enabled: boolean;
+  environment: string | null;
+  frequency: number | null;
+  name: string;
+  /**
+   * Derived field used for project-based monitor selection.
+   * Maps to issue stream detector IDs for the selected projects.
+   */
+  projectIds: string[];
+}
+
+const stripDataConditionId = (condition: DataCondition): NewAutomationDataCondition => {
+  const {id: _id, ...conditionWithoutId} = condition;
+
+  if (condition.comparison?.filters) {
+    return {
+      ...conditionWithoutId,
+      comparison: {
+        ...condition.comparison,
+        filters: condition.comparison.filters.map(stripSubfilterId),
+      },
+    };
+  }
+  return conditionWithoutId;
+};
+
+const stripSubfilterId = (subfilter: Subfilter): Omit<Subfilter, 'id'> => {
+  const {id: _id, ...subfilterWithoutId} = subfilter;
+  return subfilterWithoutId;
+};
+
+export const stripActionFields = (action: Action): NewAutomationAction => {
+  const {id: _id, ...actionWithoutId} = action;
+
+  // Strip targetDisplay from email action config
+  if ([ActionType.EMAIL, ActionType.WEBHOOK].includes(action.type) && action.config) {
+    return {
+      ...actionWithoutId,
+      config: {...action.config, targetDisplay: null},
+    };
+  }
+
+  return actionWithoutId;
+};
+
+const stripDataConditionGroupId = (
+  group: DataConditionGroup
+): NewAutomationDataConditionGroup => {
+  const {id: _id, ...groupWithoutId} = group;
+  return {
+    ...groupWithoutId,
+    conditions: group.conditions.map(stripDataConditionId),
+    actions: group.actions?.map(stripActionFields) ?? [],
+  };
+};
+
+const serializePreviewConditionGroup = (
+  group: DataConditionGroup
+): AlertPreviewRequest['triggers'] => ({
+  logicType: group.logicType,
+  conditions: group.conditions.map(condition => {
+    const {type, comparison} = stripDataConditionId(condition);
+    return {type, comparison};
+  }),
+});
+
+export function getNewAutomationData({
+  data,
+  state,
+}: {
+  data: AutomationFormData;
+  state: AutomationBuilderState;
+}): NewAutomation {
+  return {
+    name: data.name || 'New Alert',
+    triggers: stripDataConditionGroupId(state.triggers),
+    environment: data.environment,
+    actionFilters: state.actionFilters.map(stripDataConditionGroupId),
+    config: {
+      frequency: data.frequency ?? undefined,
+    },
+    detectorIds: data.detectorIds,
+    enabled: data.enabled,
+  };
+}
+
+export function getAlertPreviewRequest({
+  frequency,
+  projectIds,
+  state,
+}: {
+  frequency: number | null;
+  projectIds: readonly string[];
+  state: AutomationBuilderState;
+}): AlertPreviewRequest | null {
+  if (
+    projectIds.length === 0 ||
+    state.triggers.conditions.length === 0 ||
+    state.actionFilters.length === 0 ||
+    [state.triggers, ...state.actionFilters].some(group =>
+      group.conditions.some(condition =>
+        dataConditionNodesMap.get(condition.type)?.validate?.({condition})
+      )
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    projectIds: projectIds.map(Number),
+    config: {frequency: frequency ?? 0},
+    triggers: serializePreviewConditionGroup(state.triggers),
+    actionFilters: state.actionFilters.map(serializePreviewConditionGroup),
+  };
+}
+
+export function getAutomationFormData(
+  automation: Automation
+): Record<string, FieldValue> {
+  return {
+    allProjects: false,
+    detectorIds: automation.detectorIds,
+    environment: automation.environment,
+    frequency: automation.config.frequency ?? 0,
+    name: automation.name,
+    enabled: automation.enabled,
+    projectIds: [],
+  };
+}
+
+export interface ValidateDataConditionProps {
+  condition: DataCondition;
+}
+
+export function validateAutomationBuilderState(
+  state: AutomationBuilderState,
+  data: AutomationFormData,
+  {validateConnectedMonitors = true}: {validateConnectedMonitors?: boolean} = {}
+) {
+  const errors: Record<string, string> = {};
+
+  if (
+    validateConnectedMonitors &&
+    !data.allProjects &&
+    !data.detectorIds?.length &&
+    !data.projectIds?.length
+  ) {
+    errors[CONNECTED_MONITORS_ERROR_ID] = t(
+      'Select at least one project or monitor to create an alert.'
+    );
+  }
+
+  // validate trigger conditions
+  for (const condition of state.triggers.conditions || []) {
+    const validationResult = dataConditionNodesMap
+      .get(condition.type)
+      ?.validate?.({condition});
+    if (validationResult) {
+      errors[condition.id] = validationResult;
+    }
+  }
+
+  // validate action filters
+  for (const actionFilter of state.actionFilters) {
+    // validate action filter conditions
+    for (const condition of actionFilter.conditions || []) {
+      const validationResult = dataConditionNodesMap
+        .get(condition.type)
+        ?.validate?.({condition});
+      if (validationResult) {
+        errors[condition.id] = validationResult;
+      }
+    }
+    // validate action filter actions
+    if (actionFilter.actions?.length === 0) {
+      errors[actionFilter.id] = t('You must add an action for this alert to run.');
+      continue;
+    }
+    for (const action of actionFilter.actions || []) {
+      const validationResult = actionNodesMap.get(action.type)?.validate?.(action);
+      if (validationResult) {
+        errors[action.id] = validationResult;
+      }
+    }
+  }
+  return errors;
+}
+
+export function validateActions({actions}: {actions: Action[]}): Record<string, string> {
+  const errors: Record<string, string> = {};
+
+  for (const action of actions) {
+    const validationResult = actionNodesMap.get(action.type)?.validate?.(action);
+    if (validationResult) {
+      errors[action.id] = validationResult;
+    }
+  }
+  return errors;
+}
+
+/**
+ * Subfilter IDs are stripped on form submission, so they need to be re-assigned
+ * when loading the edit form for the remove/update logic to work correctly.
+ */
+export function assignSubfilterIds(
+  actionFilters: DataConditionGroup[]
+): DataConditionGroup[] {
+  return actionFilters.map(assignConditionGroupSubfilterIds);
+}
+
+function assignConditionGroupSubfilterIds(group: DataConditionGroup): DataConditionGroup {
+  return {
+    ...group,
+    conditions: group.conditions.map(assignConditionSubfilterIds),
+  };
+}
+
+function assignConditionSubfilterIds(condition: DataCondition): DataCondition {
+  const filters = condition.comparison?.filters;
+  if (!filters) {
+    return condition;
+  }
+  return {
+    ...condition,
+    comparison: {
+      ...condition.comparison,
+      filters: filters.map(assignSubfilterId),
+    },
+  };
+}
+
+function assignSubfilterId(filter: Subfilter): Subfilter {
+  return {
+    ...filter,
+    id: filter.id ?? uuid4(),
+  };
+}

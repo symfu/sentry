@@ -1,25 +1,50 @@
-import random
-import logging
-from importlib import import_module
-from urllib.parse import parse_qs as urlparse_parse_qs, parse_qsl
+from __future__ import annotations
 
-from django.conf import settings
-from django.db.models import Model
-from django.contrib.contenttypes.models import ContentType
-from urllib.parse import urlencode, urlparse, urlunparse
+import logging
+from collections.abc import Mapping, Sequence
+from importlib import import_module
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import parse_qs as urlparse_parse_qs
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import urlopen
 
-try:
-    random = random.SystemRandom()
-    using_sysrandom = True
-except NotImplementedError:
-    using_sysrandom = False
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Model
+from django.http import HttpRequest
 
+from sentry.hybridcloud.rpc import RpcModel
+from sentry.users.services.user import RpcUser
 
 LEAVE_CHARS = getattr(settings, "SOCIAL_AUTH_LOG_SANITIZE_LEAVE_CHARS", 4)
 
 
-def sanitize_log_data(secret, data=None, leave_characters=LEAVE_CHARS):
+if TYPE_CHECKING:
+    from sentry.users.services.usersocialauth.model import RpcUserSocialAuth
+    from social_auth.backends import BaseAuth
+
+    from .models import UserSocialAuth
+
+
+def get_backend(instance: UserSocialAuth | RpcUserSocialAuth) -> type[BaseAuth] | None:
+    # Make import here to avoid recursive imports :-/
+    from social_auth.backends import get_backends
+
+    return get_backends().get(instance.provider)
+
+
+def tokens(instance: UserSocialAuth | RpcUserSocialAuth) -> dict[str, Any]:
+    """Return access_token stored in extra_data or None"""
+    backend = instance.get_backend()
+    if backend:
+        return backend.AUTH_BACKEND.tokens(cast("UserSocialAuth", instance))
+    else:
+        return {}
+
+
+def sanitize_log_data(
+    secret: str, data: str | None = None, leave_characters: int = LEAVE_CHARS
+) -> str:
     """
     Clean private/secret data from log statements and other data.
 
@@ -37,19 +62,19 @@ def sanitize_log_data(secret, data=None, leave_characters=LEAVE_CHARS):
     return replace_secret
 
 
-def setting(name, default=None):
+def setting(name: str, default: Any = None) -> Any:
     """Return setting value for given name or default value."""
     return getattr(settings, name, default)
 
 
-def backend_setting(backend, name, default=None):
+def backend_setting(backend: object, name: str, default: Any = None) -> Any:
     """
     Looks for setting value following these rules:
         1. Search for <backend_name> prefixed setting
         2. Search for setting given by name
         3. Return default
     """
-    backend_name = get_backend_name(backend)
+    backend_name = cast("str", get_backend_name(backend))
     setting_name = "{}_{}".format(backend_name.upper().replace("-", "_"), name)
     if hasattr(settings, setting_name):
         return setting(setting_name)
@@ -59,13 +84,11 @@ def backend_setting(backend, name, default=None):
         return default
 
 
-logger = None
-if not logger:
-    logger = logging.getLogger("SocialAuth")
-    logger.setLevel(logging.DEBUG)
+logger = logging.getLogger("SocialAuth")
+logger.setLevel(logging.DEBUG)
 
 
-def log(level, *args, **kwargs):
+def log(level: str, *args: Any, **kwargs: Any) -> None:
     """Small wrapper around logger functions."""
     {
         "debug": logger.debug,
@@ -75,24 +98,30 @@ def log(level, *args, **kwargs):
     }[level](*args, **kwargs)
 
 
-def model_to_ctype(val):
+def model_to_ctype(val: Any) -> Any:
     """Converts values that are instance of Model to a dictionary
     with enough information to retrieve the instance back later."""
     if isinstance(val, Model):
-        val = {"pk": val.pk, "ctype": ContentType.objects.get_for_model(val).pk}
+        return {"pk": val.pk, "ctype": ContentType.objects.get_for_model(val).pk}
+    if isinstance(val, RpcModel):
+        return val.dict()
     return val
 
 
-def ctype_to_model(val):
+def ctype_to_model(val: Any) -> Any:
     """Converts back the instance saved by model_to_ctype function."""
     if isinstance(val, dict) and "pk" in val and "ctype" in val:
         ctype = ContentType.objects.get_for_id(val["ctype"])
         ModelClass = ctype.model_class()
-        val = ModelClass.objects.get(pk=val["pk"])
+        assert ModelClass is not None
+        return ModelClass.objects.get(pk=val["pk"])
+
+    if isinstance(val, dict) and "username" in val and "name" in val:
+        return RpcUser.parse_obj(val)
     return val
 
 
-def clean_partial_pipeline(request):
+def clean_partial_pipeline(request: HttpRequest) -> None:
     """Cleans any data for partial pipeline."""
     name = setting("SOCIAL_AUTH_PARTIAL_PIPELINE_KEY", "partial_pipeline")
     # Check for key to avoid flagging the session as modified unnecessary
@@ -100,7 +129,7 @@ def clean_partial_pipeline(request):
         request.session.pop(name, None)
 
 
-def url_add_parameters(url, params):
+def url_add_parameters(url: str, params: Mapping[str, Any] | None) -> str:
     """Adds parameters to URL, parameter will be repeated if already present"""
     if params:
         fragments = list(urlparse(url))
@@ -109,7 +138,7 @@ def url_add_parameters(url, params):
     return url
 
 
-def dsa_urlopen(*args, **kwargs):
+def dsa_urlopen(*args: Any, **kwargs: Any) -> Any:
     """Like urllib2.urlopen but sets a timeout defined by
     SOCIAL_AUTH_URLOPEN_TIMEOUT setting if defined (and not already in
     kwargs)."""
@@ -119,22 +148,22 @@ def dsa_urlopen(*args, **kwargs):
     return urlopen(*args, **kwargs)
 
 
-def get_backend_name(backend):
+def get_backend_name(backend: object) -> str | None:
     return getattr(getattr(backend, "AUTH_BACKEND", backend), "name", None)
 
 
-def module_member(name):
+def module_member(name: str) -> Any:
     mod, member = name.rsplit(".", 1)
     module = import_module(mod)
     return getattr(module, member)
 
 
-def parse_qs(value):
+def parse_qs(value: str) -> dict[str, str]:
     """Like urlparse.parse_qs but transform list values to single items"""
     return drop_lists(urlparse_parse_qs(value))
 
 
-def drop_lists(value):
+def drop_lists(value: Mapping[str, Sequence[str]]) -> dict[str, str]:
     return {key: val[0] for key, val in value.items()}
 
 

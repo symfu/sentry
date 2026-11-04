@@ -1,0 +1,419 @@
+import {Fragment} from 'react';
+import {css} from '@emotion/react';
+import styled from '@emotion/styled';
+import {IconChevron} from '@sentry/icons/chevron';
+import {useQuery} from '@tanstack/react-query';
+
+import {Button} from '@sentry/scraps/button';
+import {Container, Flex} from '@sentry/scraps/layout';
+
+import * as Layout from 'sentry/components/layouts/thirds';
+import type {DatePageFilterProps} from 'sentry/components/pageFilters/date/datePageFilter';
+import {DatePageFilter} from 'sentry/components/pageFilters/date/datePageFilter';
+import {EnvironmentPageFilter} from 'sentry/components/pageFilters/environment/environmentPageFilter';
+import {PageFilterBar} from 'sentry/components/pageFilters/pageFilterBar';
+import {ProjectPageFilter} from 'sentry/components/pageFilters/project/projectPageFilter';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {useCaseInsensitivity} from 'sentry/components/searchQueryBuilder/hooks';
+import {TourElement} from 'sentry/components/tours/components';
+import {t} from 'sentry/locale';
+import type {Organization} from 'sentry/types/organization';
+import type {Project} from 'sentry/types/project';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {defined} from 'sentry/utils/defined';
+import {parseError} from 'sentry/utils/discover/genericDiscoverQuery';
+import {DiscoverDatasets} from 'sentry/utils/discover/types';
+import {useChartInterval} from 'sentry/utils/useChartInterval';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {ChartSelectionProvider} from 'sentry/views/explore/components/attributeBreakdowns/chartSelectionContext';
+import {ExploreQuotaExceededAlert} from 'sentry/views/explore/components/exploreQuotaExceededAlert';
+import {ExploreShareButton} from 'sentry/views/explore/components/exploreShareButton';
+import {OverChartButtonGroup} from 'sentry/views/explore/components/overChartButtonGroup';
+import {
+  ExploreBodyContent,
+  ExploreBodySearch,
+  ExploreContentSection,
+  ExploreControlSection,
+} from 'sentry/views/explore/components/styles';
+import {Mode} from 'sentry/views/explore/contexts/pageParamsContext/mode';
+import {useAnalytics} from 'sentry/views/explore/hooks/useAnalytics';
+import {useControlSectionExpanded} from 'sentry/views/explore/hooks/useControlSectionExpanded';
+import {useCrossEventQueries} from 'sentry/views/explore/hooks/useCrossEventQueries';
+import {useExploreAggregatesTable} from 'sentry/views/explore/hooks/useExploreAggregatesTable';
+import {useExploreSpansTable} from 'sentry/views/explore/hooks/useExploreSpansTable';
+import {useExploreTimeseries} from 'sentry/views/explore/hooks/useExploreTimeseries';
+import {
+  type TracesTableResult,
+  useExploreTracesTableApiOptions,
+} from 'sentry/views/explore/hooks/useExploreTracesTable';
+import {Tab, useTab} from 'sentry/views/explore/hooks/useTab';
+import {useVisitQuery} from 'sentry/views/explore/hooks/useVisitQuery';
+import {
+  useQueryParamsAggregateSortBys,
+  useQueryParamsExtrapolate,
+  useQueryParamsGroupBys,
+  useQueryParamsId,
+  useQueryParamsQuery,
+  useQueryParamsSortBys,
+  useQueryParamsVisualizes,
+  useSetQueryParamsVisualizes,
+} from 'sentry/views/explore/queryParams/context';
+import {ExploreCharts} from 'sentry/views/explore/spans/charts';
+import {SPANS_TABLE_LIMIT} from 'sentry/views/explore/spans/constants';
+import {useCrossEventDatasetAvailability} from 'sentry/views/explore/spans/crossEvents/useCrossEventDatasetAvailability';
+import {DroppedFieldsAlert} from 'sentry/views/explore/spans/droppedFieldsAlert';
+import {ExtrapolationEnabledAlert} from 'sentry/views/explore/spans/extrapolationEnabledAlert';
+import {SettingsDropdown} from 'sentry/views/explore/spans/settingsDropdown';
+import {SpanTabSearchSection} from 'sentry/views/explore/spans/spansTabSearchSection';
+import {ExploreSpansTour, ExploreSpansTourContext} from 'sentry/views/explore/spans/tour';
+import {TracesExportModalButton} from 'sentry/views/explore/spans/tracesExportModalButton';
+import {ExploreTables} from 'sentry/views/explore/tables';
+import {ExploreToolbar} from 'sentry/views/explore/toolbar';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+import {useRawCounts} from 'sentry/views/explore/useRawCounts';
+import {Onboarding} from 'sentry/views/performance/onboarding';
+import {useLLMContext} from 'sentry/views/seerExplorer/contexts/llmContext';
+import {registerLLMContext} from 'sentry/views/seerExplorer/contexts/registerLLMContext';
+import {
+  toLLMContextProjectFields,
+  useSelectedProjectsForLLMContext,
+} from 'sentry/views/seerExplorer/utils/selectedProjectsForLLMContext';
+
+interface SpansTabOnboardingProps {
+  datePageFilterProps: DatePageFilterProps;
+  organization: Organization;
+  project: Project;
+}
+
+function SpansTabOnboardingInner({
+  datePageFilterProps,
+  organization,
+  project,
+}: SpansTabOnboardingProps) {
+  const selectedProjects = useSelectedProjectsForLLMContext();
+
+  useLLMContext({
+    contextHint:
+      'Sentry traces explorer page. Shows setup instructions because the selected projects have not sent any spans yet. ' +
+      'onboardingProject is the project the setup instructions are for. ' +
+      'projectSelectionInstruction describes the page-filter project scope (explicit pins vs My/All Projects). ' +
+      'When projectIds/projectSlugs are empty, that is expected for My/All Projects — follow projectSelectionInstruction.',
+    onboardingProject: {slug: project.slug, platform: project.platform},
+    ...toLLMContextProjectFields(selectedProjects),
+  });
+
+  return (
+    <Layout.Body>
+      <PageFilterBar condensed>
+        <ProjectPageFilter />
+        <EnvironmentPageFilter />
+        <DatePageFilter {...datePageFilterProps} />
+      </PageFilterBar>
+      <OnboardingContentSection>
+        <ExploreQuotaExceededAlert referrer="spans-explore" traceItemDataset="spans" />
+        <Onboarding project={project} organization={organization} />
+      </OnboardingContentSection>
+    </Layout.Body>
+  );
+}
+
+interface SpanTabProps {
+  datePageFilterProps: DatePageFilterProps;
+}
+
+const SPANS_TOOLBAR_STORAGE_KEY = 'explore-spans-toolbar';
+
+export function SpansTabContent({datePageFilterProps}: SpanTabProps) {
+  const id = useQueryParamsId();
+  useVisitQuery(id);
+
+  const [controlSectionExpanded, setControlSectionExpanded] = useControlSectionExpanded(
+    SPANS_TOOLBAR_STORAGE_KEY
+  );
+
+  return (
+    <Fragment>
+      <ChartSelectionProvider>
+        <ExploreBodySearch>
+          <SpanTabSearchSection datePageFilterProps={datePageFilterProps} />
+        </ExploreBodySearch>
+        <ExploreBodyContent>
+          <SpanTabControlSection controlSectionExpanded={controlSectionExpanded} />
+          <SpanTabContentSection
+            setControlSectionExpanded={setControlSectionExpanded}
+            controlSectionExpanded={controlSectionExpanded}
+          />
+        </ExploreBodyContent>
+      </ChartSelectionProvider>
+    </Fragment>
+  );
+}
+
+interface SpanTabControlSectionProps {
+  controlSectionExpanded: boolean;
+}
+
+function SpanTabControlSection({controlSectionExpanded}: SpanTabControlSectionProps) {
+  const toolbarExtras: Array<'equations'> = ['equations'];
+
+  return (
+    <ExploreControlSection expanded={controlSectionExpanded}>
+      <TourElement<ExploreSpansTour>
+        tourContext={ExploreSpansTourContext}
+        id={ExploreSpansTour.TOOLBAR}
+        title={t('Configure Your Query')}
+        description={t(
+          'Based on your search, you can determine how you want your results shown. Choose your metric visualization, group (optional) and sort.'
+        )}
+        position="right"
+        margin={-8}
+      >
+        {tourProps => (
+          <div {...tourProps}>
+            {controlSectionExpanded && (
+              <ExploreToolbar width={300} extras={toolbarExtras} />
+            )}
+          </div>
+        )}
+      </TourElement>
+    </ExploreControlSection>
+  );
+}
+
+type SpanTabContentSectionProps = {
+  controlSectionExpanded: boolean;
+  setControlSectionExpanded: (expanded: boolean) => void;
+};
+
+function SpanTabContentSectionInner({
+  controlSectionExpanded,
+  setControlSectionExpanded,
+}: SpanTabContentSectionProps) {
+  const {isReady, selection} = usePageFilters();
+  const selectedProjects = useSelectedProjectsForLLMContext();
+  const query = useQueryParamsQuery();
+  const visualizes = useQueryParamsVisualizes();
+  const setVisualizes = useSetQueryParamsVisualizes();
+  const extrapolate = useQueryParamsExtrapolate();
+  const id = useQueryParamsId();
+  const [tab, setTab] = useTab();
+  const [caseInsensitive] = useCaseInsensitivity();
+  const organization = useOrganization();
+  const crossEventDatasetAvailability = useCrossEventDatasetAvailability(organization);
+  const crossEventQueries = useCrossEventQueries(crossEventDatasetAvailability);
+  const sortBys = useQueryParamsSortBys();
+  const aggregateSortBys = useQueryParamsAggregateSortBys();
+  const groupBys = useQueryParamsGroupBys();
+
+  // In aggregate mode the table is driven by aggregateSortBys, not the
+  // samples sort (which falls back to `-timestamp`), so pick accordingly.
+  const activeSortBys = tab === Mode.AGGREGATE ? aggregateSortBys : sortBys;
+
+  // Push page state into the LLM context tree for Seer Explorer.
+  useLLMContext({
+    contextHint:
+      'Sentry traces explorer page. Users search spans/traces by attributes and view samples, aggregates, or breakdowns. ' +
+      'You can search live telemetry for spans/traces/errors/logs/metrics, get a trace waterfall by trace ID, ' +
+      'list telemetry index nodes by keyword to discover span/function types, and query node dependencies for upstream/downstream call graphs. ' +
+      'projectSelectionInstruction describes the page-filter project scope (explicit pins vs My/All Projects). ' +
+      'When projectIds/projectSlugs are empty, that is expected for My/All Projects — follow projectSelectionInstruction.',
+    searchQuery: query,
+    activeTab: tab,
+    visualizes: visualizes.map(v => v.yAxis),
+    groupBys: groupBys.filter(g => g !== ''),
+    sortBys: activeSortBys.map(s => (s.kind === 'desc' ? `-${s.field}` : s.field)),
+    currentSelectedDateRange: selection.datetime,
+    ...toLLMContextProjectFields(selectedProjects),
+  });
+
+  const queryType =
+    tab === Mode.AGGREGATE
+      ? 'aggregate'
+      : tab === Tab.TRACE
+        ? 'traces'
+        : tab === Tab.ATTRIBUTE_BREAKDOWNS
+          ? 'attribute_breakdowns'
+          : 'samples';
+
+  const rawSpanCounts = useRawCounts({dataset: DiscoverDatasets.SPANS});
+
+  const aggregatesTableResult = useExploreAggregatesTable({
+    query,
+    limit: SPANS_TABLE_LIMIT,
+    enabled: isReady && queryType === 'aggregate',
+    queryExtras: {
+      caseInsensitive,
+      ...crossEventQueries,
+    },
+  });
+  const spansTableResult = useExploreSpansTable({
+    query,
+    limit: SPANS_TABLE_LIMIT,
+    enabled: isReady && queryType === 'samples',
+    queryExtras: {
+      caseInsensitive,
+      ...crossEventQueries,
+    },
+  });
+  const tracesTableQuery = useQuery({
+    ...useExploreTracesTableApiOptions({
+      query,
+      limit: SPANS_TABLE_LIMIT,
+      queryExtras: {
+        caseInsensitive,
+        ...crossEventQueries,
+      },
+    }),
+    select: selectJsonWithHeaders,
+    enabled: isReady && queryType === 'traces',
+  });
+  const tracesTableResult = {
+    result: tracesTableQuery,
+    error: parseError(tracesTableQuery.error),
+  } satisfies TracesTableResult;
+
+  const {result: timeseriesResult, samplingMode: timeseriesSamplingMode} =
+    useExploreTimeseries({
+      query,
+      enabled: isReady,
+      queryExtras: {
+        caseInsensitive,
+        ...crossEventQueries,
+      },
+    });
+
+  const [interval] = useChartInterval();
+
+  useAnalytics({
+    queryType,
+    aggregatesTableResult,
+    spansTableResult,
+    tracesTableResult,
+    timeseriesResult,
+    interval,
+    crossEventQueries,
+  });
+
+  return (
+    <ExploreContentSection gap="md">
+      <OverChartButtonGroup>
+        <ChevronButton
+          aria-label={
+            controlSectionExpanded ? t('Collapse sidebar') : t('Expand sidebar')
+          }
+          expanded={controlSectionExpanded}
+          size="xs"
+          icon={
+            <IconChevron
+              isDouble
+              direction={controlSectionExpanded ? 'left' : 'right'}
+              size="xs"
+            />
+          }
+          onClick={() => setControlSectionExpanded(!controlSectionExpanded)}
+        >
+          {controlSectionExpanded ? null : t('Advanced')}
+        </ChevronButton>
+        <Flex gap="xs">
+          <ExploreShareButton traceItemDataset={TraceItemDataset.SPANS} />
+          <TracesExportModalButton
+            aggregatesTableResult={aggregatesTableResult}
+            spansTableResult={spansTableResult}
+            rawSpanCounts={rawSpanCounts}
+          />
+          <SettingsDropdown />
+        </Flex>
+      </OverChartButtonGroup>
+      {defined(id) && <DroppedFieldsAlert />}
+      <ExploreQuotaExceededAlert referrer="spans-explore" traceItemDataset="spans" />
+      <ExtrapolationEnabledAlert />
+      <TourElement<ExploreSpansTour>
+        tourContext={ExploreSpansTourContext}
+        id={ExploreSpansTour.RESULTS}
+        title={t('Get Results')}
+        description={t(
+          'See a chart and list of samples or aggregates. IDs will link you to a waterfall for debugging while aggregates will let you scope it down further.'
+        )}
+        position="top"
+        margin={-8}
+      >
+        {props => (
+          <div {...props}>
+            <ExploreCharts
+              query={query}
+              extrapolate={extrapolate}
+              timeseriesResult={timeseriesResult}
+              visualizes={visualizes}
+              setVisualizes={setVisualizes}
+              samplingMode={timeseriesSamplingMode}
+              rawSpanCounts={rawSpanCounts}
+            />
+            <ExploreTables
+              aggregatesTableResult={aggregatesTableResult}
+              spansTableResult={spansTableResult}
+              tracesTableResult={tracesTableResult}
+              tab={tab}
+              setTab={(newTab, reason) => {
+                if (newTab === Mode.AGGREGATE) {
+                  setControlSectionExpanded(true);
+                }
+
+                if (reason === 'click') {
+                  trackAnalytics('trace.explorer.table_tab_changed', {
+                    organization,
+                    tab: newTab,
+                  });
+                }
+
+                setTab(newTab);
+              }}
+            />
+          </div>
+        )}
+      </TourElement>
+    </ExploreContentSection>
+  );
+}
+
+export const SpansTabOnboarding = registerLLMContext(
+  'traces-explorer',
+  SpansTabOnboardingInner
+);
+
+const SpanTabContentSection = registerLLMContext(
+  'traces-explorer',
+  SpanTabContentSectionInner
+);
+
+const OnboardingContentSection = styled('section')`
+  grid-column: 1/3;
+`;
+
+export function ChevronButton(
+  props: React.ComponentProps<typeof Button> & {expanded: boolean}
+) {
+  return (
+    <Container as="span" display="inline-flex">
+      <StyledChevronButton {...props} />
+    </Container>
+  );
+}
+
+const StyledChevronButton = styled(Button)<{expanded: boolean}>`
+  ${p =>
+    p.expanded &&
+    css`
+      @container (min-width: ${p.theme.container.xl}) {
+        margin-left: -17px;
+        border-top-left-radius: 0;
+        border-bottom-left-radius: 0;
+
+        &::after {
+          border-left-color: ${p.theme.tokens.border.primary};
+          border-top-left-radius: 0;
+          border-bottom-left-radius: 0;
+        }
+      }
+    `}
+`;

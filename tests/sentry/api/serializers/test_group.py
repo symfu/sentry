@@ -1,26 +1,40 @@
 from datetime import timedelta
+from typing import Any
+from unittest.mock import MagicMock, call, patch
+
 from django.utils import timezone
 
 from sentry.api.serializers import serialize
-from sentry.api.serializers.models.group import StreamGroupSerializer
-from sentry.models import (
-    Group,
-    Environment,
-    GroupLink,
-    GroupResolution,
-    GroupSnooze,
-    GroupStatus,
-    GroupSubscription,
-    UserOption,
-    UserOptionValue,
+from sentry.api.serializers.models.group import GroupSerializer, SimpleGroupSerializer
+from sentry.integrations.types import ExternalProviderEnum
+from sentry.issues.derived.processing import PIPELINE
+from sentry.issues.derived.serialization import get_bulk_group_derived_data
+from sentry.issues.progress_state import IssueProgressState
+from sentry.models.group import Group, GroupStatus
+from sentry.models.grouplink import GroupLink
+from sentry.models.groupresolution import GroupResolution
+from sentry.models.groupsnooze import GroupSnooze
+from sentry.models.groupsubscription import GroupSubscription
+from sentry.notifications.models.notificationsettingoption import NotificationSettingOption
+from sentry.notifications.models.notificationsettingprovider import NotificationSettingProvider
+from sentry.notifications.types import (
+    NotificationScopeEnum,
+    NotificationSettingEnum,
+    NotificationSettingsOptionEnum,
 )
-from sentry.testutils import TestCase
-from sentry.utils.compat import mock
-from sentry.utils.compat.mock import patch
+from sentry.service_accounts.principal import ServiceAccountPrincipal
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import PerformanceIssueTestCase, TestCase
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.testutils.skips import requires_snuba
+from sentry.types.group import IssueAutofixStep, IssueBlocker
+from sentry.users.models.user_option import UserOption
+
+pytestmark = [requires_snuba]
 
 
-class GroupSerializerTest(TestCase):
-    def test_project(self):
+class GroupSerializerTest(TestCase, PerformanceIssueTestCase):
+    def test_project(self) -> None:
         user = self.create_user()
         group = self.create_group()
 
@@ -31,7 +45,7 @@ class GroupSerializerTest(TestCase):
         assert "slug" in result["project"]
         assert "platform" in result["project"]
 
-    def test_is_ignored_with_expired_snooze(self):
+    def test_is_ignored_with_expired_snooze(self) -> None:
         now = timezone.now()
 
         user = self.create_user()
@@ -42,7 +56,7 @@ class GroupSerializerTest(TestCase):
         assert result["status"] == "unresolved"
         assert result["statusDetails"] == {}
 
-    def test_is_ignored_with_valid_snooze(self):
+    def test_is_ignored_with_valid_snooze(self) -> None:
         now = timezone.now()
 
         user = self.create_user()
@@ -58,7 +72,7 @@ class GroupSerializerTest(TestCase):
         assert result["statusDetails"]["ignoreUntil"] == snooze.until
         assert result["statusDetails"]["actor"] is None
 
-    def test_is_ignored_with_valid_snooze_and_actor(self):
+    def test_is_ignored_with_valid_snooze_and_actor(self) -> None:
         now = timezone.now()
 
         user = self.create_user()
@@ -69,7 +83,7 @@ class GroupSerializerTest(TestCase):
         assert result["status"] == "ignored"
         assert result["statusDetails"]["actor"]["id"] == str(user.id)
 
-    def test_resolved_in_next_release(self):
+    def test_resolved_in_next_release(self) -> None:
         release = self.create_release(project=self.project, version="a")
         user = self.create_user()
         group = self.create_group(status=GroupStatus.RESOLVED)
@@ -81,7 +95,7 @@ class GroupSerializerTest(TestCase):
         assert result["status"] == "resolved"
         assert result["statusDetails"] == {"inNextRelease": True, "actor": None}
 
-    def test_resolved_in_release(self):
+    def test_resolved_in_release(self) -> None:
         release = self.create_release(project=self.project, version="a")
         user = self.create_user()
         group = self.create_group(status=GroupStatus.RESOLVED)
@@ -93,7 +107,7 @@ class GroupSerializerTest(TestCase):
         assert result["status"] == "resolved"
         assert result["statusDetails"] == {"inRelease": "a", "actor": None}
 
-    def test_resolved_with_actor(self):
+    def test_resolved_with_actor(self) -> None:
         release = self.create_release(project=self.project, version="a")
         user = self.create_user()
         group = self.create_group(status=GroupStatus.RESOLVED)
@@ -105,7 +119,7 @@ class GroupSerializerTest(TestCase):
         assert result["status"] == "resolved"
         assert result["statusDetails"]["actor"]["id"] == str(user.id)
 
-    def test_resolved_in_commit(self):
+    def test_resolved_in_commit(self) -> None:
         repo = self.create_repo(project=self.project)
         commit = self.create_commit(repo=repo)
         user = self.create_user()
@@ -122,141 +136,254 @@ class GroupSerializerTest(TestCase):
         assert result["status"] == "resolved"
         assert result["statusDetails"]["inCommit"]["id"] == commit.key
 
-    @patch("sentry.models.Group.is_over_resolve_age")
-    def test_auto_resolved(self, mock_is_over_resolve_age):
-        mock_is_over_resolve_age.return_value = True
-
-        user = self.create_user()
-        group = self.create_group(status=GroupStatus.UNRESOLVED)
-
-        result = serialize(group, user)
-        assert result["status"] == "resolved"
-        assert result["statusDetails"] == {"autoResolved": True}
-
-    def test_subscribed(self):
+    def test_subscribed(self) -> None:
         user = self.create_user()
         group = self.create_group()
 
         GroupSubscription.objects.create(
-            user=user, group=group, project=group.project, is_active=True
+            user_id=user.id, group=group, project=group.project, is_active=True
         )
 
         result = serialize(group, user)
         assert result["isSubscribed"]
         assert result["subscriptionDetails"] == {"reason": "unknown"}
 
-    def test_explicit_unsubscribed(self):
+    def test_explicit_unsubscribed(self) -> None:
         user = self.create_user()
         group = self.create_group()
 
         GroupSubscription.objects.create(
-            user=user, group=group, project=group.project, is_active=False
+            user_id=user.id, group=group, project=group.project, is_active=False
         )
 
         result = serialize(group, user)
         assert not result["isSubscribed"]
         assert not result["subscriptionDetails"]
 
-    def test_implicit_subscribed(self):
+    def test_implicit_subscribed(self) -> None:
         user = self.create_user()
         group = self.create_group()
 
         combinations = (
-            # ((default, project), (subscribed, details))
-            ((UserOptionValue.all_conversations, None), (True, None)),
-            ((UserOptionValue.all_conversations, UserOptionValue.all_conversations), (True, None)),
+            # (default, project, subscribed, has_details)
             (
-                (UserOptionValue.all_conversations, UserOptionValue.participating_only),
-                (False, None),
+                NotificationSettingsOptionEnum.ALWAYS,
+                None,
+                True,
+                False,
             ),
             (
-                (UserOptionValue.all_conversations, UserOptionValue.no_conversations),
-                (False, {"disabled": True}),
-            ),
-            ((None, None), (False, None)),
-            ((UserOptionValue.participating_only, None), (False, None)),
-            ((UserOptionValue.participating_only, UserOptionValue.all_conversations), (True, None)),
-            (
-                (UserOptionValue.participating_only, UserOptionValue.participating_only),
-                (False, None),
+                NotificationSettingsOptionEnum.ALWAYS,
+                NotificationSettingsOptionEnum.ALWAYS,
+                True,
+                False,
             ),
             (
-                (UserOptionValue.participating_only, UserOptionValue.no_conversations),
-                (False, {"disabled": True}),
+                NotificationSettingsOptionEnum.ALWAYS,
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                False,
+                False,
             ),
-            ((UserOptionValue.no_conversations, None), (False, {"disabled": True})),
-            ((UserOptionValue.no_conversations, UserOptionValue.all_conversations), (True, None)),
-            ((UserOptionValue.no_conversations, UserOptionValue.participating_only), (False, None)),
             (
-                (UserOptionValue.no_conversations, UserOptionValue.no_conversations),
-                (False, {"disabled": True}),
+                NotificationSettingsOptionEnum.ALWAYS,
+                NotificationSettingsOptionEnum.NEVER,
+                False,
+                True,
+            ),
+            (
+                None,
+                None,
+                False,
+                False,
+            ),
+            (
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                None,
+                False,
+                False,
+            ),
+            (
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                NotificationSettingsOptionEnum.ALWAYS,
+                True,
+                False,
+            ),
+            (
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                False,
+                False,
+            ),
+            (
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                NotificationSettingsOptionEnum.NEVER,
+                False,
+                True,
+            ),
+            (
+                NotificationSettingsOptionEnum.NEVER,
+                None,
+                False,
+                True,
+            ),
+            (
+                NotificationSettingsOptionEnum.NEVER,
+                NotificationSettingsOptionEnum.ALWAYS,
+                True,
+                False,
+            ),
+            (
+                NotificationSettingsOptionEnum.NEVER,
+                NotificationSettingsOptionEnum.SUBSCRIBE_ONLY,
+                False,
+                False,
+            ),
+            (
+                NotificationSettingsOptionEnum.NEVER,
+                NotificationSettingsOptionEnum.NEVER,
+                False,
+                True,
             ),
         )
 
-        def maybe_set_value(project, value):
-            if value is not None:
-                UserOption.objects.set_value(
-                    user=user, project=project, key="workflow:notifications", value=value
-                )
-            else:
-                UserOption.objects.unset_value(
-                    user=user, project=project, key="workflow:notifications"
-                )
-
-        for options, (is_subscribed, subscription_details) in combinations:
-            default_value, project_value = options
+        for default_value, project_value, is_subscribed, has_details in combinations:
             UserOption.objects.clear_local_cache()
-            maybe_set_value(None, default_value)
-            maybe_set_value(group.project, project_value)
+
+            with assume_test_silo_mode(SiloMode.CONTROL):
+                for provider in [
+                    ExternalProviderEnum.EMAIL.value,
+                    ExternalProviderEnum.SLACK.value,
+                ]:
+                    if default_value is None:
+                        NotificationSettingOption.objects.filter(
+                            scope_type=NotificationScopeEnum.USER.value,
+                            scope_identifier=user.id,
+                            user_id=user.id,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                        ).delete()
+                        NotificationSettingProvider.objects.filter(
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            user_id=user.id,
+                            scope_type=NotificationScopeEnum.USER.value,
+                            scope_identifier=user.id,
+                            provider=provider,
+                        ).delete()
+                    else:
+                        NotificationSettingOption.objects.update_or_create(
+                            scope_type=NotificationScopeEnum.USER.value,
+                            scope_identifier=user.id,
+                            user_id=user.id,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            defaults={"value": default_value.value},
+                        )
+                        NotificationSettingProvider.objects.update_or_create(
+                            provider=provider,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            user_id=user.id,
+                            scope_type=NotificationScopeEnum.USER.value,
+                            scope_identifier=user.id,
+                            defaults={"value": NotificationSettingsOptionEnum.ALWAYS.value},
+                        )
+
+                    if project_value is None:
+                        NotificationSettingOption.objects.filter(
+                            scope_type=NotificationScopeEnum.PROJECT.value,
+                            scope_identifier=group.project.id,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            user_id=user.id,
+                        ).delete()
+                        NotificationSettingProvider.objects.filter(
+                            scope_type=NotificationScopeEnum.PROJECT.value,
+                            scope_identifier=group.project.id,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            user_id=user.id,
+                            provider=provider,
+                        ).delete()
+                    else:
+                        NotificationSettingOption.objects.update_or_create(
+                            scope_type=NotificationScopeEnum.PROJECT.value,
+                            scope_identifier=group.project.id,
+                            user_id=user.id,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            defaults={"value": project_value.value},
+                        )
+                        NotificationSettingProvider.objects.update_or_create(
+                            provider=provider,
+                            type=NotificationSettingEnum.WORKFLOW.value,
+                            user_id=user.id,
+                            scope_type=NotificationScopeEnum.PROJECT.value,
+                            scope_identifier=group.project.id,
+                            defaults={"value": NotificationSettingsOptionEnum.ALWAYS.value},
+                        )
+
             result = serialize(group, user)
+            subscription_details = result.get("subscriptionDetails")
+
             assert result["isSubscribed"] is is_subscribed
-            assert result.get("subscriptionDetails") == subscription_details
+            assert (
+                subscription_details == {"disabled": True}
+                if has_details
+                else subscription_details is None
+            )
 
-    def test_global_no_conversations_overrides_group_subscription(self):
+    def test_global_no_conversations_overrides_group_subscription(self) -> None:
         user = self.create_user()
         group = self.create_group()
 
         GroupSubscription.objects.create(
-            user=user, group=group, project=group.project, is_active=True
+            user_id=user.id, group=group, project=group.project, is_active=True
         )
 
-        UserOption.objects.set_value(
-            user=user,
-            project=None,
-            key="workflow:notifications",
-            value=UserOptionValue.no_conversations,
-        )
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            NotificationSettingOption.objects.get_or_create(
+                scope_type=NotificationScopeEnum.USER.value,
+                scope_identifier=user.id,
+                type=NotificationSettingEnum.WORKFLOW.value,
+                value=NotificationSettingsOptionEnum.NEVER.value,
+                user_id=user.id,
+            )
 
         result = serialize(group, user)
         assert not result["isSubscribed"]
         assert result["subscriptionDetails"] == {"disabled": True}
 
-    def test_project_no_conversations_overrides_group_subscription(self):
+    def test_project_no_conversations_overrides_group_subscription(self) -> None:
         user = self.create_user()
         group = self.create_group()
 
         GroupSubscription.objects.create(
-            user=user, group=group, project=group.project, is_active=True
+            user_id=user.id, group=group, project=group.project, is_active=True
         )
 
-        UserOption.objects.set_value(
-            user=user,
-            project=group.project,
-            key="workflow:notifications",
-            value=UserOptionValue.no_conversations,
-        )
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            NotificationSettingOption.objects.get_or_create(
+                scope_type=NotificationScopeEnum.PROJECT.value,
+                scope_identifier=group.project.id,
+                type=NotificationSettingEnum.WORKFLOW.value,
+                value=NotificationSettingsOptionEnum.NEVER.value,
+                user_id=user.id,
+            )
 
         result = serialize(group, user)
         assert not result["isSubscribed"]
         assert result["subscriptionDetails"] == {"disabled": True}
 
-    def test_no_user_unsubscribed(self):
+    def test_no_user_unsubscribed(self) -> None:
         group = self.create_group()
-
         result = serialize(group)
         assert not result["isSubscribed"]
 
-    def test_reprocessing(self):
+    def test_service_account(self) -> None:
+        group = self.create_group()
+        principal: Any = ServiceAccountPrincipal(
+            service_account_id=1, organization_id=group.project.organization_id, name="deploy-bot"
+        )
+        result = serialize(group, principal)
+        assert result["isBookmarked"] is False
+        assert result["hasSeen"] is False
+        assert result["isSubscribed"] is False
+
+    def test_reprocessing(self) -> None:
         from sentry.reprocessing2 import start_group_reprocessing
 
         group = self.create_group()
@@ -270,43 +397,199 @@ class GroupSerializerTest(TestCase):
         assert result["statusDetails"] == {
             "pendingEvents": 0,
             "info": {
+                "syncCount": 0,
                 "totalEvents": 0,
                 "dateCreated": result["statusDetails"]["info"]["dateCreated"],
             },
         }
 
+    def test_perf_issue(self) -> None:
+        event = self.create_performance_issue()
+        perf_group = event.group
+        serialized = serialize(perf_group)
+        assert serialized["count"] == "1"
+        assert serialized["issueCategory"] == "db_query"
+        assert serialized["issueType"] == "performance_n_plus_one_db_queries"
 
-class StreamGroupSerializerTestCase(TestCase):
-    def test_environment(self):
-        group = self.group
+    def test_seer_autofix_last_triggered_without_explorer(self) -> None:
+        user = self.create_user()
+        group = self.create_group()
+        now = timezone.now()
+        group.update(seer_autofix_last_triggered=now)
 
-        environment = Environment.get_or_create(group.project, "production")
+        result = serialize(group, user)
+        assert result["seerAutofixLastTriggered"] == now
+        assert result["seerExplorerAutofixLastTriggered"] is None
 
-        from sentry.api.serializers.models.group import tsdb
+    def test_seer_autofix_last_triggered_with_explorer(self) -> None:
+        user = self.create_user()
+        group = self.create_group()
+        old_time = timezone.now() - timedelta(hours=1)
+        new_time = timezone.now()
+        group.update(
+            seer_autofix_last_triggered=old_time,
+            seer_explorer_autofix_last_triggered=new_time,
+        )
 
-        with mock.patch(
-            "sentry.api.serializers.models.group.tsdb.get_range", side_effect=tsdb.get_range
-        ) as get_range:
-            serialize(
-                [group],
-                serializer=StreamGroupSerializer(
-                    environment_func=lambda: environment, stats_period="14d"
+        result = serialize(group, user)
+        assert result["seerAutofixLastTriggered"] == old_time
+        assert result["seerExplorerAutofixLastTriggered"] == new_time
+
+
+class GroupSerializerDerivedDataTest(TestCase):
+    @patch("sentry.issues.derived.serialization.metrics.incr")
+    def test_derived_data_served_metric(self, mock_metrics_incr: MagicMock) -> None:
+        fresh_group = self.create_group()
+        self.create_group_derived_data(
+            group=fresh_group,
+            pipeline_hash=PIPELINE.pipeline_hash,
+        )
+        stale_group = self.create_group(project=fresh_group.project)
+        self.create_group_derived_data(group=stale_group, pipeline_hash="stale")
+        invalidated_group = self.create_group(project=fresh_group.project)
+        self.create_group_derived_data(group=invalidated_group, pipeline_hash=None)
+
+        get_bulk_group_derived_data({fresh_group.id, stale_group.id, invalidated_group.id})
+
+        mock_metrics_incr.assert_has_calls(
+            [
+                call(
+                    "issues.derived.served",
+                    amount=1,
+                    sample_rate=1.0,
+                    tags={"status": "fresh"},
                 ),
-            )
-            assert get_range.call_count == 1
-            for args, kwargs in get_range.call_args_list:
-                assert kwargs["environment_ids"] == [environment.id]
-
-        def get_invalid_environment():
-            raise Environment.DoesNotExist()
-
-        with mock.patch(
-            "sentry.api.serializers.models.group.tsdb.make_series", side_effect=tsdb.make_series
-        ) as make_series:
-            serialize(
-                [group],
-                serializer=StreamGroupSerializer(
-                    environment_func=get_invalid_environment, stats_period="14d"
+                call(
+                    "issues.derived.served",
+                    amount=1,
+                    sample_rate=1.0,
+                    tags={"status": "stale_hash"},
                 ),
+                call(
+                    "issues.derived.served",
+                    amount=1,
+                    sample_rate=1.0,
+                    tags={"status": "invalidated"},
+                ),
+            ],
+            any_order=True,
+        )
+
+    def test_derived_data_included(self) -> None:
+        group = self.create_group()
+        last_progressed_at = timezone.now()
+        self.create_group_derived_data(
+            group=group,
+            view_count=7,
+            progress=IssueProgressState.DIAGNOSED.value,
+            last_progressed_at=last_progressed_at,
+            data={
+                "status": "open",
+                "is_assigned": True,
+                "has_root_cause": True,
+                "has_open_fix_pr": False,
+                "blocker": IssueBlocker.APPROVE_PLAN.value,
+                "last_completed_autofix_step": IssueAutofixStep.SOLUTION.value,
+            },
+        )
+
+        result = serialize(group, self.user, GroupSerializer(expand=["derivedData"]))
+
+        assert result["derivedData"] == {
+            "blocker": IssueBlocker.APPROVE_PLAN.value,
+            "progress": "diagnosed",
+            "status": "open",
+            "viewCount": 7,
+            "hasOpenFixPr": False,
+            "isAssigned": True,
+            "hasRootCause": True,
+            "lastCompletedAutofixStep": IssueAutofixStep.SOLUTION.value,
+            "lastProgressedAt": last_progressed_at,
+        }
+
+    def test_derived_data_fix_applied_progress_for_closed_issue(self) -> None:
+        group = self.create_group()
+        self.create_group_derived_data(
+            group=group,
+            progress=None,
+            data={"status": "closed"},
+        )
+
+        result = serialize(group, self.user, GroupSerializer(expand=["derivedData"]))
+
+        assert result["derivedData"]["progress"] == IssueProgressState.FIX_APPLIED.value
+        assert result["derivedData"]["status"] == "closed"
+
+    def test_derived_data_omitted_without_row(self) -> None:
+        group = self.create_group()
+
+        result = serialize(group, self.user, GroupSerializer(expand=["derivedData"]))
+
+        assert "derivedData" not in result
+
+    def test_derived_data_omitted_without_expand(self) -> None:
+        group = self.create_group()
+        self.create_group_derived_data(group=group, progress=IssueProgressState.DIAGNOSED.value)
+
+        result = serialize(group, self.user)
+
+        assert "derivedData" not in result
+
+    def test_malformed_derived_data_does_not_fail_bulk_serialization(self) -> None:
+        self._assert_corrupt_derived_data_is_omitted(progress="invalid")
+
+    def test_malformed_blob_does_not_fail_bulk_serialization(self) -> None:
+        self._assert_corrupt_derived_data_is_omitted(data=[])
+
+    def test_invalid_boolean_does_not_leak_into_bulk_serialization(self) -> None:
+        self._assert_corrupt_derived_data_is_omitted(data={"has_open_fix_pr": "false"})
+
+    def _assert_corrupt_derived_data_is_omitted(self, **values: Any) -> None:
+        malformed_group = self.create_group()
+        self.create_group_derived_data(
+            group=malformed_group, pipeline_hash=PIPELINE.pipeline_hash, **values
+        )
+        valid_group = self.create_group(project=malformed_group.project)
+        self.create_group_derived_data(
+            group=valid_group,
+            pipeline_hash=PIPELINE.pipeline_hash,
+            progress=IssueProgressState.DIAGNOSED.value,
+        )
+
+        with patch("sentry.issues.derived.serialization.metrics.incr") as incr:
+            malformed_result, valid_result = serialize(
+                [malformed_group, valid_group], self.user, GroupSerializer(expand=["derivedData"])
             )
-            assert make_series.call_count == 1
+        served = [call for call in incr.call_args_list if call.args[0] == "issues.derived.served"]
+        assert served == [
+            call("issues.derived.served", amount=1, sample_rate=1.0, tags={"status": "fresh"})
+        ]
+
+        assert "derivedData" not in malformed_result
+        assert valid_result["derivedData"]["progress"] == "diagnosed"
+
+
+class SimpleGroupSerializerTest(TestCase):
+    def test_simple_group_serializer(self) -> None:
+        group = self.create_group()
+        serialized = serialize(group, self.user, SimpleGroupSerializer())
+        assert serialized["id"] == str(group.id)
+        assert serialized["title"] == group.title
+        assert serialized["culprit"] == group.culprit
+        assert serialized["level"] == "error"
+        assert serialized["project"] == {
+            "id": str(group.project.id),
+            "name": group.project.name,
+            "slug": group.project.slug,
+            "platform": group.project.platform,
+        }
+        assert serialized["shortId"] == group.qualified_short_id
+        assert serialized["status"] == "unresolved"
+        assert serialized["substatus"] == "new"
+        assert serialized["type"] == "default"
+        assert serialized["issueType"] == "error"
+        assert serialized["issueCategory"] == "error"
+        assert serialized["metadata"] == group.get_event_metadata()
+        assert serialized["numComments"] == group.num_comments
+        assert serialized["firstSeen"] == group.first_seen
+        assert serialized["lastSeen"] == group.last_seen

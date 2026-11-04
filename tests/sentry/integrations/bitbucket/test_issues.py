@@ -1,20 +1,28 @@
-import copy
+import orjson
+import pytest
 import responses
 
-from sentry.integrations.bitbucket.issues import ISSUE_TYPES, PRIORITIES
-from sentry.models import ExternalIssue, Integration
-from sentry.testutils import APITestCase
-from sentry.testutils.factories import DEFAULT_EVENT_DATA
-from sentry.testutils.helpers.datetime import iso_format, before_now
-from sentry.utils import json
+from sentry.integrations.bitbucket.integration import BitbucketIntegration
+from sentry.integrations.bitbucket.issues import BITBUCKET_MAX_TITLE_LENGTH, ISSUE_TYPES, PRIORITIES
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.services.integration import integration_service
+from sentry.shared_integrations.exceptions import IntegrationFormError
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.factories import EventType
+from sentry.testutils.helpers.datetime import before_now
+from sentry.testutils.skips import requires_snuba
+from sentry.utils.strings import truncatechars
+
+pytestmark = [requires_snuba]
 
 
 class BitbucketIssueTest(APITestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.base_url = "https://api.bitbucket.org"
         self.shared_secret = "234567890"
         self.subject = "connect:1234567"
-        self.integration = Integration.objects.create(
+        self.integration = self.create_integration(
+            organization=self.organization,
             provider="bitbucket",
             external_id=self.subject,
             name="myaccount",
@@ -24,28 +32,42 @@ class BitbucketIssueTest(APITestCase):
                 "subject": self.subject,
             },
         )
-        min_ago = iso_format(before_now(minutes=1))
+        org_integration = integration_service.get_organization_integration(
+            integration_id=self.integration.id, organization_id=self.organization.id
+        )
+        assert org_integration is not None
+        self.org_integration = org_integration
+        min_ago = before_now(minutes=1).isoformat()
         event = self.store_event(
             data={
                 "event_id": "a" * 32,
                 "message": "message",
                 "timestamp": min_ago,
-                "stacktrace": copy.deepcopy(DEFAULT_EVENT_DATA["stacktrace"]),
             },
             project_id=self.project.id,
+            default_event_type=EventType.DEFAULT,
         )
+        assert event.group is not None
         self.group = event.group
         self.repo_choices = [
             ("myaccount/repo1", "myaccount/repo1"),
             ("myaccount/repo2", "myaccount/repo2"),
         ]
-        self.org_integration = self.integration.add_organization(self.organization)
 
-    def build_autocomplete_url(self):
+    def build_autocomplete_url(self) -> str:
         return "/extensions/bitbucket/search/baz/%d/" % self.integration.id
 
+    def test_issue_url(self) -> None:
+        installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
+        assert installation.get_issue_link_data(
+            "https://bitbucket.org/myaccount/myrepo/issues/3/issue-title"
+        ) == {"repo": "myaccount/myrepo", "externalIssue": "3"}
+        with pytest.raises(IntegrationFormError):
+            installation.get_issue_link_data("https://other.example.org/myaccount/myrepo/issues/3")
+
     @responses.activate
-    def test_link_issue(self):
+    def test_link_issue(self) -> None:
         issue_id = 3
         repo = "myaccount/myrepo"
         responses.add(
@@ -56,7 +78,9 @@ class BitbucketIssueTest(APITestCase):
 
         data = {"repo": repo, "externalIssue": issue_id, "comment": "hello"}
 
-        assert self.integration.get_installation(None).get_issue(issue_id, data=data) == {
+        installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
+        assert installation.get_issue(issue_id, data=data) == {
             "key": issue_id,
             "description": "This is the description",
             "title": "hello",
@@ -64,7 +88,7 @@ class BitbucketIssueTest(APITestCase):
         }
 
     @responses.activate
-    def test_after_link_issue(self):
+    def test_after_link_issue(self) -> None:
         issue_id = 3
         repo = "myaccount/myrepo"
         comment = {"comment": "hello I'm a comment"}
@@ -81,55 +105,61 @@ class BitbucketIssueTest(APITestCase):
             key="%s#%d" % (repo, issue_id),
         )
 
-        self.integration.get_installation(external_issue.organization_id).after_link_issue(
-            external_issue, data=comment
-        )
+        installation = self.integration.get_installation(external_issue.organization_id)
+        assert isinstance(installation, BitbucketIntegration)
+        installation.after_link_issue(external_issue, data=comment)
 
         request = responses.calls[0].request
         assert responses.calls[0].response.status_code == 201
-        payload = json.loads(request.body)
+        payload = orjson.loads(request.body)
         assert payload == {"content": {"raw": comment["comment"]}}
 
     @responses.activate
-    def test_default_repo_link_fields(self):
+    def test_default_repo_link_fields(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/myaccount",
             body=b"""{
                 "values": [
-                    {"full_name": "myaccount/repo1"},
-                    {"full_name": "myaccount/repo2"}
+                    {"full_name": "myaccount/repo1", "uuid": "{repo-1}"},
+                    {"full_name": "myaccount/repo2", "uuid": "{repo-2}"}
                 ]
             }""",
             content_type="application/json",
         )
-        self.org_integration.config = {
-            "project_issue_defaults": {str(self.group.project_id): {"repo": "myaccount/repo1"}}
-        }
-        self.org_integration.save()
+        integration_service.update_organization_integration(
+            org_integration_id=self.org_integration.id,
+            config={
+                "project_issue_defaults": {str(self.group.project_id): {"repo": "myaccount/repo1"}}
+            },
+        )
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         fields = installation.get_link_issue_config(self.group)
         repo_field = [field for field in fields if field["name"] == "repo"][0]
         assert repo_field["default"] == "myaccount/repo1"
 
     @responses.activate
-    def test_default_repo_create_fields(self):
+    def test_default_repo_create_fields(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/myaccount",
             body=b"""{
                 "values": [
-                    {"full_name": "myaccount/repo1"},
-                    {"full_name": "myaccount/repo2"}
+                    {"full_name": "myaccount/repo1", "uuid": "{repo-1}"},
+                    {"full_name": "myaccount/repo2", "uuid": "{repo-2}"}
                 ]
             }""",
             content_type="application/json",
         )
-        self.org_integration.config = {
-            "project_issue_defaults": {str(self.group.project_id): {"repo": "myaccount/repo1"}}
-        }
-        self.org_integration.save()
+        integration_service.update_organization_integration(
+            org_integration_id=self.org_integration.id,
+            config={
+                "project_issue_defaults": {str(self.group.project_id): {"repo": "myaccount/repo1"}}
+            },
+        )
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         fields = installation.get_create_issue_config(self.group, self.user)
         for field in fields:
             if field["name"] == "repo":
@@ -138,7 +168,7 @@ class BitbucketIssueTest(APITestCase):
         assert repo_field["default"] == "myaccount/repo1"
 
     @responses.activate
-    def test_default_repo_link_fields_no_repos(self):
+    def test_default_repo_link_fields_no_repos(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/myaccount",
@@ -149,13 +179,14 @@ class BitbucketIssueTest(APITestCase):
         )
 
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         fields = installation.get_link_issue_config(self.group)
         repo_field = [field for field in fields if field["name"] == "repo"][0]
         assert repo_field["default"] == ""
         assert repo_field["choices"] == []
 
     @responses.activate
-    def test_default_repo_create_fields_no_repos(self):
+    def test_default_repo_create_fields_no_repos(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/myaccount",
@@ -166,20 +197,27 @@ class BitbucketIssueTest(APITestCase):
         )
 
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         fields = installation.get_create_issue_config(self.group, self.user)
         repo_field = [field for field in fields if field["name"] == "repo"][0]
         assert repo_field["default"] == ""
         assert repo_field["choices"] == []
 
     @responses.activate
-    def test_get_create_issue_config(self):
+    def test_get_create_issue_config(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/myaccount",
-            json={"values": [{"full_name": "myaccount/repo1"}, {"full_name": "myaccount/repo2"}]},
+            json={
+                "values": [
+                    {"full_name": "myaccount/repo1", "uuid": "{repo-1}"},
+                    {"full_name": "myaccount/repo2", "uuid": "{repo-2}"},
+                ]
+            },
         )
 
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         assert installation.get_create_issue_config(self.group, self.user) == [
             {
                 "name": "repo",
@@ -197,6 +235,7 @@ class BitbucketIssueTest(APITestCase):
                 "default": "message",
                 "type": "string",
                 "required": True,
+                "maxLength": BITBUCKET_MAX_TITLE_LENGTH,
             },
             {
                 "name": "description",
@@ -224,13 +263,80 @@ class BitbucketIssueTest(APITestCase):
         ]
 
     @responses.activate
-    def test_get_link_issue_config(self):
+    def test_get_create_issue_config_with_long_title(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/myaccount",
-            json={"values": [{"full_name": "myaccount/repo1"}, {"full_name": "myaccount/repo2"}]},
+            json={
+                "values": [
+                    {"full_name": "myaccount/repo1", "uuid": "{repo-1}"},
+                    {"full_name": "myaccount/repo2", "uuid": "{repo-2}"},
+                ]
+            },
         )
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
+        event = self.store_event(
+            data={
+                "event_id": "a" * 32,
+                "message": "b" * 5000,
+                "timestamp": before_now(minutes=1).isoformat(),
+            },
+            project_id=self.project.id,
+        )
+        config = installation.get_create_issue_config(event.group, self.user)
+        title_field = next(field for field in config if field["name"] == "title")
+        assert title_field
+        assert title_field["default"] == truncatechars(event.message, BITBUCKET_MAX_TITLE_LENGTH)
+        assert title_field["maxLength"] == BITBUCKET_MAX_TITLE_LENGTH
+
+    @responses.activate
+    def test_get_create_issue_config_without_group(self) -> None:
+        responses.add(
+            responses.GET,
+            "https://api.bitbucket.org/2.0/repositories/myaccount",
+            json={
+                "values": [
+                    {"full_name": "myaccount/repo1", "uuid": "{repo-1}"},
+                    {"full_name": "myaccount/repo2", "uuid": "{repo-2}"},
+                ],
+            },
+        )
+
+        responses.add(
+            responses.GET,
+            "https://api.bitbucket.org/2.0/repositories/myaccount/issues/labels",
+            json=[
+                {"name": "bug"},
+                {"name": "not-bug"},
+            ],
+        )
+
+        installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
+        config = installation.get_create_issue_config(None, self.user, params={})
+        [repo_field, assignee_field, label_field] = config
+        assert repo_field["name"] == "repo"
+        assert repo_field["type"] == "select"
+        assert repo_field["label"] == "Bitbucket Repository"
+        assert label_field["name"] == "priority"
+        assert label_field["type"] == "select"
+        assert label_field["label"] == "Priority"
+
+    @responses.activate
+    def test_get_link_issue_config(self) -> None:
+        responses.add(
+            responses.GET,
+            "https://api.bitbucket.org/2.0/repositories/myaccount",
+            json={
+                "values": [
+                    {"full_name": "myaccount/repo1", "uuid": "{repo-1}"},
+                    {"full_name": "myaccount/repo2", "uuid": "{repo-2}"},
+                ]
+            },
+        )
+        installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         assert installation.get_link_issue_config(self.group) == [
             {
                 "name": "repo",
@@ -256,14 +362,12 @@ class BitbucketIssueTest(APITestCase):
                 "default": "",
                 "type": "textarea",
                 "required": False,
-                "help": (
-                    "Leave blank if you don't want to " "add a comment to the Bitbucket issue."
-                ),
+                "help": ("Leave blank if you don't want to add a comment to the Bitbucket issue."),
             },
         ]
 
     @responses.activate
-    def test_create_issue(self):
+    def test_create_issue(self) -> None:
         repo = "myaccount/repo1"
         id = "112"
         title = "hello"
@@ -275,6 +379,7 @@ class BitbucketIssueTest(APITestCase):
             json={"id": id, "title": title, "content": {"html": content}},
         )
         installation = self.integration.get_installation(self.organization.id)
+        assert isinstance(installation, BitbucketIntegration)
         result = installation.create_issue(
             {"id": id, "title": title, "description": content, "repo": repo}
         )

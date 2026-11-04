@@ -1,27 +1,106 @@
-from sentry.models import (
-    Commit,
-    CommitAuthor,
-    Dashboard,
-    Environment,
-    ExternalIssue,
-    Organization,
-    PullRequest,
-    Release,
-    ReleaseCommit,
-    ReleaseEnvironment,
-    Repository,
-    ScheduledDeletion,
+from datetime import timedelta
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+from django.db import connection
+
+from sentry.deletions.tasks.scheduled import run_scheduled_deletions
+from sentry.discover.models import DiscoverSavedQuery, DiscoverSavedQueryProject
+from sentry.incidents.grouptype import MetricIssue
+from sentry.incidents.models.alert_rule import AlertRule, AlertRuleStatus
+from sentry.incidents.utils.types import DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.models.commit import Commit
+from sentry.models.commitauthor import CommitAuthor
+from sentry.models.dashboard import Dashboard
+from sentry.models.dashboard_widget import (
     DashboardWidget,
     DashboardWidgetQuery,
+    DashboardWidgetTypes,
 )
-from sentry.tasks.deletion import run_deletion
-from sentry.testutils import TestCase
+from sentry.models.environment import Environment, EnvironmentProject
+from sentry.models.group import Group
+from sentry.models.groupenvironment import GroupEnvironment
+from sentry.models.organization import Organization, OrganizationStatus
+from sentry.models.organizationmapping import OrganizationMapping
+from sentry.models.organizationmember import OrganizationMember
+from sentry.models.organizationmembermapping import OrganizationMemberMapping
+from sentry.models.project import Project
+from sentry.models.pullrequest import PullRequest
+from sentry.models.release import Release
+from sentry.models.releasecommit import ReleaseCommit
+from sentry.models.releaseenvironment import ReleaseEnvironment
+from sentry.models.repository import Repository
+from sentry.silo.base import SiloMode
+from sentry.snuba.dataset import Dataset
+from sentry.snuba.models import QuerySubscription, SnubaQuery
+from sentry.snuba.subscriptions import create_snuba_query
+from sentry.testutils.cases import TransactionTestCase
+from sentry.testutils.hybrid_cloud import HybridCloudTestMixin
+from sentry.testutils.outbox import outbox_runner
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.viewer_context import ActorType, get_viewer_context
+from sentry.workflow_engine.models import (
+    DataCondition,
+    DataConditionGroup,
+    DataSource,
+    Detector,
+    DetectorWorkflow,
+    Workflow,
+)
+from tests.sentry.workflow_engine.test_base import BaseWorkflowTest
 
 
-class DeleteOrganizationTest(TestCase):
-    def test_simple(self):
+class DeleteOrganizationTest(TransactionTestCase, HybridCloudTestMixin, BaseWorkflowTest):
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = patch("sentry.deletions.defaults.repository.notify_seer_repository_deleted")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch(
+        "sentry.tasks.seer.delete_seer_grouping_records.delete_seer_grouping_records_by_hash.apply_async"
+    )
+    def test_seer_cleanup_uses_scheduled_actor_context(
+        self, mock_delete_seer_grouping_records: MagicMock
+    ) -> None:
         org = self.create_organization(name="test")
-        org2 = self.create_organization(name="test2")
+        project = self.create_project(organization=org)
+        project.update_option("sentry:similarity_backfill_completed", 1)
+        event = self.store_event(data={"message": "error"}, project_id=project.id)
+        assert event.group is not None
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+
+        def assert_viewer_context(*_args: object, **_kwargs: object) -> None:
+            viewer_context = get_viewer_context()
+            assert viewer_context is not None
+            assert viewer_context.organization_id == org.id
+            assert viewer_context.project_id == project.id
+            assert viewer_context.actor.actor_id == self.user.id
+            assert viewer_context.actor.type == ActorType.USER
+
+        mock_delete_seer_grouping_records.side_effect = assert_viewer_context
+        self.ScheduledDeletion.schedule(instance=org, actor=self.user, days=0)
+
+        with self.tasks(), outbox_runner():
+            run_scheduled_deletions()
+
+        mock_delete_seer_grouping_records.assert_called()
+        assert get_viewer_context() is None
+
+    def test_simple(self) -> None:
+        org_owner = self.create_user()
+        org = self.create_organization(name="test", owner=org_owner)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            org_mapping = OrganizationMapping.objects.get(organization_id=org.id)
+        org_member = OrganizationMember.objects.get(organization_id=org.id, user_id=org_owner.id)
+        self.assert_org_member_mapping(org_member=org_member)
+
+        org_owner2 = self.create_user()
+        org2 = self.create_organization(name="test2", owner=org_owner2)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            org_mapping2 = OrganizationMapping.objects.get(organization_id=org2.id)
+
         self.create_team(organization=org, name="test1")
         self.create_team(organization=org, name="test2")
         release = Release.objects.create(version="a" * 32, organization_id=org.id)
@@ -39,7 +118,7 @@ class DeleteOrganizationTest(TestCase):
             organization_id=org.id, release=release, commit=commit, order=0
         )
 
-        env = Environment.objects.create(organization_id=org.id, project_id=4, name="foo")
+        env = Environment.objects.create(organization_id=org.id, name="foo")
         release_env = ReleaseEnvironment.objects.create(
             organization_id=org.id, project_id=4, release_id=release.id, environment_id=env.id
         )
@@ -49,13 +128,21 @@ class DeleteOrganizationTest(TestCase):
         )
 
         dashboard = Dashboard.objects.create(
-            organization_id=org.id, title="The Dashboard", created_by=self.user
+            organization_id=org.id, title="The Dashboard", created_by_id=self.user.id
         )
         widget_1 = DashboardWidget.objects.create(
-            dashboard=dashboard, order=1, title="Widget 1", display_type=0
+            dashboard=dashboard,
+            order=1,
+            title="Widget 1",
+            display_type=0,
+            widget_type=DashboardWidgetTypes.DISCOVER,
         )
         widget_2 = DashboardWidget.objects.create(
-            dashboard=dashboard, order=2, title="Widget 2", display_type=5
+            dashboard=dashboard,
+            order=2,
+            title="Widget 2",
+            display_type=5,
+            widget_type=DashboardWidgetTypes.DISCOVER,
         )
         widget_1_data = DashboardWidgetQuery.objects.create(
             widget=widget_1, order=1, name="Incoming data"
@@ -64,18 +151,24 @@ class DeleteOrganizationTest(TestCase):
             widget=widget_2, order=1, name="Incoming data"
         )
         widget_2_data_2 = DashboardWidgetQuery.objects.create(
-            widget=widget_2, order=2, name="Outcoming data"
+            widget=widget_2, order=2, name="Outgoing data"
         )
+        org.update(status=OrganizationStatus.PENDING_DELETION)
 
-        deletion = ScheduledDeletion.schedule(org, days=0)
-        deletion.update(in_progress=True)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
 
-        with self.tasks():
-            run_deletion(deletion.id)
+        with self.tasks(), outbox_runner():
+            run_scheduled_deletions()
 
         assert Organization.objects.filter(id=org2.id).exists()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            assert OrganizationMapping.objects.filter(id=org_mapping2.id).exists()
+            assert OrganizationMemberMapping.objects.filter(organization_id=org2.id).exists()
 
         assert not Organization.objects.filter(id=org.id).exists()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            assert not OrganizationMapping.objects.filter(id=org_mapping.id).exists()
+            assert not OrganizationMemberMapping.objects.filter(organization_id=org.id).exists()
         assert not Environment.objects.filter(id=env.id).exists()
         assert not ReleaseEnvironment.objects.filter(id=release_env.id).exists()
         assert not Repository.objects.filter(id=repo.id).exists()
@@ -90,3 +183,361 @@ class DeleteOrganizationTest(TestCase):
         assert not DashboardWidgetQuery.objects.filter(
             id__in=[widget_1_data.id, widget_2_data_1.id, widget_2_data_2.id]
         ).exists()
+
+    def test_no_delete_visible(self) -> None:
+        org = self.create_organization(name="test")
+        release = Release.objects.create(version="a" * 32, organization_id=org.id)
+
+        deletion = self.ScheduledDeletion.schedule(instance=org, days=0)
+        assert org.status == OrganizationStatus.ACTIVE
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert Organization.objects.filter(id=org.id).exists()
+        assert Release.objects.filter(id=release.id).exists()
+        assert not self.ScheduledDeletion.objects.filter(id=deletion.id).exists()
+
+    def test_large_child_relation_deletion(self) -> None:
+        org = self.create_organization(name="test")
+        self.create_team(organization=org, name="test1")
+        repo = Repository.objects.create(organization_id=org.id, name=org.name, provider="dummy")
+        author_bob = CommitAuthor.objects.create(
+            organization_id=org.id, name="bob", email="bob@example.com"
+        )
+        author_sally = CommitAuthor.objects.create(
+            organization_id=org.id, name="sally", email="sally@example.com"
+        )
+        # Make >100 commits so we can ensure that all commits are removed before authors are.
+        for i in range(0, 150):
+            author = author_bob if i % 2 == 0 else author_sally
+            Commit.objects.create(
+                repository_id=repo.id, organization_id=org.id, author=author, key=uuid4().hex
+            )
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(id=org.id).exists()
+        assert not Commit.objects.filter(organization_id=org.id).exists()
+        assert not CommitAuthor.objects.filter(organization_id=org.id).exists()
+
+    def test_group_first_release(self) -> None:
+        org = self.create_organization(name="test")
+        project = self.create_project(organization=org)
+        release = self.create_release(project=project, user=self.user, version="1.2.3")
+        group = Group.objects.create(project=project, first_release=release)
+
+        # Simulate the project being deleted but the deletion crashing.
+        project.delete()
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Group.objects.filter(id=group.id).exists()
+        assert not Organization.objects.filter(id=org.id).exists()
+
+    def test_orphan_commits(self) -> None:
+        # We have had a few orgs get into a state where they have commits
+        # but no repositories. Ensure that we can proceed.
+        org = self.create_organization(name="test")
+
+        repo = Repository.objects.create(organization_id=org.id, name=org.name, provider="dummy")
+        author = CommitAuthor.objects.create(
+            organization_id=org.id, name="foo", email="foo@example.com"
+        )
+        commit = Commit.objects.create(
+            repository_id=repo.id, organization_id=org.id, author=author, key="a" * 40
+        )
+
+        # Simulate the project being deleted but the deletion crashing.
+        repo.delete()
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(id=org.id).exists()
+        assert not Commit.objects.filter(id=commit.id).exists()
+        assert not CommitAuthor.objects.filter(id=author.id).exists()
+
+    def test_alert_rule(self) -> None:
+        org = self.create_organization(name="test", owner=self.user)
+        self.create_team(organization=org, name="test1")
+
+        env = Environment.objects.create(organization_id=org.id, name="foo")
+        snuba_query = SnubaQuery.objects.create(
+            type=SnubaQuery.Type.ERROR.value,
+            dataset="events",
+            aggregate="count()",
+            time_window=60,
+            resolution=60,
+            environment=env,
+        )
+        alert_rule = AlertRule.objects.create(
+            organization=org,
+            name="rule with environment",
+            threshold_period=1,
+            snuba_query=snuba_query,
+            # This status is hidden from the default finder.
+            status=AlertRuleStatus.SNAPSHOT.value,
+        )
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(id=org.id).exists()
+        assert not Environment.objects.filter(id=env.id).exists()
+        assert not AlertRule.objects.filter(id=alert_rule.id).exists()
+        assert not SnubaQuery.objects.filter(id=snuba_query.id).exists()
+
+    def test_discover_query_cleanup(self) -> None:
+        org = self.create_organization(name="test", owner=self.user)
+        self.create_team(organization=org, name="test1")
+
+        other = self.create_organization(name="other", owner=self.user)
+        other_project = self.create_project(organization=other, name="other project")
+
+        query = DiscoverSavedQuery.objects.create(organization=org, name="test query", query={})
+        # Make a cross-org project reference. This can happen when an account was
+        # merged in the past and we didn't update the discover queries.
+        query_project = DiscoverSavedQueryProject.objects.create(
+            discover_saved_query=query, project=other_project
+        )
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(id=org.id).exists()
+        assert not DiscoverSavedQuery.objects.filter(id=query.id).exists()
+        assert not DiscoverSavedQueryProject.objects.filter(id=query_project.id).exists()
+
+    def test_delete_org_simple(self) -> None:
+        name_filter = {"name": "test_delete_org_simple"}
+        org = self.create_organization(**name_filter)
+
+        assert Organization.objects.filter(**name_filter).count() == 1
+        assert self.ScheduledDeletion.objects.count() == 0
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert Organization.objects.filter(**name_filter).count() == 0
+
+    def test_delete_org_after_project_transfer(self) -> None:
+        from_org = self.create_organization(name="from_org")
+        from_user = self.create_user()
+        self.create_member(user=from_user, role="member", organization=from_org)
+        from_team = self.create_team(organization=from_org)
+
+        to_org = self.create_organization(name="to_org")
+        self.create_team(organization=to_org)
+        to_user = self.create_user()
+        self.create_member(user=to_user, role="member", organization=to_org)
+
+        project = self.create_project(teams=[from_team])
+        environment = Environment.get_or_create(project, "production")
+        snuba_query = create_snuba_query(
+            query_type=SnubaQuery.Type.ERROR,
+            dataset=Dataset.Events,
+            query="",
+            aggregate="count()",
+            time_window=timedelta(minutes=5),
+            resolution=timedelta(minutes=1),
+            environment=environment,
+        )
+        subscription = QuerySubscription.objects.create(
+            project=project,
+            snuba_query=snuba_query,
+            type="test",
+        )
+        data_source = self.create_data_source(
+            organization=from_org,
+            source_id=str(subscription.id),
+            type=DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION,
+        )
+        detector = self.create_detector(project=project, type=MetricIssue.slug)
+        self.create_data_source_detector(data_source=data_source, detector=detector)
+        workflow = self.create_workflow(organization=from_org)
+        self.create_detector_workflow(detector=detector, workflow=workflow)
+
+        project.transfer_to(organization=to_org)
+        assert project.organization.id is to_org.id
+
+        snuba_query.refresh_from_db()
+        data_source.refresh_from_db()
+        workflow.refresh_from_db()
+        assert snuba_query.environment is not None
+        assert snuba_query.environment.id != environment.id
+        assert snuba_query.environment.organization_id == to_org.id
+        assert snuba_query.environment.name == environment.name
+        assert data_source.organization_id == to_org.id
+        assert workflow.organization_id == to_org.id
+        assert DetectorWorkflow.objects.filter(detector=detector, workflow=workflow).exists()
+        assert EnvironmentProject.objects.filter(project=project).count() == 1
+        assert (
+            Environment.objects.filter(organization_id=from_org.id, name=environment.name).get().id
+            == environment.id
+        )
+        assert (
+            Environment.objects.filter(organization_id=to_org.id, name=environment.name).get().id
+            != environment.id
+        )
+
+        from_org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=from_org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(name=from_org.name).exists()
+        assert Organization.objects.filter(name=to_org.name).exists()
+        assert not Environment.objects.filter(organization_id=from_org.id).exists()
+        assert Environment.objects.filter(organization_id=to_org.id).count() == 1
+        assert EnvironmentProject.objects.filter(project_id=project.id).count() == 1
+        assert QuerySubscription.objects.filter(id=subscription.id).exists()
+        assert DataSource.objects.filter(id=data_source.id, organization_id=to_org.id).exists()
+        assert Detector.objects.filter(id=detector.id, project_id=project.id).exists()
+        assert Workflow.objects.filter(id=workflow.id, organization_id=to_org.id).exists()
+        assert SnubaQuery.objects.filter(id=snuba_query.id).exclude(environment=None).exists()
+
+    def test_orphan_group_environment_cleanup(self) -> None:
+        # Regression test: GroupEnvironment rows orphaned after group deletion (e.g. groups
+        # deleted via a path that didn't cascade to GroupEnvironment) must not block
+        # Environment deletion. Without the explicit GroupEnvironment child relation in
+        # OrganizationDeletionTask, Django's ORM cascade from environment.delete() fires a
+        # post_delete signal per GroupEnvironment row, which causes timeouts at scale.
+        # Uses multiple environments to exercise the environment_id__in query.
+
+        org = self.create_organization(name="test")
+        project = self.create_project(organization=org)
+        env_prod = Environment.objects.create(organization_id=org.id, name="production")
+        env_staging = Environment.objects.create(organization_id=org.id, name="staging")
+        env_dev = Environment.objects.create(organization_id=org.id, name="development")
+        group1 = Group.objects.create(project=project)
+        group2 = Group.objects.create(project=project)
+        group_env1 = GroupEnvironment.objects.create(group=group1, environment=env_prod)
+        group_env2 = GroupEnvironment.objects.create(group=group1, environment=env_staging)
+        group_env3 = GroupEnvironment.objects.create(group=group2, environment=env_prod)
+        group_env4 = GroupEnvironment.objects.create(group=group2, environment=env_dev)
+
+        # Delete the groups via raw SQL to bypass Django's ORM cascade, leaving the
+        # GroupEnvironment rows orphaned (no parent group) — this is the production scenario.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM sentry_groupedmessage WHERE id IN (%s, %s)",
+                [group1.id, group2.id],
+            )
+        assert (
+            GroupEnvironment.objects.filter(
+                id__in=[group_env1.id, group_env2.id, group_env3.id, group_env4.id]
+            ).count()
+            == 4
+        )
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(id=org.id).exists()
+        assert not Environment.objects.filter(organization_id=org.id).exists()
+        assert not GroupEnvironment.objects.filter(
+            id__in=[group_env1.id, group_env2.id, group_env3.id, group_env4.id]
+        ).exists()
+
+    def test_orphan_group_environment_batched_cleanup(self) -> None:
+        org = self.create_organization(name="test")
+        project = self.create_project(organization=org)
+        envs = [
+            Environment.objects.create(organization_id=org.id, name=f"env-{i}") for i in range(5)
+        ]
+        group = Group.objects.create(project=project)
+        group_envs = [GroupEnvironment.objects.create(group=group, environment=env) for env in envs]
+
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM sentry_groupedmessage WHERE id = %s", [group.id])
+
+        group_env_ids = [ge.id for ge in group_envs]
+        assert GroupEnvironment.objects.filter(id__in=group_env_ids).count() == 5
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with (
+            patch(
+                "sentry.deletions.defaults.organization.GroupEnvironmentBulkDeletionTask.ENV_ID_BATCH_SIZE",
+                2,
+            ),
+            self.tasks(),
+        ):
+            run_scheduled_deletions()
+
+        assert not Organization.objects.filter(id=org.id).exists()
+        assert not Environment.objects.filter(organization_id=org.id).exists()
+        assert not GroupEnvironment.objects.filter(id__in=group_env_ids).exists()
+
+    def test_workflow_engine_cleanup(self) -> None:
+        org = self.create_organization(name="test")
+        project = self.create_project(organization=org)
+
+        dcg = self.create_data_condition_group(organization=org)
+        dc = self.create_data_condition(condition_group=dcg)
+
+        detector = self.create_detector(
+            project_id=project.id,
+            name="Test Detector",
+            type=MetricIssue.slug,
+            workflow_condition_group=dcg,
+        )
+        workflow = self.create_workflow(organization=org, name="Test Workflow")
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Project.objects.filter(id=project.id).exists()
+        assert not Detector.objects.filter(id=detector.id).exists()
+        assert not DataConditionGroup.objects.filter(id=dcg.id).exists()
+        assert not DataCondition.objects.filter(id=dc.id).exists()
+        assert not Workflow.objects.filter(id=workflow.id).exists()
+
+    def test_all_projects_detector_cleanup(self) -> None:
+        org = self.create_organization()
+        project = self.create_project(organization=org)
+        all_projects_detector = self.create_all_projects_detector(organization=org)
+        project_detector = self.create_detector(project=project)
+
+        assert Detector.objects.filter(id=all_projects_detector.id).exists()
+        assert Detector.objects.filter(id=project_detector.id).exists()
+        assert not all_projects_detector.project_id
+        assert project_detector.project_id == project.id
+
+        org.update(status=OrganizationStatus.PENDING_DELETION)
+        self.ScheduledDeletion.schedule(instance=org, days=0)
+
+        with self.tasks():
+            run_scheduled_deletions()
+
+        assert not Detector.objects.filter(id=all_projects_detector.id).exists()
+        assert not Detector.objects.filter(id=project_detector.id).exists()

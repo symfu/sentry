@@ -1,0 +1,29 @@
+import styled from '@emotion/styled';
+
+import {Stack, Flex} from '@sentry/scraps/layout';
+
+interface Props {
+  children: React.ReactNode;
+}
+
+export function SettingsLayout({children}: Props) {
+  return (
+    <SettingsColumn>
+      <Flex flex="1">
+        <Stack flex="1" padding="xl" minWidth="0">
+          {children}
+        </Stack>
+      </Flex>
+    </SettingsColumn>
+  );
+}
+
+const SettingsColumn = styled('div')`
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  footer {
+    margin-top: 0;
+  }
+`;

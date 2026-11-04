@@ -1,127 +1,158 @@
-import pytz
-from datetime import datetime, timedelta
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import cast
 
+from sentry.constants import DataCategory
 from sentry.testutils.cases import OutcomesSnubaTest
 from sentry.tsdb.base import TSDBModel
 from sentry.tsdb.snuba import SnubaTSDB
-from sentry.utils.dates import to_timestamp
 from sentry.utils.outcomes import Outcome
-from sentry_relay import DataCategory
 
 
-def floor_to_hour_epoch(value):
+def floor_to_hour_epoch(value: datetime) -> int:
     value = value.replace(minute=0, second=0, microsecond=0)
-    return int(to_timestamp(value))
+    return int(value.timestamp())
 
 
-def floor_to_10s_epoch(value):
+def floor_to_10s_epoch(value: datetime) -> int:
     seconds = value.second
     floored_second = 10 * (seconds // 10)
 
     value = value.replace(second=floored_second, microsecond=0)
-    return int(to_timestamp(value))
+    return int(value.timestamp())
 
 
 class SnubaTSDBTest(OutcomesSnubaTest):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.db = SnubaTSDB()
 
         # Set up the times
-        self.now = datetime.now(pytz.utc)
+        self.now = datetime.now(timezone.utc)
         self.start_time = self.now - timedelta(days=7)
         self.one_day_later = self.start_time + timedelta(days=1)
         self.day_before_start_time = self.start_time - timedelta(days=1)
 
-    def test_organization_outcomes(self):
+    def test_organization_outcomes(self) -> None:
         other_organization = self.create_organization()
 
         for outcome in [Outcome.ACCEPTED, Outcome.RATE_LIMITED, Outcome.FILTERED]:
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.start_time,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.start_time,
+                    "quantity": 1,
+                },
                 3,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.one_day_later,
+                    "quantity": 1,
+                },
                 4,
             )
             # security and default should be included in these queries
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.SECURITY,
-                self.start_time,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.SECURITY,
+                    "timestamp": self.start_time,
+                    "quantity": 1,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.DEFAULT,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.DEFAULT,
+                    "timestamp": self.one_day_later,
+                    "quantity": 1,
+                },
                 1,
             )
 
             # Also create some outcomes we shouldn't be querying
             self.store_outcomes(
-                other_organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": other_organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.one_day_later,
+                    "quantity": 1,
+                },
                 5,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.day_before_start_time,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.day_before_start_time,
+                    "quantity": 1,
+                },
                 6,
             )
             # we also shouldn't see any other datacategories in these queries
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.TRANSACTION,
-                self.one_day_later,
-                1,
-                1,
-            )
-            self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ATTACHMENT,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.TRANSACTION,
+                    "timestamp": self.one_day_later,
+                    "quantity": 1,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.SESSION,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ATTACHMENT,
+                    "timestamp": self.one_day_later,
+                    "quantity": 1,
+                },
                 1,
             )
+            self.store_outcomes(
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.SESSION,
+                    "timestamp": self.one_day_later,
+                    "quantity": 1,
+                },
+                1,
+            )
+
+        # Add client-discards (which we shouldn't show in total queries)
+        self.store_outcomes(
+            {
+                "org_id": other_organization.id,
+                "project_id": self.project.id,
+                "outcome": Outcome.CLIENT_DISCARD.value,
+                "category": DataCategory.ERROR,
+                "timestamp": self.start_time,
+                "quantity": 1,
+            },
+            5,
+        )
 
         for tsdb_model, granularity, floor_func, start_time_count, day_later_count in [
             (TSDBModel.organization_total_received, 3600, floor_to_hour_epoch, 4 * 3, 5 * 3),
@@ -133,7 +164,13 @@ class SnubaTSDBTest(OutcomesSnubaTest):
         ]:
             # Query SnubaTSDB
             response = self.db.get_range(
-                tsdb_model, [self.organization.id], self.start_time, self.now, granularity, None
+                tsdb_model,
+                [self.organization.id],
+                self.start_time,
+                self.now,
+                granularity,
+                None,
+                tenant_ids={"referrer": "tests", "organization_id": 1},
             )
 
             # Assert that the response has values set for the times we expect, and nothing more
@@ -147,93 +184,123 @@ class SnubaTSDBTest(OutcomesSnubaTest):
                 if time not in [floor_func(self.start_time), floor_func(self.one_day_later)]:
                     assert count == 0
 
-    def test_project_outcomes(self):
+    def test_project_outcomes(self) -> None:
         other_project = self.create_project(organization=self.organization)
 
         for outcome in [Outcome.ACCEPTED, Outcome.RATE_LIMITED, Outcome.FILTERED]:
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.start_time,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.start_time,
+                    "key_id": 1,
+                },
                 1,
-                3,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.one_day_later,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.start_time,
+                    "key_id": 1,
+                    "quantity": 2,
+                },
                 1,
+            )
+            self.store_outcomes(
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.one_day_later,
+                    "key_id": 1,
+                },
                 4,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.SECURITY,
-                self.start_time,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.SECURITY,
+                    "timestamp": self.start_time,
+                    "key_id": 1,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.DEFAULT,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.DEFAULT,
+                    "timestamp": self.one_day_later,
+                    "key_id": 1,
+                },
                 1,
             )
 
             # Also create some outcomes we shouldn't be querying
             self.store_outcomes(
-                self.organization.id,
-                other_project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": other_project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.one_day_later,
+                    "key_id": 1,
+                },
                 5,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.day_before_start_time,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.day_before_start_time,
+                    "key_id": 1,
+                },
                 6,
             )
 
             # we also shouldn't see any other datacategories in these queries
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.TRANSACTION,
-                self.one_day_later,
-                1,
-                1,
-            )
-            self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ATTACHMENT,
-                self.one_day_later,
-                1,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.TRANSACTION,
+                    "timestamp": self.one_day_later,
+                    "key_id": 1,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.SESSION,
-                self.one_day_later,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ATTACHMENT,
+                    "timestamp": self.one_day_later,
+                    "key_id": 1,
+                },
                 1,
+            )
+            self.store_outcomes(
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.SESSION,
+                    "timestamp": self.one_day_later,
+                    "key_id": 1,
+                },
                 1,
             )
 
@@ -246,7 +313,13 @@ class SnubaTSDBTest(OutcomesSnubaTest):
             (TSDBModel.project_total_blacklisted, 10, floor_to_10s_epoch, 4, 5),
         ]:
             response = self.db.get_range(
-                tsdb_model, [self.project.id], self.start_time, self.now, granularity, None
+                tsdb_model,
+                [self.project.id],
+                self.start_time,
+                self.now,
+                granularity,
+                None,
+                tenant_ids={"referrer": "tests", "organization_id": 1},
             )
 
             # Assert that the response has values set for the times we expect, and nothing more
@@ -260,94 +333,112 @@ class SnubaTSDBTest(OutcomesSnubaTest):
                 if time not in [floor_func(self.start_time), floor_func(self.one_day_later)]:
                     assert count == 0
 
-    def test_key_outcomes(self):
+    def test_key_outcomes(self) -> None:
         project_key = self.create_project_key(project=self.project)
         other_project = self.create_project(organization=self.organization)
         other_project_key = self.create_project_key(project=other_project)
 
         for outcome in [Outcome.ACCEPTED, Outcome.RATE_LIMITED, Outcome.FILTERED]:
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.start_time,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.start_time,
+                    "key_id": project_key.id,
+                },
                 3,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.one_day_later,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.one_day_later,
+                    "key_id": project_key.id,
+                },
                 4,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.SECURITY,
-                self.start_time,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.SECURITY,
+                    "timestamp": self.start_time,
+                    "key_id": project_key.id,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.DEFAULT,
-                self.one_day_later,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.DEFAULT,
+                    "timestamp": self.one_day_later,
+                    "key_id": project_key.id,
+                },
                 1,
             )
 
             # Also create some outcomes we shouldn't be querying
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.one_day_later,
-                other_project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.one_day_later,
+                    "key_id": other_project_key.id,
+                },
                 5,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ERROR,
-                self.day_before_start_time,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ERROR,
+                    "timestamp": self.day_before_start_time,
+                    "key_id": project_key.id,
+                },
                 6,
             )
             # we also shouldn't see any other datacategories in these queries
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.TRANSACTION,
-                self.one_day_later,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.TRANSACTION,
+                    "timestamp": self.one_day_later,
+                    "key_id": project_key.id,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.ATTACHMENT,
-                self.one_day_later,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.ATTACHMENT,
+                    "timestamp": self.one_day_later,
+                    "key_id": project_key.id,
+                },
                 1,
             )
             self.store_outcomes(
-                self.organization.id,
-                self.project.id,
-                outcome.value,
-                DataCategory.SESSION,
-                self.one_day_later,
-                project_key.id,
+                {
+                    "org_id": self.organization.id,
+                    "project_id": self.project.id,
+                    "outcome": outcome.value,
+                    "category": DataCategory.SESSION,
+                    "timestamp": self.one_day_later,
+                    "key_id": project_key.id,
+                },
                 1,
             )
 
@@ -363,11 +454,12 @@ class SnubaTSDBTest(OutcomesSnubaTest):
                 # with [project_key.id, str(project_key.id), we are imitating the hack in
                 # project_key_stats.py cause that is what `get_range` will be called with.
                 tsdb_model,
-                [project_key.id, str(project_key.id)],
+                cast("Sequence[int]", [project_key.id, str(project_key.id)]),
                 self.start_time,
                 self.now,
                 granularity,
                 None,
+                tenant_ids={"referrer": "tests", "organization_id": 123},
             )
 
             # Assert that the response has values set for the times we expect, and nothing more
@@ -381,39 +473,8 @@ class SnubaTSDBTest(OutcomesSnubaTest):
                 if time not in [floor_func(self.start_time), floor_func(self.one_day_later)]:
                     assert count == 0
 
-    def test_all_tsdb_models_have_an_entry_in_model_query_settings(self):
+    def test_all_tsdb_models_have_an_entry_in_model_query_settings(self) -> None:
         # Ensure that the models we expect to be using Snuba are using Snuba
-        exceptions = [
-            TSDBModel.project_total_forwarded  # this is not outcomes and will be moved separately
-        ]
-
-        # does not include the internal TSDB model
-        models = [
-            model for model in list(TSDBModel) if 0 < model.value < 700 and model not in exceptions
-        ]
+        models = [model for model in list(TSDBModel) if model.value < 700]
         for model in models:
             assert model in SnubaTSDB.model_query_settings
-
-    def test_outcomes_have_a_10s_setting(self):
-        exceptions = [
-            TSDBModel.project_total_forwarded  # this is not outcomes and will be moved separately
-        ]
-
-        def is_an_outcome(model):
-            if model in exceptions:
-                return False
-
-            # 100 - 200: project outcomes
-            # 200 - 300: organization outcomes
-            # 500 - 600: key outcomes
-            # 600 - 700: filtered project based outcomes
-            return (
-                (100 <= model.value < 200)
-                or (200 <= model.value < 300)
-                or (500 <= model.value < 600)
-                or (600 <= model.value < 700)
-            )
-
-        models = [x for x in list(TSDBModel) if is_an_outcome(x)]
-        for model in models:
-            assert model in SnubaTSDB.lower_rollup_query_settings

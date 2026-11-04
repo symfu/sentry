@@ -1,0 +1,257 @@
+import {MemberFixture} from 'sentry-fixture/member';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {TeamFixture} from 'sentry-fixture/team';
+import {UserFixture} from 'sentry-fixture/user';
+
+import {
+  render,
+  renderGlobalModal,
+  screen,
+  userEvent,
+} from 'sentry-test/reactTestingLibrary';
+import {selectEvent} from 'sentry-test/selectEvent';
+
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {TeamStore} from 'sentry/stores/teamStore';
+import type {OrgRole} from 'sentry/types/organization';
+import {InviteRequestRow} from 'sentry/views/settings/organizationMembers/inviteRequestRow';
+
+const roles: OrgRole[] = [
+  {
+    id: 'admin',
+    name: 'Admin',
+    desc: 'This is the admin role',
+    minimumTeamRole: '',
+    isAllowed: true,
+  },
+  {
+    id: 'member',
+    name: 'Member',
+    desc: 'This is the member role',
+    minimumTeamRole: '',
+    isAllowed: true,
+  },
+  {
+    id: 'owner',
+    name: 'Owner',
+    desc: 'This is the owner role',
+    minimumTeamRole: '',
+    isAllowed: false,
+  },
+];
+
+describe('InviteRequestRow', () => {
+  const orgWithoutAdminAccess = OrganizationFixture({
+    access: [],
+  });
+  const orgWithAdminAccess = OrganizationFixture({
+    access: ['member:admin'],
+  });
+  const inviteRequestBusy: Record<string, boolean> = {};
+
+  const inviteRequest = MemberFixture({
+    user: null,
+    inviterName: UserFixture().name,
+    inviteStatus: 'requested_to_be_invited',
+    role: 'member',
+    teams: ['myteam'],
+  });
+
+  const joinRequest = MemberFixture({
+    user: null,
+    inviteStatus: 'requested_to_join',
+    role: 'member',
+    teams: ['myteam'],
+  });
+
+  it('renders request to be invited', () => {
+    render(
+      <InviteRequestRow
+        organization={orgWithoutAdminAccess}
+        inviteRequest={inviteRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={() => {}}
+        onDeny={() => {}}
+        onUpdate={() => {}}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    expect(screen.getByText(inviteRequest.email)).toBeInTheDocument();
+    expect(
+      screen.getByText(`Requested by ${inviteRequest.inviterName}`)
+    ).toBeInTheDocument();
+  });
+
+  it('renders request to join', () => {
+    render(
+      <InviteRequestRow
+        organization={orgWithoutAdminAccess}
+        inviteRequest={joinRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={() => {}}
+        onDeny={() => {}}
+        onUpdate={() => {}}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    expect(screen.getByText(joinRequest.email)).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Approve'})).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Deny'})).toBeInTheDocument();
+  });
+
+  it('admin can approve invite request', async () => {
+    const mockApprove = jest.fn();
+    const mockDeny = jest.fn();
+
+    render(
+      <InviteRequestRow
+        organization={orgWithAdminAccess}
+        inviteRequest={inviteRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={mockApprove}
+        onDeny={mockDeny}
+        onUpdate={() => {}}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    await userEvent.click(screen.getByRole('button', {name: 'Approve'}));
+
+    renderGlobalModal();
+    await userEvent.click(screen.getByTestId('confirm-button'));
+
+    expect(mockApprove).toHaveBeenCalledWith(inviteRequest);
+    expect(mockDeny).not.toHaveBeenCalled();
+  });
+
+  it('admin can deny invite request', async () => {
+    const mockApprove = jest.fn();
+    const mockDeny = jest.fn();
+
+    render(
+      <InviteRequestRow
+        organization={orgWithAdminAccess}
+        inviteRequest={inviteRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={mockApprove}
+        onDeny={mockDeny}
+        onUpdate={() => {}}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    await userEvent.click(screen.getByRole('button', {name: 'Deny'}));
+
+    expect(mockDeny).toHaveBeenCalledWith(inviteRequest);
+    expect(mockApprove).not.toHaveBeenCalled();
+  });
+
+  it('non-admin can not approve or deny invite request', () => {
+    render(
+      <InviteRequestRow
+        organization={orgWithoutAdminAccess}
+        inviteRequest={inviteRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={() => {}}
+        onDeny={() => {}}
+        onUpdate={() => {}}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    expect(screen.getByRole('button', {name: 'Approve'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('button', {name: 'Deny'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
+
+  it('admin can change role and teams', async () => {
+    const adminInviteRequest = MemberFixture({
+      user: null,
+      inviterName: UserFixture().name,
+      inviteStatus: 'requested_to_be_invited',
+      role: 'admin',
+      teams: ['myteam'],
+    });
+
+    TeamStore.loadInitialData([
+      TeamFixture({id: '1', slug: 'one'}),
+      TeamFixture({id: '2', slug: 'two'}),
+    ]);
+    MockApiClient.addMockResponse({
+      url: `/organizations/${orgWithAdminAccess.slug}/teams/`,
+      match: [MockApiClient.matchQuery({query: 'slug:myteam'})],
+      body: [TeamFixture({id: '3', slug: 'myteam'})],
+    });
+    const mockUpdate = jest.fn();
+
+    render(
+      <InviteRequestRow
+        organization={orgWithAdminAccess}
+        inviteRequest={adminInviteRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={() => {}}
+        onDeny={() => {}}
+        onUpdate={mockUpdate}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    // Select role from first select input
+    await selectEvent.select(screen.getAllByRole('textbox')[0]!, 'Member', {
+      container: document.body,
+    });
+    expect(mockUpdate).toHaveBeenCalledWith({role: 'member'});
+
+    // Select teams from first select input
+    expect(await screen.findByText('#myteam')).toBeInTheDocument();
+    await selectEvent.select(screen.getAllByRole('textbox')[1]!, ['#one'], {
+      container: document.body,
+    });
+    expect(mockUpdate).toHaveBeenCalledWith({teams: ['myteam', 'one']});
+
+    TeamStore.reset();
+  });
+
+  it('cannot be approved when invitee role is not allowed', () => {
+    const ownerInviteRequest = MemberFixture({
+      user: null,
+      inviterName: UserFixture().name,
+      inviteStatus: 'requested_to_be_invited',
+      role: 'owner',
+      teams: ['myteam'],
+    });
+
+    const mockUpdate = jest.fn();
+
+    render(
+      <InviteRequestRow
+        organization={orgWithoutAdminAccess}
+        inviteRequest={ownerInviteRequest}
+        inviteRequestBusy={inviteRequestBusy}
+        onApprove={() => {}}
+        onDeny={() => {}}
+        onUpdate={mockUpdate}
+        allRoles={roles}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    expect(screen.getByRole('button', {name: 'Approve'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
+});

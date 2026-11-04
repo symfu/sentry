@@ -1,0 +1,379 @@
+import logging
+from collections.abc import Iterator, Mapping
+from typing import Any
+
+from django.db import IntegrityError, router, transaction
+
+from sentry.auth.services.auth import RpcApiKey, RpcApiToken, RpcAuthIdentity, RpcAuthProvider
+from sentry.auth.services.orgauthtoken.model import RpcOrgAuthToken
+from sentry.db.models import BaseModel, FlexibleForeignKey
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
+from sentry.db.postgres.transactions import enforce_constraints
+from sentry.hybridcloud.models import (
+    ApiKeyReplica,
+    ApiTokenReplica,
+    OrgAuthTokenReplica,
+)
+from sentry.hybridcloud.outbox.base import ReplicatedCellModel, ReplicatedControlModel
+from sentry.hybridcloud.outbox.category import OutboxCategory
+from sentry.hybridcloud.services.project_key_mapping import RpcProjectKeyMapping
+from sentry.hybridcloud.services.replica.service import CellReplicaService, ControlReplicaService
+from sentry.integrations.models.integration import Integration
+from sentry.models.apikey import ApiKey
+from sentry.models.apitoken import ApiToken
+from sentry.models.authidentity import AuthIdentity
+from sentry.models.authidentityreplica import AuthIdentityReplica
+from sentry.models.authprovider import AuthProvider
+from sentry.models.authproviderreplica import AuthProviderReplica
+from sentry.models.organization import Organization
+from sentry.models.organizationavatarreplica import OrganizationAvatarReplica
+from sentry.models.orgauthtoken import OrgAuthToken
+from sentry.models.project import Project
+from sentry.models.projectkeymapping import ProjectKeyMapping
+from sentry.service_accounts.models import (
+    ServiceAccount,
+    ServiceAccountProjectReplica,
+    ServiceAccountReplica,
+)
+from sentry.service_accounts.services.service_account.model import RpcServiceAccount
+from sentry.silo.base import SiloMode
+from sentry.users.models.user import User
+from sentry.utils import metrics
+
+logger = logging.getLogger(__name__)
+
+
+def _record_replica_write(category: OutboxCategory, outcome: str) -> None:
+    metrics.incr(
+        "hybridcloud.replication.write",
+        tags={
+            "silo": SiloMode.get_current_mode().value.lower(),
+            "category": category.name,
+            "outcome": outcome,
+        },
+    )
+
+
+def get_foreign_key_columns(
+    destination: BaseModel,
+    *source_models: type[BaseModel],
+) -> Iterator[str]:
+    destination_model: type[BaseModel] = type(destination)
+    found_one = False
+    for field in destination_model._meta.get_fields():
+        if isinstance(field, HybridCloudForeignKey):
+            if field.foreign_model in source_models:
+                yield field.name
+                found_one = True
+        elif isinstance(field, FlexibleForeignKey):
+            if field.related_model in source_models:
+                yield field.name
+                found_one = True
+
+    if not found_one:
+        raise TypeError(
+            f"replication to {destination_model} lacking required HybridCloudForeignKey to {source_models}"
+        )
+
+
+def get_foreign_key_column(
+    destination: BaseModel,
+    source_model: type[BaseModel],
+) -> str:
+    return next(get_foreign_key_columns(destination, source_model))
+
+
+def get_conflicting_unique_columns(
+    destination: BaseModel,
+    fk: str,
+    category: OutboxCategory,
+) -> Iterator[list[str]]:
+    destination_model: type[BaseModel] = type(destination)
+
+    uniques = list(destination_model._meta.unique_together) + [
+        (field.name,)
+        for field in destination_model._meta.get_fields()
+        if getattr(field, "unique", False) and not getattr(field, "primary_key", False)
+    ]
+    if not uniques:
+        return
+
+    scope = category.get_scope()
+    scope_controlled_columns: list[str]
+    if scope == scope.USER_SCOPE:
+        scope_controlled_columns = [get_foreign_key_column(destination, User)]
+
+        if isinstance(destination, AuthIdentityReplica):
+            scope_controlled_columns.append("ident")
+    elif scope == scope.ORGANIZATION_SCOPE:
+        scope_controlled_columns = list(
+            get_foreign_key_columns(destination, Organization, AuthProvider)
+        )
+    elif scope == scope.INTEGRATION_SCOPE:
+        scope_controlled_columns = list(
+            get_foreign_key_columns(destination, Organization, Integration)
+        )
+    else:
+        raise TypeError(
+            f"replication to {destination_model} includes unique index that is not scoped by shard!"
+        )
+    scope_controlled_columns.append(fk)
+
+    for columns in uniques:
+        if not any(c in columns for c in scope_controlled_columns):
+            raise TypeError(
+                f"replication to {destination_model} includes unique index that is not scoped by shard: {columns}!"
+            )
+        yield list(columns)
+
+
+def handle_replication(
+    source_model: type[ReplicatedControlModel] | type[ReplicatedCellModel],
+    destination: BaseModel,
+    fk: str | None = None,
+) -> None:
+    category: OutboxCategory = source_model.category
+    destination_model: type[BaseModel] = type(destination)
+    fk = fk or get_foreign_key_column(destination, source_model)
+    dest_filter: Mapping[str, Any] = {fk: getattr(destination, fk)}
+
+    try:
+        with enforce_constraints(transaction.atomic(router.db_for_write(destination_model))):
+            for columns in get_conflicting_unique_columns(destination, fk, category):
+                destination_model.objects.filter(
+                    **{c: getattr(destination, c) for c in columns}
+                ).exclude(**dest_filter).delete()
+            existing = destination_model.objects.filter(**dest_filter).first()
+            if existing:
+                update: Mapping[str, Any] = {
+                    field.name: getattr(destination, field.name)
+                    for field in destination_model._meta.get_fields()
+                    if field.editable and field.name not in ("id", "date_added")
+                }
+                existing.update(**update)
+                outcome = "updated"
+            else:
+                destination.save()
+                outcome = "created"
+    except Exception:
+        _record_replica_write(category, "error")
+        raise
+    _record_replica_write(category, outcome)
+
+
+class DatabaseBackedCellReplicaService(CellReplicaService):
+    def upsert_replicated_api_token(
+        self,
+        *,
+        api_token: RpcApiToken,
+        cell_name: str,
+    ) -> None:
+        organization: Organization | None = None
+        if api_token.organization_id is not None:
+            try:
+                organization = Organization.objects.get(id=api_token.organization_id)
+            except Organization.DoesNotExist:
+                return
+
+        destination = ApiTokenReplica(
+            application_id=api_token.application_id,
+            organization=organization,
+            application_is_active=api_token.application_is_active,
+            token=api_token.token,
+            hashed_token=api_token.hashed_token,
+            expires_at=api_token.expires_at,
+            apitoken_id=api_token.id,
+            scope_list=api_token.scope_list,
+            allowed_origins=(
+                "\n".join(api_token.allowed_origins) if api_token.allowed_origins else None
+            ),
+            user_id=api_token.user_id,
+            scoping_organization_id=api_token.scoping_organization_id,
+        )
+        handle_replication(ApiToken, destination)
+
+    def delete_replicated_api_token(
+        self,
+        *,
+        apitoken_id: int,
+        cell_name: str,
+    ) -> None:
+        with enforce_constraints(transaction.atomic(router.db_for_write(ApiTokenReplica))):
+            api_token_qs = ApiTokenReplica.objects.filter(apitoken_id=apitoken_id)
+            api_token_qs.delete()
+
+    def upsert_replicated_org_auth_token(
+        self,
+        *,
+        token: RpcOrgAuthToken,
+        cell_name: str,
+    ) -> None:
+        try:
+            organization = Organization.objects.get(id=token.organization_id)
+        except Organization.DoesNotExist:
+            return
+
+        destination = OrgAuthTokenReplica(
+            organization=organization,
+            orgauthtoken_id=token.id,
+            token_hashed=token.token_hashed,
+            name=token.name,
+            scope_list=token.scope_list,
+            created_by_id=token.created_by_id,
+            date_deactivated=token.date_deactivated,
+        )
+        handle_replication(OrgAuthToken, destination)
+
+    def upsert_replicated_service_account(
+        self,
+        *,
+        service_account: RpcServiceAccount,
+        cell_name: str,
+    ) -> None:
+        try:
+            organization = Organization.objects.get(id=service_account.organization_id)
+        except Organization.DoesNotExist:
+            return
+
+        destination = ServiceAccountReplica(
+            organization=organization,
+            service_account_id=service_account.id,
+            name=service_account.name,
+            scope_list=service_account.scope_list,
+            is_active=service_account.is_active,
+            all_projects=service_account.all_projects,
+        )
+        with enforce_constraints(transaction.atomic(router.db_for_write(ServiceAccountReplica))):
+            handle_replication(ServiceAccount, destination)
+            replica = ServiceAccountReplica.objects.get(service_account_id=service_account.id)
+            # A control link can outlive its project until the tombstone cascade reaches
+            # control, and survives a transfer of its project to another org.
+            valid_project_ids = set(
+                Project.objects.filter(
+                    organization_id=organization.id, id__in=service_account.project_ids
+                ).values_list("id", flat=True)
+            )
+            links = ServiceAccountProjectReplica.objects.filter(service_account=replica)
+            links.exclude(project_id__in=valid_project_ids).delete()
+            existing_project_ids = set(links.values_list("project_id", flat=True))
+            ServiceAccountProjectReplica.objects.bulk_create(
+                [
+                    ServiceAccountProjectReplica(service_account=replica, project_id=project_id)
+                    for project_id in valid_project_ids - existing_project_ids
+                ]
+            )
+
+    def upsert_replicated_auth_provider(
+        self,
+        *,
+        auth_provider: RpcAuthProvider,
+        cell_name: str,
+    ) -> None:
+        try:
+            organization = Organization.objects.get(id=auth_provider.organization_id)
+        except Organization.DoesNotExist:
+            return
+
+        destination = AuthProviderReplica(
+            auth_provider_id=auth_provider.id,
+            provider=auth_provider.provider,
+            organization_id=organization.id,
+            config=auth_provider.config,
+            default_role=auth_provider.default_role,
+            default_global_access=auth_provider.default_global_access,
+            allow_unlinked=auth_provider.flags.allow_unlinked,
+            scim_enabled=auth_provider.flags.scim_enabled,
+        )
+
+        handle_replication(AuthProvider, destination)
+
+    def upsert_replicated_auth_identity(
+        self,
+        *,
+        auth_identity: RpcAuthIdentity,
+        cell_name: str,
+    ) -> None:
+        destination = AuthIdentityReplica(
+            auth_identity_id=auth_identity.id,
+            user_id=auth_identity.user_id,
+            auth_provider_id=auth_identity.auth_provider_id,
+            ident=auth_identity.ident,
+            data=auth_identity.data,
+            last_verified=auth_identity.last_verified,
+        )
+
+        handle_replication(AuthIdentity, destination)
+
+    def upsert_replicated_api_key(
+        self,
+        *,
+        api_key: RpcApiKey,
+        cell_name: str,
+    ) -> None:
+        try:
+            organization = Organization.objects.get(id=api_key.organization_id)
+        except Organization.DoesNotExist:
+            return
+
+        destination = ApiKeyReplica(
+            apikey_id=api_key.id,
+            organization_id=organization.id,
+            label=api_key.label,
+            key=api_key.key,
+            status=api_key.status,
+            allowed_origins="\n".join(api_key.allowed_origins),
+            scope_list=api_key.scope_list,
+        )
+
+        handle_replication(ApiKey, destination)
+
+    def delete_replicated_auth_provider(
+        self,
+        *,
+        auth_provider_id: int,
+        cell_name: str,
+    ) -> None:
+        with enforce_constraints(transaction.atomic(router.db_for_write(AuthProviderReplica))):
+            AuthProviderReplica.objects.filter(auth_provider_id=auth_provider_id).delete()
+
+
+class DatabaseBackedControlReplicaService(ControlReplicaService):
+    def upsert_project_key_mapping(self, *, project_key: RpcProjectKeyMapping) -> bool:
+        try:
+            with transaction.atomic(router.db_for_write(ProjectKeyMapping)):
+                _, created = ProjectKeyMapping.objects.update_or_create(
+                    project_key_id=project_key.id,
+                    cell_name=project_key.cell_name,
+                    defaults={"public_key": project_key.public_key},
+                )
+        except IntegrityError:
+            logger.error(
+                "project_key_mapping.conflict",
+                extra={"project_key_id": project_key.id, "cell_name": project_key.cell_name},
+            )
+            _record_replica_write(OutboxCategory.PROJECT_KEY_UPDATE, "conflict")
+            return False
+        _record_replica_write(
+            OutboxCategory.PROJECT_KEY_UPDATE, "created" if created else "updated"
+        )
+        return True
+
+    def delete_project_key_mapping(self, *, project_key_id: int, cell_name: str) -> None:
+        ProjectKeyMapping.objects.filter(
+            project_key_id=project_key_id, cell_name=cell_name
+        ).delete()
+
+    def upsert_organization_avatar_replica(
+        self, *, organization_id: int, avatar_type: int, avatar_ident: str
+    ) -> None:
+        with transaction.atomic(router.db_for_write(OrganizationAvatarReplica)):
+            _, created = OrganizationAvatarReplica.objects.update_or_create(
+                organization_id=organization_id,
+                defaults={"avatar_type": avatar_type, "avatar_ident": avatar_ident},
+            )
+        _record_replica_write(
+            OutboxCategory.ORGANIZATION_AVATAR_UPDATE, "created" if created else "updated"
+        )
+
+    def delete_organization_avatar_replica(self, *, organization_id: int) -> None:
+        OrganizationAvatarReplica.objects.filter(organization_id=organization_id).delete()

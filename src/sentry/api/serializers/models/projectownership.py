@@ -1,17 +1,83 @@
+from collections.abc import Mapping
+from datetime import datetime
+from typing import NotRequired, TypedDict
+
+from django.contrib.auth.models import AnonymousUser
+
 from sentry.api.serializers import Serializer, register
-from sentry.models import ProjectOwnership
+from sentry.issues.ownership.grammar import OwnershipRuleMatcher
+from sentry.models.projectownership import ProjectOwnership
+from sentry.users.models.user import User
+from sentry.users.services.user.model import RpcUser
+
+
+class OwnershipRuleOwnerResponse(TypedDict):
+    """Owner as it appears in the API response (after identifier->name rename)."""
+
+    type: str
+    name: str
+    id: NotRequired[str]
+
+
+class OwnershipRuleResponse(TypedDict):
+    matcher: OwnershipRuleMatcher
+    owners: list[OwnershipRuleOwnerResponse]
+
+
+OwnershipSchemaResponse = TypedDict(
+    "OwnershipSchemaResponse", {"$version": int, "rules": list[OwnershipRuleResponse]}
+)
+
+
+# JSON object representing optional part of API response
+class ProjectOwnershipResponseOptional(TypedDict, total=False):
+    schema: OwnershipSchemaResponse | None
+
+
+# JSON object representing this serializer in API response
+class ProjectOwnershipResponse(ProjectOwnershipResponseOptional):
+    raw: str | None
+    fallthrough: bool
+    dateCreated: datetime | None
+    lastUpdated: datetime | None
+    isActive: bool
+    autoAssignment: str
+    codeownersAutoSync: bool | None
 
 
 @register(ProjectOwnership)
-class ProjectOwnershipSerializer(Serializer):
-    def serialize(self, obj, attrs, user):
-        return {
+class ProjectOwnershipSerializer(Serializer[ProjectOwnershipResponse]):
+    def serialize(
+        self,
+        obj: ProjectOwnership,
+        attrs: Mapping[object, object],
+        user: User | RpcUser | AnonymousUser | None,
+        **kwargs: object,
+    ) -> ProjectOwnershipResponse:
+        assignment = (
+            "Auto Assign to Suspect Commits"
+            if obj.auto_assignment and obj.suspect_committer_auto_assignment
+            else (
+                "Auto Assign to Issue Owner"
+                if obj.auto_assignment and not obj.suspect_committer_auto_assignment
+                else "Turn off Auto-Assignment"
+            )
+        )
+
+        project_ownership_data: ProjectOwnershipResponse = {
             "raw": obj.raw,
-            # Should we expose this?
-            # 'schema': obj.schema,
             "fallthrough": obj.fallthrough,
             "dateCreated": obj.date_created,
             "lastUpdated": obj.last_updated,
             "isActive": obj.is_active,
-            "autoAssignment": obj.auto_assignment,
+            "autoAssignment": assignment,
+            "codeownersAutoSync": obj.codeowners_auto_sync,
         }
+        if obj.schema and obj.schema.get("rules"):
+            for rule in obj.schema["rules"]:
+                for owner in rule["owners"]:
+                    if "id" in owner:
+                        owner["id"] = str(owner["id"])
+        project_ownership_data["schema"] = obj.schema
+
+        return project_ownership_data

@@ -1,30 +1,42 @@
+import orjson
+import pytest
 import responses
-import copy
 
-from sentry.shared_integrations.exceptions import IntegrationError
-from sentry.models import ExternalIssue
+from fixtures.gitlab import GitLabTestCase
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.services.integration import integration_service
+from sentry.models.grouplink import GroupLink
+from sentry.shared_integrations.exceptions import IntegrationError, IntegrationFormError
+from sentry.testutils.factories import EventType
+from sentry.testutils.helpers.datetime import before_now
+from sentry.testutils.skips import requires_snuba
 from sentry.utils.http import absolute_uri
-from sentry.testutils.factories import DEFAULT_EVENT_DATA
-from sentry.testutils.helpers.datetime import iso_format, before_now
-from .testutils import GitLabTestCase
+
+pytestmark = [requires_snuba]
 
 
 class GitlabIssuesTest(GitLabTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
-        min_ago = iso_format(before_now(minutes=1))
+        min_ago = before_now(minutes=1).isoformat()
         event = self.store_event(
             data={
                 "event_id": "a" * 32,
                 "message": "message",
                 "timestamp": min_ago,
-                "stacktrace": copy.deepcopy(DEFAULT_EVENT_DATA["stacktrace"]),
             },
             project_id=self.project.id,
+            default_event_type=EventType.DEFAULT,
         )
+        assert event.group is not None
         self.group = event.group
 
-    def test_make_external_key(self):
+    def latest_event_title(self) -> str:
+        event = self.group.get_latest_event()
+        assert event is not None
+        return event.title
+
+    def test_make_external_key(self) -> None:
         project_name = "getsentry/sentry"
         issue_iid = "7"
         external_key = f"{project_name}#{issue_iid}"
@@ -32,15 +44,69 @@ class GitlabIssuesTest(GitLabTestCase):
         data = {"key": external_key}
         assert self.installation.make_external_key(data) == f"{domain_name}:{external_key}"
 
-    def test_get_issue_url(self):
+    def test_get_issue_url(self) -> None:
         issue_id = "example.gitlab.com:project/project#7"
         assert (
             self.installation.get_issue_url(issue_id)
             == "https://example.gitlab.com/project/project/issues/7"
         )
 
+    def test_issue_url_with_deployment_prefix(self) -> None:
+        self.installation.model.metadata.update(
+            base_url="https://example.gitlab.com/gitlab", domain_name="example.gitlab.com/team"
+        )
+        for issue_path in ("issues/13", "-/issues/13"):
+            assert self.installation.get_issue_link_data(
+                f"https://example.gitlab.com/gitlab/team/subgroup/project/{issue_path}?view=1#note"
+            ) == {"externalIssue": "team/subgroup/project#13"}
+
+    def test_issue_url_rejects_other_installations(self) -> None:
+        self.installation.model.metadata.update(
+            base_url="https://example.gitlab.com/gitlab", domain_name="example.gitlab.com/team"
+        )
+        for url in (
+            "https://other.gitlab.com/gitlab/team/project/-/issues/13",
+            "https://example.gitlab.com/gitlab-archive/team/project/-/issues/13",
+            "https://example.gitlab.com/gitlab/team-other/project/-/issues/13",
+        ):
+            with pytest.raises(IntegrationFormError):
+                self.installation.get_issue_link_data(url)
+
     @responses.activate
-    def test_get_create_issue_config(self):
+    def test_link_issue_url(self) -> None:
+        project = "group-x/subgroup/project"
+        api_url = "https://example.gitlab.com/api/v4/projects/group-x%2Fsubgroup%2Fproject"
+        responses.get(
+            f"{api_url}/issues/13",
+            json={
+                "iid": 13,
+                "title": "Existing issue",
+                "description": "Details",
+                "web_url": f"https://example.gitlab.com/{project}/-/issues/13",
+            },
+        )
+        responses.get(api_url, json={"id": 12, "path_with_namespace": project})
+
+        with self.feature("organizations:integrations-issue-basic"):
+            for issue_path in ("-/issues/13", "issues/13"):
+                group = self.create_group(project=self.project)
+                path = f"/api/0/organizations/{self.organization.slug}/issues/{group.id}/integrations/{self.integration.id}/"
+                response = self.client.put(
+                    path,
+                    data={"externalIssue": f"https://example.gitlab.com/{project}/{issue_path}"},
+                )
+                assert response.status_code == 201
+                assert response.data["key"] == f"example.gitlab.com/group-x:{project}#13"
+                assert GroupLink.objects.filter(
+                    group_id=group.id,
+                    linked_id=response.data["id"],
+                    linked_type=GroupLink.LinkedType.issue,
+                    relationship=GroupLink.Relationship.references,
+                ).exists()
+        assert len(responses.calls) == 4
+
+    @responses.activate
+    def test_get_create_issue_config(self) -> None:
         group_description = (
             "Sentry Issue: [%s](%s)\n\n"
             "```\nStacktrace (most recent call first):\n\n"
@@ -55,8 +121,18 @@ class GitlabIssuesTest(GitLabTestCase):
             "https://example.gitlab.com/api/v4/groups/%s/projects"
             % self.installation.model.metadata["group_id"],
             json=[
-                {"name_with_namespace": "getsentry / sentry", "id": 1},
-                {"name_with_namespace": "getsentry / hello", "id": 22},
+                {
+                    "name_with_namespace": "getsentry / sentry",
+                    "id": 1,
+                    "path_with_namespace": "getsentry/sentry",
+                    "web_url": "https://example.gitlab.com/getsentry/sentry",
+                },
+                {
+                    "name_with_namespace": "getsentry / hello",
+                    "id": 22,
+                    "path_with_namespace": "getsentry/hello",
+                    "web_url": "https://example.gitlab.com/getsentry/hello",
+                },
             ],
         )
         assert self.installation.get_create_issue_config(self.group, self.user) == [
@@ -66,13 +142,13 @@ class GitlabIssuesTest(GitLabTestCase):
                 "required": True,
                 "type": "select",
                 "label": "GitLab Project",
-                "choices": [(1, "getsentry / sentry"), (22, "getsentry / hello")],
-                "defaultValue": 1,
+                "choices": [("1", "getsentry / sentry"), ("22", "getsentry / hello")],
+                "defaultValue": "1",
             },
             {
                 "name": "title",
                 "label": "Title",
-                "default": self.group.get_latest_event().title,
+                "default": self.latest_event_title(),
                 "type": "string",
                 "required": True,
             },
@@ -87,14 +163,24 @@ class GitlabIssuesTest(GitLabTestCase):
         ]
 
     @responses.activate
-    def test_get_link_issue_config(self):
+    def test_get_link_issue_config(self) -> None:
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/groups/%s/projects"
             % self.installation.model.metadata["group_id"],
             json=[
-                {"name_with_namespace": "getsentry / sentry", "id": 1},
-                {"name_with_namespace": "getsentry / hello", "id": 22},
+                {
+                    "name_with_namespace": "getsentry / sentry",
+                    "id": 1,
+                    "path_with_namespace": "getsentry/sentry",
+                    "web_url": "https://example.gitlab.com/getsentry/sentry",
+                },
+                {
+                    "name_with_namespace": "getsentry / hello",
+                    "id": 22,
+                    "path_with_namespace": "getsentry/hello",
+                    "web_url": "https://example.gitlab.com/getsentry/hello",
+                },
             ],
         )
         autocomplete_url = "/extensions/gitlab/search/baz/%d/" % self.installation.model.id
@@ -103,8 +189,8 @@ class GitlabIssuesTest(GitLabTestCase):
                 "name": "project",
                 "label": "GitLab Project",
                 "type": "select",
-                "default": 1,
-                "choices": [(1, "getsentry / sentry"), (22, "getsentry / hello")],
+                "default": "1",
+                "choices": [("1", "getsentry / sentry"), ("22", "getsentry / hello")],
                 "url": autocomplete_url,
                 "updatesForm": True,
                 "required": True,
@@ -120,7 +206,7 @@ class GitlabIssuesTest(GitLabTestCase):
             {
                 "name": "comment",
                 "label": "Comment",
-                "default": "Sentry issue: [{issue_id}]({url})".format(
+                "default": "Sentry Issue: [{issue_id}]({url})".format(
                     url=absolute_uri(
                         self.group.get_absolute_url(params={"referrer": "gitlab_integration"})
                     ),
@@ -128,12 +214,12 @@ class GitlabIssuesTest(GitLabTestCase):
                 ),
                 "type": "textarea",
                 "required": False,
-                "help": ("Leave blank if you don't want to " "add a comment to the GitLab issue."),
+                "help": ("Leave blank if you don't want to add a comment to the GitLab issue."),
             },
         ]
 
     @responses.activate
-    def test_create_issue(self):
+    def test_create_issue(self) -> None:
         issue_iid = "1"
         project_id = "10"
         project_name = "getsentry/sentry"
@@ -170,7 +256,7 @@ class GitlabIssuesTest(GitLabTestCase):
         }
 
     @responses.activate
-    def test_get_issue(self):
+    def test_get_issue(self) -> None:
         project_id = "12"
         project_name = "getsentry/sentry"
         issue_iid = "13"
@@ -202,7 +288,7 @@ class GitlabIssuesTest(GitLabTestCase):
         }
 
     @responses.activate
-    def test_create_issue_default_project_in_group_api_call(self):
+    def test_create_issue_default_project_in_group_api_call(self) -> None:
         group_description = (
             "Sentry Issue: [%s](%s)\n\n"
             "```\nStacktrace (most recent call first):\n\n"
@@ -214,20 +300,39 @@ class GitlabIssuesTest(GitLabTestCase):
         )
         project_id = 10
         project_name = "This_is / a_project"
-        org_integration = self.installation.org_integration
-        org_integration.config["project_issue_defaults"] = {
-            str(self.group.project_id): {"project": project_id}
-        }
-        org_integration.save()
+        assert self.installation.org_integration is not None
+        org_integration = integration_service.update_organization_integration(
+            org_integration_id=self.installation.org_integration.id,
+            config={
+                "project_issue_defaults": {str(self.group.project_id): {"project": project_id}}
+            },
+        )
+        assert org_integration is not None
+        self.installation.org_integration = org_integration
 
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/groups/%s/projects"
             % self.installation.model.metadata["group_id"],
             json=[
-                {"name_with_namespace": "getsentry / sentry", "id": 1},
-                {"name_with_namespace": project_name, "id": project_id},
-                {"name_with_namespace": "getsentry / hello", "id": 22},
+                {
+                    "name_with_namespace": "getsentry / sentry",
+                    "id": 1,
+                    "path_with_namespace": "getsentry/sentry",
+                    "web_url": "https://example.gitlab.com/getsentry/sentry",
+                },
+                {
+                    "name_with_namespace": project_name,
+                    "id": project_id,
+                    "path_with_namespace": "this_is/a_project",
+                    "web_url": "https://example.gitlab.com/this_is/a_project",
+                },
+                {
+                    "name_with_namespace": "getsentry / hello",
+                    "id": 22,
+                    "path_with_namespace": "getsentry/hello",
+                    "web_url": "https://example.gitlab.com/getsentry/hello",
+                },
             ],
         )
         responses.add(
@@ -241,18 +346,18 @@ class GitlabIssuesTest(GitLabTestCase):
                 "name": "project",
                 "required": True,
                 "choices": [
-                    (1, "getsentry / sentry"),
-                    (10, "This_is / a_project"),
-                    (22, "getsentry / hello"),
+                    ("1", "getsentry / sentry"),
+                    ("10", "This_is / a_project"),
+                    ("22", "getsentry / hello"),
                 ],
-                "defaultValue": project_id,
+                "defaultValue": str(project_id),
                 "type": "select",
                 "label": "GitLab Project",
             },
             {
                 "name": "title",
                 "label": "Title",
-                "default": self.group.get_latest_event().title,
+                "default": self.latest_event_title(),
                 "type": "string",
                 "required": True,
             },
@@ -267,7 +372,7 @@ class GitlabIssuesTest(GitLabTestCase):
         ]
 
     @responses.activate
-    def test_create_issue_default_project_not_in_api_call(self):
+    def test_create_issue_default_project_not_in_api_call(self) -> None:
         group_description = (
             "Sentry Issue: [%s](%s)\n\n"
             "```\nStacktrace (most recent call first):\n\n"
@@ -279,25 +384,44 @@ class GitlabIssuesTest(GitLabTestCase):
         )
         project_id = 10
         project_name = "This_is / a_project"
-        org_integration = self.installation.org_integration
-        org_integration.config["project_issue_defaults"] = {
-            str(self.group.project_id): {"project": project_id}
-        }
-        org_integration.save()
+        assert self.installation.org_integration is not None
+        org_integration = integration_service.update_organization_integration(
+            org_integration_id=self.installation.org_integration.id,
+            config={
+                "project_issue_defaults": {str(self.group.project_id): {"project": project_id}}
+            },
+        )
+        assert org_integration is not None
+        self.installation.org_integration = org_integration
 
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/groups/%s/projects"
             % self.installation.model.metadata["group_id"],
             json=[
-                {"name_with_namespace": "getsentry / sentry", "id": 1},
-                {"name_with_namespace": "getsentry / hello", "id": 22},
+                {
+                    "name_with_namespace": "getsentry / sentry",
+                    "id": 1,
+                    "path_with_namespace": "getsentry/sentry",
+                    "web_url": "https://example.gitlab.com/getsentry/sentry",
+                },
+                {
+                    "name_with_namespace": "getsentry / hello",
+                    "id": 22,
+                    "path_with_namespace": "getsentry/hello",
+                    "web_url": "https://example.gitlab.com/getsentry/hello",
+                },
             ],
         )
         responses.add(
             responses.GET,
             "https://example.gitlab.com/api/v4/projects/%s" % project_id,
-            json={"name_with_namespace": project_name, "id": project_id},
+            json={
+                "name_with_namespace": project_name,
+                "id": project_id,
+                "path_with_namespace": "this_is/a_project",
+                "web_url": "https://example.gitlab.com/this_is/a_project",
+            },
         )
         assert self.installation.get_create_issue_config(self.group, self.user) == [
             {
@@ -305,18 +429,18 @@ class GitlabIssuesTest(GitLabTestCase):
                 "name": "project",
                 "required": True,
                 "choices": [
-                    (10, "This_is / a_project"),
-                    (1, "getsentry / sentry"),
-                    (22, "getsentry / hello"),
+                    ("10", "This_is / a_project"),
+                    ("1", "getsentry / sentry"),
+                    ("22", "getsentry / hello"),
                 ],
-                "defaultValue": project_id,
+                "defaultValue": str(project_id),
                 "type": "select",
                 "label": "GitLab Project",
             },
             {
                 "name": "title",
                 "label": "Title",
-                "default": self.group.get_latest_event().title,
+                "default": self.latest_event_title(),
                 "type": "string",
                 "required": True,
             },
@@ -331,7 +455,7 @@ class GitlabIssuesTest(GitLabTestCase):
         ]
 
     @responses.activate
-    def test_create_issue_no_projects(self):
+    def test_create_issue_no_projects(self) -> None:
         group_description = (
             "Sentry Issue: [%s](%s)\n\n"
             "```\nStacktrace (most recent call first):\n\n"
@@ -361,7 +485,7 @@ class GitlabIssuesTest(GitLabTestCase):
             {
                 "name": "title",
                 "label": "Title",
-                "default": self.group.get_latest_event().title,
+                "default": self.latest_event_title(),
                 "type": "string",
                 "required": True,
             },
@@ -376,11 +500,11 @@ class GitlabIssuesTest(GitLabTestCase):
         ]
 
     @responses.activate
-    def test_after_link_issue(self):
+    def test_after_link_issue(self) -> None:
         responses.add(
             responses.POST,
             "https://example.gitlab.com/api/v4/projects/2/issues/321/notes",
-            json=[],
+            json={},
         )
         data = {"externalIssue": "2#321", "comment": "This is not good."}
         external_issue = ExternalIssue.objects.create(
@@ -388,16 +512,17 @@ class GitlabIssuesTest(GitLabTestCase):
         )
         self.installation.after_link_issue(external_issue, data=data)
 
-    def test_after_link_issue_required_fields(self):
+    @responses.activate
+    def test_after_link_issue_required_fields(self) -> None:
         data = {"externalIssue": "2#231", "comment": "This is not good."}
         external_issue = ExternalIssue.objects.create(
             organization_id=self.organization.id, integration_id=self.integration.id, key="#"
         )
-        with self.assertRaises(IntegrationError):
+        with pytest.raises(IntegrationError):
             self.installation.after_link_issue(external_issue, data=data)
 
     @responses.activate
-    def test_after_link_issue_failure(self):
+    def test_after_link_issue_failure(self) -> None:
         responses.add(
             responses.POST,
             "https://example.gitlab.com/api/v4/projects/2/issues/321/notes",
@@ -407,5 +532,102 @@ class GitlabIssuesTest(GitLabTestCase):
         external_issue = ExternalIssue.objects.create(
             organization_id=self.organization.id, integration_id=self.integration.id, key="2#321"
         )
-        with self.assertRaises(IntegrationError):
+        with pytest.raises(IntegrationError):
             self.installation.after_link_issue(external_issue, data=data)
+
+    @responses.activate
+    def test_create_issue_missing_title(self) -> None:
+        """Test that an error is raised when title is missing"""
+        project_id = "10"
+        data_without_title = {
+            "project": project_id,
+            "description": "This is a test issue description",
+        }
+
+        with pytest.raises(IntegrationFormError):
+            self.installation.create_issue(data_without_title)
+
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_create_issue_title_too_long(self) -> None:
+        """Test that title is truncated when it exceeds max length"""
+        project_id = "10"
+        project_name = "getsentry/sentry"
+        issue_iid = "1"
+
+        long_title = "A" * 300  # Title longer than GITLAB_ISSUE_TITLE_MAX_LENGTH (255)
+        expected_truncated_title = "A" * 252 + "..."  # 255 - 3 chars for ellipsis
+
+        data_with_long_title = {
+            "project": project_id,
+            "title": long_title,
+            "description": "This is a test issue description",
+        }
+
+        responses.add(
+            responses.POST,
+            f"https://example.gitlab.com/api/v4/projects/{project_id}/issues",
+            json={
+                "id": 8,
+                "iid": issue_iid,
+                "title": expected_truncated_title,
+                "description": "This is a test issue description",
+                "web_url": f"https://example.gitlab.com/{project_name}/issues/{issue_iid}",
+            },
+            status=201,
+        )
+
+        responses.add(
+            responses.GET,
+            f"https://example.gitlab.com/api/v4/projects/{project_id}",
+            json={"path_with_namespace": project_name, "id": int(project_id)},
+        )
+
+        result = self.installation.create_issue(data_with_long_title)
+
+        assert len(responses.calls) == 2
+        request_data = orjson.loads(responses.calls[0].request.body)
+        assert request_data["title"] == expected_truncated_title
+        assert len(request_data["title"]) == 255
+
+        assert result["title"] == expected_truncated_title
+
+    @responses.activate
+    def test_create_issue_api_error(self) -> None:
+        """Test handling of API errors during issue creation"""
+        project_id = "10"
+        error_response = {"message": "Project not found"}
+
+        responses.add(
+            responses.POST,
+            f"https://example.gitlab.com/api/v4/projects/{project_id}/issues",
+            json=error_response,
+            status=404,
+        )
+
+        with pytest.raises(IntegrationError):
+            self.installation.create_issue(
+                {
+                    "project": project_id,
+                    "title": "Test Issue Title",
+                    "description": "This is a test issue description",
+                }
+            )
+
+        assert len(responses.calls) == 1
+        assert responses.calls[0].response.status_code == 404
+
+    @responses.activate
+    def test_create_issue_missing_project(self) -> None:
+        """Test that an error is raised when project is missing"""
+        with pytest.raises(IntegrationError) as excinfo:
+            self.installation.create_issue(
+                {
+                    "title": "Test Issue Title",
+                    "description": "This is a test issue description",
+                }
+            )
+
+        assert "project kwarg must be provided" in str(excinfo.value)
+        assert len(responses.calls) == 0

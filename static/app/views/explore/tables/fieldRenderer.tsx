@@ -1,0 +1,451 @@
+import {useMemo} from 'react';
+import {useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import type {MenuItemProps} from '@sentry/scraps/dropdownMenu';
+import {InfoText} from '@sentry/scraps/info';
+import {Container as ScrapsContainer} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import {Text} from '@sentry/scraps/text';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import ProjectBadge from 'sentry/components/idBadge/projectBadge';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {
+  type CaseInsensitive,
+  useCaseInsensitivity,
+} from 'sentry/components/searchQueryBuilder/hooks';
+import {TimeSince} from 'sentry/components/timeSince';
+import {t, tct} from 'sentry/locale';
+import type {Project} from 'sentry/types/project';
+import {defined} from 'sentry/utils/defined';
+import type {TableDataRow} from 'sentry/utils/discover/discoverQuery';
+import {nullableValue} from 'sentry/utils/discover/emptyFieldValues';
+import type {EventData, MetaType} from 'sentry/utils/discover/eventView';
+import {EventView} from 'sentry/utils/discover/eventView';
+import {getFieldRenderer, renderUrlCellValue} from 'sentry/utils/discover/fieldRenderers';
+import {Container} from 'sentry/utils/discover/styles';
+import {generateLinkToEventInTraceView} from 'sentry/utils/discover/urls';
+import {getShortEventId} from 'sentry/utils/events';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {
+  type Actions,
+  CellAction,
+  updateQuery,
+} from 'sentry/views/discover/table/cellAction';
+import type {TableColumn} from 'sentry/views/discover/table/types';
+import {ALLOWED_CELL_ACTIONS} from 'sentry/views/explore/components/cellActions';
+import {
+  useReadQueriesFromLocation,
+  useUpdateQueryAtIndex,
+} from 'sentry/views/explore/multiQueryMode/locationUtils';
+import {
+  useQueryParamsQuery,
+  useSetQueryParamsQuery,
+} from 'sentry/views/explore/queryParams/context';
+import {
+  getSimilarEventsUrl,
+  isPartialSpanOrTraceData,
+} from 'sentry/views/explore/tables/tracesTable/utils';
+import {SpanFields} from 'sentry/views/insights/types';
+import {TraceViewSources} from 'sentry/views/performance/traceDetails/traceHeader/traceViewSources';
+import {getTraceDetailsUrl} from 'sentry/views/performance/traceDetails/traceUrl';
+
+interface FieldProps {
+  data: EventData;
+  meta: MetaType;
+  allowActions?: Actions[];
+  column?: TableColumn<keyof TableDataRow>;
+  disableTraceLinks?: boolean;
+  extraMenuItems?: MenuItemProps[];
+  tooltipTitle?: React.ReactNode;
+  unit?: string;
+  usePortalOnDropdown?: boolean;
+}
+
+export function FieldRenderer({
+  data,
+  meta,
+  unit,
+  column,
+  allowActions,
+  disableTraceLinks,
+  extraMenuItems,
+  tooltipTitle,
+  usePortalOnDropdown,
+}: FieldProps) {
+  const userQuery = useQueryParamsQuery();
+  const setUserQuery = useSetQueryParamsQuery();
+
+  return (
+    <BaseExploreFieldRenderer
+      data={data}
+      meta={meta}
+      unit={unit}
+      column={column}
+      allowActions={allowActions}
+      disableTraceLinks={disableTraceLinks}
+      extraMenuItems={extraMenuItems}
+      tooltipTitle={tooltipTitle}
+      userQuery={userQuery}
+      setUserQuery={setUserQuery}
+      usePortalOnDropdown={usePortalOnDropdown}
+    />
+  );
+}
+
+interface MultiQueryFieldProps extends FieldProps {
+  index: number;
+}
+
+export function MultiQueryFieldRenderer({
+  data,
+  meta,
+  unit,
+  column,
+  index,
+  extraMenuItems,
+  tooltipTitle,
+}: MultiQueryFieldProps) {
+  const queries = useReadQueriesFromLocation();
+  const userQuery = queries[index]?.query ?? '';
+  const updateQuerySearch = useUpdateQueryAtIndex(index);
+
+  return (
+    <BaseExploreFieldRenderer
+      data={data}
+      meta={meta}
+      unit={unit}
+      column={column}
+      extraMenuItems={extraMenuItems}
+      tooltipTitle={tooltipTitle}
+      userQuery={userQuery}
+      setUserQuery={(query: string) => updateQuerySearch({query})}
+      caseInsensitive={queries[index]?.caseInsensitive === '1' ? true : null}
+    />
+  );
+}
+
+interface BaseFieldProps extends FieldProps {
+  setUserQuery: (query: string) => void;
+  userQuery: string;
+  caseInsensitive?: CaseInsensitive;
+}
+
+function BaseExploreFieldRenderer({
+  data,
+  meta,
+  unit,
+  column,
+  allowActions,
+  disableTraceLinks,
+  extraMenuItems,
+  userQuery,
+  setUserQuery,
+  tooltipTitle,
+  usePortalOnDropdown,
+  caseInsensitive: queryCaseInsensitive,
+}: BaseFieldProps) {
+  if (!defined(column)) {
+    return nullableValue(null);
+  }
+
+  let rendered: React.ReactNode = (
+    <ExploreFieldValue
+      data={data}
+      meta={meta}
+      unit={unit}
+      column={column}
+      disableTraceLinks={disableTraceLinks}
+      queryCaseInsensitive={queryCaseInsensitive}
+    />
+  );
+
+  if (String(column.key) === 'id') {
+    return rendered;
+  }
+
+  if (defined(tooltipTitle)) {
+    rendered = (
+      <Tooltip title={tooltipTitle} showOnlyOnOverflow containerDisplayMode="block">
+        {rendered}
+      </Tooltip>
+    );
+  }
+
+  return (
+    <CellAction
+      column={column}
+      dataRow={data as TableDataRow}
+      handleCellAction={(actions, value) => {
+        const query = new MutableSearch(userQuery);
+        updateQuery(query, actions, column, value);
+        setUserQuery(query.formatString());
+      }}
+      allowActions={allowActions ?? ALLOWED_CELL_ACTIONS}
+      extraMenuItems={extraMenuItems}
+      usePortalOnDropdown={usePortalOnDropdown}
+    >
+      {rendered}
+    </CellAction>
+  );
+}
+
+function ExploreFieldValue({
+  data,
+  meta,
+  unit,
+  column,
+  disableTraceLinks,
+  queryCaseInsensitive,
+}: Pick<FieldProps, 'data' | 'meta' | 'unit' | 'disableTraceLinks'> & {
+  column: TableColumn<keyof TableDataRow>;
+  queryCaseInsensitive?: CaseInsensitive;
+}) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const organization = useOrganization();
+  const theme = useTheme();
+  const {selection} = usePageFilters();
+  const [pageCaseInsensitive] = useCaseInsensitivity();
+  const caseInsensitive = queryCaseInsensitive ?? pageCaseInsensitive;
+  const dateSelection = EventView.fromLocation(location).normalizeDateSelection(location);
+  const {projects} = useProjects();
+  const projectsMap = useMemo(() => {
+    return projects.reduce<Record<string, Project>>((acc, project) => {
+      acc[project.slug] = project;
+      return acc;
+    }, {});
+  }, [projects]);
+
+  const project = projectsMap[data.project];
+
+  const field = String(column.key);
+
+  const renderer = getExploreFieldRenderer(field, meta, projectsMap);
+
+  let rendered = renderer(data, {
+    location,
+    navigate,
+    organization,
+    theme,
+    unit,
+    projects,
+  });
+
+  if (field === 'timestamp') {
+    const date = new Date(data.timestamp);
+    rendered = <StyledTimeSince unitStyle="short" date={date} tooltipShowSeconds />;
+  }
+
+  if (field === 'trace' && !disableTraceLinks) {
+    if (isPartialSpanOrTraceData(data.timestamp)) {
+      const queryString = new MutableSearch('');
+
+      if (data?.['span.name']) {
+        queryString.addFilterValue('span.name', data['span.name']);
+      }
+
+      if (data?.['span.description']) {
+        queryString.addFilterValue('span.description', data['span.description']);
+      }
+      rendered = (
+        <ScrapsContainer maxWidth="fit-content">
+          <InfoText
+            title={
+              <Text>
+                {tct(
+                  'Trace is older than 30 days. [similarTraces] in the past 24 hours.',
+                  {
+                    similarTraces: (
+                      <Link
+                        to={getSimilarEventsUrl({
+                          caseInsensitive,
+                          queryString: queryString.formatString(),
+                          table: 'trace',
+                          organization,
+                          projectIds: defined(project?.id)
+                            ? [parseInt(project.id, 10)]
+                            : selection.projects,
+                          selection,
+                        })}
+                      >
+                        {t('View similar traces')}
+                      </Link>
+                    ),
+                  }
+                )}
+              </Text>
+            }
+            variant="muted"
+          >
+            {rendered}
+          </InfoText>
+        </ScrapsContainer>
+      );
+    } else {
+      const target = getTraceDetailsUrl({
+        traceSlug: data.trace,
+        timestamp: data.timestamp,
+        organization,
+        dateSelection,
+        location,
+        source: TraceViewSources.TRACES,
+      });
+
+      rendered = <Link to={target}>{rendered}</Link>;
+    }
+  }
+
+  if (!disableTraceLinks && ['id', 'span_id', 'transaction.id'].includes(field)) {
+    const spanId = field === 'transaction.id' ? undefined : (data.span_id ?? data.id);
+
+    if (isPartialSpanOrTraceData(data.timestamp)) {
+      const queryString = new MutableSearch('');
+
+      if (field === 'transaction.id') {
+        queryString.addFilterValue('is_transaction', 'true');
+      }
+
+      if (data?.['span.name']) {
+        queryString.addFilterValue('span.name', data['span.name']);
+      }
+
+      if (data?.['span.description']) {
+        queryString.addFilterValue('span.description', data['span.description']);
+      }
+
+      rendered = (
+        <ScrapsContainer maxWidth="fit-content">
+          <InfoText
+            title={
+              <Text>
+                {tct('Span is older than 30 days. [similarSpans] in the past 24 hours.', {
+                  similarSpans: (
+                    <Link
+                      to={getSimilarEventsUrl({
+                        caseInsensitive,
+                        queryString: queryString.formatString(),
+                        organization,
+                        projectIds: defined(project?.id)
+                          ? [parseInt(project.id, 10)]
+                          : selection.projects,
+                        selection,
+                      })}
+                    >
+                      {t('View similar spans')}
+                    </Link>
+                  ),
+                })}
+              </Text>
+            }
+            variant="muted"
+          >
+            {rendered}
+          </InfoText>
+        </ScrapsContainer>
+      );
+    } else {
+      const target = generateLinkToEventInTraceView({
+        traceSlug: data.trace,
+        timestamp: data.timestamp,
+        targetId: data['transaction.span_id'],
+        eventId: undefined,
+        organization,
+        location,
+        spanId,
+        source: TraceViewSources.TRACES,
+      });
+
+      rendered = <Link to={target}>{rendered}</Link>;
+    }
+  }
+
+  return rendered;
+}
+
+function getExploreFieldRenderer(
+  field: string,
+  meta: MetaType,
+  projects: Record<string, Project>
+): ReturnType<typeof getFieldRenderer> {
+  if (field === 'id' || field === 'span_id') {
+    return eventIdRenderFunc(field);
+  }
+  if (field === SpanFields.NAME) {
+    return spanDescriptionRenderFunc(SpanFields.NAME, projects);
+  }
+  return getFieldRenderer(field, meta, false);
+}
+
+function eventIdRenderFunc(field: string) {
+  function renderer(data: EventData) {
+    const spanId: string | unknown = data?.[field];
+    if (typeof spanId !== 'string') {
+      return null;
+    }
+
+    return <Container>{getShortEventId(spanId)}</Container>;
+  }
+  return renderer;
+}
+
+function spanDescriptionRenderFunc(field: string, projects: Record<string, Project>) {
+  function renderer(data: EventData) {
+    const project = projects[data.project];
+
+    const value = data[field];
+
+    return (
+      <span>
+        <Tooltip
+          title={value}
+          containerDisplayMode="block"
+          showOnlyOnOverflow
+          maxWidth={400}
+        >
+          <Description>
+            {project && (
+              <ProjectBadge
+                project={project ? project : {slug: data.project}}
+                avatarSize={16}
+                avatarProps={{hasTooltip: true, tooltip: project.slug}}
+                hideName
+                disableLink
+              />
+            )}
+            <WrappingText>{renderUrlCellValue(value)}</WrappingText>
+          </Description>
+        </Tooltip>
+      </span>
+    );
+  }
+  return renderer;
+}
+
+const StyledTimeSince = styled(TimeSince)`
+  width: fit-content;
+`;
+
+const Description = styled('div')`
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: ${p => p.theme.space.md};
+`;
+
+const WrappingText = styled('div')`
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: auto;
+`;

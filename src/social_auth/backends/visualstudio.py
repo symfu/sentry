@@ -4,15 +4,16 @@ VISUALSTUDIO_CLIENT_ID & VISUALSTUDIO_CLIENT_SECRET
 and put into sentry.conf.py
 """
 
+from collections.abc import Mapping
+from typing import Any
+
 import requests
-
 from django.conf import settings
-from django.core.urlresolvers import reverse
-
-from social_auth.backends import BaseOAuth2, OAuthBackend
-from social_auth.utils import setting
+from django.urls import reverse
 
 from sentry.utils.http import absolute_uri
+from social_auth.backends import BaseOAuth2, OAuthBackend
+from social_auth.utils import setting
 
 VISUALSTUDIO_AUTHORIZATION_URL = "https://app.vssps.visualstudio.com/oauth2/authorize"
 VISUALSTUDIO_TOKEN_EXCHANGE_URL = "https://app.vssps.visualstudio.com/oauth2/token"
@@ -27,7 +28,7 @@ class VisualStudioBackend(OAuthBackend):
     name = "visualstudio"
     EXTRA_DATA = [("id", "id"), ("refresh_token", "refresh_token")]
 
-    def get_user_details(self, response):
+    def get_user_details(self, response: Mapping[str, Any]) -> dict[str, Any]:
         """Return user details from Visual Studio account"""
         return {
             "email": response.get("email"),
@@ -49,7 +50,7 @@ class VisualStudioAuth(BaseOAuth2):
     DEFAULT_SCOPE = settings.VISUALSTUDIO_SCOPES
     RESPONSE_TYPE = "Assertion"
 
-    def user_data(self, access_token, *args, **kwargs):
+    def user_data(self, access_token: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Loads user data from service"""
         resp = requests.get(
             VISUALSTUDIO_USER_DETAILS_URL,
@@ -63,7 +64,7 @@ class VisualStudioAuth(BaseOAuth2):
             "full_name": content["displayName"],
         }
 
-    def auth_complete_params(self, state=None):
+    def auth_complete_params(self, state: str | None = None) -> dict[str, Any]:
         secret = setting(self.SETTINGS_CLIENT_SECRET_NAME)
         return {
             "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
@@ -74,14 +75,16 @@ class VisualStudioAuth(BaseOAuth2):
         }
 
     @classmethod
-    def refresh_token_params(cls, token, provider):
+    def refresh_token_params(cls, token: str, provider: str) -> dict[str, str]:
         secret = setting(cls.SETTINGS_CLIENT_SECRET_NAME)
 
         return {
             "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
             "client_assertion": secret,
             "grant_type": "refresh_token",
-            "redirect_uri": absolute_uri(reverse("socialauth_associate_complete", args=[provider])),
+            "redirect_uri": absolute_uri(
+                reverse("socialauth_associate_complete_auth_sso", args=[provider])
+            ),
             "assertion": token,
         }
 

@@ -1,0 +1,84 @@
+import {useCallback} from 'react';
+import {parseAsBoolean, parseAsString, useQueryStates} from 'nuqs';
+
+import {useDrawer} from '@sentry/scraps/drawer';
+
+import {SeerDrawer} from 'sentry/components/events/autofix/v3/drawer';
+import {t} from 'sentry/locale';
+import type {Group} from 'sentry/types/group';
+import type {Project} from 'sentry/types/project';
+import {areAiFeaturesAllowed} from 'sentry/utils/seer/areAiFeaturesAllowed';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {hasAutofixPage, makeSeerLocation} from 'sentry/views/issueDetails/autofix/utils';
+
+export const useOpenSeerDrawer = ({group, project}: {group: Group; project: Project}) => {
+  const {openDrawer} = useDrawer();
+  const [{seerDrawer}, setDrawerQuery] = useQueryStates(
+    {
+      seerDrawer: parseAsBoolean.withDefault(false),
+      seerDrawerAction: parseAsString,
+    },
+    {shallow: false}
+  );
+  const organization = useOrganization();
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const openSeerDrawer = useCallback(() => {
+    if (!areAiFeaturesAllowed(organization)) {
+      return;
+    }
+
+    // Autofix has its own tab behind the flag, so every entry point that used
+    // to open the drawer navigates there instead. Legacy `?seerDrawer=true` URLs
+    // are redirected by the issue details page and never reach here.
+    if (hasAutofixPage(organization)) {
+      navigate(
+        makeSeerLocation({organization, groupId: group.id, query: location.query})
+      );
+      return;
+    }
+
+    const issueBaseUrl = normalizeUrl(
+      `/organizations/${organization.slug}/issues/${group.id}/`
+    );
+    openDrawer(() => <SeerDrawer group={group} project={project} />, {
+      ariaLabel: t('Seer drawer'),
+      drawerKey: 'seer-autofix-drawer',
+      drawerWidth: '80%',
+      drawerMaxWidth: '1600px',
+      resizable: true,
+      mode: 'passive',
+      shouldCloseOnLocationChange: nextLocation => {
+        const nextPath = nextLocation.pathname.endsWith('/')
+          ? nextLocation.pathname
+          : `${nextLocation.pathname}/`;
+        return !nextPath.startsWith(issueBaseUrl);
+      },
+      onClose: () => {
+        void setDrawerQuery(
+          {seerDrawer: null, seerDrawerAction: null},
+          {history: 'replace'}
+        );
+      },
+    });
+
+    if (!seerDrawer) {
+      void setDrawerQuery({seerDrawer: true}, {history: 'push'});
+    }
+  }, [
+    openDrawer,
+    group,
+    project,
+    seerDrawer,
+    setDrawerQuery,
+    organization,
+    navigate,
+    location.query,
+  ]);
+
+  return {openSeerDrawer};
+};

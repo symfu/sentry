@@ -1,0 +1,81 @@
+from sentry_protos.snuba.v1.trace_item_attribute_pb2 import AttributeKey, Function
+
+from sentry.search.eap import constants
+from sentry.search.eap.aggregate_utils import count_processor
+from sentry.search.eap.columns import (
+    AggregateDefinition,
+    AttributeArgumentDefinition,
+    NumericArgumentDefinition,
+    count_argument_resolver_optimized,
+)
+
+REPLAYS_ALWAYS_PRESENT_ATTRIBUTES = [
+    AttributeKey(name="replay_id", type=AttributeKey.Type.TYPE_STRING),
+]
+
+REPLAYS_AGGREGATE_DEFINITIONS = {
+    "count": AggregateDefinition(
+        internal_function=Function.FUNCTION_COUNT,
+        infer_search_type_from_arguments=False,
+        processor=count_processor,
+        default_search_type="integer",
+        arguments=[
+            AttributeArgumentDefinition(
+                attribute_types={
+                    "string",
+                    "number",
+                    "integer",
+                },
+                default_arg="replay.id",
+            )
+        ],
+        attribute_resolver=count_argument_resolver_optimized(REPLAYS_ALWAYS_PRESENT_ATTRIBUTES),
+        valid_arithmetic=True,
+    ),
+    "sum": AggregateDefinition(
+        internal_function=Function.FUNCTION_SUM,
+        default_search_type="integer",
+        arguments=[
+            NumericArgumentDefinition(),
+        ],
+        valid_arithmetic=True,
+    ),
+    "min": AggregateDefinition(
+        internal_function=Function.FUNCTION_MIN,
+        default_search_type="duration",
+        arguments=[
+            AttributeArgumentDefinition(
+                attribute_types={
+                    "string",
+                    "duration",
+                    "number",
+                    "integer",
+                    "percentage",
+                    "currency",
+                    *constants.SIZE_TYPE,
+                    *constants.DURATION_TYPE,
+                },
+            )
+        ],
+        valid_arithmetic=True,
+    ),
+    "max": AggregateDefinition(
+        internal_function=Function.FUNCTION_MAX,
+        default_search_type="duration",
+        arguments=[
+            AttributeArgumentDefinition(
+                attribute_types={
+                    "string",
+                    "duration",
+                    "number",
+                    "integer",
+                    "percentage",
+                    "currency",
+                    *constants.SIZE_TYPE,
+                    *constants.DURATION_TYPE,
+                },
+            )
+        ],
+        valid_arithmetic=True,
+    ),
+}

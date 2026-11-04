@@ -1,0 +1,397 @@
+'use strict';
+
+import '@testing-library/jest-dom';
+
+import {webcrypto} from 'node:crypto';
+import {TextDecoder, TextEncoder} from 'node:util';
+
+import React, {type ReactElement} from 'react';
+import {act, configure as configureRtl} from '@testing-library/react'; // eslint-disable-line no-restricted-imports
+import {MotionGlobalConfig} from 'framer-motion';
+import {enableFetchMocks} from 'jest-fetch-mock';
+import {ConfigFixture} from 'sentry-fixture/config';
+
+import {MockResizeObserver, resetResizeObservers} from 'sentry-test/resizeObserver';
+import {resetMockDate} from 'sentry-test/utils';
+
+// eslint-disable-next-line jest/no-mocks-import
+import type {Client} from 'sentry/__mocks__/api';
+// eslint-disable-next-line no-restricted-imports
+import {DEFAULT_LOCALE_DATA, setLocale} from 'sentry/locale';
+import {ConfigStore} from 'sentry/stores/configStore';
+import * as performanceForSentry from 'sentry/utils/performanceForSentry';
+
+/**
+ * Set locale to English
+ */
+setLocale(DEFAULT_LOCALE_DATA);
+
+/**
+ * Enable fetch mocks and provide fetch primitives missing from jsdom.
+ */
+enableFetchMocks();
+
+// @ts-expect-error XXX(epurkhiser): Gross hack to fix a bug in jsdom which makes testing of
+// framer-motion SVG components fail
+// See https://github.com/jsdom/jsdom/issues/1330
+SVGElement.prototype.getTotalLength ??= () => 1;
+
+/**
+ * Skip all framer-motion animations in tests so components render immediately
+ * without waiting for animation frames or transitions.
+ */
+MotionGlobalConfig.skipAnimations = true;
+
+/**
+ * React Testing Library configuration
+ *
+ * - Override the default test id attribute.
+ *   See: https://testing-library.com/docs/queries/bytestid/#overriding-data-testid
+ * - Raise the `findBy*` / `waitFor` timeout from the 1000ms default. The first
+ *   render in a file routinely takes 600-800ms on an idle machine, which leaves
+ *   too little headroom on contended CI runners and causes intermittent
+ *   "Unable to find an element" failures. Passing tests are not slowed down.
+ *   See: https://testing-library.com/docs/dom-testing-library/api-configuration/#asyncutiltimeout
+ */
+configureRtl({testIdAttribute: 'data-test-id', asyncUtilTimeout: 2000});
+
+/**
+ * Mock (current) date to always be National Pasta Day
+ * 2017-10-17T02:41:20.000Z
+ */
+resetMockDate();
+
+/**
+ * Global testing configuration
+ */
+
+/**
+ * Mocks
+ */
+// jsdom does not lay out elements. Skip Floating UI's geometry work and the
+// React updates it schedules; overlay interactions still use the real component
+// code. Positioning tests can opt back in with jest.unmock('@floating-ui/react-dom').
+jest.mock('@floating-ui/react-dom', () => {
+  const {useState} = jest.requireActual<typeof import('react')>('react');
+  const update = () => {};
+  const useFloating: typeof import('@floating-ui/react-dom').useFloating = ({
+    placement = 'bottom',
+    strategy = 'absolute',
+  } = {}) => {
+    const [refs] = useState(() => {
+      const reference: {current: any} = {current: null};
+      const floating: {current: HTMLElement | null} = {current: null};
+      return {
+        reference,
+        floating,
+        setReference: (node: unknown) => {
+          reference.current = node;
+        },
+        setFloating: (node: HTMLElement | null) => {
+          floating.current = node;
+        },
+      };
+    });
+
+    return {
+      x: 0,
+      y: 0,
+      placement,
+      strategy,
+      middlewareData: {},
+      isPositioned: false,
+      update,
+      refs,
+      elements: {reference: null, floating: null},
+      floatingStyles: {position: strategy, left: 0, top: 0},
+    };
+  };
+  return {...jest.requireActual('@floating-ui/react-dom'), useFloating};
+});
+
+jest.mock('lodash/debounce', () =>
+  jest.fn(fn => {
+    fn.cancel = jest.fn();
+    return fn;
+  })
+);
+// Keep callback and value debounces synchronous by default in tests. Suites that
+// assert scheduling behavior can load the real Pacer implementations explicitly.
+jest.mock('@tanstack/react-pacer', () => ({
+  ...jest.requireActual('@tanstack/react-pacer'),
+  useAsyncDebouncedCallback: <TFn>(fn: TFn) => fn,
+  useDebouncedCallback: <TFn>(fn: TFn) => fn,
+  useDebouncedValue: <T>(value: T) => [value, {state: {isPending: false}}] as const,
+}));
+jest.mock('sentry/utils/recreateRoute');
+jest.mock('sentry/api');
+jest
+  .spyOn(performanceForSentry, 'VisuallyCompleteWithData')
+  .mockImplementation(props => props.children as ReactElement);
+
+jest.mock('@sentry-internal/global-search', () => ({
+  SentryGlobalSearch: jest.fn().mockImplementation(() => ({
+    query: jest.fn().mockResolvedValue([]),
+  })),
+}));
+
+jest.mock('sentry/utils/testableWindowLocation', () => ({
+  /**
+   * Prefer using {@link import('sentry-test/utils').setWindowLocation} to change test location
+   * instead of mocking properties on the testableLocation object.
+   * Use this mock for checking if window.location.assign was called.
+   */
+  testableWindowLocation: {
+    assign: jest.fn(),
+    replace: jest.fn(),
+    reload: jest.fn(),
+  },
+}));
+
+// The hooks below reset state only when its module is already loaded. Check
+// require.cache to avoid loading the module and its imports into every spec.
+// Close any open modals before each test
+beforeEach(() => {
+  if (require.resolve('sentry/stores/modalStore') in require.cache) {
+    jest
+      .requireActual<typeof import('sentry/stores/modalStore')>(
+        'sentry/stores/modalStore'
+      )
+      .ModalStore.closeModal();
+  }
+});
+afterEach(() => {
+  // Avoid loading the toast module into tests that do not use it.
+  if (require.resolve('@sentry/scraps/toast') in require.cache) {
+    const {toast} =
+      jest.requireActual<typeof import('@sentry/scraps/toast')>('@sentry/scraps/toast');
+    act(() => void toast.dismiss());
+  }
+  resetResizeObservers();
+});
+
+jest.mock('echarts-for-react/lib/core', function echartsMockFactory() {
+  // We need to do this because `jest.mock` gets hoisted before imports and `React` is not
+  // guaranteed to be in scope
+  const ReactActual = require('react');
+
+  // We need a class component here because `BaseChart` passes `ref` which will
+  // error if we return a stateless/functional component
+  return class extends ReactActual.Component {
+    render() {
+      return null;
+    }
+  };
+});
+
+jest.mock('@sentry/react', function sentryReact() {
+  const SentryReact = jest.requireActual('@sentry/react');
+  return {
+    ...SentryReact,
+    init: jest.fn(),
+    setTag: jest.fn(),
+    setTags: jest.fn(),
+    getReplay: jest.fn(),
+    setExtra: jest.fn(),
+    setExtras: jest.fn(),
+    captureBreadcrumb: jest.fn(),
+    addBreadcrumb: jest.fn(),
+    captureMessage: jest.fn(),
+    captureException: jest.fn(),
+    showReportDialog: jest.fn(),
+    getDefaultIntegrations: jest.spyOn(SentryReact, 'getDefaultIntegrations'),
+    startSpan: jest.spyOn(SentryReact, 'startSpan'),
+    finishSpan: jest.fn(),
+    lastEventId: jest.fn(),
+    getClient: jest.spyOn(SentryReact, 'getClient'),
+    getCurrentScope: jest.spyOn(SentryReact, 'getCurrentScope'),
+    withScope: jest.spyOn(SentryReact, 'withScope'),
+    withProfiler: SentryReact.withProfiler,
+    metrics: {
+      count: jest.fn(),
+      increment: jest.fn(),
+      gauge: jest.fn(),
+      set: jest.fn(),
+      distribution: jest.fn(),
+    },
+    reactRouterBrowserTracingIntegration: jest.fn().mockReturnValue({}),
+    browserTracingIntegration: jest.fn().mockReturnValue({}),
+    browserProfilingIntegration: jest.fn().mockReturnValue({}),
+    addEventProcessor: jest.fn(),
+    BrowserClient: jest.fn().mockReturnValue({
+      captureEvent: jest.fn(),
+    }),
+    startInactiveSpan: () => ({
+      end: jest.fn(),
+      setStatus: jest.fn(),
+      startChild: jest.fn().mockReturnValue({
+        end: jest.fn(),
+      }),
+      spanContext: jest.fn().mockReturnValue({
+        spanId: 'test-span-id',
+        traceId: 'test-trace-id',
+      }),
+    }),
+    logger: {
+      warn: jest.fn(),
+      error: jest.fn(),
+      fatal: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+      trace: jest.fn(),
+      fmt: jest.fn(),
+    },
+  };
+});
+
+ConfigStore.loadInitialData(ConfigFixture());
+
+// Default browser timezone to UTC
+jest.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions').mockImplementation(() => ({
+  locale: 'en-US',
+  calendar: 'gregory',
+  numberingSystem: 'latn',
+  timeZone: 'UTC',
+  timeZoneName: 'short',
+}));
+
+/**
+ * Test Globals
+ */
+declare global {
+  /**
+   * Generates a promise that resolves on the next macro-task
+   */
+  var tick: () => Promise<void>;
+  /**
+   * Used to mock API requests
+   */
+  var MockApiClient: typeof Client;
+}
+
+// needed by cbor-web for webauthn
+window.TextEncoder = TextEncoder;
+window.TextDecoder = TextDecoder as typeof window.TextDecoder;
+
+// This is so we can use async/await in tests instead of wrapping with `setTimeout`.
+window.tick = () => new Promise(resolve => setTimeout(resolve));
+
+window.MockApiClient = jest.requireMock('sentry/api').Client;
+
+window.scrollTo = jest.fn();
+
+window.ra = {event: jest.fn()};
+
+// The full jsdom CSS cascade is too slow, especially for dropdown positioning.
+// Tests only need inline styles here, so reuse the element's declaration directly.
+// See https://github.com/jsdom/jsdom/issues/3234.
+Object.defineProperty(window, 'getComputedStyle', {
+  value: (element: HTMLElement) => element.style,
+  configurable: true,
+  writable: true,
+});
+
+// React's development build captures an `Error` for every element it creates so
+// warnings can show owner stacks. In CI that is roughly 7% of test CPU for stacks
+// nobody reads, so pin React's per-render budget above any cap there and
+// elements skip the capture. Warnings still fire; locally the full stacks stay
+// on. If React's internals change shape, warn so the slowdown doesn't go unnoticed.
+if (process.env.CI) {
+  const internals = (
+    React as unknown as {
+      __CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE?: {
+        recentlyCreatedOwnerStacks?: number;
+      };
+    }
+  ).__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+  if (internals && 'recentlyCreatedOwnerStacks' in internals) {
+    Object.defineProperty(internals, 'recentlyCreatedOwnerStacks', {
+      configurable: true,
+      get: () => Infinity,
+      set: () => {},
+    });
+  } else {
+    // eslint-disable-next-line no-console
+    console.warn(
+      'tests/js/setup.ts: React internals changed shape, so owner stacks are no longer skipped in CI. Update or remove the override.'
+    );
+  }
+}
+
+Object.defineProperty(window, 'matchMedia', {
+  writable: true,
+  value: (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: jest.fn(), // Deprecated
+    removeListener: jest.fn(), // Deprecated
+    addEventListener: jest.fn(),
+    removeEventListener: jest.fn(),
+    dispatchEvent: jest.fn(),
+  }),
+});
+
+window.IntersectionObserver = class IntersectionObserver {
+  root = null;
+  rootMargin = '';
+  scrollMargin = '';
+  thresholds = [];
+  takeRecords = jest.fn();
+
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+
+HTMLElement.prototype.setPointerCapture ??= jest.fn();
+
+window.ResizeObserver = MockResizeObserver;
+
+// Mock the crypto.subtle API for Gravatar
+Object.defineProperty(global.self, 'crypto', {
+  value: {
+    subtle: webcrypto.subtle,
+  },
+});
+
+if (typeof globalThis.structuredClone !== 'function') {
+  const nodeUtil = require('node:util') as {
+    structuredClone?: typeof globalThis.structuredClone;
+  };
+  globalThis.structuredClone =
+    nodeUtil.structuredClone ?? ((value: unknown) => JSON.parse(JSON.stringify(value)));
+}
+
+if (globalThis.setImmediate === undefined) {
+  // @ts-expect-error setImmediate is not defined in jsdom, but we can use setTimeout as a polyfill
+  globalThis.setImmediate = setTimeout;
+  // @ts-expect-error clearImmediate is not defined in jsdom, but we can use clearTimeout as a polyfill
+  globalThis.clearImmediate = clearTimeout;
+}
+
+/**
+ * it.isKnownFlake — wraps a known-flaky test for stress-testing in CI.
+ *
+ * When RERUN_KNOWN_FLAKY_TESTS is "true" (set by the "Frontend: Rerun Flaky
+ * Tests" PR label), the test runs 50x inside a describe block. Otherwise it
+ * runs once, behaving identically to a normal `it()`.
+ */
+const FLAKY_RERUN_COUNT = 50;
+
+it.isKnownFlake = function isKnownFlake(
+  name: string,
+  fn: jest.ProvidesCallback,
+  timeout?: number
+) {
+  if (process.env.RERUN_KNOWN_FLAKY_TESTS !== 'true') {
+    it(name, fn, timeout);
+    return;
+  }
+
+  describe(`[flaky rerun x${FLAKY_RERUN_COUNT}] ${name}`, () => {
+    for (let i = 1; i <= FLAKY_RERUN_COUNT; i++) {
+      it(`run ${i}/${FLAKY_RERUN_COUNT}`, fn, timeout);
+    }
+  });
+};

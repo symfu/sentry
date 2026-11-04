@@ -1,0 +1,340 @@
+import {Fragment, type PropsWithChildren, useEffect} from 'react';
+import {css, Global, useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import {Alert} from '@sentry/scraps/alert';
+import {GlobalDrawer} from '@sentry/scraps/drawer';
+import {Container, Stack} from '@sentry/scraps/layout';
+import {TrackingContextProvider} from '@sentry/scraps/trackingContext';
+
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {handleExpressiveCodeCopyClick} from 'sentry/stories/view/expressiveCodeCopy';
+import {StorySidebar} from 'sentry/stories/view/storySidebar';
+import {
+  StoryTreeNode,
+  useFlatStoryList,
+  type StoryCategory,
+} from 'sentry/stories/view/storyTree';
+import {useLocation} from 'sentry/utils/useLocation';
+import {OrganizationContainer} from 'sentry/views/organizationContainer';
+import {RouteAnalyticsContextProvider} from 'sentry/views/routeAnalyticsContextProvider';
+
+import {StoryLanding} from './landing';
+import {StoryExports} from './storyExports';
+import {StoryHeader} from './storyHeader';
+import {useStoryDarkModeTheme} from './useStoriesDarkMode';
+import {useStoriesLoader} from './useStoriesLoader';
+import {useStoryParams} from './useStoryParams';
+
+export default function Stories() {
+  const location = useLocation();
+  return isLandingPage(location) && !location.query.name ? (
+    <StoriesLanding />
+  ) : (
+    <StoryDetail />
+  );
+}
+
+function StoriesLanding() {
+  return (
+    <StoriesLayout>
+      <StoryMainContainer
+        as="main"
+        column="2"
+        containerType="inline-size"
+        gap="xl"
+        row="1"
+      >
+        <StoryLanding />
+      </StoryMainContainer>
+    </StoriesLayout>
+  );
+}
+
+function StoryDetail() {
+  const location = useLocation();
+  const {storyCategory, storySlug} = useStoryParams();
+  const stories = useFlatStoryList();
+
+  let storyNode = getStoryFromParams(stories, {
+    category: storyCategory,
+    slug: storySlug,
+  });
+
+  // If we don't have a story node, try to find it by the filesystem path
+  if (!storyNode && location.query.name) {
+    const nodes = Object.values(stories).flat();
+    const queue = [...nodes];
+
+    while (queue.length > 0) {
+      const node = queue.pop();
+      if (!node) {
+        break;
+      }
+
+      if (node.filesystemPath === location.query.name) {
+        storyNode = node;
+        break;
+      }
+
+      for (const key in node.children) {
+        queue.push(node.children[key]!);
+      }
+    }
+  }
+
+  const story = useStoriesLoader({
+    files: storyNode ? [storyNode.filesystemPath] : [],
+  });
+
+  return (
+    <StoriesLayout>
+      {story.isLoading ? (
+        <Container
+          as="main"
+          padding="xl"
+          overflowX="visible"
+          overflowY="auto"
+          row="1"
+          column="2"
+        >
+          <LoadingIndicator />
+        </Container>
+      ) : story.isError ? (
+        <Container
+          as="main"
+          padding="xl"
+          overflowX="visible"
+          overflowY="auto"
+          row="1"
+          column="2"
+        >
+          <Alert.Container>
+            <Alert variant="danger">
+              <strong>{story.error.name}:</strong> {story.error.message}
+            </Alert>
+          </Alert.Container>
+        </Container>
+      ) : story.isSuccess ? (
+        <StoryMainContainer
+          as="main"
+          column="2"
+          containerType="inline-size"
+          gap="xl"
+          row="1"
+          onClick={handleExpressiveCodeCopyClick}
+        >
+          {story.data.map(s => {
+            return <StoryExports key={s.filename} story={s} />;
+          })}
+        </StoryMainContainer>
+      ) : (
+        <Container
+          as="main"
+          padding="xl"
+          overflowX="visible"
+          overflowY="auto"
+          row="1"
+          column="2"
+        >
+          <strong>The file you selected does not export a story.</strong>
+        </Container>
+      )}
+    </StoriesLayout>
+  );
+}
+
+function useStoriesFavicon() {
+  useEffect(() => {
+    const faviconNode = document.querySelector<HTMLLinkElement>(
+      'link[rel="icon"][type="image/png"]'
+    );
+    if (!faviconNode) {
+      return () => {};
+    }
+
+    const originalHref = faviconNode.href;
+    const url = new URL(originalHref);
+    const storiesFaviconPath = `${url.origin}${url.pathname.replace(/\/[^/]+$/, '/favicon-stories.png')}`;
+
+    const applyStoriesFavicon = () => {
+      if (faviconNode.href !== storiesFaviconPath) {
+        faviconNode.href = storiesFaviconPath;
+      }
+    };
+
+    applyStoriesFavicon();
+
+    const observer = new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'href') {
+          applyStoriesFavicon();
+        }
+      }
+    });
+
+    observer.observe(faviconNode, {
+      attributes: true,
+      attributeFilter: ['href'],
+    });
+
+    return () => {
+      observer.disconnect();
+      faviconNode.href = originalHref;
+    };
+  }, []);
+}
+
+const storiesTracking: React.ComponentProps<
+  typeof TrackingContextProvider
+>['value'] = props => {
+  // eslint-disable-next-line no-console
+  console.log('analyticsEvent', props);
+};
+
+function StoriesLayout(props: PropsWithChildren) {
+  useStoriesFavicon();
+  return (
+    <TrackingContextProvider value={storiesTracking}>
+      <Fragment>
+        <GlobalStoryStyles key="global-story-styles" />
+        <RouteAnalyticsContextProvider>
+          <GlobalDrawer>
+            <OrganizationContainer>
+              <Layout>
+                <HeaderContainer>
+                  <StoryHeader />
+                </HeaderContainer>
+                <StorySidebar />
+                {props.children}
+              </Layout>
+            </OrganizationContainer>
+          </GlobalDrawer>
+        </RouteAnalyticsContextProvider>
+      </Fragment>
+    </TrackingContextProvider>
+  );
+}
+
+function isLandingPage(location: ReturnType<typeof useLocation>) {
+  // Handles both /scraps and /organizations/{org}/scraps
+  return /\/scraps\/?$/.test(location.pathname);
+}
+
+function getStoryFromParams(
+  stories: ReturnType<typeof useFlatStoryList>,
+  context: {category?: StoryCategory; slug?: string}
+): StoryTreeNode | undefined {
+  if (stories.length === 0) {
+    return undefined;
+  }
+
+  const queue = [...stories];
+
+  while (queue.length > 0) {
+    const node = queue.pop();
+    if (!node) {
+      break;
+    }
+
+    if (node.category === context.category && node.slug === context.slug) {
+      return node;
+    }
+
+    for (const key in node.children) {
+      queue.push(node.children[key]!);
+    }
+  }
+
+  return undefined;
+}
+
+function GlobalStoryStyles() {
+  const theme = useTheme();
+  const darkTheme = useStoryDarkModeTheme();
+  const location = useLocation();
+  const isIndex = isLandingPage(location);
+  const styles = css`
+    /* match body background with header story styles */
+    body {
+      background-color: ${
+        isIndex ? darkTheme.tokens.background.secondary : theme.tokens.background.primary
+      };
+    }
+    /* fixed position color block to match overscroll color to story background */
+    body::after {
+      content: '';
+      display: block;
+      position: fixed;
+      inset: 0;
+      top: unset;
+      background-color: ${theme.tokens.background.primary};
+      height: 50vh;
+      z-index: -1;
+      pointer-events: none;
+    }
+    /* adjust position of global .messages-container element */
+    .messages-container {
+      margin-top: 52px;
+      margin-left: 256px;
+      z-index: ${theme.zIndex.header};
+      background: ${theme.tokens.background.primary};
+    }
+  `;
+  return <Global styles={styles} />;
+}
+
+const Layout = styled('div')`
+  background: ${p => p.theme.tokens.background.primary};
+  --stories-grid-space: 0;
+
+  display: grid;
+  grid-template-rows: 1fr;
+  grid-template-columns: 256px minmax(auto, 1fr);
+  place-items: stretch;
+  min-height: calc(100dvh - 52px);
+  padding-bottom: ${p => p.theme.space['3xl']};
+  position: absolute;
+  top: 52px;
+  left: 0;
+  right: 0;
+`;
+
+const HeaderContainer = styled('header')`
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: ${p => p.theme.zIndex.header};
+  background: ${p => p.theme.tokens.background.primary};
+`;
+
+const StoryMainContainer = styled(Stack)`
+  color: ${p => p.theme.tokens.content.primary};
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    scroll-margin-top: 80px;
+  }
+
+  div + .expressive-code .frame {
+    border-radius: 0 0 ${p => p.theme.radius.md} ${p => p.theme.radius.md};
+    pre {
+      border-radius: 0 0 ${p => p.theme.radius.md} ${p => p.theme.radius.md};
+    }
+  }
+
+  .expressive-code .frame {
+    margin: 0;
+    box-shadow: none;
+    border: none;
+    pre {
+      background: hsla(254, 18%, 15%, 1);
+      border: 0;
+    }
+  }
+`;

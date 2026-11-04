@@ -1,0 +1,371 @@
+import {Fragment, useCallback, useEffect, useRef, useState} from 'react';
+import styled from '@emotion/styled';
+import * as Sentry from '@sentry/react';
+import debounce from 'lodash/debounce';
+
+import {Button, ButtonBar} from '@sentry/scraps/button';
+import {InfoTip} from '@sentry/scraps/info';
+import {Flex} from '@sentry/scraps/layout';
+import {Pagination} from '@sentry/scraps/pagination';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+import {Text} from '@sentry/scraps/text';
+
+import {addErrorMessage, addSuccessMessage} from 'sentry/actionCreators/indicator';
+import {Confirm} from 'sentry/components/confirm';
+import {NotificationActionManager} from 'sentry/components/notificationActions/notificationActionManager';
+import {SearchBar} from 'sentry/components/searchBar';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {DEFAULT_DEBOUNCE_DURATION} from 'sentry/constants';
+import {t, tct} from 'sentry/locale';
+import type {
+  AvailableNotificationAction,
+  NotificationAction,
+} from 'sentry/types/notificationActions';
+import type {ProjectSummaryWithOptions} from 'sentry/types/project';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
+import {useApi} from 'sentry/utils/useApi';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {ProjectBadge} from 'sentry/views/organizationStats/teamInsights/styles';
+
+import {withSubscription} from 'getsentry/components/withSubscription';
+import type {Subscription} from 'getsentry/types';
+import {
+  SpendVisibilityEvents,
+  trackSpendVisibilityAnaltyics,
+} from 'getsentry/utils/trackSpendVisibilityAnalytics';
+import {
+  SPIKE_PROTECTION_ERROR_MESSAGE,
+  SPIKE_PROTECTION_OPTION_DISABLED,
+} from 'getsentry/views/spikeProtection/constants';
+import SpikeProtectionProjectToggle, {
+  isSpikeProtectionEnabled,
+} from 'getsentry/views/spikeProtection/spikeProtectionProjectToggle';
+
+import {AccordionRow} from './components/accordionRow';
+
+interface Props {
+  subscription: Subscription;
+}
+
+const PROJECT_COLUMNS: TableColumnConfig[] = [{key: 'project', width: 'auto'}];
+
+function AllProjectsAction({
+  hasOrgWrite,
+  isEnabling,
+  updateAllProjects,
+}: {
+  hasOrgWrite: boolean;
+  isEnabling: boolean;
+  updateAllProjects: (isEnabling: boolean) => void;
+}) {
+  const action = isEnabling ? t('Enable') : t('Disable');
+  const confirmationText = tct(
+    'This will [action] spike protection for all projects in the organization immediately. Are you sure?',
+    {action: action.toLowerCase()}
+  );
+  return (
+    <Confirm
+      onConfirm={() => {
+        updateAllProjects(isEnabling);
+      }}
+      message={confirmationText}
+      disabled={!hasOrgWrite}
+    >
+      <Button
+        disabled={!hasOrgWrite}
+        variant={isEnabling ? 'primary' : 'secondary'}
+        data-test-id={`sp-${action.toLowerCase()}-all`}
+        tooltipProps={{
+          title: hasOrgWrite
+            ? undefined
+            : tct(
+                'You do not have permission to [action] spike protection for all projects.',
+                {action: action.toLowerCase()}
+              ),
+        }}
+      >
+        {tct('[action] All', {action})}
+      </Button>
+    </Confirm>
+  );
+}
+
+function AccordionTitle({project}: {project: ProjectSummaryWithOptions}) {
+  return (
+    <Flex justify="between" align="center" width="100%" height="100%">
+      <Flex align="center" marginRight="xl">
+        <StyledProjectBadge hideOverflow project={project} displayName={project.slug} />
+      </Flex>
+    </Flex>
+  );
+}
+
+function SpikeProtectionProjects({subscription}: Props) {
+  const [projects, setProjects] = useState([] as ProjectSummaryWithOptions[]);
+  const [pageLinks, setPageLinks] = useState<string | null>();
+  const [currentCursor, setCurrentCursor] = useState<string | undefined>('');
+  const [availableNotificationActions, setAvailableNotificationActions] = useState<
+    AvailableNotificationAction[]
+  >([]);
+  const [notificationActionsById, setNotificationActionsById] = useState<
+    Record<string, NotificationAction[]>
+  >({});
+  const [isFetchingProjects, setIsFetchingProjects] = useState(true);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const organization = useOrganization();
+  const api = useApi();
+  const debouncedSearch = useRef(
+    debounce(value => {
+      fetchProjects(value);
+    }, DEFAULT_DEBOUNCE_DURATION)
+  ).current;
+  const triggerType = 'spike-protection';
+  const hasOrgAdmin = organization.access.includes('org:admin');
+  const hasOrgWrite = organization.access.includes('org:write') || hasOrgAdmin;
+
+  const fetchProjects = useCallback(
+    async (query = '') => {
+      let accessibleProjectsQuery = query;
+      if (!organization.openMembership && !isActiveSuperuser() && !hasOrgAdmin) {
+        accessibleProjectsQuery += ' is_member:1';
+      }
+      setIsFetchingProjects(true);
+      const [data, _, resp] = await api.requestPromise(
+        getApiUrl('/organizations/$organizationIdOrSlug/projects/', {
+          path: {organizationIdOrSlug: organization.slug},
+        }),
+        {
+          includeAllArgs: true,
+          query: {
+            cursor: currentCursor,
+            query: accessibleProjectsQuery,
+            options: SPIKE_PROTECTION_OPTION_DISABLED,
+          },
+        }
+      );
+      setProjects(data);
+      const links =
+        (resp?.getResponseHeader('Link') || resp?.getResponseHeader('link')) ?? undefined;
+      setPageLinks(links);
+
+      if (query.length > 0) {
+        trackSpendVisibilityAnaltyics(SpendVisibilityEvents.SP_PROJECT_SEARCHED, {
+          organization,
+          subscription,
+          view: 'spike_protection_settings',
+        });
+      }
+      setIsFetchingProjects(false);
+    },
+    [api, currentCursor, organization, subscription, hasOrgAdmin]
+  );
+
+  const fetchAvailableNotificationActions = useCallback(async () => {
+    const data = await api.requestPromise(
+      getApiUrl('/organizations/$organizationIdOrSlug/notifications/available-actions/', {
+        path: {organizationIdOrSlug: organization.slug},
+      })
+    );
+    setAvailableNotificationActions(data.actions);
+  }, [api, organization]);
+
+  const fetchData = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      await fetchAvailableNotificationActions();
+    } catch (err) {
+      Sentry.captureException(err);
+      addErrorMessage(t('Unable to fetch available notification actions'));
+    }
+    setIsLoading(false);
+  }, [fetchAvailableNotificationActions]);
+
+  const fetchProjectNotificationActions = async (
+    project: ProjectSummaryWithOptions,
+    projectNotificationActions: Record<string, NotificationAction[]>
+  ) => {
+    const projectId = project.id;
+    const data = await api.requestPromise(
+      getApiUrl('/organizations/$organizationIdOrSlug/notifications/actions/', {
+        path: {organizationIdOrSlug: organization.slug},
+      }),
+      {query: {triggerType, project: projectId}}
+    );
+
+    const notifActionsById = {...projectNotificationActions};
+    data.forEach((action: NotificationAction) => {
+      if (notifActionsById[projectId]) {
+        notifActionsById[projectId].push(action);
+      } else {
+        notifActionsById[projectId] = [action];
+      }
+    });
+    setNotificationActionsById(notifActionsById);
+  };
+
+  const updateAllProjects = async (isEnabling: boolean) => {
+    try {
+      await api.requestPromise(
+        `${getApiUrl('/organizations/$organizationIdOrSlug/spike-protections/', {
+          path: {organizationIdOrSlug: organization.slug},
+        })}?projectSlug=$all`,
+        {
+          method: isEnabling ? 'POST' : 'DELETE',
+          data: {projects: []},
+        }
+      );
+      const newProjects = projects.map(p => ({
+        ...p,
+        options: {...p.options, [SPIKE_PROTECTION_OPTION_DISABLED]: !isEnabling},
+      }));
+      setProjects(newProjects);
+      await fetchData();
+      addSuccessMessage(
+        tct('[action] spike protection for all projects', {
+          action: isEnabling ? t('Enabled') : t('Disabled'),
+        })
+      );
+    } catch (err) {
+      Sentry.captureException(err);
+      addErrorMessage(SPIKE_PROTECTION_ERROR_MESSAGE);
+    }
+  };
+
+  useEffect(() => {
+    fetchProjects();
+    // oxlint-disable-next-line react/set-state-in-effect
+    fetchData();
+  }, [fetchProjects, fetchData]);
+
+  function toggleSpikeProtectionOption(
+    project: ProjectSummaryWithOptions,
+    isFeatureEnabled: boolean
+  ) {
+    const updatedProject = {
+      ...project,
+      options: {
+        ...project.options,
+        // If the project option is True, the feature is disabled
+        // Therefore, if the newValue of the field is True, the option must be set to False
+        [SPIKE_PROTECTION_OPTION_DISABLED]: !isFeatureEnabled,
+      },
+    };
+    const newProjects = projects.map(p => (p.id === project.id ? updatedProject : p));
+    setProjects(newProjects);
+  }
+
+  const onChange = useCallback(
+    (value: any) => {
+      debouncedSearch(value);
+    },
+    [debouncedSearch]
+  );
+
+  return (
+    <Fragment>
+      <Flex justify="between" marginBottom="xl">
+        <StyledSearch placeholder={t('Search projects')} onChange={onChange} />
+        <ButtonBar marginLeft="xl">
+          <AllProjectsAction
+            hasOrgWrite={hasOrgWrite}
+            isEnabling={false}
+            updateAllProjects={updateAllProjects}
+          />
+          <AllProjectsAction
+            hasOrgWrite={hasOrgWrite}
+            isEnabling
+            updateAllProjects={updateAllProjects}
+          />
+        </ButtonBar>
+      </Flex>
+      <StyledSimpleTable
+        columns={PROJECT_COLUMNS}
+        header={
+          <SimpleTable.HeaderRow>
+            <SimpleTable.HeaderCell>
+              <Flex gap="xs" align="center">
+                <Text variant="muted">{t('Projects')}</Text>
+                <InfoTip title={t('Expand a project to add a notification action')} />
+              </Flex>
+            </SimpleTable.HeaderCell>
+          </SimpleTable.HeaderRow>
+        }
+      >
+        {(isLoading || isFetchingProjects) && <SimpleTable.Loading />}
+        {!isLoading && !isFetchingProjects && !projects.length && (
+          <SimpleTable.Empty>There are no items to display</SimpleTable.Empty>
+        )}
+        {projects?.map(project => {
+          const hasProjectWrite = project.access.includes('project:write');
+          const accordionTitle = <AccordionTitle project={project} />;
+          const accordionBody = isLoading ? null : (
+            <StyledAccordionDetails>
+              <NotificationActionManager
+                actions={notificationActionsById[project.id] ?? []}
+                availableActions={availableNotificationActions}
+                recipientRoles={['owner', 'manager', 'billing']}
+                project={project}
+                disabled={!hasOrgWrite && !hasProjectWrite}
+              />
+            </StyledAccordionDetails>
+          );
+          const isAccordionDisabled = !isSpikeProtectionEnabled(project);
+
+          return (
+            <SimpleTable.Row key={project.id}>
+              <SimpleTable.RowCell
+                gap="xl"
+                padding="xl"
+                overflow="visible"
+                data-test-id={`${project.slug}-accordion-row${
+                  isAccordionDisabled ? '-disabled' : ''
+                }`}
+              >
+                <SpikeProtectionProjectToggle
+                  project={project}
+                  disabled={!hasOrgWrite && !hasProjectWrite}
+                  analyticsView="spike_protection_settings"
+                  onChange={isEnabled => toggleSpikeProtectionOption(project, isEnabled)}
+                />
+                <AccordionRow
+                  disabled={isAccordionDisabled}
+                  disableBody={isLoading}
+                  title={accordionTitle}
+                  body={accordionBody}
+                  onOpen={() =>
+                    fetchProjectNotificationActions(project, notificationActionsById)
+                  }
+                />
+              </SimpleTable.RowCell>
+            </SimpleTable.Row>
+          );
+        })}
+      </StyledSimpleTable>
+      {pageLinks && <Pagination pageLinks={pageLinks} onCursor={setCurrentCursor} />}
+    </Fragment>
+  );
+}
+
+export default withSubscription(SpikeProtectionProjects);
+
+const StyledSearch = styled(SearchBar)`
+  flex: 1;
+`;
+
+const StyledSimpleTable = styled(SimpleTable)`
+  align-items: center;
+  overflow: visible;
+`;
+
+const StyledProjectBadge = styled(ProjectBadge)`
+  font-weight: bold;
+`;
+
+const StyledAccordionDetails = styled('div')`
+  margin-right: ${p => p.theme.space['2xl']};
+  margin-top: ${p => p.theme.space.xl};
+  padding-bottom: ${p => p.theme.space.md};
+  font-size: ${p => p.theme.font.size.sm};
+`;

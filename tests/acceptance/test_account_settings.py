@@ -1,10 +1,10 @@
-import pytest
+from sentry.testutils.cases import AcceptanceTestCase
+from sentry.testutils.silo import no_silo_test
 
-from sentry.testutils import AcceptanceTestCase
 
-
+@no_silo_test
 class AccountSettingsTest(AcceptanceTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.user = self.create_user("foo@example.com")
         self.org = self.create_organization(name="Rowdy Tiger Rowdy Tiger Rowdy Tiger", owner=None)
@@ -21,97 +21,91 @@ class AccountSettingsTest(AcceptanceTestCase):
         )
         self.login_as(self.user)
 
-    # TODO(billy): Enable this and remove the slower tests below
-    @pytest.mark.skip(
-        reason="This will be faster but does not check if old django routes are redirecting"
-    )
-    def test_account_settings(self):
-        with self.feature("organizations:onboarding"):
-            path = "/account/settings/"
-            self.browser.get(path)
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account settings")
+    def test_account_notifications(self) -> None:
+        with (
+            self.options({"system.url-prefix": self.browser.live_server_url}),
+            self.feature("organizations:onboarding"),
+        ):
+            self.browser.get("/settings/account/notifications/")
+            self.browser.wait_until_not('[data-test-id="loading-indicator"]')
 
-            self.browser.click('[href="/settings/account/security/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account security settings")
+            self.browser.click_when_visible('[data-test-id="fine-tuning"]')
+            self.browser.wait_until_not('[data-test-id="loading-indicator"]')
 
-            self.browser.click('[href="/settings/account/notifications/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account notification settings")
 
-            self.browser.click_when_visible("#Alerts a")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot('account notification - fine tune "Alerts"')
+@no_silo_test
+class AccountSettingsWithoutOrganizationTest(AcceptanceTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.user = self.create_user("orgless@example.com")
+        self.login_as(self.user)
 
-            self.browser.click('[href="/settings/account/emails/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account emails settings")
+    def test_navigate_account_settings(self) -> None:
+        with self.options({"system.url-prefix": self.browser.live_server_url}):
+            self.browser.get("/settings/account/details/")
+            self.browser.wait_until('input[name="name"]')
 
-            self.browser.click('[href="/settings/account/subscriptions/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account subscriptions settings")
+            primary_navigation = self.browser.element('nav[aria-label="Primary Navigation"]')
+            avatar = self.browser.element('button[aria-label="Account"]')
+            assert avatar.rect["y"] > primary_navigation.rect["y"]
 
-            self.browser.click('[href="/settings/account/authorizations/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account authorizations settings")
+            secondary_navigation = '[role="navigation"][aria-label="Secondary Navigation"]'
+            links = self.browser.elements(f"{secondary_navigation} a[href]")
+            assert len(links) == 10
+            assert all("/settings/account/" in (link.get_attribute("href") or "") for link in links)
 
-            self.browser.click('[href="/settings/account/identities/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account identities settings")
+            for path, title in [
+                ("security", "Security"),
+                ("notifications", "Notifications"),
+                ("emails", "Email Addresses"),
+                ("subscriptions", "Subscriptions"),
+                ("authorizations", "Authorized Applications"),
+                ("identities", "Identities"),
+                ("close-account", "Close Account"),
+                ("api/auth-tokens", "Personal Tokens"),
+                ("api/applications", "API Applications"),
+            ]:
+                destination = f"/settings/account/{path}/"
+                self.browser.click_when_visible(f'{secondary_navigation} a[href="{destination}"]')
+                self.browser.wait_until(xpath=f'//*[@id="main"]//h1[contains(., "{title}")]')
+                self.wait_for_loading()
+                assert self.browser.driver.current_url.endswith(destination)
+                assert (
+                    self.browser.element(
+                        f'{secondary_navigation} a[href="{destination}"]'
+                    ).get_attribute("aria-current")
+                    == "page"
+                )
 
-            self.browser.click('[href="/settings/account/close-account/"]')
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account settings - close account")
+            self.browser.click_when_visible(
+                f'{secondary_navigation} a[href="/settings/account/details/"]'
+            )
+            self.browser.wait_until('input[name="name"]')
+            assert self.browser.driver.current_url.endswith("/settings/account/details/")
 
-    def test_account_appearance_settings(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/settings/appearance/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account appearance settings")
+    def test_navigate_account_settings_on_mobile(self) -> None:
+        with (
+            self.options({"system.url-prefix": self.browser.live_server_url}),
+            self.browser.full_viewport(width=375, height=812, fit_content=False),
+        ):
+            getattr(self.browser.driver, "execute_cdp_cmd")(
+                "Emulation.setTouchEmulationEnabled", {"enabled": True}
+            )
+            try:
+                self.browser.get("/settings/account/details/")
+                self.browser.wait_until('input[name="name"]')
+                self.browser.click_when_visible('button[aria-label="Open main menu"]')
+                self.browser.click_when_visible('a[href="/settings/account/security/"]')
+                self.browser.wait_until('button[aria-label="Open main menu"]')
+                self.browser.wait_until('input[autocomplete="current-password"]')
+                assert self.browser.driver.current_url.endswith("/settings/account/security/")
 
-    def test_account_security_settings(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/settings/security/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account security settings")
-
-    def test_account_notifications(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/settings/notifications/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account notification settings")
-
-            self.browser.click_when_visible("#Alerts a")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot('account notification - fine tune "Alerts"')
-
-    def test_account_emails_settings(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/settings/emails/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account emails settings")
-
-    def test_account_subscriptions_settings(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/settings/subscriptions/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account subscriptions settings")
-
-    def test_account_authorizations_settings(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/authorizations/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account authorizations settings")
-
-    def test_account_identities_settings(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/settings/identities/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account identities settings")
-
-    def test_close_account(self):
-        with self.feature("organizations:onboarding"):
-            self.browser.get("/account/remove/")
-            self.browser.wait_until_not(".loading-indicator")
-            self.browser.snapshot("account settings - close account")
+                self.browser.click_when_visible('button[aria-label="Open main menu"]')
+                self.browser.click_when_visible('a[href="/settings/account/emails/"]')
+                self.browser.wait_until('button[aria-label="Open main menu"]')
+                self.browser.wait_until('input[name="email"]')
+                assert self.browser.driver.current_url.endswith("/settings/account/emails/")
+            finally:
+                getattr(self.browser.driver, "execute_cdp_cmd")(
+                    "Emulation.setTouchEmulationEnabled", {"enabled": False}
+                )

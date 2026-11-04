@@ -1,3 +1,9 @@
+from collections.abc import Callable
+from typing import Any, cast
+
+from sentry_sdk.types import Event
+from symbolic.exceptions import SymbolicError
+
 from sentry.utils.rust import merge_rust_info_frames, starts_with, strip_symbol
 
 STACKTRACE = """
@@ -71,7 +77,7 @@ stacktrace: stack backtrace:
 """
 
 
-def get_event(stacktrace):
+def get_event(stacktrace: str) -> dict[str, Any]:
     return {
         "event_id": "fe628bfa48064c9b97ce7e75a19e6197",
         "level": "error",
@@ -100,18 +106,21 @@ def get_event(stacktrace):
     }
 
 
-def get_exc_info(rust_info):
-    exc = ValueError("hello world")
+def get_exc_info(
+    rust_info: str | None,
+) -> tuple[type[BaseException], BaseException, None]:
+    make_error = cast("Callable[[str], SymbolicError]", SymbolicError)
+    exc = make_error("hello world")
     if rust_info is not None:
         exc.rust_info = rust_info
     return type(exc), exc, None
 
 
-def test_merge_rust_info():
+def test_merge_rust_info() -> None:
     event = get_event(STACKTRACE)
     exc_info = get_exc_info(STACKTRACE)
 
-    merge_rust_info_frames(event, {"exc_info": exc_info})
+    merge_rust_info_frames(cast("Event", event), {"exc_info": exc_info})
 
     assert event["platform"] == "native"
     assert event["logentry"]["formatted"] == "invalid debug identifier"
@@ -140,11 +149,11 @@ def test_merge_rust_info():
     assert frames[6]["lineno"] == 456
 
 
-def test_merge_rust_info_linux():
+def test_merge_rust_info_linux() -> None:
     event = get_event(STACKTRACE_SEMAPHORE_LINUX)
     exc_info = get_exc_info(STACKTRACE_SEMAPHORE_LINUX)
 
-    merge_rust_info_frames(event, {"exc_info": exc_info})
+    merge_rust_info_frames(cast("Event", event), {"exc_info": exc_info})
 
     assert event["platform"] == "native"
     assert event["logentry"]["formatted"] == "invalid debug identifier"
@@ -165,26 +174,26 @@ def test_merge_rust_info_linux():
     assert frames[-2]["function"] == "std::panic::catch_unwind"
 
 
-def test_without_exc_info():
+def test_without_exc_info() -> None:
     event = get_event(STACKTRACE)
-    merge_rust_info_frames(event, {})
+    merge_rust_info_frames(cast("Event", event), {})
     assert event["platform"] == "python"
 
 
-def test_without_rust_info():
+def test_without_rust_info() -> None:
     event = get_event(STACKTRACE)
     exc_info = get_exc_info(None)
 
-    merge_rust_info_frames(event, {"exc_info": exc_info})
+    merge_rust_info_frames(cast("Event", event), {"exc_info": exc_info})
     assert event["platform"] == "python"
 
 
-def test_without_stacktrace():
+def test_without_stacktrace() -> None:
     stacktrace = "stacktrace: stack backtrace:\n\n"
     event = get_event(stacktrace)
     exc_info = get_exc_info(stacktrace)
 
-    merge_rust_info_frames(event, {"exc_info": exc_info})
+    merge_rust_info_frames(cast("Event", event), {"exc_info": exc_info})
 
     assert event["platform"] == "native"
     assert event["logentry"]["formatted"] == "invalid debug identifier"
@@ -196,16 +205,16 @@ def test_without_stacktrace():
     assert len(frames) == 1
 
 
-def test_without_exception():
+def test_without_exception() -> None:
     event = get_event(STACKTRACE)
     exc_info = get_exc_info(STACKTRACE)
 
     del event["exception"]
-    merge_rust_info_frames(event, {"exc_info": exc_info})
+    merge_rust_info_frames(cast("Event", event), {"exc_info": exc_info})
     assert event["platform"] == "python"
 
 
-def test_starts_with():
+def test_starts_with() -> None:
     # Basic functions
     assert starts_with("__rust_maybe_catch_panic", "__rust")
     assert starts_with("futures::task_impl::std::set", "futures::")
@@ -225,7 +234,7 @@ def test_starts_with():
     assert starts_with("<T as core::convert::Into<U>>::into", "core::")
 
 
-def test_strip_symbol():
+def test_strip_symbol() -> None:
     assert strip_symbol("") == ""
     assert strip_symbol("_ffi_call_unix64") == "_ffi_call_unix64"
     assert (

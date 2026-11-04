@@ -1,0 +1,714 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+import {IconAdd} from '@sentry/icons/add';
+import {IconUser} from '@sentry/icons/user';
+import uniqBy from 'lodash/uniqBy';
+
+import {
+  ActorAvatar,
+  type BaseAvatarProps,
+  getTeamAvatarProps,
+  getUserAvatarProps,
+} from '@sentry/scraps/avatar';
+import {AvatarButton} from '@sentry/scraps/avatarButton';
+import {
+  CompactSelect,
+  MenuComponents,
+  type SelectOption,
+  type SelectOptionOrSection,
+} from '@sentry/scraps/compactSelect';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+import {OverlayTrigger, type TriggerProps} from '@sentry/scraps/overlayTrigger';
+import {Text} from '@sentry/scraps/text';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {openInviteMembersModal} from 'sentry/actionCreators/modal';
+import {
+  AssignedTooltip,
+  type AssignmentDetails,
+  UnassignedTooltip,
+} from 'sentry/components/assigneeBadge';
+import {TeamBadge} from 'sentry/components/idBadge/teamBadge';
+import {UserBadge} from 'sentry/components/idBadge/userBadge';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {SuggestedAvatarStack} from 'sentry/components/suggestedAvatarStack';
+import {t, tct, tn} from 'sentry/locale';
+import {ProjectsStore} from 'sentry/stores/projectsStore';
+import type {Actor} from 'sentry/types/core';
+import type {Group, SuggestedOwnerReason} from 'sentry/types/group';
+import type {Team} from 'sentry/types/organization';
+import type {User} from 'sentry/types/user';
+import {buildTeamId} from 'sentry/utils';
+import {useNewIssuePriorityAndAssigneeUI} from 'sentry/utils/useNewIssuePriorityAndAssigneeUI';
+import {useUser} from 'sentry/utils/useUser';
+
+const suggestedReasonTable: Record<SuggestedOwnerReason, string> = {
+  suspectCommit: t('Suspect Commit'),
+  ownershipRule: t('Ownership Rule'),
+  projectOwnership: t('Ownership Rule'),
+  seerSuggested: t('Seer Suggestion'),
+  // TODO: codeowners may no longer exist
+  codeowners: t('Codeowners'),
+};
+
+export type AssignableEntity = {
+  assignee: User | Actor;
+  id: string;
+  type: Actor['type'];
+  suggestedAssignee?: SuggestedAssignee;
+};
+
+export type SuggestedAssignee = Actor & {
+  assignee: AssignableTeam | User;
+  suggestedReason: SuggestedOwnerReason;
+  suggestedReasonText?: React.ReactNode;
+};
+
+type AssignableTeam = {
+  display: string;
+  email: string;
+  id: string;
+  team: Team;
+};
+
+export type AssigneeGroup = Pick<Group, 'assignedTo' | 'id' | 'owners'> & {
+  project: Pick<Group['project'], 'id' | 'slug'>;
+};
+
+interface AssigneeSelectorDropdownProps {
+  /**
+   * The group (issue) that the assignee selector is for
+   * TODO: generalize this for alerts
+   */
+  group: AssigneeGroup;
+  /**
+   * If true, there will be a loading indicator in the menu header.
+   */
+  loading: boolean;
+  /**
+   * Additional items to render in the menu footer
+   */
+  additionalMenuFooterItems?: React.ReactNode;
+  assignmentDetails?: AssignmentDetails;
+  /**
+   * Additional styles to apply to the dropdown
+   */
+  className?: string;
+  /**
+   * Optional list of members to populate the dropdown with.
+   */
+  memberList?: User[];
+  /**
+   * Callback for when an assignee is selected from the dropdown.
+   * The parent component should update the group with the new assignee
+   * in this callback.
+   */
+  onAssign?: (assignedActor: AssignableEntity | null) => void;
+  /**
+   * Callback for when the assignee is cleared
+   */
+  onClear?: (clearedAssignee: User | Actor) => void;
+  /**
+   * Optional list of suggested owners of the group
+   */
+  owners?: Array<Omit<SuggestedAssignee, 'assignee'>>;
+  /**
+   * Show the assignee name next to the avatar.
+   */
+  showLabel?: boolean;
+  /**
+   * Optional trigger for the assignee selector. If nothing passed in,
+   * the default trigger will be used
+   */
+  trigger?: (props: TriggerProps, isOpen: boolean) => React.ReactNode;
+}
+
+function AssigneeAvatar({
+  assignedTo,
+  suggestedActors = [],
+}: {
+  assignedTo?: Actor | null;
+  suggestedActors?: SuggestedAssignee[];
+}) {
+  const suggestedReasons: Record<SuggestedOwnerReason, React.ReactNode> = {
+    suspectCommit: tct('Suggested based on [commit:commit data]', {
+      commit: (
+        <TooltipSubExternalLink href="https://docs.sentry.io/product/sentry-basics/integrate-frontend/configure-scms/" />
+      ),
+    }),
+    ownershipRule: t('Matching Issue Owners Rule'),
+    projectOwnership: t('Matching Issue Owners Rule'),
+    seerSuggested: t('Seer Suggestion'),
+    codeowners: t('Matching Codeowners Rule'),
+  };
+  const assignedToSuggestion = suggestedActors.find(actor => actor.id === assignedTo?.id);
+
+  if (assignedTo) {
+    return (
+      <ActorAvatar
+        actor={assignedTo}
+        className="avatar"
+        tooltip={
+          <Stack gap="xs" align="start">
+            <Text as="div" align="left" wrap="nowrap">
+              {tct('Assigned to [name]', {
+                name:
+                  assignedTo.type === 'team' ? `#${assignedTo.name}` : assignedTo.name,
+              })}
+            </Text>
+            {assignedToSuggestion &&
+              suggestedReasons[assignedToSuggestion.suggestedReason] && (
+                <Text as="div" align="left" variant="muted">
+                  {suggestedReasons[assignedToSuggestion.suggestedReason]}
+                </Text>
+              )}
+          </Stack>
+        }
+      />
+    );
+  }
+
+  if (suggestedActors.length > 0) {
+    const actor = suggestedActors[0]!;
+    return (
+      <SuggestedAvatarStack
+        size={26}
+        owners={suggestedActors}
+        tooltip={
+          <Stack gap="xs" align="start">
+            <Text as="div" align="left" wrap="nowrap">
+              {tct('Suggestion: [name]', {
+                name: actor.type === 'team' ? `#${actor.name}` : actor.name,
+              })}
+              {suggestedActors.length > 1 &&
+                tn(' + %s other', ' + %s others', suggestedActors.length - 1)}
+            </Text>
+            <Text as="div" align="left" variant="muted">
+              {suggestedReasons[actor.suggestedReason]}
+            </Text>
+          </Stack>
+        }
+      />
+    );
+  }
+
+  return (
+    <Tooltip
+      skipWrapper
+      title={
+        <Stack gap="xs" align="start">
+          <Text as="div" align="left">
+            {t('Unassigned')}
+          </Text>
+          <Text as="div" align="left" variant="muted">
+            {tct(
+              'You can auto-assign issues by adding [issueOwners:Issue Owner rules].',
+              {
+                issueOwners: (
+                  <TooltipSubExternalLink href="https://docs.sentry.io/product/error-monitoring/issue-owners/" />
+                ),
+              }
+            )}
+          </Text>
+        </Stack>
+      }
+    >
+      <StyledIconUser data-test-id="unassigned" size="md" variant="primary" />
+    </Tooltip>
+  );
+}
+
+function AvatarButtonTooltip({
+  assignedTo,
+  assignmentDetails,
+  suggestedActors,
+}: {
+  suggestedActors: SuggestedAssignee[];
+  assignedTo?: Actor | null;
+  assignmentDetails?: AssignmentDetails;
+}) {
+  if (assignedTo) {
+    return (
+      <AssignedTooltip assignedTo={assignedTo} assignmentDetails={assignmentDetails} />
+    );
+  }
+
+  const suggestion = suggestedActors[0];
+  if (suggestion) {
+    return (
+      <Stack gap="xs" align="start">
+        <Text as="div" align="left" wrap="nowrap">
+          {tct('Suggestion: [name]', {
+            name: suggestion.type === 'team' ? `#${suggestion.name}` : suggestion.name,
+          })}
+          {suggestedActors.length > 1 &&
+            tn(' + %s other', ' + %s others', suggestedActors.length - 1)}
+        </Text>
+        <Text as="div" align="left" variant="muted">
+          {suggestion.suggestedReasonText ??
+            suggestedReasonTable[suggestion.suggestedReason]}
+        </Text>
+      </Stack>
+    );
+  }
+
+  return <UnassignedTooltip />;
+}
+
+function isAssignableTeam(assignee: AssignableTeam | User): assignee is AssignableTeam {
+  return 'team' in assignee;
+}
+
+function getAvatarButtonAvatar({
+  actor,
+  assignee,
+  suggested,
+}: {
+  actor: Actor;
+  suggested: boolean;
+  assignee?: AssignableTeam | User;
+}): BaseAvatarProps {
+  const avatar =
+    actor.type === 'user'
+      ? getUserAvatarProps(assignee && !isAssignableTeam(assignee) ? assignee : actor)
+      : assignee && isAssignableTeam(assignee)
+        ? getTeamAvatarProps(assignee.team)
+        : {
+            type: 'letter_avatar' as const,
+            identifier: actor.name,
+            name: actor.name,
+            title: actor.name,
+          };
+
+  return {...avatar, round: actor.type === 'user', suggested};
+}
+
+export function AssigneeSelectorDropdown({
+  assignmentDetails,
+  className,
+  group,
+  loading,
+  memberList,
+  onAssign,
+  onClear,
+  owners,
+  showLabel = false,
+  trigger,
+  additionalMenuFooterItems,
+}: AssigneeSelectorDropdownProps) {
+  const shouldUseNewUI = useNewIssuePriorityAndAssigneeUI();
+  const sessionUser = useUser();
+
+  const currentMemberList = memberList ?? [];
+
+  const getSuggestedAssignees = (): SuggestedAssignee[] => {
+    const currAssignableTeams = getAssignableTeams();
+    // Use owners from the group if no owners are provided
+    const suggestedOwners =
+      owners ??
+      uniqBy(group.owners ?? [], owner => owner.owner).map(suggestion => {
+        const [type, id] = suggestion.owner.split(':') as [Actor['type'], string];
+        return {
+          id,
+          type,
+          name: '',
+          suggestedReason: suggestion.type,
+          suggestedReasonText: suggestedReasonTable[suggestion.type],
+        };
+      });
+
+    return suggestedOwners
+      .map<SuggestedAssignee | null>(owner => {
+        if (owner.type === 'user') {
+          const member = currentMemberList.find(user => user.id === owner.id);
+          if (member) {
+            return {
+              ...owner,
+              name: owner.name || member.name,
+              assignee: member,
+            };
+          }
+        }
+        if (owner.type === 'team') {
+          const matchingTeam = currAssignableTeams.find(
+            assignableTeam => assignableTeam.team.id === owner.id
+          );
+          if (matchingTeam) {
+            return {
+              ...owner,
+              name: owner.name || matchingTeam.team.name,
+              assignee: matchingTeam,
+            };
+          }
+        }
+
+        return null;
+      })
+      .filter((owner): owner is SuggestedAssignee => !!owner);
+  };
+
+  const getAssignableTeams = (): AssignableTeam[] => {
+    const teams = ProjectsStore.getBySlug(group?.project.slug)?.teams ?? [];
+    return teams
+      .sort((a, b) => a.slug.localeCompare(b.slug))
+      .map(team => ({
+        id: buildTeamId(team.id),
+        display: `#${team.slug}`,
+        email: team.id,
+        team,
+      }));
+  };
+
+  const handleSelect = (selectedOption: SelectOption<string> | undefined) => {
+    // selectedOption is falsey when the option selected is already selected, or when the clear button is clicked
+    if (!selectedOption) {
+      if (onClear && group.assignedTo) {
+        onClear(group.assignedTo);
+      }
+      return;
+    }
+    // See makeMemberOption and makeTeamOption for how the value is formatted
+    const type = selectedOption.value.startsWith('user:') ? 'user' : 'team';
+    const assigneeId = selectedOption.value.split(':')[1]!;
+    let assignee: User | Actor;
+
+    if (type === 'user') {
+      assignee = currentMemberList.find(member => member.id === assigneeId)!;
+    } else {
+      const assignedTeam = getAssignableTeams().find(
+        assignableTeam => assignableTeam.team.id === assigneeId
+      )!;
+      // Convert AssingableTeam to Actor
+      assignee = {
+        id: assignedTeam.id,
+        name: assignedTeam.team.slug,
+        type: 'team',
+      };
+    }
+    // Assignee is guaranteed to exist here, but we check to satisfy the type-checker
+    if (assignee && onAssign) {
+      const suggestedAssignee = getSuggestedAssignees().find(
+        actor => actor.type === type && actor.id === assignee.id
+      );
+      onAssign({
+        assignee,
+        id: assigneeId,
+        type,
+        suggestedAssignee,
+      });
+    }
+  };
+
+  const makeMemberOption = (user: User): SelectOption<string> => {
+    const isCurrentUser = user.id === sessionUser?.id;
+    const userDisplay = user.name || user.email;
+
+    return {
+      label: (
+        <UserBadge
+          data-test-id="assignee-option"
+          displayName={`${userDisplay}${isCurrentUser ? ' (You)' : ''}`}
+          hideEmail
+          user={user}
+        />
+      ),
+      // Jank way to pass assignee type (team or user) into each row
+      value: `user:${user.id}`,
+      textValue: `${user.name}${user.email}`,
+    };
+  };
+
+  const makeTeamOption = (assignableTeam: AssignableTeam): SelectOption<string> => ({
+    label: <TeamBadge data-test-id="assignee-option" team={assignableTeam.team} />,
+    value: `team:${assignableTeam.team.id}`,
+    textValue: `#${assignableTeam.team.slug}`,
+  });
+
+  const makeSuggestedAssigneeOption = (
+    assignee: SuggestedAssignee
+  ): SelectOption<string> => {
+    if (assignee.type === 'user') {
+      const isCurrentUser = assignee.id === sessionUser?.id;
+      return {
+        label: (
+          <UserBadge
+            hideEmail
+            data-test-id="assignee-option"
+            displayName={`${assignee.name}${isCurrentUser ? ' (You)' : ''}`}
+            user={assignee.assignee as User}
+            description={
+              assignee.suggestedReasonText ??
+              suggestedReasonTable[assignee.suggestedReason]
+            }
+          />
+        ),
+        value: `user:${assignee.id}`,
+        textValue: assignee.name,
+      };
+    }
+    const assignedTeam = assignee.assignee as AssignableTeam;
+    return {
+      label: (
+        <TeamBadge
+          data-test-id="assignee-option"
+          team={assignedTeam.team}
+          description={
+            assignee.suggestedReasonText ?? suggestedReasonTable[assignee.suggestedReason]
+          }
+        />
+      ),
+      value: `team:${assignee.id}`,
+      textValue: assignedTeam.team.slug,
+    };
+  };
+
+  const makeAllOptions = (): Array<SelectOptionOrSection<string>> => {
+    const options: Array<SelectOptionOrSection<string>> = [];
+
+    let memList = currentMemberList;
+    let assignableTeamList = getAssignableTeams();
+    let suggestedAssignees = getSuggestedAssignees();
+    let assignedUser: User | undefined;
+
+    // If the group is already assigned, extract the assigned user/team
+    // from the member-list/assignedTeam-list and add to the top of the menu
+    if (group.assignedTo) {
+      if (group.assignedTo.type === 'team') {
+        const assignedTeam = assignableTeamList.find(
+          assignableTeam => assignableTeam.team.id === group.assignedTo?.id
+        );
+        if (assignedTeam) {
+          options.push(makeTeamOption(assignedTeam));
+          assignableTeamList = assignableTeamList?.filter(
+            assignableTeam => assignableTeam.team.id !== group.assignedTo?.id
+          );
+          suggestedAssignees = suggestedAssignees?.filter(suggestedAssignee => {
+            return suggestedAssignee.id !== group.assignedTo?.id;
+          });
+        }
+      } else {
+        assignedUser = currentMemberList.find(user => user.id === group.assignedTo?.id);
+        if (assignedUser) {
+          options.push(makeMemberOption(assignedUser));
+          memList = memList.filter(member => member.id !== group.assignedTo?.id);
+          suggestedAssignees = suggestedAssignees?.filter(suggestedAssignee => {
+            return suggestedAssignee.id !== group.assignedTo?.id;
+          });
+        }
+      }
+    }
+
+    // Only bubble the current user to the top if they are not already assigned or suggested
+    const isUserAssignedOrSuggested =
+      assignedUser?.id === sessionUser.id ||
+      !!getSuggestedAssignees()?.find(
+        suggestedAssignee => suggestedAssignee.id === sessionUser.id
+      );
+    if (!isUserAssignedOrSuggested) {
+      const currentUser = memList.find(user => user.id === sessionUser.id);
+      if (currentUser) {
+        memList = memList.filter(user => user.id !== sessionUser.id);
+        // This can't be sessionUser even though they're the same thing
+        // because it would bork the tests
+        memList.unshift(currentUser);
+      }
+    }
+
+    const suggestedUsers = suggestedAssignees?.filter(
+      assignee => assignee.type === 'user'
+    );
+    const suggestedTeams = suggestedAssignees?.filter(
+      assignee => assignee.type === 'team'
+    );
+
+    // Remove suggested assignees from the member list and team list to avoid duplicates
+    memList = memList.filter(
+      user => !suggestedUsers.some(suggested => suggested.id === user.id)
+    );
+    assignableTeamList = assignableTeamList.filter(
+      assignableTeam =>
+        !suggestedTeams.some(suggested => suggested.id === assignableTeam.team.id)
+    );
+
+    const memberOptions = {
+      value: '_members',
+      label: t('Members'),
+      options: memList.map(member => makeMemberOption(member)) ?? [],
+    };
+
+    const teamOptions = {
+      value: '_teams',
+      label: t('Teams'),
+      options: assignableTeamList?.map(makeTeamOption) ?? [],
+    };
+
+    const suggestedOptions = {
+      value: '_suggested_assignees',
+      label: t('Suggested'),
+      options:
+        suggestedUsers
+          .map(makeSuggestedAssigneeOption)
+          .concat(suggestedTeams?.map(makeSuggestedAssigneeOption)) ?? [],
+    };
+
+    options.push(suggestedOptions, memberOptions, teamOptions);
+
+    return options;
+  };
+
+  const makeTrigger = (props: TriggerProps) => {
+    if (shouldUseNewUI) {
+      const suggestedActors = getSuggestedAssignees();
+      const actor = group.assignedTo ?? suggestedActors[0];
+      const assignee = group.assignedTo
+        ? group.assignedTo.type === 'user'
+          ? currentMemberList.find(member => member.id === group.assignedTo?.id)
+          : getAssignableTeams().find(team => team.team.id === group.assignedTo?.id)
+        : suggestedActors[0]?.assignee;
+      const triggerLabel = loading
+        ? t('Loading…')
+        : actor
+          ? `${actor.type === 'team' ? '#' : ''}${actor.name}`
+          : t('Unassigned');
+      const tooltipTitle = (
+        <AvatarButtonTooltip
+          assignedTo={group.assignedTo}
+          assignmentDetails={assignmentDetails}
+          suggestedActors={suggestedActors}
+        />
+      );
+
+      const avatarButton = (
+        <AvatarButton
+          {...props}
+          aria-label={t('Modify issue assignee: %s', triggerLabel)}
+          avatar={
+            actor
+              ? getAvatarButtonAvatar({
+                  actor,
+                  assignee,
+                  suggested: !group.assignedTo,
+                })
+              : undefined
+          }
+          busy={loading}
+          data-test-id="assignee-selector"
+          disabled={loading}
+          size="xs"
+          tooltipProps={showLabel ? undefined : {maxWidth: 300, title: tooltipTitle}}
+        />
+      );
+
+      if (!showLabel) {
+        return avatarButton;
+      }
+
+      return (
+        <Tooltip maxWidth={300} skipWrapper title={tooltipTitle}>
+          <Flex as="label" align="center" gap="sm" htmlFor={props.id}>
+            {avatarButton}
+            <AssigneeLabel ellipsis>{triggerLabel}</AssigneeLabel>
+          </Flex>
+        </Tooltip>
+      );
+    }
+
+    const avatarElement = (
+      <AssigneeAvatar
+        assignedTo={group.assignedTo}
+        suggestedActors={getSuggestedAssignees()}
+      />
+    );
+    return (
+      <Fragment>
+        {loading && (
+          <LoadingIndicator mini style={{height: '24px', margin: 0, marginRight: 11}} />
+        )}
+        {!loading && (
+          <AssigneeTrigger
+            variant="transparent"
+            data-test-id="assignee-selector"
+            {...props}
+          >
+            {avatarElement}
+          </AssigneeTrigger>
+        )}
+      </Fragment>
+    );
+  };
+
+  return (
+    <AssigneeWrapper>
+      <CompactSelect
+        style={shouldUseNewUI ? {display: 'flex'} : undefined}
+        search={{placeholder: 'Search users or teams...'}}
+        clearable
+        className={className}
+        menuWidth={275}
+        position="bottom-end"
+        onClick={e => e.stopPropagation()}
+        value={
+          group.assignedTo
+            ? `${group.assignedTo?.type === 'user' ? 'user:' : 'team:'}${
+                group.assignedTo.id
+              }`
+            : ''
+        }
+        menuTitle={t('Assignee')}
+        size="sm"
+        onChange={handleSelect}
+        options={makeAllOptions()}
+        trigger={trigger ?? makeTrigger}
+        menuFooter={({closeOverlay}) => (
+          <Flex gap="md">
+            <MenuComponents.CTAButton
+              disabled={loading}
+              onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
+                event.preventDefault();
+                closeOverlay();
+                openInviteMembersModal({source: 'assignee_selector'});
+              }}
+              icon={<IconAdd />}
+            >
+              {t('Invite Member')}
+            </MenuComponents.CTAButton>
+            {additionalMenuFooterItems}
+          </Flex>
+        )}
+        sizeLimit={150}
+        sizeLimitMessage="Use search to find more users and teams..."
+        strategy="fixed"
+      />
+    </AssigneeWrapper>
+  );
+}
+
+const AssigneeWrapper = styled('div')`
+  display: flex;
+  justify-content: flex-end;
+  text-align: left;
+`;
+
+const AssigneeTrigger = styled(OverlayTrigger.Button)`
+  z-index: 0;
+  padding-left: ${p => p.theme.space.xs};
+  padding-right: ${p => p.theme.space.xs};
+`;
+
+const AssigneeLabel = styled(Text)`
+  max-width: 114px;
+`;
+
+const StyledIconUser = styled(IconUser)`
+  margin-right: 2px;
+`;
+
+const TooltipSubExternalLink = styled(ExternalLink)`
+  color: ${p => p.theme.tokens.content.secondary};
+  text-decoration: underline;
+
+  :hover {
+    color: ${p => p.theme.tokens.content.secondary};
+  }
+`;

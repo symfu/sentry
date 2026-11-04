@@ -1,0 +1,619 @@
+from collections.abc import Iterable, Mapping, Sequence
+from functools import partial
+from typing import Any, assert_never
+
+from django.db import router, transaction
+from django.db.models import Count, Exists, F, OuterRef, Q, Subquery
+from django.db.models.query import QuerySet
+from drf_spectacular.utils import extend_schema
+from rest_framework import serializers, status
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry import audit_log, quotas
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases import OrganizationEndpoint
+from sentry.api.bases.organization import OrganizationDetectorPermission
+from sentry.api.event_search import SearchConfig, SearchFilter, SearchKey, default_config
+from sentry.api.event_search import parse_search_query as base_parse_search_query
+from sentry.api.paginator import OffsetPaginator
+from sentry.api.serializers import serialize
+from sentry.api.utils import to_valid_int_id_list
+from sentry.apidocs.constants import (
+    RESPONSE_BAD_REQUEST,
+    RESPONSE_FORBIDDEN,
+    RESPONSE_NO_CONTENT,
+    RESPONSE_NOT_FOUND,
+    RESPONSE_SUCCESS,
+    RESPONSE_UNAUTHORIZED,
+)
+from sentry.apidocs.examples.workflow_engine_examples import WorkflowEngineExamples
+from sentry.apidocs.parameters import (
+    CursorQueryParam,
+    DetectorParams,
+    GlobalParams,
+    OrganizationParams,
+    VisibilityParams,
+)
+from sentry.apidocs.response_types import DetailResponse
+from sentry.apidocs.utils import inline_sentry_response_serializer
+from sentry.auth.principal import RequestPrincipal
+from sentry.constants import ObjectStatus
+from sentry.deletions.models.scheduleddeletion import CellScheduledDeletion
+from sentry.exceptions import InvalidSearchQuery
+from sentry.issues.issue_search import convert_actor_or_none_value
+from sentry.models.group import GroupStatus
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.models.team import Team
+from sentry.monitors.models import get_cron_monitor
+from sentry.users.models.user import User
+from sentry.users.services.user import RpcUser
+from sentry.utils.audit import create_audit_entry
+from sentry.workflow_engine.endpoints.serializers.detector_serializer import (
+    DetectorSerializerResponse,
+)
+from sentry.workflow_engine.endpoints.utils.filters import (
+    apply_filter,
+    exclude_disallowed_metric_detectors,
+    get_excluded_detector_types,
+)
+from sentry.workflow_engine.endpoints.validators.base import BaseDetectorTypeValidator
+from sentry.workflow_engine.endpoints.validators.detector_workflow_mutation import (
+    DetectorWorkflowMutationValidator,
+)
+from sentry.workflow_engine.endpoints.validators.utils import (
+    can_delete_detectors,
+    can_edit_detectors,
+    get_unknown_detector_type_error,
+    should_include_all_projects_detector,
+)
+from sentry.workflow_engine.models import DataSourceDetector, Detector
+from sentry.workflow_engine.models.detector_group import DetectorGroup
+from sentry.workflow_engine.processors.detector import get_all_projects_detector
+from sentry.workflow_engine.registry import detector_settings_registry
+from sentry.workflow_engine.types import DetectorAPIOperation, DetectorType
+
+detector_search_config = SearchConfig.create_from(
+    default_config,
+    text_operator_keys={"name", "type", "workflow"},
+    allowed_keys={"name", "type", "assignee", "workflow"},
+    allow_boolean=False,
+    free_text_key="query",
+)
+parse_detector_query = partial(base_parse_search_query, config=detector_search_config)
+
+
+def convert_assignee_values(
+    value: Iterable[str], projects: Sequence[Project], user: RequestPrincipal
+) -> Q:
+    """
+    Convert an assignee search value to a Django Q object for filtering detectors.
+    """
+    actors_or_none: list[RpcUser | Team | None] = convert_actor_or_none_value(
+        value, projects, user, None
+    )
+    if not actors_or_none:
+        # my_teams for a caller with no teams; Q() would match every detector
+        return Q(pk__in=[])
+    assignee_query = Q()
+    for actor in actors_or_none:
+        if isinstance(actor, (User, RpcUser)):
+            assignee_query |= Q(owner_user_id=actor.id)
+        elif isinstance(actor, Team):
+            assignee_query |= Q(owner_team_id=actor.id)
+        elif actor is None:
+            assignee_query |= Q(owner_team_id__isnull=True, owner_user_id__isnull=True)
+        else:
+            assert_never(actor)
+    return assignee_query
+
+
+# Maps API field name to database ordering expressions
+SORT_MAP = {
+    "name": "name",
+    "-name": "-name",
+    "id": "id",
+    "-id": "-id",
+    "type": "type",
+    "-type": "-type",
+    "connectedWorkflows": "connected_workflows",
+    "-connectedWorkflows": "-connected_workflows",
+    "latestGroup": F("latest_group_last_seen").asc(nulls_first=True),
+    "-latestGroup": F("latest_group_last_seen").desc(nulls_last=True),
+    "openIssues": F("open_issues_count").asc(nulls_first=True),
+    "-openIssues": F("open_issues_count").desc(nulls_last=True),
+}
+
+DETECTOR_TYPE_ALIASES = {
+    "metric": DetectorType.METRIC_ISSUE,
+    "uptime": DetectorType.UPTIME_DOMAIN_FAILURE,
+    "cron": DetectorType.MONITOR_CHECK_IN_FAILURE,
+}
+
+SEAT_DETECTOR_TYPES = (DetectorType.MONITOR_CHECK_IN_FAILURE, DetectorType.UPTIME_DOMAIN_FAILURE)
+
+
+def get_detector_validator(
+    request: Request,
+    project: Project,
+    detector_type_slug: str,
+    instance: Detector | None = None,
+    partial: bool = False,
+    data: Mapping[str, Any] | None = None,
+) -> BaseDetectorTypeValidator:
+    try:
+        detector_type = DetectorType(detector_type_slug)
+        settings = detector_settings_registry.get(detector_type)
+    except ValueError:
+        error_message = get_unknown_detector_type_error(detector_type_slug, project.organization)
+        raise ValidationError({"type": [error_message]})
+
+    if settings.validator is None:
+        raise ValidationError({"type": ["Detector type not compatible with detectors"]})
+
+    if detector_type_slug in get_excluded_detector_types(
+        request.method, project.organization, actor=request.user
+    ):
+        raise ValidationError(
+            {"type": [f"Detector type does not support {request.method} requests"]}
+        )
+
+    return settings.validator(
+        instance=instance,
+        context={
+            "project": project,
+            "organization": project.organization,
+            "request": request,
+            "access": request.access,
+            "user": request.user,
+        },
+        data=request.data if data is None else data,
+        partial=partial,
+    )
+
+
+class BulkUpdateMonitorsSerializer(DetectorWorkflowMutationValidator):
+    # Redeclared for this endpoint's wording.
+    enabled = serializers.BooleanField(help_text="Whether to enable or disable the monitors")
+
+
+@cell_silo_endpoint
+@extend_schema(tags=["Monitors"])
+class OrganizationDetectorIndexEndpoint(OrganizationEndpoint):
+    publish_status = {
+        "GET": ApiPublishStatus.PUBLIC,
+        "PUT": ApiPublishStatus.PUBLIC,
+        "DELETE": ApiPublishStatus.PUBLIC,
+    }
+    idempotent_methods = frozenset({"PUT"})
+    owner = ApiOwner.ISSUES
+
+    permission_classes = (OrganizationDetectorPermission,)
+
+    def filter_detectors(self, request: Request, organization: Any) -> QuerySet[Detector]:
+        """
+        Filter detectors based on the request parameters.
+        """
+
+        if not request.user.is_authenticated:
+            return Detector.objects.none()
+
+        all_projects_detector = get_all_projects_detector(organization.id)
+        if raw_idlist := request.GET.getlist("id"):
+            ids = to_valid_int_id_list("id", raw_idlist)
+            # If filtering by IDs, we must search across all accessible projects
+            projects = self.get_projects(request, organization, include_all_accessible=True)
+            detector_q = Q(project_id__in=projects)
+            if all_projects_detector and should_include_all_projects_detector(
+                request, organization
+            ):
+                detector_q |= Q(id__in=[all_projects_detector.id])
+            return Detector.objects.with_type_filters().filter(detector_q, id__in=ids)
+
+        projects = self.get_projects(request, organization)
+        detector_q = Q(project_id__in=projects)
+
+        # XXX: We have to do this to avoid breaking the Terraform provider.
+        # src: https://github.com/jianyuan/terraform-provider-sentry/blob/b59481f837cbeae74be2fe9883eab473fb63f3a1/internal/provider/data_source_project_issue_stream_monitor_impl.go#L29-L54
+        # We exclude the all projects detector when the request filters to specific projects.
+        # However, if the all projects sentinel is used, we do add it into the response.
+        project_params_unchecked = self.get_requested_project_params_unchecked(request)
+        project_params_include_all_projects = (
+            not project_params_unchecked.has_values
+            or project_params_unchecked.has_all_projects_sentinel
+        )
+        if (
+            all_projects_detector
+            and should_include_all_projects_detector(request, organization)
+            and project_params_include_all_projects
+        ):
+            detector_q |= Q(id__in=[all_projects_detector.id])
+
+        queryset: QuerySet[Detector] = Detector.objects.with_type_filters().filter(detector_q)
+
+        if raw_query := request.GET.get("query"):
+            try:
+                parsed_filters = parse_detector_query(raw_query)
+            except InvalidSearchQuery as e:
+                raise ValidationError({"query": [str(e)]})
+            for filter in parsed_filters:
+                assert isinstance(filter, SearchFilter)
+                match filter:
+                    case SearchFilter(key=SearchKey("name"), operator=("=" | "IN" | "!=")):
+                        queryset = apply_filter(queryset, filter, "name")
+                    case SearchFilter(key=SearchKey("type"), operator=("=" | "IN" | "!=")):
+                        values = (
+                            filter.value.value
+                            if isinstance(filter.value.value, list)
+                            else [filter.value.value]
+                        )
+                        values = [DETECTOR_TYPE_ALIASES.get(value, value) for value in values]
+
+                        if filter.operator == "!=":
+                            queryset = queryset.exclude(type__in=values)
+                        else:
+                            queryset = queryset.filter(type__in=values)
+                    case SearchFilter(
+                        key=SearchKey("assignee"), operator=("=" | "IN" | "!=" | "NOT IN")
+                    ):
+                        # Filter values can be emails, team slugs, "me", "my_teams", "none"
+                        values = (
+                            filter.value.value
+                            if isinstance(filter.value.value, list)
+                            else [filter.value.value]
+                        )
+                        assignee_q = convert_assignee_values(values, projects, request.user)
+
+                        if filter.operator == "!=" or filter.operator == "NOT IN":
+                            queryset = queryset.exclude(assignee_q)
+                        else:
+                            queryset = queryset.filter(assignee_q)
+                    case SearchFilter(
+                        key=SearchKey("workflow"),
+                        operator=("=" | "IN" | "!=" | "NOT IN"),
+                    ):
+                        workflow_ids = (
+                            filter.value.value
+                            if isinstance(filter.value.value, list)
+                            else [filter.value.value]
+                        )
+                        workflow_ids = to_valid_int_id_list("workflow", workflow_ids)
+                        if filter.operator in ("!=", "NOT IN"):
+                            queryset = queryset.exclude(
+                                detectorworkflow__workflow_id__in=workflow_ids
+                            )
+                        else:
+                            queryset = queryset.filter(
+                                detectorworkflow__workflow_id__in=workflow_ids
+                            ).distinct()
+                    case SearchFilter(key=SearchKey("query"), operator="="):
+                        # 'query' is our free text key; all free text gets returned here
+                        # as '=', and we search any relevant fields for it.
+                        queryset = queryset.filter(
+                            Q(description__icontains=filter.value.value)
+                            | Q(name__icontains=filter.value.value)
+                            | Q(type__icontains=filter.value.value)
+                        ).distinct()
+
+        return queryset
+
+    @extend_schema(
+        operation_id="listOrganizationDetectors",
+        summary="Fetch an Organization's Monitors",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            OrganizationParams.PROJECT,
+            DetectorParams.QUERY,
+            DetectorParams.SORT,
+            DetectorParams.ID,
+            DetectorParams.TYPE,
+            DetectorParams.ENABLED,
+            VisibilityParams.PER_PAGE,
+            CursorQueryParam,
+        ],
+        responses={
+            200: inline_sentry_response_serializer(
+                "ListDetectorSerializerResponse", list[DetectorSerializerResponse]
+            ),
+            400: RESPONSE_BAD_REQUEST,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+        examples=WorkflowEngineExamples.LIST_ORG_DETECTORS,
+    )
+    def get(
+        self, request: Request, organization: Organization
+    ) -> Response[list[DetectorSerializerResponse]] | Response[DetailResponse]:
+        """
+        List an Organization's Monitors
+        """
+        if not request.user.is_authenticated:
+            return self.respond(status=status.HTTP_401_UNAUTHORIZED)
+
+        queryset = self.filter_detectors(request, organization)
+        queryset = queryset.exclude(
+            type__in=get_excluded_detector_types(
+                DetectorAPIOperation.LIST, organization, actor=request.user
+            )
+        )
+
+        if detector_types := request.GET.getlist("type"):
+            detector_types = [DETECTOR_TYPE_ALIASES.get(value, value) for value in detector_types]
+            queryset = queryset.filter(type__in=detector_types)
+
+        raw_enabled = request.GET.get("enabled")
+        if raw_enabled is not None:
+            try:
+                enabled = serializers.BooleanField().run_validation(raw_enabled)
+            except ValidationError as error:
+                raise ValidationError({"enabled": error.detail}) from error
+            queryset = queryset.filter(enabled=enabled)
+
+        queryset = exclude_disallowed_metric_detectors(queryset, organization)
+
+        # Cron and uptime detectors that lost their data source can't run and
+        # can't be rendered, so hide them until they're cleaned up.
+        queryset = queryset.exclude(
+            Q(type__in=[DetectorType.MONITOR_CHECK_IN_FAILURE, DetectorType.UPTIME_DOMAIN_FAILURE])
+            & ~Exists(DataSourceDetector.objects.filter(detector_id=OuterRef("pk")))
+        )
+
+        sort_by = request.GET.get("sortBy", "id")
+        sort_by_field = sort_by.lstrip("-")
+        if sort_by not in SORT_MAP:
+            raise ValidationError({"sortBy": ["Invalid sort field"]})
+
+        if sort_by_field == "connectedWorkflows":
+            queryset = queryset.annotate(connected_workflows=Count("detectorworkflow"))
+        elif sort_by_field == "latestGroup":
+            latest_detector_group_subquery = (
+                DetectorGroup.objects.filter(detector=OuterRef("pk"))
+                .order_by("-date_added")
+                .values("group__last_seen")[:1]
+            )
+            queryset = queryset.annotate(
+                latest_group_last_seen=Subquery(latest_detector_group_subquery)
+            )
+        elif sort_by_field == "openIssues":
+            queryset = queryset.annotate(
+                open_issues_count=Count(
+                    "detectorgroup__group",
+                    filter=Q(detectorgroup__group__status=GroupStatus.UNRESOLVED),
+                )
+            )
+
+        order_by_field = [SORT_MAP[sort_by]]
+
+        return self.paginate(
+            request=request,
+            paginator_cls=OffsetPaginator,
+            queryset=queryset,
+            order_by=order_by_field,
+            on_results=lambda x: serialize(x, request.user),
+            count_hits=True,
+        )
+
+    @extend_schema(
+        operation_id="updateOrganizationDetectors",
+        summary="Mutate an Organization's Monitors",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            OrganizationParams.PROJECT,
+            DetectorParams.QUERY,
+            DetectorParams.ID,
+        ],
+        request=BulkUpdateMonitorsSerializer,
+        responses={
+            200: inline_sentry_response_serializer(
+                "ListDetectorSerializerResponse", list[DetectorSerializerResponse]
+            ),
+            400: RESPONSE_BAD_REQUEST,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+        examples=WorkflowEngineExamples.LIST_ORG_DETECTORS,
+    )
+    def put(
+        self, request: Request, organization: Organization
+    ) -> Response[list[DetectorSerializerResponse]] | Response[DetailResponse]:
+        """
+        Bulk enable or disable an Organization's Monitors
+        """
+        if not request.user.is_authenticated:
+            return self.respond(status=status.HTTP_401_UNAUTHORIZED)
+
+        if not (
+            request.GET.getlist("id")
+            or request.GET.get("query")
+            or request.GET.getlist("project")
+            or request.GET.getlist("projectSlug")
+        ):
+            return Response(
+                {
+                    "detail": "At least one of 'id', 'query', 'project', or 'projectSlug' must be provided."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        validator = BulkUpdateMonitorsSerializer(data=request.data)
+        validator.is_valid(raise_exception=True)
+        enabled = validator.validated_data.get("enabled", True)
+
+        queryset = self.filter_detectors(request, organization)
+        queryset = queryset.exclude(
+            type__in=get_excluded_detector_types(
+                DetectorAPIOperation.PUT, organization, actor=request.user
+            )
+        )
+        queryset = exclude_disallowed_metric_detectors(queryset, organization)
+        queryset = queryset.exclude(type=DetectorType.ISSUE_STREAM)
+
+        # If explicitly filtering by IDs and some were not found, return 400
+        if request.GET.getlist("id") and len(queryset) != len(set(request.GET.getlist("id"))):
+            return Response(
+                {
+                    "detail": "Some detectors were not found or you do not have permission to update them."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not queryset:
+            return Response(
+                {"detail": "No detectors found."},
+                status=status.HTTP_200_OK,
+            )
+
+        # Check if the user has edit permissions for all detectors
+        if not can_edit_detectors(queryset, request):
+            raise PermissionDenied
+
+        seat_detectors = [
+            detector
+            for detector in queryset
+            if detector.type in SEAT_DETECTOR_TYPES and detector.enabled != enabled
+        ]
+        if enabled:
+            monitors = [
+                get_cron_monitor(detector)
+                for detector in seat_detectors
+                if detector.type == DetectorType.MONITOR_CHECK_IN_FAILURE
+            ]
+            uptime_detectors = [
+                detector
+                for detector in seat_detectors
+                if detector.type == DetectorType.UPTIME_DOMAIN_FAILURE
+            ]
+            for seat_objects in (monitors, uptime_detectors):
+                if not seat_objects:
+                    continue
+                assign_result = quotas.backend.check_assign_seats(seat_objects=seat_objects)
+                if not assign_result.assignable:
+                    return Response(
+                        {"detail": assign_result.reason}, status=status.HTTP_400_BAD_REQUEST
+                    )
+
+        # We update detectors individually to ensure post_save signals are called
+        with transaction.atomic(router.db_for_write(Detector)):
+            for detector in queryset:
+                if detector.type not in SEAT_DETECTOR_TYPES:
+                    detector.update(enabled=enabled)
+
+        # Seat detectors commit one at a time, so keep going past failures
+        failed_detectors = []
+        for detector in seat_detectors:
+            detector_validator = get_detector_validator(
+                request,
+                detector.linked_project,
+                detector.type,
+                detector,
+                partial=True,
+                data={"enabled": enabled},
+            )
+            try:
+                detector_validator.is_valid(raise_exception=True)
+                detector_validator.save()
+            except ValidationError:
+                failed_detectors.append(detector)
+
+        if failed_detectors:
+            action = "enable" if enabled else "disable"
+            names = ", ".join(detector.name for detector in failed_detectors)
+            return Response(
+                {"detail": f"Failed to {action} some monitors: {names}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return self.paginate(
+            request=request,
+            queryset=queryset,
+            paginator_cls=OffsetPaginator,
+            on_results=lambda x: serialize(x, request.user),
+            order_by=["id"],
+        )
+
+    @extend_schema(
+        operation_id="deleteOrganizationDetectors",
+        summary="Bulk Delete Monitors",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            OrganizationParams.PROJECT,
+            DetectorParams.QUERY,
+            DetectorParams.SORT,
+            DetectorParams.ID,
+        ],
+        responses={
+            200: RESPONSE_SUCCESS,
+            204: RESPONSE_NO_CONTENT,
+            400: RESPONSE_BAD_REQUEST,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+    )
+    def delete(
+        self, request: Request, organization: Organization
+    ) -> Response[None] | Response[DetailResponse]:
+        """
+        Bulk delete Monitors for a given organization
+        """
+        if not request.user.is_authenticated:
+            return self.respond(status=status.HTTP_401_UNAUTHORIZED)
+
+        if not (
+            request.GET.getlist("id")
+            or request.GET.get("query")
+            or request.GET.getlist("project")
+            or request.GET.getlist("projectSlug")
+        ):
+            return Response(
+                {
+                    "detail": "At least one of 'id', 'query', 'project', or 'projectSlug' must be provided."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        queryset = self.filter_detectors(request, organization)
+        queryset = queryset.exclude(
+            type__in=get_excluded_detector_types(
+                DetectorAPIOperation.DELETE, organization, actor=request.user
+            )
+        )
+
+        # If explicitly filtering by IDs and some were not found, return 400
+        if request.GET.getlist("id") and len(queryset) != len(set(request.GET.getlist("id"))):
+            return Response(
+                {
+                    "detail": "Some detectors were not found or you do not have permission to delete them."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not queryset:
+            return Response(
+                {"detail": "No detectors found."},
+                status=status.HTTP_200_OK,
+            )
+
+        # Check if the user has edit permissions for all detectors
+        if not can_delete_detectors(queryset, request):
+            raise PermissionDenied
+
+        for detector in queryset:
+            with transaction.atomic(router.db_for_write(Detector)):
+                CellScheduledDeletion.schedule(detector, days=0, actor=request.user)
+                create_audit_entry(
+                    request=request,
+                    organization=organization,
+                    target_object=detector.id,
+                    event=audit_log.get_event_id("DETECTOR_REMOVE"),
+                    data=detector.get_audit_log_data(),
+                )
+                detector.update(status=ObjectStatus.PENDING_DELETION)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)

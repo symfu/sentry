@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from collections.abc import Generator, Sequence
+from typing import Any
+
+from sentry.integrations.messaging.metrics import (
+    MessagingInteractionEvent,
+    MessagingInteractionType,
+)
+from sentry.integrations.msteams.card_builder.issues import MSTeamsIssueMessageBuilder
+from sentry.integrations.msteams.client import MsTeamsClient
+from sentry.integrations.msteams.metrics import record_lifecycle_termination_level
+from sentry.integrations.msteams.spec import MsTeamsMessagingSpec
+from sentry.integrations.services.integration import RpcIntegration
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.notifications.platform.shadow.capture import record_legacy_render
+from sentry.notifications.platform.types import NotificationProviderKey
+from sentry.notifications.types import RuleFuture
+from sentry.rules.actions import IntegrationEventAction
+from sentry.rules.base import CallbackFuture
+from sentry.services.eventstore.models import GroupEvent
+from sentry.shared_integrations.exceptions import ApiError, IntegrationError
+from sentry.utils import metrics
+
+
+class MsTeamsNotifyServiceAction(IntegrationEventAction):
+    id = "sentry.integrations.msteams.notify_action.MsTeamsNotifyServiceAction"
+    label = "Send a notification to the {team} Team to {channel}"
+    prompt = "Send a Microsoft Teams notification"
+    provider = IntegrationProviderSlug.MSTEAMS.value
+    integration_key = "team"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.form_fields = {
+            "team": {
+                "type": "choice",
+                "choices": [(i.id, i.name) for i in self.get_integrations()],
+            },
+            "channel": {"type": "string", "placeholder": "i.e. General, Jane Schmidt"},
+        }
+
+    def get_integrations(self) -> list[RpcIntegration]:
+        # NOTE: We exclude installations of `tenant` type to NOT show up in the team choices dropdown in alert rule actions
+        # as currently, there is no way to query the API for users or channels within a `tenant` to send alerts to.
+        return [
+            a for a in super().get_integrations() if a.metadata.get("installation_type") != "tenant"
+        ]
+
+    def after(
+        self, event: GroupEvent, notification_uuid: str | None = None
+    ) -> Generator[CallbackFuture]:
+        channel = self.get_option("channel_id")
+
+        integration = self.get_integration()
+        if not integration:
+            return
+
+        def send_notification(event: GroupEvent, futures: Sequence[RuleFuture]) -> None:
+            contexts = [future.context for future in futures]
+            rules = [context.origin for context in contexts]
+            card = MSTeamsIssueMessageBuilder(
+                event.group, event, rules, integration
+            ).build_group_card(notification_uuid=notification_uuid)
+            record_legacy_render(NotificationProviderKey.MSTEAMS, card)
+
+            client = MsTeamsClient(integration)
+            with MessagingInteractionEvent(
+                interaction_type=MessagingInteractionType.SEND_ISSUE_ALERT_NOTIFICATION,
+                spec=MsTeamsMessagingSpec(),
+            ).capture() as lifecycle:
+                lifecycle.add_extras({"integration_id": integration.id, "channel": channel})
+                try:
+                    client.send_card(channel, card)
+                except (ApiError, IntegrationError) as e:
+                    record_lifecycle_termination_level(lifecycle, e)
+            context = contexts[0] if contexts else None
+            self.record_notification_sent(event, channel, context, notification_uuid)
+
+        key = f"msteams:{integration.id}:{channel}"
+
+        metrics.incr(
+            "notifications.sent",
+            instance="msteams.notification",
+            tags={
+                "issue_type": event.group.issue_type.slug,
+            },
+            skip_internal=False,
+        )
+        yield self.future(send_notification, key=key)
+
+    def render_label(self) -> str:
+        return self.label.format(
+            team=self.get_integration_name(), channel=self.get_option("channel")
+        )

@@ -1,17 +1,17 @@
 import sys
 
-from django.core.management.base import BaseCommand
-from django.utils import timezone
 from click import echo
+from django.core.management.base import BaseCommand, CommandParser
+from django.utils import timezone
 
-from sentry.models import LostPasswordHash
+from sentry.users.models.lostpasswordhash import LostPasswordHash
 from sentry.utils.auth import find_users
 
 
 class Command(BaseCommand):
     help = "Generate a link for a user to reset their password"
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--noinput",
             dest="noinput",
@@ -20,7 +20,7 @@ class Command(BaseCommand):
             help="Dont ask for confirmation before merging accounts.",
         )
 
-    def handle(self, username, **options):
+    def handle(self, username: str, **options: object) -> None:
         users = find_users(username, with_valid_password=False)
         if not users:
             sys.stdout.write("No account found with given username.\n")

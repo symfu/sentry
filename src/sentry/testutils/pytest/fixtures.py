@@ -1,0 +1,420 @@
+"""
+A number of generic default fixtures to use with tests.
+
+All model-related fixtures defined here require the database, and should imply as much by
+including ``db`` fixture in the function resolution scope.
+"""
+
+from __future__ import annotations
+
+import difflib
+import os
+import re
+import sys
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor  # noqa: S016 - test infra, no tracing needed
+from contextlib import AbstractContextManager
+from string import Template
+from typing import TYPE_CHECKING, Any, ContextManager, Protocol, overload
+
+import pytest
+import requests
+import yaml
+from django.conf import LazySettings
+from django.core.cache import cache
+from django.core.cache.backends.base import BaseCache
+from sentry_viewercontext import viewer_context_var
+
+import sentry
+from sentry.types.activity import ActivityType
+
+if TYPE_CHECKING:
+    from sentry.models.activity import Activity
+    from sentry.models.environment import Environment
+    from sentry.models.group import Group
+    from sentry.models.organization import Organization
+    from sentry.models.project import Project
+    from sentry.models.projectkey import ProjectKey
+    from sentry.models.team import Team
+    from sentry.testutils.factories import Factories
+    from sentry.users.models.user import User
+
+# These chars cannot be used in Windows paths so replace them:
+# https://docs.microsoft.com/en-us/windows/desktop/FileIO/naming-a-file#naming-conventions
+
+UNSAFE_PATH_CHARS = ("<", ">", ":", '"', " | ", "?", "*")
+
+
+DIRECTORY_GROUPING_CHARS = ("::", "-", "[", "]", "\\")
+
+
+@pytest.fixture(autouse=True)
+def isolated_viewer_context() -> Generator[None]:
+    # Tests may call request handlers directly, bypassing the middleware scope
+    # that normally restores the viewer context at the end of a request.
+    token = viewer_context_var.set(None)
+    try:
+        yield
+    finally:
+        viewer_context_var.reset(token)
+
+
+@overload
+def django_db_all[R, **P](func: Callable[P, R]) -> Callable[P, R]: ...
+
+
+@overload
+def django_db_all[R, **P](
+    *, transaction: bool | None = None, reset_sequences: bool | None = None
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
+def django_db_all[R, **P](
+    func: Callable[P, R] | None = None,
+    *,
+    transaction: bool | None = None,
+    reset_sequences: bool | None = None,
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+    """Pytest decorator for resetting all databases"""
+
+    if func is not None:
+        return pytest.mark.django_db(
+            transaction=transaction, reset_sequences=reset_sequences, databases="__all__"
+        )(func)
+
+    def decorator(function: Callable[P, R]) -> Callable[P, R]:
+        return pytest.mark.django_db(
+            transaction=transaction, reset_sequences=reset_sequences, databases="__all__"
+        )(function)
+
+    return decorator
+
+
+@pytest.fixture
+def factories() -> type[Factories]:
+    # XXX(dcramer): hack to prevent recursive imports
+    from sentry.testutils.factories import Factories
+
+    return Factories
+
+
+@pytest.fixture
+def task_runner() -> Callable[[], ContextManager[None]]:
+    """Context manager that ensures tasks run directly inline where invoked.
+
+    While this context manager is active any tasks created will run immediately at
+    the callsite rather than being sent to RabbitMQ and handled by a worker.
+    """
+    from sentry.testutils.helpers.task_runner import TaskRunner
+
+    return TaskRunner
+
+
+@pytest.fixture(scope="function")
+def default_user(factories: type[Factories]) -> User:
+    """A default (super)user with email ``admin@localhost`` and password ``admin``.
+
+    :returns: A :class:`sentry.users.models.user.User` instance.
+    """
+    return factories.create_user(email="admin@localhost", is_superuser=True)
+
+
+@pytest.fixture(scope="function")
+def default_organization(factories: type[Factories], default_user: User) -> Organization:
+    """A default organization (slug=``baz``) owned by the ``default_user`` fixture.
+
+    :returns: A :class:`sentry.models.organization.Organization` instance.
+    """
+    # XXX(dcramer): ensure that your org slug doesnt match your team slug
+    # and the same for your project slug
+    return factories.create_organization(name="baz", slug="baz", owner=default_user)
+
+
+@pytest.fixture(scope="function")
+def default_team(factories: type[Factories], default_organization: Organization) -> Team:
+    from sentry.models.organizationmember import OrganizationMember
+    from sentry.models.organizationmemberteam import OrganizationMemberTeam
+
+    team = factories.create_team(organization=default_organization, name="foo", slug="foo")
+    # XXX: handle legacy team fixture
+    queryset = OrganizationMember.objects.filter(organization=default_organization)
+    for om in queryset:
+        OrganizationMemberTeam.objects.create(team=team, organizationmember=om, is_active=True)
+    return team
+
+
+@pytest.fixture(scope="function")
+def default_project(factories: type[Factories], default_team: Team) -> Project:
+    return factories.create_project(name="Bar", slug="bar", teams=[default_team])
+
+
+@pytest.fixture(scope="function")
+def default_projectkey(factories: type[Factories], default_project: Project) -> ProjectKey:
+    return factories.create_project_key(project=default_project)
+
+
+@pytest.fixture(scope="function")
+def default_environment(factories: type[Factories], default_project: Project) -> Environment:
+    return factories.create_environment(name="development", project=default_project)
+
+
+@pytest.fixture(scope="function")
+def default_group(factories: type[Factories], default_project: Project) -> Group:
+    # こんにちは konichiwa
+    return factories.create_group(project=default_project, message="\u3053\u3093\u306b\u3061\u306f")
+
+
+@pytest.fixture(scope="function")
+def default_activity(
+    default_group: Group, default_project: Project, default_user: User
+) -> Activity:
+    from sentry.models.activity import Activity
+
+    return Activity.objects.create(
+        group=default_group,
+        project=default_project,
+        type=ActivityType.NOTE.value,
+        user_id=default_user.id,
+        data={},
+    )
+
+
+@pytest.fixture()
+def dyn_sampling_data() -> Callable[[bool], dict[str, object]]:
+    # return a function that returns fresh config so we don't accidentally get tests interfering with each other
+    def inner(active: bool = True) -> dict[str, object]:
+        return {
+            "rules": [
+                {
+                    "sampleRate": 0.7,
+                    "type": "trace",
+                    "active": active,
+                    "condition": {
+                        "op": "and",
+                        "inner": [
+                            {"op": "eq", "ignoreCase": True, "name": "field1", "value": ["val"]},
+                            {"op": "glob", "name": "field1", "value": ["val"]},
+                        ],
+                    },
+                }
+            ],
+        }
+
+    return inner
+
+
+_snapshot_writeback: str | None = os.environ.get("SENTRY_SNAPSHOTS_WRITEBACK") or "0"
+if _snapshot_writeback in ("true", "1", "overwrite"):
+    _snapshot_writeback = "overwrite"
+elif _snapshot_writeback != "new":
+    _snapshot_writeback = None
+repo_abs_path = os.path.realpath(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(sentry.__file__))))
+)
+SNAPSHOT_REGEX = re.compile(r"^---\r?\n.*?\r?\n---\r?\n(.*)$", re.DOTALL)
+
+
+@pytest.fixture
+def log() -> Callable[[str], int]:
+    def inner(x: str) -> int:
+        return sys.stdout.write(x + "\n")
+
+    return inner
+
+
+class ReadableYamlDumper(yaml.dumper.SafeDumper):
+    """Disable pyyaml aliases for identical object references"""
+
+    def ignore_aliases(self, data: object) -> bool:
+        return True
+
+
+def read_snapshot_file(reference_file: str) -> str:
+    with open(reference_file, encoding="utf-8") as f:
+        match = SNAPSHOT_REGEX.match(f.read())
+        if match is None:
+            raise OSError()
+
+        return match.group(1)
+
+
+InequalityComparator = Callable[[str, str], bool | str]
+default_comparator = lambda refval, output: refval != output
+
+
+class InstaSnapshotter(Protocol):
+    def __call__(
+        self,
+        output: str | Any,
+        reference_file: str | None = None,
+        subname: str | None = None,
+        inequality_comparator: InequalityComparator = default_comparator,
+    ) -> None: ...
+
+
+@pytest.fixture
+def insta_snapshot(request: pytest.FixtureRequest) -> Generator[InstaSnapshotter]:
+    def inner(
+        output: str | Any,
+        reference_file: str | None = None,
+        subname: str | None = None,
+        inequality_comparator: InequalityComparator = default_comparator,
+    ) -> None:
+        from sentry.testutils.silo import strip_silo_mode_test_suffix
+
+        if reference_file is None:
+            test_func = getattr(request.node, "obj", None)
+            name = getattr(test_func, "_snapshot_name", None) or request.node.name
+            for c in UNSAFE_PATH_CHARS:
+                name = name.replace(c, "@")
+            for c in DIRECTORY_GROUPING_CHARS:
+                name = name.replace(c, "/")
+            name = name.strip("/")
+
+            if subname is not None:
+                name += f"_{subname}"
+
+            # If testing in an alternative silo mode, use the same snapshot as the
+            # base test. This would need to change if we want different snapshots for
+            # different silo modes.
+            parent_name = strip_silo_mode_test_suffix(request.node.parent.name)
+
+            reference_file = os.path.join(
+                os.path.dirname(str(request.node.fspath)),
+                "snapshots",
+                os.path.splitext(os.path.basename(parent_name))[0],
+                name + ".pysnap",
+            )
+        elif subname is not None:
+            raise ValueError(
+                "subname only works if you don't provide your own entire reference_file"
+            )
+
+        if not isinstance(output, str):
+            output = yaml.dump(
+                output, indent=2, default_flow_style=False, Dumper=ReadableYamlDumper
+            )
+
+        try:
+            refval = read_snapshot_file(reference_file)
+        except OSError:
+            refval = ""
+
+        refval = refval.rstrip()
+        output = output.rstrip()
+        is_unequal = inequality_comparator(refval, output)
+
+        if _snapshot_writeback is not None and is_unequal:
+            os.makedirs(os.path.dirname(reference_file), exist_ok=True)
+            test_file = os.path.realpath(str(request.node.fspath))
+            test_name = request.node.originalname
+            if test_file.startswith(repo_abs_path + os.path.sep):
+                test_file = test_file.replace(repo_abs_path + os.path.sep, "")
+            if _snapshot_writeback == "new":
+                reference_file += ".new"
+            with open(reference_file, "w") as f:
+                header = f"---\nsource: {test_file}::{test_name}\n---"
+                f.write(f"{header}\n{output}\n")
+        elif is_unequal:
+            __tracebackhide__ = True
+            if isinstance(is_unequal, str):
+                _print_custom_insta_diff(reference_file, is_unequal)
+            else:
+                _print_insta_diff(reference_file, refval, output)
+
+    yield inner
+
+
+INSTA_DIFF_TEMPLATE = Template(
+    """~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Snapshot $reference_file changed!
+
+
+Re-run pytest with SENTRY_SNAPSHOTS_WRITEBACK=new and then use 'make review-python-snapshots' to review.
+
+Or: Use SENTRY_SNAPSHOTS_WRITEBACK=1 to update snapshots directly.
+
+
+$diff_text
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+"""
+)
+
+
+def _print_insta_diff(reference_file: str, a: str, b: str) -> None:
+    __tracebackhide__ = True
+    pytest.fail(
+        INSTA_DIFF_TEMPLATE.substitute(
+            reference_file=reference_file,
+            diff_text="\n".join(difflib.unified_diff(a.splitlines(), b.splitlines())),
+        )
+    )
+
+
+def _print_custom_insta_diff(reference_file: str, diff_text: str) -> None:
+    __tracebackhide__ = True
+    pytest.fail(INSTA_DIFF_TEMPLATE.substitute(reference_file=reference_file, diff_text=diff_text))
+
+
+@pytest.fixture
+def call_snuba(settings: LazySettings) -> Callable[[str], requests.Response]:
+    def inner(endpoint: str) -> requests.Response:
+        return requests.post(settings.SENTRY_SNUBA + endpoint, timeout=30)
+
+    return inner
+
+
+@pytest.fixture
+def reset_snuba(call_snuba: Callable[[str], requests.Response]) -> None:
+    init_endpoints = [
+        "/tests/events_analytics_platform/drop",
+        "/tests/events/drop",
+        "/tests/functions/drop",
+        "/tests/groupedmessage/drop",
+        "/tests/transactions/drop",
+        "/tests/metrics/drop",
+        "/tests/search_issues/drop",
+        "/tests/group_attributes/drop",
+    ]
+
+    assert all(
+        response.status_code == 200
+        for response in ThreadPoolExecutor(len(init_endpoints)).map(call_snuba, init_endpoints)
+    )
+
+
+@pytest.fixture
+def skip_group_attributes_snapshots() -> Generator[None]:
+    """
+    Skip sending group attribute snapshots to Snuba, for tests that create groups but run
+    without Snuba.
+    """
+    from unittest import mock
+
+    with mock.patch("sentry.issues.attributes.produce_snapshot_to_kafka"):
+        yield
+
+
+@pytest.fixture
+def set_sentry_option() -> Callable[[str, object], AbstractContextManager[None]]:
+    """
+    A pytest-style wrapper around override_options.
+
+    ```python
+    def test_basic(set_sentry_option):
+        with set_sentry_option("key", 1.0):
+            do stuff
+    ```
+    """
+    from sentry.testutils.helpers.options import override_options
+
+    def inner(key: str, value: object) -> AbstractContextManager[None]:
+        return override_options({key: value})
+
+    return inner
+
+
+@pytest.fixture
+def django_cache() -> Generator[BaseCache]:
+    yield cache
+    cache.clear()

@@ -1,0 +1,234 @@
+from typing import Any
+
+from django.db.models import BigIntegerField
+from django.db.models.functions import Cast
+from drf_spectacular.utils import extend_schema
+from rest_framework import status
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry import audit_log
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases import OrganizationDetectorPermission, OrganizationEndpoint
+from sentry.api.exceptions import ResourceDoesNotExist
+from sentry.api.permissions import enforce_scope
+from sentry.api.serializers import serialize
+from sentry.api.utils import to_valid_int_id
+from sentry.apidocs.constants import (
+    RESPONSE_BAD_REQUEST,
+    RESPONSE_FORBIDDEN,
+    RESPONSE_NO_CONTENT,
+    RESPONSE_NOT_FOUND,
+    RESPONSE_UNAUTHORIZED,
+)
+from sentry.apidocs.examples.workflow_engine_examples import WorkflowEngineExamples
+from sentry.apidocs.parameters import DetectorParams, GlobalParams
+from sentry.apidocs.response_types import ValidationErrorResponse, as_validation_errors
+from sentry.incidents.metric_issue_detector import schedule_update_project_config
+from sentry.incidents.utils.subscription_limits import is_metric_subscription_allowed
+from sentry.incidents.utils.types import DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION
+from sentry.models.organization import Organization
+from sentry.snuba.models import SnubaQuery
+from sentry.utils.audit import create_audit_entry
+from sentry.workflow_engine.endpoints.organization_detector_index import get_detector_validator
+from sentry.workflow_engine.endpoints.serializers.detector_serializer import (
+    DetectorSerializer,
+    DetectorSerializerResponse,
+)
+from sentry.workflow_engine.endpoints.utils.filters import get_excluded_detector_types
+from sentry.workflow_engine.endpoints.validators.base import BaseDetectorTypeValidator
+from sentry.workflow_engine.endpoints.validators.utils import (
+    can_delete_detector,
+    can_edit_detector,
+    is_system_created_detector,
+    should_include_all_projects_detector,
+)
+from sentry.workflow_engine.models import DataSource, Detector
+from sentry.workflow_engine.types import DetectorType
+
+
+def check_metric_detector_allowed(detector: Detector, organization: Organization) -> None:
+    """Raise ResourceDoesNotExist if this is a metric detector the org is not entitled to."""
+    if detector.type != DetectorType.METRIC_ISSUE:
+        return
+
+    # Single query: DataSource -> (cast source_id) -> QuerySubscription -> SnubaQuery
+    dataset = (
+        SnubaQuery.objects.filter(
+            subscriptions__id__in=DataSource.objects.filter(
+                detector=detector,
+                type=DATA_SOURCE_SNUBA_QUERY_SUBSCRIPTION,
+                organization=organization,
+            ).values(_source_int=Cast("source_id", output_field=BigIntegerField()))
+        )
+        .values_list("dataset", flat=True)
+        .first()
+    )
+    if dataset is None:
+        return
+    if not is_metric_subscription_allowed(dataset, organization):
+        raise ResourceDoesNotExist
+
+
+@cell_silo_endpoint
+@extend_schema(tags=["Monitors"])
+class OrganizationDetectorDetailsEndpoint(OrganizationEndpoint):
+    def convert_args(
+        self, request: Request, detector_id: str, *args: Any, **kwargs: Any
+    ) -> tuple[tuple[Any, ...], dict[str, Organization | Detector]]:
+        args, kwargs = super().convert_args(request, *args, **kwargs)
+        organization = kwargs["organization"]
+        validated_detector_id = to_valid_int_id("detector_id", detector_id, raise_404=True)
+        try:
+            detector = (
+                Detector.objects.by_organization(organization.id)
+                .with_type_filters()
+                .exclude(
+                    type__in=get_excluded_detector_types(
+                        request.method, organization, actor=request.user
+                    )
+                )
+                .select_related("project")
+                .get(id=validated_detector_id)
+            )
+            kwargs["detector"] = detector
+        except Detector.DoesNotExist:
+            raise ResourceDoesNotExist
+
+        if detector.project is None:
+            if not should_include_all_projects_detector(organization=organization, request=request):
+                raise PermissionDenied
+        else:
+            # Verify user has access to the detector's project (respects Open Membership setting)
+            if not request.access.has_project_access(detector.project):
+                raise PermissionDenied
+
+        return args, kwargs
+
+    publish_status = {
+        "GET": ApiPublishStatus.PUBLIC,
+        "PUT": ApiPublishStatus.PUBLIC,
+        "DELETE": ApiPublishStatus.PUBLIC,
+    }
+    idempotent_methods = frozenset()
+    owner = ApiOwner.ALERTS_MONITORS
+    permission_classes = (OrganizationDetectorPermission,)
+
+    @extend_schema(
+        operation_id="getOrganizationDetector",
+        summary="Fetch a Monitor",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            DetectorParams.DETECTOR_ID,
+        ],
+        responses={
+            200: DetectorSerializer,
+            400: RESPONSE_BAD_REQUEST,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+        examples=WorkflowEngineExamples.GET_DETECTOR,
+    )
+    def get(
+        self, request: Request, organization: Organization, detector: Detector
+    ) -> Response[DetectorSerializerResponse]:
+        """
+        Return details on an individual monitor
+        """
+        check_metric_detector_allowed(detector, organization)
+
+        serialized_detector = serialize(
+            detector,
+            request.user,
+            DetectorSerializer(),
+        )
+        return Response(serialized_detector)
+
+    @extend_schema(
+        operation_id="updateOrganizationDetector",
+        summary="Update a Monitor by ID",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            DetectorParams.DETECTOR_ID,
+        ],
+        request=BaseDetectorTypeValidator,
+        responses={
+            200: DetectorSerializer,
+            400: RESPONSE_BAD_REQUEST,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+        examples=WorkflowEngineExamples.UPDATE_DETECTOR,
+    )
+    def put(
+        self, request: Request, organization: Organization, detector: Detector
+    ) -> Response[DetectorSerializerResponse] | Response[ValidationErrorResponse]:
+        """
+        Update an existing monitor
+        """
+        check_metric_detector_allowed(detector, organization)
+
+        if not can_edit_detector(detector, request):
+            if not is_system_created_detector(detector):
+                enforce_scope(request, "alerts:write")
+            raise PermissionDenied
+
+        detector_type = request.data.get("type") or detector.type
+        validator = get_detector_validator(
+            request, detector.linked_project, detector_type, detector, partial=True
+        )
+
+        if not validator.is_valid():
+            return Response(as_validation_errors(validator), status=status.HTTP_400_BAD_REQUEST)
+
+        updated_detector = validator.save()
+
+        body: DetectorSerializerResponse = serialize(updated_detector, request.user)
+        return Response(body, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        operation_id="deleteOrganizationDetector",
+        summary="Delete a Monitor",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            DetectorParams.DETECTOR_ID,
+        ],
+        responses={
+            204: RESPONSE_NO_CONTENT,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+    )
+    def delete(
+        self, request: Request, organization: Organization, detector: Detector
+    ) -> Response[None]:
+        """
+        Delete a monitor
+        """
+        # Intentionally no check_metric_detector_allowed gate here:
+        # orgs should be able to delete detectors they can no longer use
+        # (e.g. after a plan downgrade).
+        if not can_delete_detector(detector, request):
+            raise PermissionDenied
+
+        validator = get_detector_validator(
+            request, detector.linked_project, detector.type, instance=detector
+        )
+        validator.delete()
+
+        if detector.type == DetectorType.METRIC_ISSUE:
+            schedule_update_project_config(detector)
+
+        create_audit_entry(
+            request=request,
+            organization=detector.linked_project.organization,
+            target_object=detector.id,
+            event=audit_log.get_event_id("DETECTOR_REMOVE"),
+            data=detector.get_audit_log_data(),
+        )
+        return Response(status=204)

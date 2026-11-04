@@ -1,0 +1,135 @@
+import {useState} from 'react';
+import {IconAdd} from '@sentry/icons/add';
+import {IconSort} from '@sentry/icons/sort';
+
+import {LinkButton} from '@sentry/scraps/button';
+import {CompactSelect} from '@sentry/scraps/compactSelect';
+import {DropdownMenu} from '@sentry/scraps/dropdownMenu';
+import {Flex, Container} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+
+import {SearchBar} from 'sentry/components/searchBar';
+import {t} from 'sentry/locale';
+import {decodeScalar} from 'sentry/utils/queryString';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import type {SortOption} from 'sentry/views/explore/hooks/useGetSavedQueries';
+import {isLogsEnabled} from 'sentry/views/explore/logs/isLogsEnabled';
+import {getLogsUrl} from 'sentry/views/explore/logs/utils';
+import {getExploreUrl} from 'sentry/views/explore/utils';
+
+import {SavedQueriesTable} from './savedQueriesTable';
+
+type Option = {label: string; value: SortOption};
+
+export function SavedQueriesLandingContent() {
+  const organization = useOrganization();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const hasLogsFeature = isLogsEnabled(organization);
+  const searchQuery = decodeScalar(location.query.query);
+  const [sort, setSort] = useState<SortOption>('mostStarred');
+  const sortOptions: Option[] = [
+    {value: 'mostStarred', label: t('Most Starred')},
+    {value: 'recentlyViewed', label: t('Recently Viewed')},
+    {value: 'name', label: t('Name A-Z')},
+    {value: '-name', label: t('Name Z-A')},
+    {value: '-dateAdded', label: t('Created (Newest)')},
+    {value: 'dateAdded', label: t('Created (Oldest)')},
+  ];
+  return (
+    <div>
+      <Flex align="center" marginBottom="xl" gap="md">
+        <Container flex="1">
+          <SearchBar
+            onSearch={newQuery => {
+              navigate({
+                pathname: location.pathname,
+                query: {
+                  ...location.query,
+                  query: newQuery,
+                  ownedCursor: undefined,
+                  sharedCursor: undefined,
+                },
+              });
+            }}
+            defaultQuery={searchQuery}
+            placeholder={t('Search for a query')}
+          />
+        </Container>
+        <CompactSelect
+          trigger={triggerProps => (
+            <OverlayTrigger.Button {...triggerProps} icon={<IconSort />} size="md">
+              {sortOptions.find(option => option.value === sort)?.label ??
+                triggerProps.children}
+            </OverlayTrigger.Button>
+          )}
+          options={sortOptions}
+          value={sort}
+          onChange={option => setSort(option.value)}
+        />
+        {hasLogsFeature ? (
+          <DropdownMenu
+            items={[
+              {
+                key: 'create-query-spans',
+                label: <span>{t('Trace Query')}</span>,
+                textValue: t('Create Traces Query'),
+                onAction: () => {
+                  navigate(getExploreUrl({organization, visualize: []}));
+                },
+              },
+              {
+                key: 'create-query-logs',
+                label: <span>{t('Logs Query')}</span>,
+                textValue: t('Create Logs Query'),
+                onAction: () => {
+                  navigate(getLogsUrl({organization}));
+                },
+              },
+            ]}
+            trigger={triggerProps => (
+              <OverlayTrigger.Button
+                showChevron={false}
+                {...triggerProps}
+                variant="primary"
+                icon={<IconAdd />}
+                size="md"
+                aria-label={t('Create Query')}
+              >
+                {t('Create Query')}
+              </OverlayTrigger.Button>
+            )}
+          />
+        ) : (
+          <LinkButton
+            variant="primary"
+            icon={<IconAdd />}
+            size="md"
+            to={getExploreUrl({organization, visualize: []})}
+          >
+            {t('Create Query')}
+          </LinkButton>
+        )}
+      </Flex>
+      <SavedQueriesTable
+        mode="owned"
+        perPage={20}
+        cursorKey="ownedCursor"
+        sort={sort}
+        searchQuery={searchQuery}
+        title={t('Created by Me')}
+        hideIfEmpty
+      />
+      <SavedQueriesTable
+        mode="shared"
+        perPage={20}
+        cursorKey="sharedCursor"
+        sort={sort}
+        searchQuery={searchQuery}
+        title={t('Created by Others')}
+      />
+    </div>
+  );
+}

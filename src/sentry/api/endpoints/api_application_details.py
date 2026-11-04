@@ -1,18 +1,18 @@
-import logging
-
+from django.db import router, transaction
 from rest_framework import serializers
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.authentication import SessionAuthentication
+from rest_framework.request import Request
 from rest_framework.response import Response
-from uuid import uuid4
+from rest_framework.serializers import ListField
 
-from sentry.api.base import Endpoint, SessionAuthentication
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import Endpoint, control_silo_endpoint
 from sentry.api.exceptions import ResourceDoesNotExist
+from sentry.api.permissions import SentryIsAuthenticated
 from sentry.api.serializers import serialize
-from sentry.api.serializers.rest_framework import ListField
-from sentry.models import ApiApplication, ApiApplicationStatus
-from sentry.tasks.deletion import delete_api_application
-
-delete_logger = logging.getLogger("sentry.deletions.api")
+from sentry.auth.principal import is_owned_by_acting_user
+from sentry.deletions.models.scheduleddeletion import ScheduledDeletion
+from sentry.models.apiapplication import ApiApplication, ApiApplicationStatus
 
 
 class ApiApplicationSerializer(serializers.Serializer):
@@ -34,28 +34,40 @@ class ApiApplicationSerializer(serializers.Serializer):
     )
 
 
-class ApiApplicationDetailsEndpoint(Endpoint):
+class ApiApplicationEndpoint(Endpoint):
+    def convert_args(
+        self,
+        request: Request,
+        app_id: str,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
+        try:
+            application = ApiApplication.objects.get(
+                is_owned_by_acting_user(request.user, "owner_id"),
+                client_id=app_id,
+                status=ApiApplicationStatus.active,
+            )
+        except ApiApplication.DoesNotExist:
+            raise ResourceDoesNotExist
+        kwargs["application"] = application
+        return (args, kwargs)
+
+
+@control_silo_endpoint
+class ApiApplicationDetailsEndpoint(ApiApplicationEndpoint):
+    publish_status = {
+        "DELETE": ApiPublishStatus.PRIVATE,
+        "GET": ApiPublishStatus.PRIVATE,
+        "PUT": ApiPublishStatus.PRIVATE,
+    }
     authentication_classes = (SessionAuthentication,)
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (SentryIsAuthenticated,)
 
-    def get(self, request, app_id):
-        try:
-            instance = ApiApplication.objects.get(
-                owner=request.user, client_id=app_id, status=ApiApplicationStatus.active
-            )
-        except ApiApplication.DoesNotExist:
-            raise ResourceDoesNotExist
+    def get(self, request: Request, application: ApiApplication) -> Response:
+        return Response(serialize(application, request.user))
 
-        return Response(serialize(instance, request.user))
-
-    def put(self, request, app_id):
-        try:
-            instance = ApiApplication.objects.get(
-                owner=request.user, client_id=app_id, status=ApiApplicationStatus.active
-            )
-        except ApiApplication.DoesNotExist:
-            raise ResourceDoesNotExist
-
+    def put(self, request: Request, application: ApiApplication) -> Response:
         serializer = ApiApplicationSerializer(data=request.data, partial=True)
 
         if serializer.is_valid():
@@ -74,35 +86,15 @@ class ApiApplicationDetailsEndpoint(Endpoint):
             if "termsUrl" in result:
                 kwargs["terms_url"] = result["termsUrl"]
             if kwargs:
-                instance.update(**kwargs)
-            return Response(serialize(instance, request.user), status=200)
+                application.update(**kwargs)
+            return Response(serialize(application, request.user), status=200)
         return Response(serializer.errors, status=400)
 
-    def delete(self, request, app_id):
-        try:
-            instance = ApiApplication.objects.get(
-                owner=request.user, client_id=app_id, status=ApiApplicationStatus.active
+    def delete(self, request: Request, application: ApiApplication) -> Response:
+        with transaction.atomic(using=router.db_for_write(ApiApplication)):
+            updated = ApiApplication.objects.filter(id=application.id).update(
+                status=ApiApplicationStatus.pending_deletion
             )
-        except ApiApplication.DoesNotExist:
-            raise ResourceDoesNotExist
-
-        updated = ApiApplication.objects.filter(id=instance.id).update(
-            status=ApiApplicationStatus.pending_deletion
-        )
-        if updated:
-            transaction_id = uuid4().hex
-
-            delete_api_application.apply_async(
-                kwargs={"object_id": instance.id, "transaction_id": transaction_id}, countdown=3600
-            )
-
-            delete_logger.info(
-                "object.delete.queued",
-                extra={
-                    "object_id": instance.id,
-                    "transaction_id": transaction_id,
-                    "model": type(instance).__name__,
-                },
-            )
-
+            if updated:
+                ScheduledDeletion.schedule(application, days=0, actor=request.user)
         return Response(status=204)

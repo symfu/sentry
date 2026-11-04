@@ -1,19 +1,23 @@
 import re
-
-from django.utils.translation import ugettext_lazy as _
+from collections.abc import Callable, Mapping
 from functools import wraps
+from typing import Any, cast
 
+import sentry_sdk
 from django.conf import settings
 from django.core.cache import cache
+from django.utils.translation import gettext_lazy as _
 
 from sentry import options
-
-from sentry.models import Project, ProjectKey
+from sentry.projects.services.project_key import ProjectKeyRole, project_key_service
 from sentry.shared_integrations.exceptions import IntegrationError
 from sentry.tasks.release_registry import LAYER_INDEX_CACHE_KEY
-from sentry.utils.compat import filter, map
 
 SUPPORTED_RUNTIMES = [
+    "nodejs22.x",
+    "nodejs20.x",
+    "nodejs18.x",
+    "nodejs16.x",
     "nodejs14.x",
     "nodejs12.x",
     "nodejs10.x",
@@ -21,10 +25,17 @@ SUPPORTED_RUNTIMES = [
     "python3.6",
     "python3.7",
     "python3.8",
+    "python3.9",
+    "python3.10",
+    "python3.11",
+    "python3.12",
+    "python3.13",
 ]
 
 INVALID_LAYER_TEXT = "Invalid existing layer %s"
 MISSING_ROLE_TEXT = "Invalid role associated with the lambda function"
+TOO_MANY_REQUESTS_TEXT = "Something went wrong! Please enable function manually after installation"
+ENV_VARS_LIMIT_TEXT = "Environment variables size limit of 4KB was exceeded"
 
 DEFAULT_NUM_RETRIES = 3
 
@@ -33,45 +44,52 @@ OPTION_LAYER_NAME = "layer-name"
 OPTION_ACCOUNT_NUMBER = "account-number"
 
 ALL_AWS_REGIONS = [
+    "af-south-1",
+    "ap-east-1",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "me-south-1",
+    "sa-east-1",
     "us-east-1",
     "us-east-2",
     "us-west-1",
     "us-west-2",
-    "ap-south-1",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ca-central-1",
-    "eu-central-1",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
-    "sa-east-1",
 ]
 
 
 # Taken from: https://gist.github.com/gene1wood/5299969edc4ef21d8efcfea52158dd40
-def parse_arn(arn):
+def parse_arn(arn: str) -> dict[str, str | None]:
     # http://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html
     elements = arn.split(":", 5)
-    result = {
+    resource = elements[5]
+    resource_type = None
+    if "/" in resource:
+        resource_type, resource = resource.split("/", 1)
+    elif ":" in resource:
+        resource_type, resource = resource.split(":", 1)
+    return {
         "arn": elements[0],
         "partition": elements[1],
         "service": elements[2],
         "region": elements[3],
         "account": elements[4],
-        "resource": elements[5],
-        "resource_type": None,
+        "resource": resource,
+        "resource_type": resource_type,
     }
-    if "/" in result["resource"]:
-        result["resource_type"], result["resource"] = result["resource"].split("/", 1)
-    elif ":" in result["resource"]:
-        result["resource_type"], result["resource"] = result["resource"].split(":", 1)
-    return result
 
 
-def get_option_value(function, option):
+def get_option_value(function: Mapping[str, Any], option: str) -> Any:
     region = parse_arn(function["FunctionArn"])["region"]
     runtime = function["Runtime"]
 
@@ -104,7 +122,7 @@ def get_option_value(function, option):
     # special lookup for the version since it depends on the region
     if option == OPTION_VERSION:
         region_release_list = cache_value.get("regions", [])
-        matched_regions = filter(lambda x: x["region"] == region, region_release_list)
+        matched_regions = list(filter(lambda x: x["region"] == region, region_release_list))
         # see if there is the specific region in our list
         if matched_regions:
             version = matched_regions[0]["version"]
@@ -119,41 +137,36 @@ def get_option_value(function, option):
     return cache_value.get(registry_field)
 
 
-def _get_arn_without_version(arn):
+def _get_arn_without_version(arn: str) -> str:
     return arn.rpartition(":")[0]
 
 
-def get_version_of_arn(arn):
+def get_version_of_arn(arn: str) -> int:
     return int(arn.split(":")[-1])
 
 
-def _get_arn_from_layer(layer):
+def _get_arn_from_layer(layer: object) -> str:
     # layer could be a string or dict
     if isinstance(layer, dict):
-        return layer["Arn"]
-    return layer
+        return cast(str, layer["Arn"])
+    return cast(str, layer)
 
 
-def get_function_layer_arns(function):
+def get_function_layer_arns(function: Mapping[str, Any]) -> list[str]:
     layers = function.get("Layers", [])
-    return map(_get_arn_from_layer, layers)
+    return [_get_arn_from_layer(layer) for layer in layers]
 
 
-def get_latest_layer_for_function(function):
+def get_latest_layer_for_function(function: Mapping[str, Any]) -> str:
     region = parse_arn(function["FunctionArn"])["region"]
-    return "arn:aws:lambda:{}:{}:layer:{}:{}".format(
-        region,
-        get_option_value(function, OPTION_ACCOUNT_NUMBER),
-        get_option_value(function, OPTION_LAYER_NAME),
-        get_option_value(function, OPTION_VERSION),
-    )
+    return f"arn:aws:lambda:{region}:{get_option_value(function, OPTION_ACCOUNT_NUMBER)}:layer:{get_option_value(function, OPTION_LAYER_NAME)}:{get_option_value(function, OPTION_VERSION)}"
 
 
-def get_latest_layer_version(function):
+def get_latest_layer_version(function: Mapping[str, Any]) -> int:
     return int(get_option_value(function, OPTION_VERSION))
 
 
-def get_index_of_sentry_layer(layers, arn_to_match):
+def get_index_of_sentry_layer(layers: list[str], arn_to_match: str) -> int:
     """
     Find the index of the Sentry layer in a list of layers.
     If the version is different, we still consider that a match
@@ -169,32 +182,83 @@ def get_index_of_sentry_layer(layers, arn_to_match):
     return -1
 
 
-def get_supported_functions(lambda_client):
+def get_supported_functions(lambda_client: Any) -> list[dict[str, Any]]:
     paginator = lambda_client.get_paginator("list_functions")
     response_iterator = paginator.paginate()
     functions = []
     for page in response_iterator:
         functions += page["Functions"]
 
-    return filter(
-        lambda x: x.get("Runtime") in SUPPORTED_RUNTIMES,
-        functions,
+    return list(
+        filter(
+            lambda x: x.get("Runtime") in SUPPORTED_RUNTIMES,
+            functions,
+        )
     )
 
 
-def get_dsn_for_project(organization_id, project_id):
-    try:
-        project = Project.objects.get(organization_id=organization_id, id=project_id)
-    except Project.DoesNotExist:
-        raise IntegrationError("No valid project")
-
-    enabled_dsn = ProjectKey.get_default(project=project)
+def get_dsn_for_project(organization_id: int, project_id: int) -> str:
+    enabled_dsn = project_key_service.get_project_key(
+        organization_id=organization_id, project_id=project_id, role=ProjectKeyRole.store
+    )
     if not enabled_dsn:
         raise IntegrationError("Project does not have DSN enabled")
-    return enabled_dsn.get_dsn(public=True)
+    return enabled_dsn.dsn_public
 
 
-def enable_single_lambda(lambda_client, function, sentry_project_dsn, retries_left=3):
+def get_node_options_for_layer(layer_name: str | None, layer_version: int | None) -> str:
+    """
+    Depending on the SDK major our Lambda Layer represents, a different SDK
+    package has to be used when setting `NODE_OPTIONS`.
+    This helper generates the correct options for all the layers we support.
+    """
+    # Lambda layers for v7 of our AWS SDK use the older `@sentry/serverless` SDK
+    #
+    # These are specifically
+    # - `SentryNodeServerlessSDKv7`
+    # - `SentryNodeServerlessSDK:235` and lower
+    if layer_name == "SentryNodeServerlessSDKv7" or (
+        layer_name == "SentryNodeServerlessSDK"
+        and layer_version is not None
+        and layer_version <= 235
+    ):
+        return "-r @sentry/serverless/dist/awslambda-auto"
+
+    # Lambda layers for v8 and above of our AWS SDK use
+    # the newer `@sentry/aws-serverless` SDK
+    #
+    # These are specifically
+    # - `SentryNodeServerlessSDK:236` and above
+    # - `SentryNodeServerlessSDKv8`
+    # - and any other layer with a version suffix above, e.g.
+    #   `SentryNodeServerlessSDKv9`
+    if (
+        layer_name == "SentryNodeServerlessSDK"
+        or layer_name == "SentryNodeServerlessSDKv8"
+        or layer_name == "SentryNodeServerlessSDKv9"
+        or (
+            layer_name == "SentryNodeServerlessSDKv10"
+            and layer_version is not None
+            and layer_version <= 13
+        )
+    ):
+        return "-r @sentry/aws-serverless/awslambda-auto"
+
+    # Lambda layers for v10.6.0 and above can use `--import` for auto-instrumentation
+    #
+    # These are specifically
+    # - `SentryNodeServerlessSDKv10:14` and above
+    # - and any other layer with a version suffix above, e.g.
+    #   `SentryNodeServerlessSDKv11`
+    return "--import @sentry/aws-serverless/awslambda-auto"
+
+
+def enable_single_lambda(
+    lambda_client: Any,
+    function: Mapping[str, Any],
+    sentry_project_dsn: str,
+    retries_left: int = 3,
+) -> Any:
     # find the latest layer for this function
     layer_arn = get_latest_layer_for_function(function)
 
@@ -216,9 +280,21 @@ def enable_single_lambda(lambda_client, function, sentry_project_dsn, retries_le
 
     if runtime.startswith("nodejs"):
         # note the env variables would be different for non-Node runtimes
+        layer_name = get_option_value(function, OPTION_LAYER_NAME)
+        version = get_option_value(function, OPTION_VERSION)
+        try:
+            parsed_version = int(version)
+        except Exception:
+            sentry_sdk.capture_message("Invariant: Unable to parse AWS lambda version")
+            parsed_version = None
+
         env_variables.update(
-            {"NODE_OPTIONS": "-r @sentry/serverless/dist/awslambda-auto", **sentry_env_variables}
+            {
+                "NODE_OPTIONS": get_node_options_for_layer(layer_name, parsed_version),
+                **sentry_env_variables,
+            }
         )
+
     elif runtime.startswith("python"):
         # Check if we are trying to re-enable an already enabled python, and if
         # are we should not override the env variable "SENTRY_INITIAL_HANDLER"
@@ -248,7 +324,7 @@ def enable_single_lambda(lambda_client, function, sentry_project_dsn, retries_le
     return update_lambda_with_retries(lambda_client, **lambda_kwargs)
 
 
-def disable_single_lambda(lambda_client, function, layer_arn):
+def disable_single_lambda(lambda_client: Any, function: Mapping[str, Any], layer_arn: str) -> Any:
     name = function["FunctionName"]
     runtime = function["Runtime"]
     layers = get_function_layer_arns(function)
@@ -262,7 +338,7 @@ def disable_single_lambda(lambda_client, function, layer_arn):
     updated_handler = None
 
     if runtime.startswith("python"):
-        updated_handler = env_variables["SENTRY_INITIAL_HANDLER"]
+        updated_handler = env_variables.get("SENTRY_INITIAL_HANDLER")
 
     for env_name in [
         "SENTRY_INITIAL_HANDLER",
@@ -284,9 +360,8 @@ def disable_single_lambda(lambda_client, function, layer_arn):
     return update_lambda_with_retries(lambda_client, **lambda_kwargs)
 
 
-def update_lambda_with_retries(lambda_client, **kwargs):
+def update_lambda_with_retries(lambda_client: Any, **kwargs: Any) -> Any:
     num_retries = DEFAULT_NUM_RETRIES
-    # pull off the num_retries argument if it exists
     if "num_retries" in kwargs:
         num_retries = kwargs.pop("num_retries")
     try:
@@ -300,7 +375,7 @@ def update_lambda_with_retries(lambda_client, **kwargs):
         raise
 
 
-def get_invalid_layer_name(err_message):
+def get_invalid_layer_name(err_message: str) -> str | None:
     """
     Check to see if an error matches the invalid layer message
     :param err_message: error string
@@ -315,7 +390,16 @@ def get_invalid_layer_name(err_message):
     return None
 
 
-def get_missing_role_error(err_message):
+def get_too_many_requests_error_message(err_message: str) -> bool:
+    """
+    Check to see if an error is a TooManyRequestsException
+    :param err_message: error string
+    :return boolean value if the error matches the too many requests error
+    """
+    return "TooManyRequestsException" in err_message
+
+
+def get_missing_role_error(err_message: str) -> bool:
     """
     Check to see if an error matches the missing role text
     :param err_message: error string
@@ -330,7 +414,22 @@ def get_missing_role_error(err_message):
     return err_message == missing_role_err
 
 
-def get_sentry_err_message(err_message):
+def get_exceeded_env_vars_limit_error(err_message: str) -> bool:
+    """
+    Check to see if an error matches the env vars limit text
+    :param err_message: error string
+    :return boolean value if the error matches the env vars limit text
+    """
+    env_vars_limit_error = (
+        "An error occurred (InvalidParameterValueException) when calling "
+        "the UpdateFunctionConfiguration operation: Lambda was unable to configure "
+        "your environment variables because the environment variables you "
+        "have provided exceeded the 4KB limit."
+    )
+    return env_vars_limit_error in err_message
+
+
+def get_sentry_err_message(err_message: str) -> tuple[bool, str]:
     """
     Check to see if an error matches a custom error and customizes the error
     message if it is a custom error
@@ -340,21 +439,24 @@ def get_sentry_err_message(err_message):
     invalid_layer = get_invalid_layer_name(err_message)
     if invalid_layer:
         return True, (INVALID_LAYER_TEXT % invalid_layer)
-    missing_role = get_missing_role_error(err_message)
-    if missing_role:
+    if get_missing_role_error(err_message):
         return True, MISSING_ROLE_TEXT
+    if get_too_many_requests_error_message(err_message):
+        return True, TOO_MANY_REQUESTS_TEXT
+    if get_exceeded_env_vars_limit_error(err_message):
+        return True, ENV_VARS_LIMIT_TEXT
     return False, err_message
 
 
-def wrap_lambda_updater():
+def wrap_lambda_updater() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
     Wraps any function that updates a layer
     Throws an IntegrationError for specific known errors
     """
 
-    def inner(func):
+    def inner(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
-        def wrapped(*args, **kwargs):
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
             try:
                 return func(*args, **kwargs)
             except Exception as e:

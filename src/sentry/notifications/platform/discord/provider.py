@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from sentry.notifications.platform.provider import (
+    NotificationProvider,
+    NotificationProviderError,
+    SendResult,
+    SendSuccessResult,
+    integration_error_result,
+)
+from sentry.notifications.platform.registry import provider_registry
+from sentry.notifications.platform.renderer import NotificationRenderer
+from sentry.notifications.platform.target import (
+    IntegrationNotificationTarget,
+    PreparedIntegrationNotificationTarget,
+)
+from sentry.notifications.platform.threading import ThreadContext
+from sentry.notifications.platform.tracking import NotificationLinkDecorator
+from sentry.notifications.platform.types import (
+    LinkTextBlock,
+    NotificationData,
+    NotificationProviderKey,
+    NotificationRenderedTemplate,
+    NotificationSection,
+    NotificationSectionType,
+    NotificationTarget,
+    NotificationTargetResourceType,
+    NotificationTextBlock,
+    NotificationTextBlockType,
+)
+from sentry.organizations.services.organization.model import RpcOrganizationSummary
+from sentry.shared_integrations.exceptions import IntegrationError
+
+if TYPE_CHECKING:
+    from sentry.integrations.discord.message_builder.base.base import DiscordMessage
+
+# TODO(ecosystem): Proper typing - https://discord.com/developers/docs/resources/message#create-message
+type DiscordRenderable = DiscordMessage
+
+
+class DiscordRenderer(NotificationRenderer[DiscordRenderable]):
+    @classmethod
+    def render[DataT: NotificationData](
+        cls,
+        *,
+        data: DataT,
+        rendered_template: NotificationRenderedTemplate,
+        link_decorator: NotificationLinkDecorator,
+    ) -> DiscordRenderable:
+        from sentry.integrations.discord.message_builder.base.base import DiscordMessageBuilder
+        from sentry.integrations.discord.message_builder.base.component.action_row import (
+            DiscordActionRow,
+        )
+        from sentry.integrations.discord.message_builder.base.component.base import (
+            DiscordMessageComponent,
+        )
+        from sentry.integrations.discord.message_builder.base.component.button import (
+            DiscordLinkButton,
+        )
+        from sentry.integrations.discord.message_builder.base.embed.base import DiscordMessageEmbed
+        from sentry.integrations.discord.message_builder.base.embed.footer import (
+            DiscordMessageEmbedFooter,
+        )
+        from sentry.integrations.discord.message_builder.base.embed.image import (
+            DiscordMessageEmbedImage,
+        )
+
+        components: list[DiscordMessageComponent] = []
+        embeds = []
+
+        body_blocks = cls.render_body_blocks(rendered_template.body)
+        subject = cls.render_text_blocks(rendered_template.subject_blocks, include_links=False)
+
+        footer: DiscordMessageEmbedFooter | None = None
+        if rendered_template.footer:
+            # Discord does not support rich footers
+            footer = DiscordMessageEmbedFooter(text=rendered_template.footer_text)
+
+        embeds.append(
+            DiscordMessageEmbed(
+                title=subject,
+                description=body_blocks,
+                image=(
+                    DiscordMessageEmbedImage(url=rendered_template.chart.url)
+                    if rendered_template.chart
+                    else None
+                ),
+                footer=footer,
+            )
+        )
+
+        if len(rendered_template.actions) > 0:
+            buttons = [
+                DiscordLinkButton(label=action.label, url=action.link)
+                for action in rendered_template.actions
+            ]
+            components.append(DiscordActionRow(components=buttons))
+
+        builder = DiscordMessageBuilder(embeds=embeds, components=components)
+
+        return builder.build()
+
+    @classmethod
+    def render_body_blocks(cls, body: list[NotificationSection]) -> str:
+        description = []
+        for block in body:
+            if block.type == NotificationSectionType.PARAGRAPH:
+                description.append(f"\n{cls.render_text_blocks(block.blocks)}")
+            elif block.type == NotificationSectionType.CODE_BLOCK:
+                description.append(f"\n```{cls.render_text_blocks(block.blocks)}```")
+            elif block.type == NotificationSectionType.BLOCK_QUOTE:
+                description.append(f"\n>>> {cls.render_text_blocks(block.blocks)}")
+        return "".join(description)
+
+    @classmethod
+    def render_text_blocks(
+        cls, blocks: list[NotificationTextBlock], include_links: bool = True
+    ) -> str:
+        """
+        For Discord, in some cases links will not be supported even though other rich text is.
+        If include_links is False, the text will be rendered as plain text with the URL in parentheses.
+        """
+        texts = []
+        for block in blocks:
+            if block.type == NotificationTextBlockType.PLAIN_TEXT:
+                texts.append(block.text)
+            elif block.type == NotificationTextBlockType.BOLD_TEXT:
+                texts.append(f"**{block.text}**")
+            elif block.type == NotificationTextBlockType.ITALIC_TEXT:
+                texts.append(f"*{block.text}*")
+            elif block.type == NotificationTextBlockType.CODE:
+                texts.append(f"`{block.text}`")
+            elif block.type == NotificationTextBlockType.LINK and isinstance(block, LinkTextBlock):
+                if include_links:
+                    texts.append(f"[{block.text}]({block.url})")
+                else:
+                    texts.append(f"{block.text} ({block.url})")
+        return " ".join(texts)
+
+
+@provider_registry.register(NotificationProviderKey.DISCORD)
+class DiscordNotificationProvider(NotificationProvider[DiscordRenderable]):
+    key = NotificationProviderKey.DISCORD
+    default_renderer = DiscordRenderer
+    target_class = IntegrationNotificationTarget
+    target_resource_types = [
+        NotificationTargetResourceType.CHANNEL,
+        NotificationTargetResourceType.DIRECT_MESSAGE,
+    ]
+
+    @classmethod
+    def is_available(cls, *, organization: RpcOrganizationSummary | None = None) -> bool:
+        # TODO(ecosystem): Check for the integration, maybe a feature as well
+        return False
+
+    @classmethod
+    def send(
+        cls,
+        *,
+        target: NotificationTarget,
+        renderable: DiscordRenderable,
+        thread_context: ThreadContext | None = None,
+    ) -> SendResult:
+        from sentry.integrations.discord.integration import DiscordIntegration
+
+        if not isinstance(target, cls.target_class):
+            raise NotificationProviderError(
+                f"Target '{target.__class__.__name__}' is not a valid dataclass for {cls.__name__}"
+            )
+
+        discord_target = PreparedIntegrationNotificationTarget[DiscordIntegration](
+            target=target, installation_cls=DiscordIntegration
+        )
+        try:
+            discord_target.integration_installation.send_notification(
+                target=target, payload=renderable
+            )
+        except IntegrationError as e:
+            return integration_error_result(e)
+
+        return SendSuccessResult()

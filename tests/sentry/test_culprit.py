@@ -1,13 +1,14 @@
-from sentry.event_manager import EventManager, get_culprit as get_culprit_impl
+from sentry.event_manager import EventManager
+from sentry.event_manager import get_culprit as get_culprit_impl
 
 
-def get_culprit(data):
+def get_culprit(data: dict[str, object]) -> str:
     mgr = EventManager(data)
     mgr.normalize()
     return get_culprit_impl(mgr.get_data())
 
 
-def test_cocoa_culprit():
+def test_cocoa_culprit() -> None:
     culprit = get_culprit(
         {
             "platform": "cocoa",
@@ -30,7 +31,7 @@ def test_cocoa_culprit():
     assert culprit == "-[CRLCrashAsyncSafeThread crash]"
 
 
-def test_emoji_culprit():
+def test_emoji_culprit() -> None:
     culprit = get_culprit(
         {
             "platform": "native",
@@ -54,7 +55,7 @@ def test_emoji_culprit():
     assert culprit == "\U0001f60d"
 
 
-def test_cocoa_strict_stacktrace():
+def test_cocoa_strict_stacktrace() -> None:
     culprit = get_culprit(
         {
             "platform": "native",
@@ -84,7 +85,7 @@ def test_cocoa_strict_stacktrace():
     assert culprit == "-[CRLCrashAsyncSafeThread crash]"
 
 
-def test_culprit_for_synthetic_event():
+def test_culprit_for_synthetic_event() -> None:
     # Synthetic events do not generate a culprit
     culprit = get_culprit(
         {
@@ -110,7 +111,7 @@ def test_culprit_for_synthetic_event():
     assert culprit == ""
 
 
-def test_culprit_for_javascript_event():
+def test_culprit_for_javascript_event() -> None:
     culprit = get_culprit(
         {
             "platform": "javascript",
@@ -134,7 +135,7 @@ def test_culprit_for_javascript_event():
     assert culprit == "fooBar(foo/baz.js)"
 
 
-def test_culprit_for_python_event():
+def test_culprit_for_python_event() -> None:
     culprit = get_culprit(
         {
             "platform": "python",

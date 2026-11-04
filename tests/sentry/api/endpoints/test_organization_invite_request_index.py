@@ -1,24 +1,30 @@
-from django.core import mail
-from django.core.urlresolvers import reverse
-from exam import fixture
+from functools import cached_property
+from urllib.parse import parse_qs, urlparse
 
-from sentry.testutils import APITestCase
-from sentry.models import (
-    OrganizationMember,
-    OrganizationMemberTeam,
-    OrganizationOption,
-    InviteStatus,
-)
+import orjson
+from django.core import mail
+from django.test import override_settings
+from django.urls import reverse
+
+from sentry.models.options.organization_option import OrganizationOption
+from sentry.models.organization import Organization
+from sentry.models.organizationmember import InviteStatus, OrganizationMember
+from sentry.models.organizationmemberteam import OrganizationMemberTeam
+from sentry.testutils.cases import APITestCase, SlackActivityNotificationTest
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.hybrid_cloud import HybridCloudTestMixin
+from sentry.testutils.outbox import outbox_runner
+from sentry.viewer_context import Actor, ActorType, ViewerContext, encode_viewer_context
 
 
 class OrganizationInviteRequestListTest(APITestCase):
     endpoint = "sentry-api-0-organization-invite-request-index"
 
-    @fixture
-    def org(self):
+    @cached_property
+    def org(self) -> Organization:
         return self.create_organization(owner=self.user)
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.invite_request = self.create_member(
             email="test@example.com",
             organization=self.org,
@@ -32,7 +38,7 @@ class OrganizationInviteRequestListTest(APITestCase):
             invite_status=InviteStatus.REQUESTED_TO_JOIN.value,
         )
 
-    def test_simple(self):
+    def test_simple(self) -> None:
         self.login_as(user=self.user)
         resp = self.get_response(self.org.slug)
 
@@ -43,7 +49,7 @@ class OrganizationInviteRequestListTest(APITestCase):
         assert resp.data[1]["email"] == self.request_to_join.email
         assert resp.data[1]["inviteStatus"] == "requested_to_join"
 
-    def test_join_requests_disabled(self):
+    def test_join_requests_disabled(self) -> None:
         OrganizationOption.objects.create(
             organization_id=self.org.id, key="sentry:join_requests", value=False
         )
@@ -57,26 +63,62 @@ class OrganizationInviteRequestListTest(APITestCase):
         assert resp.data[0]["inviteStatus"] == "requested_to_be_invited"
 
 
-class OrganizationInviteRequestCreateTest(APITestCase):
-    def setUp(self):
-        self.user = self.create_user("foo@localhost")
-        manager = self.create_user(email="manager@localhost")
+class OrganizationInviteRequestCreateTest(
+    APITestCase, SlackActivityNotificationTest, HybridCloudTestMixin
+):
+    endpoint = "sentry-api-0-organization-invite-request-index"
+    method = "post"
 
-        self.org = self.create_organization()
-        self.team = self.create_team(organization=self.org)
-        self.member = self.create_member(user=self.user, organization=self.org, role="member")
-        self.create_member(user=manager, organization=self.org, role="manager")
+    def setUp(self) -> None:
+        self.organization = self.create_organization()
+
+        # SlackActivityNotificationTest needs the manager as self.user to create the identity
+        self.user = self.create_user(email="manager@localhost")
+        self.create_member(user=self.user, organization=self.organization, role="manager")
+        super().setUp()
+
+        # different user for logging in
+        self.user = self.create_user("foo@localhost")
+        self.team = self.create_team(organization=self.organization)
+        self.member = self.create_member(
+            user=self.user, organization=self.organization, role="member"
+        )
 
         self.login_as(user=self.user)
 
         self.url = reverse(
             "sentry-api-0-organization-invite-request-index",
-            kwargs={"organization_slug": self.org.slug},
+            kwargs={"organization_id_or_slug": self.organization.slug},
         )
 
-    def test_simple(self):
+    @override_settings(SEER_API_SHARED_SECRET="service-account-secret")
+    @with_feature("organizations:service-accounts")
+    def test_service_account_cannot_request_invite(self) -> None:
+        service_account = self.create_service_account(
+            organization=self.organization, scope_list=["member:read", "member:invite"]
+        )
+        viewer_context = encode_viewer_context(
+            ViewerContext(
+                actor=Actor(type=ActorType.SERVICE_ACCOUNT, actor_id=service_account.id),
+                organization_id=self.organization.id,
+            ),
+            key="service-account-secret",
+        )
+
+        response = self.client.post(
+            self.url,
+            {"email": "eric@localhost", "role": "member"},
+            HTTP_X_VIEWER_CONTEXT=viewer_context,
+        )
+
+        assert response.status_code == 403, response.content
+        assert response.data["detail"]["code"] == "user-required"
+        assert not OrganizationMember.objects.filter(email="eric@localhost").exists()
+
+    def test_simple(self) -> None:
         self.login_as(user=self.user)
-        with self.tasks():
+
+        with self.tasks(), outbox_runner():
             response = self.client.post(
                 self.url, {"email": "eric@localhost", "role": "member", "teams": [self.team.slug]}
             )
@@ -86,10 +128,12 @@ class OrganizationInviteRequestCreateTest(APITestCase):
 
         assert len(mail.outbox) == 1
 
-        member = OrganizationMember.objects.get(organization=self.org, email=response.data["email"])
-        assert member.user is None
+        member = OrganizationMember.objects.get(
+            organization=self.organization, email=response.data["email"]
+        )
+        assert member.user_id is None
         assert member.role == "member"
-        assert member.inviter == self.user
+        assert member.inviter_id == self.user.id
         assert member.invite_status == InviteStatus.REQUESTED_TO_BE_INVITED.value
 
         teams = OrganizationMemberTeam.objects.filter(organizationmember=member)
@@ -97,23 +141,46 @@ class OrganizationInviteRequestCreateTest(APITestCase):
         assert len(teams) == 1
         assert teams[0].team_id == self.team.id
 
-    def test_higher_role(self):
+        self.assert_org_member_mapping(org_member=member)
+
+    def test_team_roles(self) -> None:
+        self.login_as(user=self.user)
+
+        with self.tasks(), outbox_runner():
+            response = self.client.post(
+                self.url,
+                {
+                    "email": "eric@localhost",
+                    "role": "member",
+                    "teamRoles": [{"teamSlug": self.team.slug, "role": "admin"}],
+                },
+                format="json",
+            )
+
+        assert response.status_code == 201
+
+        member = OrganizationMember.objects.get(
+            organization=self.organization, email=response.data["email"]
+        )
+        teams = OrganizationMemberTeam.objects.filter(organizationmember=member)
+
+        # Team-roles are not set on invite requests
+        assert [(omt.team_id, omt.role) for omt in teams] == [(self.team.id, None)]
+
+    def test_cannot_request_higher_role(self) -> None:
         self.login_as(user=self.user)
         response = self.client.post(
             self.url, {"email": "eric@localhost", "role": "owner", "teams": [self.team.slug]}
         )
 
-        assert response.status_code == 201
-        assert response.data["email"] == "eric@localhost"
+        assert response.status_code == 400
+        assert response.data["role"] == ["You do not have permission to set that org-level role"]
 
-        member = OrganizationMember.objects.get(organization=self.org, email=response.data["email"])
-        assert member.role == "owner"
-
-    def test_existing_member(self):
+    def test_existing_member(self) -> None:
         self.login_as(user=self.user)
 
         user2 = self.create_user("foobar@example.com")
-        self.create_member(user=user2, organization=self.org)
+        self.create_member(user=user2, organization=self.organization)
 
         resp = self.client.post(
             self.url, {"email": user2.email, "role": "member", "teams": [self.team.slug]}
@@ -122,12 +189,12 @@ class OrganizationInviteRequestCreateTest(APITestCase):
         assert resp.status_code == 400
         assert ("The user %s is already a member" % user2.email).encode("utf-8") in resp.content
 
-    def test_existing_invite_request(self):
+    def test_existing_invite_request(self) -> None:
         self.login_as(user=self.user)
 
         invite_request = self.create_member(
             email="foobar@example.com",
-            organization=self.org,
+            organization=self.organization,
             invite_status=InviteStatus.REQUESTED_TO_BE_INVITED.value,
         )
 
@@ -139,3 +206,138 @@ class OrganizationInviteRequestCreateTest(APITestCase):
         assert ("There is an existing invite request for %s" % invite_request.email).encode(
             "utf-8"
         ) in resp.content
+
+    def test_request_to_invite_email(self) -> None:
+        with self.tasks():
+            resp = self.get_success_response(
+                self.organization.slug,
+                email="eric@localhost",
+                role="member",
+                teams=[self.team.slug],
+                status_code=201,
+            )
+
+        members = OrganizationMember.objects.filter(organization=self.organization)
+        join_request = members.get(email=resp.data["email"])
+        assert join_request.user_id is None
+        assert join_request.role == "member"
+        assert not join_request.invite_approved
+
+        assert len(mail.outbox) == 1
+
+        assert mail.outbox[0].to == ["manager@localhost"]
+
+        expected_subject = f"Access request to {self.organization.name}"
+        assert mail.outbox[0].subject == expected_subject
+        assert "eric@localhost" in mail.outbox[0].body
+
+    def test_request_to_invite_slack(self) -> None:
+        with self.tasks():
+            self.get_success_response(
+                self.organization.slug,
+                email="eric@localhost",
+                role="member",
+                teams=[self.team.slug],
+                status_code=201,
+            )
+
+        blocks = orjson.loads(self.mock_post.call_args.kwargs["blocks"])
+        fallback_text = self.mock_post.call_args.kwargs["text"]
+
+        assert (
+            fallback_text
+            == f"foo@localhost is requesting to invite eric@localhost into {self.organization.name}"
+        )
+        query_params = parse_qs(urlparse(blocks[1]["elements"][0]["text"]).query)
+        notification_uuid = query_params["notification_uuid"][0]
+        notification_uuid = notification_uuid.split("|")[
+            0
+        ]  # remove method of hyperlinking in slack
+        assert blocks[2]["elements"] == [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve"},
+                "action_id": "approve_request",
+                "value": "approve_member",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Reject"},
+                "action_id": "reject_request",
+                "value": "reject_member",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "See Members & Requests"},
+                "url": f"http://testserver/settings/{self.organization.slug}/members/?referrer=invite_request-slack-user&notification_uuid={notification_uuid}",
+                "value": "link_clicked",
+            },
+        ]
+        footer = blocks[1]["elements"][0]["text"]
+        assert (
+            footer
+            == f"You are receiving this notification because you have the scope member:write | <http://testserver/settings/account/notifications/approval/?referrer=invite_request-slack-user&notification_uuid={notification_uuid}|Notification Settings>"
+        )
+        member = OrganizationMember.objects.get(email="eric@localhost")
+        context_params = orjson.loads(
+            orjson.loads(self.mock_post.call_args.kwargs["blocks"])[0]["block_id"]
+        )
+        assert context_params == {
+            "member_id": member.id,
+            "member_email": "eric@localhost",
+        }
+
+    def test_invitations_capped_at_member_permissions(self) -> None:
+        manager_user = self.create_user("manager2@localhost")
+        self.create_member(user=manager_user, organization=self.organization, role="manager")
+        self.login_as(user=manager_user)
+
+        assert not OrganizationMember.objects.filter(inviter_id=manager_user.id).exists()
+
+        # invite owner — should be rejected
+        response = self.client.post(
+            self.url, {"email": "foo@example.com", "role": "owner", "teams": [self.team.slug]}
+        )
+        assert response.status_code == 400
+        assert response.data["role"] == ["You do not have permission to set that org-level role"]
+
+        # invite manager — allowed (same level as the inviter)
+        response = self.client.post(
+            self.url, {"email": "bar@example.com", "role": "manager", "teams": [self.team.slug]}
+        )
+        assert response.status_code == 201
+
+        # invite member — allowed (below the inviter's level)
+        response = self.client.post(
+            self.url, {"email": "baz@example.com", "role": "member", "teams": [self.team.slug]}
+        )
+        assert response.status_code == 201
+
+    def test_disallow_when_sso_required(self) -> None:
+        from sentry.models.authidentity import AuthIdentity
+        from sentry.models.authprovider import AuthProvider
+        from sentry.silo.base import SiloMode
+        from sentry.testutils.silo import assume_test_silo_mode
+        from sentry.utils.auth import SsoSession
+
+        self.member.flags["sso:linked"] = True
+        self.member.save()
+
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            # Sets org-wise `requiresSso` to True
+            ap = AuthProvider.objects.create(organization_id=self.organization.id, provider="dummy")
+            AuthIdentity.objects.create(auth_provider=ap, user=self.user)
+
+        sso_session = SsoSession.create(self.organization.id)
+        self.session[sso_session.session_key] = sso_session.to_dict()
+        self.save_session()
+
+        resp = self.client.post(
+            self.url, {"email": "eric@localhost", "role": "member", "teams": [self.team.slug]}
+        )
+
+        assert resp.status_code == 400
+        assert (
+            resp.data["detail"]
+            == "Your organization must use its single sign-on provider to register new members."
+        )

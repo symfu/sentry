@@ -1,73 +1,91 @@
-from django.core.urlresolvers import reverse
-from django.db import transaction
-from django.views.decorators.cache import never_cache
+import logging
+
 from django.contrib import messages
+from django.contrib.auth import REDIRECT_FIELD_NAME
+from django.http import HttpRequest, HttpResponseNotAllowed
+from django.http.response import HttpResponseBase
+from django.urls import reverse
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import never_cache
 
 from sentry.auth.helper import AuthHelper
+from sentry.auth.store import FLOW_LOGIN
 from sentry.constants import WARN_SESSION_EXPIRED
-from sentry.models import AuthProvider, Organization, OrganizationStatus
-from sentry.web.frontend.auth_login import AuthLoginView
+from sentry.models.authprovider import AuthProvider
+from sentry.organizations.services.organization import RpcOrganization, organization_service
+from sentry.utils.auth import construct_link_with_query, initiate_login
+from sentry.web.frontend.auth_login import AuthPageView
+
+logger = logging.getLogger("sentry.saml_setup_error")
 
 
-class AuthOrganizationLoginView(AuthLoginView):
-    def respond_login(self, request, context, *args, **kwargs):
-        return self.respond("sentry/organization-login.html", context)
+class AuthOrganizationLoginView(AuthPageView):
+    def handle_sso(
+        self, request: HttpRequest, organization: RpcOrganization, auth_provider: AuthProvider
+    ) -> HttpResponseBase:
+        helper = AuthHelper(
+            request=request,
+            organization=organization,
+            auth_provider=auth_provider,
+            flow=FLOW_LOGIN,
+            referrer=request.GET.get(
+                "referrer"
+            ),  # TODO: get referrer from the form submit - not the query parms
+        )
 
-    def handle_sso(self, request, organization, auth_provider):
-        if request.method == "POST":
-            helper = AuthHelper(
-                request=request,
-                organization=organization,
-                auth_provider=auth_provider,
-                flow=AuthHelper.FLOW_LOGIN,
+        if request.POST.get("init"):
+            helper.initialize()
+
+        if not helper.is_valid():
+            logger.info(
+                "AuthOrganizationLoginView",
+                extra=helper.state.get_state(),
             )
+            return helper.error("Something unexpected happened during authentication.")
 
-            if request.POST.get("init"):
-                helper.init_pipeline()
+        return helper.current_step()
 
-            if not helper.pipeline_is_valid():
-                return helper.error("Something unexpected happened during authentication.")
+    @method_decorator(never_cache)
+    def handle(self, request: HttpRequest, organization_slug: str) -> HttpResponseBase:
+        if request.method == "GET":
+            if (
+                request.resolver_match
+                and request.resolver_match.url_name == "sentry-auth-link-identity"
+            ):
+                path = reverse("sentry-auth-organization", args=[organization_slug])
+                return self.redirect(construct_link_with_query(path, request.GET))
 
-            return helper.current_step()
+            customer_domain_redirect = self.get_customer_domain_login_redirect(request)
+            if customer_domain_redirect is not None:
+                return customer_domain_redirect
 
-        provider = auth_provider.get_provider()
+            return self.handle_react(request)
 
-        context = {
-            "CAN_REGISTER": False,
-            "organization": organization,
-            "provider_key": provider.key,
-            "provider_name": provider.name,
-            "authenticated": request.user.is_authenticated(),
-        }
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["GET", "POST"])
 
-        return self.respond("sentry/organization-login.html", context)
+        org_context = organization_service.get_organization_by_slug(
+            slug=organization_slug, only_visible=True
+        )
+        if org_context is None:
+            return self.redirect(reverse("sentry-login"))
+        organization = org_context.organization
 
-    @never_cache
-    @transaction.atomic
-    def handle(self, request, organization_slug):
         try:
-            organization = Organization.objects.get(slug=organization_slug)
-        except Organization.DoesNotExist:
-            return self.redirect(reverse("sentry-login"))
-
-        if organization.status != OrganizationStatus.VISIBLE:
-            return self.redirect(reverse("sentry-login"))
+            auth_provider = AuthProvider.objects.get(organization_id=organization.id)
+        except AuthProvider.DoesNotExist:
+            return self.redirect(request.get_full_path())
 
         request.session.set_test_cookie()
-
-        try:
-            auth_provider = AuthProvider.objects.get(organization=organization)
-        except AuthProvider.DoesNotExist:
-            auth_provider = None
+        referrer = request.session.pop("_referrer", None)
+        next_uri = request.GET.get(REDIRECT_FIELD_NAME, request.session.pop("_next", None))
+        initiate_login(request, next_uri, referrer)
 
         session_expired = "session_expired" in request.COOKIES
         if session_expired:
             messages.add_message(request, messages.WARNING, WARN_SESSION_EXPIRED)
 
-        if not auth_provider:
-            response = self.handle_basic_auth(request, organization=organization)
-        else:
-            response = self.handle_sso(request, organization, auth_provider)
+        response = self.handle_sso(request, organization, auth_provider)
 
         if session_expired:
             response.delete_cookie("session_expired")

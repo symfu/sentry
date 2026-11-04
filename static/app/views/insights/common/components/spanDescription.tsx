@@ -1,0 +1,222 @@
+import {Fragment, useEffect, useMemo, useState} from 'react';
+import styled from '@emotion/styled';
+import {useQuery} from '@tanstack/react-query';
+import {useQueryState} from 'nuqs';
+
+import {CodeBlock} from '@sentry/scraps/codeBlock';
+import {Flex} from '@sentry/scraps/layout';
+
+import {ClippedBox} from 'sentry/components/clippedBox';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {getAttributeValue} from 'sentry/utils/fields/getAttributeValue';
+import {releaseApiOptions} from 'sentry/utils/releaseApiOptions';
+import {SQLishFormatter} from 'sentry/utils/sqlish';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {useSpans} from 'sentry/views/insights/common/queries/useDiscover';
+import {
+  MissingFrame,
+  StackTraceMiniFrame,
+} from 'sentry/views/insights/database/components/stackTraceMiniFrame';
+import {SupportedDatabaseSystem} from 'sentry/views/insights/database/utils/constants';
+import {
+  isValidJson,
+  prettyPrintJsonString,
+} from 'sentry/views/insights/database/utils/jsonUtils';
+import type {SpanResponse} from 'sentry/views/insights/types';
+import {SpanFields} from 'sentry/views/insights/types';
+
+interface Props {
+  spanId: SpanResponse[SpanFields.ID];
+  preliminaryDescription?: string;
+  shouldClipHeight?: boolean;
+  showBorder?: boolean;
+}
+
+const formatter = new SQLishFormatter();
+
+export function DatabaseSpanDescription({
+  spanId,
+  preliminaryDescription,
+  showBorder = true,
+  shouldClipHeight = true,
+}: Props) {
+  const {projects} = useProjects();
+  const organization = useOrganization();
+
+  const {data: indexedSpans, isFetching: areIndexedSpansLoading} = useSpans(
+    {
+      search: MutableSearch.fromQueryObject({id: spanId}),
+      enabled: Boolean(spanId),
+      limit: 1,
+      fields: [
+        SpanFields.PROJECT_ID,
+        SpanFields.SPAN_DESCRIPTION,
+        SpanFields.DB_SYSTEM_NAME,
+        SpanFields.CODE_FILE_PATH,
+        SpanFields.CODE_LINE_NUMBER,
+        SpanFields.CODE_FUNCTION,
+        SpanFields.SDK_NAME,
+        SpanFields.SDK_VERSION,
+        SpanFields.RELEASE,
+        SpanFields.PLATFORM,
+      ],
+    },
+    'api.insights.span-description'
+  );
+  const indexedSpan = indexedSpans?.[0];
+
+  const project = projects.find(p => p.id === indexedSpan?.['project.id']?.toString());
+
+  const {data: release} = useQuery({
+    ...releaseApiOptions({
+      orgSlug: organization.slug,
+      projectSlug: project?.slug ?? '',
+      releaseVersion: indexedSpan?.release ?? '',
+    }),
+    enabled: indexedSpan?.release !== undefined,
+  });
+
+  const sdk =
+    indexedSpan?.['sdk.name'] && indexedSpan?.['sdk.version']
+      ? {
+          name: indexedSpan?.['sdk.name'],
+          version: indexedSpan?.['sdk.version'],
+        }
+      : undefined;
+
+  const event = {
+    platform: indexedSpan?.platform,
+    release,
+    sdk,
+  };
+
+  // isExpanded is a query param that is meant to be accessed only when clicking on the
+  // "View full query" button from the hover tooltip. It is removed from the query params
+  // on the initial load so the value is not persisted through the link
+  const [isExpandedParam, setIsExpandedParam] = useQueryState('isExpanded');
+  const [isExpanded] = useState<boolean>(() => Boolean(isExpandedParam));
+  useEffect(() => {
+    setIsExpandedParam(null);
+  }, [setIsExpandedParam]);
+
+  const system = getAttributeValue(
+    indexedSpan ?? {},
+    SpanFields.DB_SYSTEM_NAME,
+    'string'
+  );
+  const codeFilepath = getAttributeValue(
+    indexedSpan ?? {},
+    SpanFields.CODE_FILE_PATH,
+    'string'
+  );
+  const codeLineNumber = getAttributeValue(
+    indexedSpan ?? {},
+    SpanFields.CODE_LINE_NUMBER,
+    'number'
+  );
+  const codeLineno = codeLineNumber === undefined ? undefined : Number(codeLineNumber);
+  const codeFunction = getAttributeValue(
+    indexedSpan ?? {},
+    SpanFields.CODE_FUNCTION,
+    'string'
+  );
+
+  const formattedDescription = useMemo(() => {
+    const rawDescription = indexedSpan?.['span.description'] || preliminaryDescription;
+
+    if (system === SupportedDatabaseSystem.MONGODB) {
+      let bestDescription = '';
+
+      if (preliminaryDescription && isValidJson(preliminaryDescription)) {
+        bestDescription = preliminaryDescription;
+      } else if (
+        indexedSpan?.['span.description'] &&
+        isValidJson(indexedSpan?.['span.description'])
+      ) {
+        bestDescription = indexedSpan?.['span.description'];
+      } else {
+        return rawDescription ?? 'N/A';
+      }
+
+      return prettyPrintJsonString(bestDescription).prettifiedQuery;
+    }
+
+    return formatter.toString(rawDescription ?? '');
+  }, [preliminaryDescription, indexedSpan, system]);
+
+  return (
+    <Frame showBorder={showBorder}>
+      {areIndexedSpansLoading ? (
+        <Flex padding="md xl">
+          <LoadingIndicator mini />
+        </Flex>
+      ) : (
+        <QueryWrapper
+          clipHeight={500}
+          isExpanded={isExpanded}
+          shouldClipHeight={shouldClipHeight}
+        >
+          <CodeBlock language={system === 'mongodb' ? 'json' : 'sql'} isRounded={false}>
+            {formattedDescription ?? ''}
+          </CodeBlock>
+        </QueryWrapper>
+      )}
+
+      {!areIndexedSpansLoading && (
+        <Fragment>
+          {codeFilepath ? (
+            <StackTraceMiniFrame
+              projectId={indexedSpan?.['project.id']?.toString()}
+              event={event}
+              frame={{
+                filename: codeFilepath,
+                lineNo: codeLineno,
+                function: codeFunction,
+              }}
+            />
+          ) : (
+            <MissingFrame system={system} />
+          )}
+        </Fragment>
+      )}
+    </Frame>
+  );
+}
+
+function QueryWrapper(props: any) {
+  const {isExpanded, children, shouldClipHeight} = props;
+
+  if (!shouldClipHeight) {
+    return <StyledFullBox>{children}</StyledFullBox>;
+  }
+
+  if (isExpanded) {
+    return children;
+  }
+  return <StyledClippedBox {...props} />;
+}
+
+const Frame = styled('div')<{showBorder: boolean}>`
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  border: ${p => (p.showBorder ? `solid 1px ${p.theme.tokens.border.primary}` : 'none')};
+  border-radius: ${p => (p.showBorder ? p.theme.radius.md : '0')};
+  overflow: hidden;
+`;
+
+const StyledClippedBox = styled(ClippedBox)`
+  padding: 0;
+
+  > div > div {
+    z-index: 1;
+  }
+`;
+
+const StyledFullBox = styled('div')`
+  padding: 0;
+  height: 100%;
+  overflow-y: auto;
+`;

@@ -1,0 +1,1789 @@
+import contextlib
+import time
+import uuid
+from collections.abc import Generator, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from unittest import mock
+
+import msgpack
+from arroyo.backends.kafka import KafkaPayload
+from arroyo.processing.strategies import ProcessingStrategy
+from arroyo.types import BrokerValue, Message, Partition, Topic
+from django.conf import settings
+from django.db import connections, router
+from django.test.utils import CaptureQueriesContext, override_settings
+from rest_framework.exceptions import ErrorDetail
+from sentry_kafka_schemas.schema_types.ingest_monitors_v1 import CheckIn
+
+from sentry import audit_log, killswitches
+from sentry.constants import ObjectStatus
+from sentry.db.models import BoundedPositiveIntegerField
+from sentry.models.environment import Environment
+from sentry.monitors.constants import MAX_TIMEOUT, TIMEOUT, PermitCheckInStatus
+from sentry.monitors.consumers.monitor_consumer import StoreMonitorCheckInStrategyFactory
+from sentry.monitors.models import (
+    CheckInStatus,
+    Monitor,
+    MonitorCheckIn,
+    MonitorCheckInConfig,
+    MonitorEnvironment,
+    MonitorStatus,
+    ScheduleType,
+    get_detector_for_monitor,
+)
+from sentry.monitors.processing_errors.errors import ProcessingErrorsException, ProcessingErrorType
+from sentry.monitors.types import CheckinItem, CrontabSchedule
+from sentry.testutils.asserts import assert_org_audit_log_exists
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.outbox import outbox_runner
+from sentry.utils import json
+from sentry.utils.outcomes import Outcome
+
+
+class ExpectNoProcessingError:
+    pass
+
+
+class MonitorConsumerTest(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.partition = Partition(Topic("test"), 0)
+
+    def _create_monitor(self, **kwargs: object) -> Monitor:
+        return Monitor.objects.create(
+            organization_id=self.organization.id,
+            project_id=self.project.id,
+            config={
+                "schedule": "* * * * *",
+                "schedule_type": ScheduleType.CRONTAB,
+                "checkin_margin": 5,
+                "max_runtime": None,
+            },
+            **kwargs,
+        )
+
+    def create_consumer(
+        self, factory_opts: Mapping[str, Any] | None = None
+    ) -> ProcessingStrategy[KafkaPayload]:
+        if factory_opts is None:
+            factory_opts = {}
+
+        factory = StoreMonitorCheckInStrategyFactory(**factory_opts)
+        commit = mock.Mock()
+        return factory.create_with_partitions(commit, {self.partition: 0})
+
+    def send_checkin(
+        self,
+        monitor_slug: str,
+        guid: str | None = None,
+        ts: datetime | None = None,
+        item_ts: datetime | None = None,
+        consumer: ProcessingStrategy[KafkaPayload] | None = None,
+        expected_error: ProcessingErrorsException | ExpectNoProcessingError | None = None,
+        expected_monitor_slug: str | None = None,
+        **overrides: Any,
+    ) -> None:
+        if ts is None:
+            ts = datetime.now()
+        if item_ts is None:
+            item_ts = ts
+        if consumer is None:
+            consumer = self.create_consumer()
+
+        self.guid = uuid.uuid4().hex if not guid else guid
+        self.trace_id = uuid.uuid4().hex
+
+        payload = {
+            "monitor_slug": monitor_slug,
+            "status": "ok",
+            "check_in_id": self.guid,
+            "environment": "production",
+            "contexts": {"trace": {"trace_id": self.trace_id}},
+        }
+        payload.update(overrides)
+
+        wrapper: CheckIn = {
+            "message_type": "check_in",
+            "start_time": ts.timestamp(),
+            "project_id": self.project.id,
+            "payload": json.dumps(payload).encode(),
+            "sdk": "test/1.0",
+            "retention_days": 90,
+        }
+
+        with self.check_processing_errors(wrapper, expected_error, expected_monitor_slug):
+            consumer.submit(
+                Message(
+                    BrokerValue(
+                        KafkaPayload(b"fake-key", msgpack.packb(wrapper), []),
+                        self.partition,
+                        1,
+                        item_ts,
+                    )
+                )
+            )
+
+    @contextlib.contextmanager
+    def check_processing_errors(
+        self,
+        expected_checkin: CheckIn,
+        expected_error: ProcessingErrorsException | ExpectNoProcessingError | None,
+        expected_monitor_slug: str | None,
+    ) -> Generator[None]:
+        if expected_error is None:
+            yield None
+            return
+
+        with mock.patch(
+            "sentry.monitors.consumers.monitor_consumer.handle_processing_errors"
+        ) as handle_processing_errors:
+            yield
+
+            args_list = handle_processing_errors.call_args_list
+            if isinstance(expected_error, ExpectNoProcessingError):
+                assert len(args_list) == 0
+                return
+
+            assert len(args_list) == 1
+
+            checkin_item, error = args_list[0][0]
+            expected_checkin_item = CheckinItem(
+                datetime.fromtimestamp(expected_checkin["start_time"]),
+                self.partition.index,
+                expected_checkin,
+                json.loads(expected_checkin["payload"]),
+            )
+            if expected_monitor_slug:
+                expected_error.monitor = Monitor.objects.get(
+                    project_id=expected_checkin["project_id"], slug=expected_monitor_slug
+                )
+            assert checkin_item == expected_checkin_item
+            assert error.monitor == expected_error.monitor
+            assert error.processing_errors == expected_error.processing_errors
+
+    def send_clock_pulse(
+        self,
+        ts: datetime | None = None,
+        consumer: ProcessingStrategy[KafkaPayload] | None = None,
+        partition_ids: list[int] | None = None,
+    ) -> None:
+        if ts is None:
+            ts = datetime.now()
+        if consumer is None:
+            consumer = self.create_consumer()
+
+        wrapper: dict[str, Any] = {"message_type": "clock_pulse"}
+        if partition_ids is not None:
+            wrapper["partition_ids"] = partition_ids
+
+        consumer.submit(
+            Message(
+                BrokerValue(
+                    KafkaPayload(b"fake-key", msgpack.packb(wrapper), []),
+                    self.partition,
+                    1,
+                    ts,
+                )
+            )
+        )
+
+    def test_payload(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+
+        self.send_checkin(monitor.slug)
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.monitor_config is None
+        assert (
+            MonitorCheckInConfig.objects.get(id=checkin.checkin_config_id).config == monitor.config
+        )
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        assert monitor_environment.last_checkin == checkin.date_added
+        assert monitor_environment.next_checkin == monitor.get_next_expected_checkin(
+            checkin.date_added
+        )
+        assert monitor_environment.next_checkin_latest == monitor.get_next_expected_checkin_latest(
+            checkin.date_added
+        )
+
+        # Process another check-in to verify we set an expected time for the next check-in
+        self.send_checkin(monitor.slug)
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.expected_time == monitor_environment.next_checkin
+        assert checkin.trace_id is not None
+        assert checkin.trace_id.hex == self.trace_id
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.process_checkin_group")
+    def test_parallel(self, process_checkin_group: mock.MagicMock) -> None:
+        """
+        Validates that the consumer in parallel mode correctly groups check-ins
+        into groups by their monitor slug / environment
+        """
+        factory = StoreMonitorCheckInStrategyFactory(
+            mode="batched-parallel",
+            max_batch_size=4,
+            max_workers=1,
+        )
+        commit = mock.Mock()
+        consumer = factory.create_with_partitions(commit, {self.partition: 0})
+
+        monitor_1 = self._create_monitor(slug="my-monitor-1")
+        monitor_2 = self._create_monitor(slug="my-monitor-2")
+
+        # Send 4 check-ins to fill the batch
+        self.send_checkin(monitor_1.slug, consumer=consumer)
+        self.send_checkin(monitor_2.slug, consumer=consumer)
+        self.send_checkin(monitor_2.slug, consumer=consumer)
+        self.send_checkin(monitor_2.slug, environment="test", consumer=consumer)
+
+        # Send one more check-in to cause the batch to be processed
+        self.send_checkin(monitor_1.slug, consumer=consumer)
+
+        # Because we have two separate monitor slugs and one separate
+        # environment, there will be three groups of check-ins to process
+        assert process_checkin_group.call_count == 3
+
+        group_1: Sequence[CheckinItem] = process_checkin_group.mock_calls[0].args[0]
+        group_2: Sequence[CheckinItem] = process_checkin_group.mock_calls[1].args[0]
+        group_3: Sequence[CheckinItem] = process_checkin_group.mock_calls[2].args[0]
+
+        # Each group has the correct number of check-ins
+        assert len(group_1) == 1
+        assert len(group_2) == 2
+        assert len(group_3) == 1
+
+        assert all(checkin.payload["monitor_slug"] == monitor_1.slug for checkin in group_1)
+        assert all(checkin.payload["monitor_slug"] == monitor_2.slug for checkin in group_2)
+
+        # The last group is monitor_2 but with a diff environment
+        assert group_3[0].payload.get("environment") == "test"
+
+    def test_passing(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug)
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.monitor_config is None
+        assert (
+            MonitorCheckInConfig.objects.get(id=checkin.checkin_config_id).config == monitor.config
+        )
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        assert monitor_environment.last_checkin == checkin.date_added
+        assert monitor_environment.next_checkin == monitor.get_next_expected_checkin(
+            checkin.date_added
+        )
+        assert monitor_environment.next_checkin_latest == monitor.get_next_expected_checkin_latest(
+            checkin.date_added
+        )
+
+        # Process another check-in to verify we set an expected time for the next check-in
+        self.send_checkin(monitor.slug)
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        # the expected time should not include the margin of 5 minutes
+        assert checkin.expected_time == monitor_environment.next_checkin
+
+    def test_failing(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, status="error")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.ERROR
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.ERROR
+        assert monitor_environment.last_checkin == checkin.date_added
+        assert monitor_environment.next_checkin == monitor.get_next_expected_checkin(
+            checkin.date_added
+        )
+        assert monitor_environment.next_checkin_latest == monitor.get_next_expected_checkin_latest(
+            checkin.date_added
+        )
+
+    def test_muted(self) -> None:
+        monitor = self._create_monitor()
+        # Create a muted environment for this monitor
+        production_env = self.create_environment(name="production")
+        MonitorEnvironment.objects.create(
+            monitor=monitor,
+            environment_id=production_env.id,
+            is_muted=True,
+        )
+        self.send_checkin(monitor.slug, status="error")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.ERROR
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+
+        # The monitor environment should still be muted and track the error status
+        assert monitor_environment.is_muted is True
+        assert monitor_environment.status == MonitorStatus.ERROR
+        assert monitor_environment.last_checkin == checkin.date_added
+        assert monitor_environment.next_checkin == monitor.get_next_expected_checkin(
+            checkin.date_added
+        )
+        assert monitor_environment.next_checkin_latest == monitor.get_next_expected_checkin_latest(
+            checkin.date_added
+        )
+
+    def test_check_in_no_in_progress(self) -> None:
+        now = datetime.now()
+
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, ts=now, status="ok", duration=10)
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.date_added == now.replace(tzinfo=UTC)
+
+    def test_check_date_updated(self) -> None:
+        now = datetime.now()
+        guid = uuid.uuid4().hex
+
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, guid=guid, ts=now, status="in_progress")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+        assert checkin.date_added == now.replace(tzinfo=UTC)
+        assert checkin.date_updated == now.replace(tzinfo=UTC)
+
+        # Another in_progress moves the date_updated forward
+        self.send_checkin(
+            monitor.slug, guid=guid, ts=now + timedelta(seconds=10), status="in_progress"
+        )
+        checkin.refresh_from_db()
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+        assert checkin.date_added == now.replace(tzinfo=UTC)
+        assert checkin.date_updated == now.replace(tzinfo=UTC) + timedelta(seconds=10)
+
+        # Closing check in moves the date_updated forward
+        self.send_checkin(monitor.slug, guid=guid, ts=now + timedelta(seconds=20), status="ok")
+        checkin.refresh_from_db()
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.date_added == now.replace(tzinfo=UTC)
+        assert checkin.date_updated == now.replace(tzinfo=UTC) + timedelta(seconds=20)
+
+    def test_check_in_date_clock(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        now = datetime.now()
+        item_ts = now
+        ts = now + timedelta(seconds=5)
+
+        self.send_checkin(monitor.slug, ts=ts, item_ts=item_ts)
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.date_added == ts.replace(tzinfo=UTC)
+        assert checkin.date_clock == item_ts.replace(second=0, microsecond=0, tzinfo=UTC)
+
+    def test_check_in_date_in_progress(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        now = datetime.now()
+        now_tz = now.replace(tzinfo=UTC)
+
+        guid1 = uuid.uuid4().hex
+
+        # First check-in will not have a date_in_progress, since we never sent
+        # an in-progress check.
+        self.send_checkin(monitor.slug, guid=guid1, ts=now, status="ok")
+        checkin1 = MonitorCheckIn.objects.get(guid=guid1)
+        assert not checkin1.date_in_progress
+
+        # Second check-in does have a date_in_progress
+        guid2 = uuid.uuid4().hex
+
+        self.send_checkin(
+            monitor.slug,
+            guid=guid2,
+            ts=now + timedelta(minutes=1),
+            status="in_progress",
+        )
+        self.send_checkin(
+            monitor.slug,
+            guid=guid2,
+            ts=now + timedelta(minutes=1, seconds=25),
+            status="ok",
+        )
+
+        checkin2 = MonitorCheckIn.objects.get(guid=guid2)
+        assert checkin2.date_in_progress == now_tz + timedelta(minutes=1)
+
+    def test_check_in_timeout_at(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, status="in_progress")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        timeout_at = checkin.date_added.replace(second=0, microsecond=0) + timedelta(
+            minutes=TIMEOUT
+        )
+        assert checkin.timeout_at == timeout_at
+
+        self.send_checkin(monitor.slug, guid=self.guid)
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.timeout_at is None
+
+        new_guid = uuid.uuid4().hex
+        self.send_checkin(
+            "my-other-monitor",
+            guid=new_guid,
+            status="in_progress",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "max_runtime": 5,
+            },
+            environment="my-environment",
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=new_guid)
+        timeout_at = checkin.date_added.replace(second=0, microsecond=0) + timedelta(minutes=5)
+        assert checkin.timeout_at == timeout_at
+
+    def test_check_in_timeout_late(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        now = datetime.now()
+        self.send_checkin(monitor.slug, status="in_progress", ts=now)
+
+        # mark monitor as timed-out
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        checkin.update(status=CheckInStatus.TIMEOUT)
+
+        assert checkin.duration is None
+
+        # next check-in reports an OK
+        self.send_checkin(monitor.slug, guid=self.guid, ts=now + timedelta(seconds=5))
+
+        # The check-in is still in TIMEOUT status, but has a duration now
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.TIMEOUT
+        assert checkin.duration == 5000
+
+    def test_check_in_in_progress_timeout_capped(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        now = datetime.now()
+        self.send_checkin(
+            monitor.slug,
+            status="in_progress",
+            ts=now - timedelta(minutes=MAX_TIMEOUT - 10),
+            item_ts=now,
+        )
+        self.send_checkin(monitor.slug, guid=self.guid, status="in_progress", ts=now)
+
+        # The in-progress update can not extend the timeout past MAX_TIMEOUT
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+        assert checkin.timeout_at == checkin.date_added.replace(
+            second=0, microsecond=0
+        ) + timedelta(minutes=MAX_TIMEOUT)
+
+    def test_check_in_in_progress_after_timeout(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, status="in_progress")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        checkin.update(status=CheckInStatus.TIMEOUT)
+
+        self.send_checkin(
+            monitor.slug,
+            guid=self.guid,
+            status="in_progress",
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.CHECKIN_FINISHED}], monitor
+            ),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.TIMEOUT
+
+    def test_check_in_update_past_max_timeout(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        now = datetime.now()
+        self.send_checkin(
+            monitor.slug,
+            status="in_progress",
+            ts=now - timedelta(minutes=MAX_TIMEOUT + 1),
+            item_ts=now,
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        checkin.update(status=CheckInStatus.TIMEOUT)
+
+        self.send_checkin(
+            monitor.slug,
+            guid=self.guid,
+            ts=now,
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.CHECKIN_FINISHED}], monitor
+            ),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.TIMEOUT
+        assert checkin.duration is None
+
+    def test_check_in_update(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, status="in_progress")
+        self.send_checkin(monitor.slug, guid=self.guid)
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.duration is not None
+
+    def test_check_in_reuses_loaded_relations(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+
+        with CaptureQueriesContext(connections[router.db_for_write(Monitor)]) as ctx:
+            self.send_checkin(monitor.slug, status="in_progress")
+            self.send_checkin(monitor.slug, guid=self.guid)
+            ok_guid = self.guid
+            self.send_checkin(monitor.slug, status="error")
+
+        def by_id_selects(table: str) -> list[str]:
+            pattern = f'FROM "{table}" WHERE "{table}"."id" = '
+            return [q["sql"] for q in ctx.captured_queries if pattern in q["sql"]]
+
+        assert by_id_selects("sentry_monitor") == []
+        assert by_id_selects("sentry_monitorenvironment") == []
+
+        assert MonitorCheckIn.objects.get(guid=ok_guid).status == CheckInStatus.OK
+        assert MonitorCheckIn.objects.get(guid=self.guid).status == CheckInStatus.ERROR
+
+    def test_check_in_update_with_reversed_dates(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        now = datetime.now()
+        self.send_checkin(monitor.slug, status="in_progress", ts=now)
+        self.send_checkin(monitor.slug, guid=self.guid, ts=now - timedelta(seconds=5))
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.duration == 5000
+
+    def test_check_in_existing_guid(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        other_monitor = self._create_monitor(slug="other-monitor")
+
+        self.send_checkin(monitor.slug, status="in_progress")
+        self.send_checkin(
+            monitor.slug, guid=self.guid, status="done", enviroment="other-environment"
+        )
+        self.send_checkin(other_monitor.slug, guid=self.guid, status="done")
+
+        # Assert check-in was not modified
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+
+    @contextlib.contextmanager
+    def first_guid_lookup_misses(self) -> Generator[None]:
+        """Simulate a check-in inserted after the initial guid lookup."""
+        select_for_update = MonitorCheckIn.objects.select_for_update
+        calls = 0
+
+        def side_effect(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            qs = select_for_update(*args, **kwargs)
+            return qs.none() if calls == 1 else qs
+
+        with mock.patch.object(
+            MonitorCheckIn.objects, "select_for_update", side_effect=side_effect
+        ):
+            yield
+
+    def test_check_in_create_race_updates_existing(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, status="in_progress")
+
+        with self.first_guid_lookup_misses():
+            self.send_checkin(monitor.slug, guid=self.guid, status="ok")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.duration is not None
+
+    def test_check_in_create_race_other_monitor(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        other_monitor = self._create_monitor(slug="other-monitor")
+        self.send_checkin(monitor.slug, status="in_progress")
+
+        with self.first_guid_lookup_misses():
+            self.send_checkin(other_monitor.slug, guid=self.guid, status="ok")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.monitor_environment.monitor_id == monitor.id
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+        assert not MonitorCheckIn.objects.filter(
+            monitor_environment__monitor=other_monitor
+        ).exists()
+
+    def test_check_in_update_terminal_in_progress(self) -> None:
+        now = datetime.now()
+        now_tz = now.replace(tzinfo=UTC)
+
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, duration=10.0, ts=now - timedelta(minutes=5))
+        self.send_checkin(
+            monitor.slug,
+            guid=self.guid,
+            status="in_progress",
+            expected_error=ExpectNoProcessingError(),
+            ts=now - timedelta(minutes=4),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+
+        # date_in_progress and duration are updated
+        assert checkin.date_in_progress == now_tz - timedelta(minutes=4)
+        assert checkin.duration == int(10.0 * 1000)
+
+        self.send_checkin(
+            monitor.slug,
+            duration=20.0,
+            status="error",
+            ts=now - timedelta(minutes=3),
+        )
+        self.send_checkin(
+            monitor.slug,
+            guid=self.guid,
+            status="in_progress",
+            expected_error=ExpectNoProcessingError(),
+            ts=now - timedelta(minutes=2),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.duration == int(20.0 * 1000)
+
+    def test_check_in_update_terminal_user_terminal(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, duration=10.0)
+        self.send_checkin(monitor.slug, guid=self.guid, status="in_progress")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.duration == int(10.0 * 1000)
+
+        self.send_checkin(monitor.slug, duration=20.0, status="error")
+        self.send_checkin(
+            monitor.slug,
+            guid=self.guid,
+            status="ok",
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.CHECKIN_FINISHED}], monitor
+            ),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.duration == int(20.0 * 1000)
+
+    def test_monitor_environment(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, environment="jungle")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        assert monitor_environment.get_environment().name == "jungle"
+        assert monitor_environment.last_checkin == checkin.date_added
+        assert monitor_environment.next_checkin == monitor.get_next_expected_checkin(
+            checkin.date_added
+        )
+        assert monitor_environment.next_checkin_latest == monitor.get_next_expected_checkin_latest(
+            checkin.date_added
+        )
+
+    def test_monitor_create(self) -> None:
+        self.send_checkin(
+            "my-new-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        assert monitor_environment.monitor.name == "my-new-monitor"
+        assert monitor_environment.get_environment().name == "production"
+        assert monitor_environment.last_checkin == checkin.date_added
+        assert (
+            monitor_environment.next_checkin
+            == monitor_environment.monitor.get_next_expected_checkin(checkin.date_added)
+        )
+        assert (
+            monitor_environment.next_checkin_latest
+            == monitor_environment.monitor.get_next_expected_checkin_latest(checkin.date_added)
+        )
+        assert get_detector_for_monitor(monitor_environment.monitor) is not None
+
+    def test_monitor_create_owner(self) -> None:
+        self.send_checkin(
+            "my-new-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "owner": f"user:{self.user.id}",
+            },
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        monitor = monitor_environment.monitor
+        assert monitor.name == "my-new-monitor"
+        assert monitor.owner_user_id == self.user.id
+        assert "owner" not in monitor.config
+
+    def test_monitor_create_owner_invalid(self) -> None:
+        bad_user = self.create_user()
+        self.send_checkin(
+            "my-new-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "owner": f"user:{bad_user.id}",
+            },
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.CHECKIN_VALIDATION_FAILED,
+                        "errors": {
+                            f"user:{bad_user.id}": [
+                                "[ErrorDetail(string='User is not a member of this organization', code='invalid')]"
+                            ]
+                        },
+                    }
+                ],
+            ),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = checkin.monitor_environment
+        assert monitor_environment.status == MonitorStatus.OK
+        monitor = monitor_environment.monitor
+        assert monitor.name == "my-new-monitor"
+        assert monitor.owner_user_id is None
+        assert "owner" not in monitor.config
+
+    def test_monitor_update_owner(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "owner": f"user:{self.user.id}",
+            },
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        monitor.refresh_from_db()
+        assert monitor.owner_user_id == self.user.id
+        assert "owner" not in monitor.config
+
+    def test_monitor_update_owner_to_team(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor", owner_user_id=self.user.id)
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "owner": f"team:{self.team.id}",
+            },
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        monitor.refresh_from_db()
+        assert monitor.owner_user_id is None
+        assert monitor.owner_team_id == self.team.id
+        assert "owner" not in monitor.config
+
+    def test_monitor_update(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor = Monitor.objects.get(id=monitor.id)
+        assert monitor.config["schedule"] == "13 * * * *"
+        # The monitor config is merged, so checkin_margin is not overwritten
+        assert monitor.config["checkin_margin"] == 5
+
+        monitor_environment = checkin.monitor_environment
+        assert checkin.monitor_environment.status == MonitorStatus.OK
+        assert checkin.monitor_environment.last_checkin == checkin.date_added
+        assert (
+            monitor_environment.next_checkin
+            == monitor_environment.monitor.get_next_expected_checkin(checkin.date_added)
+        )
+        assert (
+            monitor_environment.next_checkin_latest
+            == monitor_environment.monitor.get_next_expected_checkin_latest(checkin.date_added)
+        )
+
+    def test_check_in_empty_id(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(
+            "my-monitor",
+            guid=str(uuid.UUID(int=0)),
+        )
+
+        checkin = MonitorCheckIn.objects.get(monitor_environment__monitor=monitor)
+        assert checkin.status == CheckInStatus.OK
+        assert checkin.guid.int != 0
+
+    def test_check_in_empty_id_update(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(
+            "my-monitor",
+            status="in_progress",
+            guid=str(uuid.UUID(int=0)),
+        )
+
+        open_checkin = MonitorCheckIn.objects.get(monitor_environment__monitor=monitor)
+        assert open_checkin.status == CheckInStatus.IN_PROGRESS
+        assert open_checkin.guid != uuid.UUID(int=0)
+
+        # Send an event to a different monitor environment, tests that when we
+        # use the empty UUID "latest" we properly scope to the latest of the
+        # same monitor environment
+        self.send_checkin("my-monitor", status="in_progress", environment="dev")
+
+        self.send_checkin(
+            "my-monitor",
+            status="ok",
+            guid=str(uuid.UUID(int=0)),
+        )
+
+        closed_checkin = MonitorCheckIn.objects.get(guid=open_checkin.guid)
+        assert closed_checkin.status == CheckInStatus.OK
+        assert closed_checkin.guid != uuid.UUID(int=0)
+
+    @freeze_time()
+    def test_rate_limit(self) -> None:
+        now = datetime.now()
+        monitor = self._create_monitor(slug="my-monitor")
+
+        with override_options({"crons.per_monitor_rate_limit": 1}):
+            # Try to ingest two the second will be rate limited
+            self.send_checkin("my-monitor", ts=now)
+            self.send_checkin(
+                "my-monitor",
+                ts=now,
+                expected_error=ProcessingErrorsException(
+                    [{"type": ProcessingErrorType.MONITOR_ENVIRONMENT_RATELIMITED}]
+                ),
+            )
+
+            checkins = MonitorCheckIn.objects.filter(monitor_environment__monitor_id=monitor.id)
+            assert len(checkins) == 1
+
+            # Same monitor, diff environments
+            self.send_checkin("my-monitor", environment="dev", ts=now)
+
+            checkins = MonitorCheckIn.objects.filter(monitor_environment__monitor_id=monitor.id)
+            assert len(checkins) == 2
+
+            # Same monitor same env but a minute later, shuld NOT be rate-limited
+            self.send_checkin("my-monitor", ts=now + timedelta(minutes=1))
+
+            checkins = MonitorCheckIn.objects.filter(monitor_environment__monitor_id=monitor.id)
+            assert len(checkins) == 3
+
+    def test_invalid_guid_environment_match(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug, status="in_progress")
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.monitor_environment.get_environment().name == "production"
+
+        self.send_checkin(
+            monitor.slug,
+            guid=self.guid,
+            status="ok",
+            environment="test",
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.CHECKIN_ENVIRONMENT_MISMATCH,
+                        "existingEnvironment": "production",
+                    }
+                ],
+                monitor,
+            ),
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+        assert checkin.monitor_environment.get_environment().name != "test"
+
+    def test_invalid_duration(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+
+        # Test invalid explicit durations
+        self.send_checkin("my-monitor", status="in_progress")
+
+        # Invalid check-in updates
+        self.send_checkin(
+            "my-monitor",
+            guid=self.guid,
+            duration=-(1.0 / 1000),
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.CHECKIN_VALIDATION_FAILED,
+                        "errors": {
+                            "duration": [
+                                ErrorDetail(
+                                    string="Ensure this value is greater than or equal to 0.",
+                                    code="min_value",
+                                )
+                            ]
+                        },
+                    }
+                ],
+            ),
+        )
+        self.send_checkin(
+            "my-monitor",
+            guid=self.guid,
+            duration=((BoundedPositiveIntegerField.MAX_VALUE + 1.0) / 1000),
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.CHECKIN_VALIDATION_FAILED,
+                        "errors": {
+                            "duration": [
+                                ErrorDetail(
+                                    string="Ensure this value is less than or equal to 2147483647.",
+                                    code="max_value",
+                                )
+                            ]
+                        },
+                    }
+                ],
+            ),
+        )
+
+        # Invalid check-in creations
+        self.send_checkin(
+            "my-monitor",
+            duration=-(1.0 / 1000),
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.CHECKIN_VALIDATION_FAILED,
+                        "errors": {
+                            "duration": [
+                                ErrorDetail(
+                                    string="Ensure this value is greater than or equal to 0.",
+                                    code="min_value",
+                                )
+                            ]
+                        },
+                    }
+                ],
+            ),
+        )
+        self.send_checkin(
+            "my-monitor",
+            duration=(BoundedPositiveIntegerField.MAX_VALUE + 1.0) / 1000,
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.CHECKIN_VALIDATION_FAILED,
+                        "errors": {
+                            "duration": [
+                                ErrorDetail(
+                                    string="Ensure this value is less than or equal to 2147483647.",
+                                    code="max_value",
+                                )
+                            ]
+                        },
+                    }
+                ],
+            ),
+        )
+
+        # Only one check-in should be processed and it should still be IN_PROGRESS
+        checkins = MonitorCheckIn.objects.filter(monitor_environment__monitor_id=monitor.id)
+        assert len(checkins) == 1
+        assert checkins[0].status == CheckInStatus.IN_PROGRESS
+
+        # Test invalid implicit duration
+        old_checkin = MonitorCheckIn.objects.create(
+            monitor_environment=MonitorEnvironment.objects.get(monitor=monitor),
+            status=CheckInStatus.IN_PROGRESS,
+            date_added=monitor.date_added - timedelta(weeks=52),
+        )
+
+        self.send_checkin("my-monitor", guid=str(old_checkin.guid))
+
+        checkin = MonitorCheckIn.objects.get(guid=old_checkin.guid)
+        assert checkin.status == CheckInStatus.IN_PROGRESS
+        assert checkin.duration is None
+
+    def test_monitor_upsert(self) -> None:
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+            environment="my-environment",
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor = Monitor.objects.get(slug="my-monitor")
+        assert monitor is not None
+        assert monitor.is_upserting
+
+        env = Environment.objects.get(
+            organization_id=monitor.organization_id, name="my-environment"
+        )
+        assert MonitorEnvironment.objects.filter(monitor=monitor, environment_id=env.id).exists()
+
+    def test_upsert_existing_monitor(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug)
+
+        is_upserting = monitor.is_upserting
+        assert not is_upserting
+
+        # Update schedule via upsert
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+        )
+
+        monitor.refresh_from_db()
+        is_upserting = monitor.is_upserting
+        assert is_upserting
+        schedule = monitor.schedule
+        assert isinstance(schedule, CrontabSchedule)
+        assert schedule.crontab == "13 * * * *"
+
+        # A check-in without config keeps is_upserting
+        self.send_checkin(monitor.slug)
+
+        monitor.refresh_from_db()
+        is_upserting = monitor.is_upserting
+        assert is_upserting
+        schedule = monitor.schedule
+        assert isinstance(schedule, CrontabSchedule)
+        assert schedule.crontab == "13 * * * *"
+
+    def test_upsert_with_in_progress_completion(self) -> None:
+        """
+        Test that is_upserting stays True when an IN_PROGRESS check-in with config
+        is followed by a completing check-in without config (updating existing check-in).
+        """
+        monitor = self._create_monitor(slug="my-monitor")
+        guid = uuid.uuid4().hex
+
+        # Send IN_PROGRESS check-in with monitor config (upserts monitor)
+        self.send_checkin(
+            "my-monitor",
+            guid=guid,
+            status="in_progress",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+        )
+
+        monitor.refresh_from_db()
+        is_upserting = monitor.is_upserting
+        assert is_upserting
+        schedule = monitor.schedule
+        assert isinstance(schedule, CrontabSchedule)
+        assert schedule.crontab == "13 * * * *"
+
+        # Send completing check-in WITHOUT config (updates existing check-in)
+        # is_upserting should STAY True since we're updating an existing check-in
+        self.send_checkin("my-monitor", guid=guid, status="ok")
+
+        monitor.refresh_from_db()
+        is_upserting = monitor.is_upserting
+        assert is_upserting
+        schedule = monitor.schedule
+        assert isinstance(schedule, CrontabSchedule)
+        assert schedule.crontab == "13 * * * *"
+
+        # A new check-in without config also keeps is_upserting
+        self.send_checkin("my-monitor")
+
+        monitor.refresh_from_db()
+        is_upserting = monitor.is_upserting
+        assert is_upserting
+        schedule = monitor.schedule
+        assert isinstance(schedule, CrontabSchedule)
+        assert schedule.crontab == "13 * * * *"
+
+    def test_monitor_upsert_empty_timezone(self) -> None:
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "timezone": "",
+            },
+            environment="my-environment",
+        )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor = Monitor.objects.get(slug="my-monitor")
+        assert monitor is not None
+        assert "timezone" not in monitor.config
+
+    def _send_checkin_capturing_monitor_writes(self, monitor_slug: str, **kwargs: Any) -> list[str]:
+        with CaptureQueriesContext(connections[router.db_for_write(Monitor)]) as ctx:
+            self.send_checkin(monitor_slug, **kwargs)
+        return [
+            q["sql"]
+            for q in ctx.captured_queries
+            if q["sql"].startswith('UPDATE "sentry_monitor" ')
+        ]
+
+    def test_upsert_unchanged_config_skips_write(self) -> None:
+        config = {"schedule": {"type": "crontab", "value": "13 * * * *"}, "checkin_margin": 5}
+        self.send_checkin("my-monitor", monitor_config=config)
+        monitor = Monitor.objects.get(slug="my-monitor")
+        # Keys the upsert does not send, e.g. set from the UI
+        monitor.update(config={**monitor.config, "failure_issue_threshold": 3, "alert_rule_id": 1})
+        stored_config = monitor.config
+
+        assert (
+            self._send_checkin_capturing_monitor_writes("my-monitor", monitor_config=config) == []
+        )
+        monitor.refresh_from_db()
+        assert monitor.config == stored_config
+
+        config["checkin_margin"] = 10
+        assert (
+            len(self._send_checkin_capturing_monitor_writes("my-monitor", monitor_config=config))
+            == 1
+        )
+        monitor.refresh_from_db()
+        assert monitor.config == {**stored_config, "checkin_margin": 10}
+
+    def test_team_name_as_owner(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor", owner_user_id=self.user.id)
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "owner": f"team:{self.team.name}",
+            },
+        )
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        monitor.refresh_from_db()
+        assert monitor.owner_user_id is None
+        assert monitor.owner_team_id == self.team.id
+
+    def test_user_name_as_owner(self) -> None:
+        named_user = self.create_user(
+            "admin2@localhost",
+            username="test_user",
+            is_superuser=True,
+            is_staff=True,
+            is_sentry_app=False,
+        )
+        monitor = self._create_monitor(slug="my-monitor", owner_user_id=named_user.id)
+
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "owner": f"user:{named_user.username}",
+            },
+        )
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor_environment = MonitorEnvironment.objects.get(id=checkin.monitor_environment.id)
+        assert monitor_environment.status == MonitorStatus.OK
+        assert monitor.owner_user_id == named_user.id
+        assert monitor.owner_team_id is None
+
+    def test_monitor_upsert_invalid_slug(self) -> None:
+        self.send_checkin(
+            "some/slug@with-weird|stuff",
+            monitor_config={"schedule": {"type": "crontab", "value": "0 * * * *"}},
+        )
+
+        # invalid slug is slugified
+        monitor = Monitor.objects.get(slug="someslugwith-weirdstuff")
+        assert monitor is not None
+
+    def test_monitor_upsert_checkin_margin_zero(self) -> None:
+        """
+        As part of GH-56526 we changed the minimum value allowed for the
+        checkin_margin to 1 from 0. Some monitors may still be upserting with a
+        0 set, we transform it to None in those cases.
+        """
+        self.send_checkin(
+            "invalid-monitor-checkin",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "checkin_margin": 0,
+            },
+            environment="my-environment",
+        )
+
+        monitor = Monitor.objects.filter(slug="invalid-monitor-checkin")
+        assert monitor.exists()
+        assert monitor[0].config["checkin_margin"] == 1
+
+    def test_monitor_upsert_limits_clamped(self) -> None:
+        self.send_checkin(
+            "long-running-monitor",
+            monitor_config={
+                "schedule": {"type": "crontab", "value": "13 * * * *"},
+                "max_runtime": 20160,
+                "checkin_margin": 100000,
+            },
+        )
+
+        monitor = Monitor.objects.get(slug="long-running-monitor")
+        assert monitor.config["max_runtime"] == 10080
+        assert monitor.config["checkin_margin"] == 40320
+        assert MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+    def test_monitor_invalid_config(self) -> None:
+        # 6 value schedule
+        self.send_checkin(
+            "my-invalid-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * * *"}},
+            environment="my-environment",
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.MONITOR_INVALID_CONFIG,
+                        "errors": {
+                            "schedule": [
+                                ErrorDetail(
+                                    string="Only 5 field crontab syntax is supported",
+                                    code="invalid",
+                                )
+                            ]
+                        },
+                    },
+                    {
+                        "type": ProcessingErrorType.MONITOR_NOT_FOUND,
+                    },
+                ],
+            ),
+        )
+
+        assert not MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+        # no next valid check-in
+        self.send_checkin(
+            "my-invalid-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "* * 31 2 *"}},
+            environment="my-environment",
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.MONITOR_INVALID_CONFIG,
+                        "errors": {
+                            "schedule": [ErrorDetail(string="Schedule is invalid", code="invalid")]
+                        },
+                    },
+                    {
+                        "type": ProcessingErrorType.MONITOR_NOT_FOUND,
+                    },
+                ],
+            ),
+        )
+
+        assert not MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+    def test_payload_key_collides_with_log_record(self) -> None:
+        """
+        Client payload keys are logged on failure paths. A key such as
+        `message` collides with a `logging.LogRecord` attribute and must not
+        break check-in processing.
+        """
+        self.send_checkin(
+            "my-missing-monitor",
+            message="hello",
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.MONITOR_NOT_FOUND}],
+            ),
+        )
+
+        assert not MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+    @override_settings(MAX_MONITORS_PER_ORG=2)
+    def test_monitor_limits(self) -> None:
+        for i in range(settings.MAX_MONITORS_PER_ORG + 2):
+            expected_error = None
+            if i > settings.MAX_MONITORS_PER_ORG:
+                expected_error = ProcessingErrorsException(
+                    [
+                        {
+                            "type": ProcessingErrorType.MONITOR_LIMIT_EXCEEDED,
+                            "reason": f"You may not exceed {settings.MAX_MONITORS_PER_ORG} monitors per organization",
+                        }
+                    ]
+                )
+            self.send_checkin(
+                f"my-monitor-{i}",
+                monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+                expected_error=expected_error,
+            )
+
+        monitors = Monitor.objects.filter(organization_id=self.organization.id)
+        assert len(monitors) == settings.MAX_MONITORS_PER_ORG
+
+    @override_settings(MAX_ENVIRONMENTS_PER_MONITOR=2)
+    def test_monitor_environment_limits(self) -> None:
+        monitor_slug = "my-monitor"
+        for i in range(settings.MAX_ENVIRONMENTS_PER_MONITOR + 2):
+            expected_error = None
+            if i > settings.MAX_ENVIRONMENTS_PER_MONITOR:
+                expected_error = ProcessingErrorsException(
+                    [
+                        {
+                            "type": ProcessingErrorType.MONITOR_ENVIRONMENT_LIMIT_EXCEEDED,
+                            "reason": f"You may not exceed {settings.MAX_ENVIRONMENTS_PER_MONITOR} environments per monitor",
+                        }
+                    ],
+                )
+            self.send_checkin(
+                monitor_slug,
+                monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+                environment=f"my-environment-{i}",
+                expected_error=expected_error,
+                expected_monitor_slug=monitor_slug,
+            )
+
+        monitor = Monitor.objects.get(slug=monitor_slug)
+        assert monitor is not None
+
+        monitor_environments = MonitorEnvironment.objects.filter(monitor=monitor)
+        assert len(monitor_environments) == settings.MAX_ENVIRONMENTS_PER_MONITOR
+
+    def test_monitor_environment_validation(self) -> None:
+        invalid_name = "x" * 65
+        monitor_slug = "my-monitor"
+
+        self.send_checkin(
+            monitor_slug,
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+            environment=f"my-environment-{invalid_name}",
+            expected_error=ProcessingErrorsException(
+                [
+                    {
+                        "type": ProcessingErrorType.MONITOR_INVALID_ENVIRONMENT,
+                        "reason": "Environment name too long",
+                    }
+                ]
+            ),
+            expected_monitor_slug=monitor_slug,
+        )
+
+        monitor = Monitor.objects.get(slug=monitor_slug)
+        assert monitor is not None
+
+        monitor_environments = MonitorEnvironment.objects.filter(monitor=monitor)
+        assert len(monitor_environments) == 0
+
+    def test_monitor_disabled(self) -> None:
+        monitor = self._create_monitor(status=ObjectStatus.DISABLED, slug="my-monitor")
+        self.send_checkin(
+            "my-monitor",
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.MONITOR_DISABLED}],
+                monitor,
+            ),
+        )
+
+        checkins = MonitorCheckIn.objects.filter(monitor_environment__monitor_id=monitor.id)
+        assert len(checkins) == 0
+
+    def test_organization_killswitch(self) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+
+        opt_val = killswitches.validate_user_input(
+            "crons.organization.disable-check-in", [{"organization_id": self.organization.id}]
+        )
+
+        with self.options({"crons.organization.disable-check-in": opt_val}):
+            self.send_checkin(
+                monitor.slug,
+                expected_error=ProcessingErrorsException(
+                    [{"type": ProcessingErrorType.ORGANIZATION_KILLSWITCH_ENABLED}]
+                ),
+            )
+
+        assert not MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.update_check_in_volume")
+    def test_monitor_update_check_in_volumne(self, update_check_in_volume: mock.MagicMock) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+
+        self.send_checkin(monitor.slug)
+        assert update_check_in_volume.call_count == 1
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.try_monitor_clock_tick")
+    def test_monitor_tasks_trigger(self, try_monitor_clock_tick: mock.MagicMock) -> None:
+        monitor = self._create_monitor(slug="my-monitor")
+
+        now = datetime.now().replace(second=0, microsecond=0)
+
+        # First checkin triggers tasks
+        self.send_checkin(monitor.slug)
+        assert try_monitor_clock_tick.call_count == 1
+
+        # A clock pulse message also triggers the tasks
+        self.send_clock_pulse()
+        assert try_monitor_clock_tick.call_count == 2
+
+        # An exception dispatching the tasks does NOT cause ingestion to fail
+        with mock.patch("sentry.monitors.consumers.monitor_consumer.logger") as logger:
+            try_monitor_clock_tick.side_effect = Exception()
+            self.send_checkin(monitor.slug, ts=now + timedelta(minutes=5))
+            assert MonitorCheckIn.objects.filter(guid=self.guid).exists()
+            logger.exception.assert_called_with("Failed to trigger monitor tasks")
+            try_monitor_clock_tick.side_effect = None
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.update_check_in_volume")
+    def test_parallel_monitor_update_check_in_volume(
+        self, update_check_in_volume: mock.MagicMock
+    ) -> None:
+        factory = StoreMonitorCheckInStrategyFactory(mode="batched-parallel", max_batch_size=4)
+        commit = mock.Mock()
+        consumer = factory.create_with_partitions(commit, {self.partition: 0})
+
+        monitor = self._create_monitor(slug="my-monitor")
+
+        now = datetime.now().replace(second=5)
+
+        # Send enough check-ins to process the batch
+        self.send_checkin(monitor.slug, consumer=consumer, ts=now)
+        self.send_checkin(monitor.slug, consumer=consumer, ts=now + timedelta(seconds=10))
+        self.send_checkin(monitor.slug, consumer=consumer, ts=now + timedelta(seconds=30))
+        self.send_checkin(monitor.slug, consumer=consumer, ts=now + timedelta(minutes=1))
+
+        # One final check-in will trigger the batch to process (but will not
+        # yet be processed itself)
+        self.send_checkin(monitor.slug, consumer=consumer, ts=now + timedelta(minutes=2))
+
+        assert update_check_in_volume.call_count == 1
+        assert list(update_check_in_volume.call_args_list[0][0][0]) == [
+            now,
+            now + timedelta(seconds=10),
+            now + timedelta(seconds=30),
+            now + timedelta(minutes=1),
+        ]
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.try_monitor_clock_tick")
+    def test_parallel_monitor_task_triggers(self, try_monitor_clock_tick: mock.MagicMock) -> None:
+        factory = StoreMonitorCheckInStrategyFactory(mode="batched-parallel", max_batch_size=4)
+        commit = mock.Mock()
+        consumer = factory.create_with_partitions(commit, {self.partition: 0})
+
+        monitor = self._create_monitor(slug="my-monitor")
+
+        # First checkin does NOT trigger task since we're batching
+        self.send_checkin(monitor.slug, consumer=consumer)
+        assert try_monitor_clock_tick.call_count == 0
+
+        # Sending 3 messages (including a clock pulse)
+        self.send_checkin(monitor.slug, consumer=consumer)
+        self.send_clock_pulse(consumer=consumer)
+        self.send_checkin(monitor.slug, consumer=consumer)
+
+        # One more check-in to process the batch
+        self.send_checkin(monitor.slug, consumer=consumer)
+
+        assert try_monitor_clock_tick.call_count == 1
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.try_monitor_clock_tick")
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.record_pulse_partitions")
+    def test_clock_pulse_records_partitions(
+        self, record_pulse_partitions: mock.MagicMock, try_monitor_clock_tick: mock.MagicMock
+    ) -> None:
+        calls = mock.Mock()
+        calls.attach_mock(record_pulse_partitions, "record_pulse_partitions")
+        calls.attach_mock(try_monitor_clock_tick, "try_monitor_clock_tick")
+
+        # The partition list is remembered before the clock call measures it
+        now = datetime.now()
+        self.send_clock_pulse(ts=now, partition_ids=[0, 1, 2])
+        pulse = {"message_type": "clock_pulse", "partition_ids": [0, 1, 2]}
+        assert calls.mock_calls == [
+            mock.call.record_pulse_partitions(pulse),
+            mock.call.try_monitor_clock_tick(now, self.partition.index),
+        ]
+
+        # A check-in does not change the remembered list
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug)
+        assert record_pulse_partitions.call_count == 1
+
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.try_monitor_clock_tick")
+    @mock.patch("sentry.monitors.consumers.monitor_consumer.record_pulse_partitions")
+    def test_parallel_clock_pulse_records_partitions(
+        self, record_pulse_partitions: mock.MagicMock, try_monitor_clock_tick: mock.MagicMock
+    ) -> None:
+        factory = StoreMonitorCheckInStrategyFactory(mode="batched-parallel", max_batch_size=2)
+        commit = mock.Mock()
+        consumer = factory.create_with_partitions(commit, {self.partition: 0})
+
+        monitor = self._create_monitor(slug="my-monitor")
+
+        self.send_clock_pulse(consumer=consumer, partition_ids=[0, 1])
+        self.send_checkin(monitor.slug, consumer=consumer)
+
+        # One more check-in to process the batch
+        self.send_checkin(monitor.slug, consumer=consumer)
+
+        record_pulse_partitions.assert_called_once_with(
+            {"message_type": "clock_pulse", "partition_ids": [0, 1]}
+        )
+        assert try_monitor_clock_tick.call_count == 1
+
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_quotas_accept(self, check_accept_monitor_checkin: mock.MagicMock) -> None:
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.ACCEPT
+
+        # Explicitly leaving off the "disabled" status to validate that we're
+        # not dropping due to the monitor being disabled
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(monitor.slug)
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+
+        checkin = MonitorCheckIn.objects.get(monitor_environment__monitor_id=monitor.id)
+        assert checkin.status == CheckInStatus.OK
+
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_quotas_drop(self, check_accept_monitor_checkin: mock.MagicMock) -> None:
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.DROP
+
+        # Explicitly leaving off the "disabled" status to validate that we're
+        # not dropping due to the monitor being disabled
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin(
+            monitor.slug,
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.MONITOR_OVER_QUOTA}],
+            ),
+        )
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+
+        checkins = MonitorCheckIn.objects.filter(monitor_environment__monitor_id=monitor.id)
+        assert len(checkins) == 0
+
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_quotas_timeout_accepts(
+        self, check_accept_monitor_checkin: mock.MagicMock
+    ) -> None:
+        """
+        A hung quotas seat check must fail open so the consumer does not stall.
+        """
+
+        def hang(*args: object, **kwargs: object) -> PermitCheckInStatus:
+            time.sleep(1.0)
+            return PermitCheckInStatus.DROP
+
+        check_accept_monitor_checkin.side_effect = hang
+
+        monitor = self._create_monitor(slug="my-monitor")
+        with override_options(
+            {
+                "crons.check_accept_monitor_checkin.timeout_rollout_rate": 1.0,
+                "crons.check_accept_monitor_checkin.timeout_sec": 0.05,
+            }
+        ):
+            self.send_checkin(monitor.slug)
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+
+        checkin = MonitorCheckIn.objects.get(monitor_environment__monitor_id=monitor.id)
+        assert checkin.status == CheckInStatus.OK
+
+    @mock.patch(
+        "sentry.monitors.consumers.monitor_consumer._CHECK_ACCEPT_SLOTS.acquire",
+        return_value=False,
+    )
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_quotas_shed_accepts(
+        self,
+        check_accept_monitor_checkin: mock.MagicMock,
+        acquire: mock.MagicMock,
+    ) -> None:
+        """
+        When too many seat checks are already in flight, fail open without
+        queuing another stale call.
+        """
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.DROP
+
+        monitor = self._create_monitor(slug="my-monitor")
+        with override_options({"crons.check_accept_monitor_checkin.timeout_rollout_rate": 1.0}):
+            self.send_checkin(monitor.slug)
+
+        acquire.assert_called_once_with(blocking=False)
+        check_accept_monitor_checkin.assert_not_called()
+
+        checkin = MonitorCheckIn.objects.get(monitor_environment__monitor_id=monitor.id)
+        assert checkin.status == CheckInStatus.OK
+
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_quotas_timeout_rollout_disabled(
+        self, check_accept_monitor_checkin: mock.MagicMock
+    ) -> None:
+        """
+        With rollout rate 0, seat acceptance is called directly (no timeout
+        wrapper), so a DROP result still drops the check-in.
+        """
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.DROP
+
+        monitor = self._create_monitor(slug="my-monitor")
+        with override_options(
+            {
+                "crons.check_accept_monitor_checkin.timeout_rollout_rate": 0.0,
+                # Would fail-open if the wrapper ran; prove it does not.
+                "crons.check_accept_monitor_checkin.timeout_sec": 0.05,
+            }
+        ):
+            self.send_checkin(
+                monitor.slug,
+                expected_error=ProcessingErrorsException(
+                    [{"type": ProcessingErrorType.MONITOR_OVER_QUOTA}],
+                ),
+            )
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+        assert not MonitorCheckIn.objects.filter(
+            monitor_environment__monitor_id=monitor.id
+        ).exists()
+
+    @mock.patch("sentry.quotas.backend.assign_seat")
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_accept_upsert_with_seat(
+        self,
+        check_accept_monitor_checkin: mock.MagicMock,
+        assign_seat: mock.MagicMock,
+    ) -> None:
+        """
+        Validates that a monitor can be upserted and processes a full check-in
+        when the PermitCheckInStatus is ACCEPTED_FOR_UPSERT and a seat is
+        allocated with a Outcome.ACCEPTED.
+        """
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.ACCEPTED_FOR_UPSERT
+        assign_seat.return_value = Outcome.ACCEPTED
+
+        with outbox_runner():
+            self.send_checkin(
+                "my-monitor",
+                monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+                environment="my-environment",
+            )
+
+        checkin = MonitorCheckIn.objects.get(guid=self.guid)
+        assert checkin.status == CheckInStatus.OK
+
+        monitor = Monitor.objects.get(slug="my-monitor")
+        assert monitor is not None
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+        assign_seat.assert_called_with(seat_object=monitor)
+
+        assert_org_audit_log_exists(
+            organization=self.organization,
+            event=audit_log.get_event_id("MONITOR_ADD"),
+            data={"upsert": True, **monitor.get_audit_log_data()},
+        )
+
+    @mock.patch("sentry.quotas.backend.assign_seat")
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_accept_upsert_no_seat(
+        self,
+        check_accept_monitor_checkin: mock.MagicMock,
+        assign_seat: mock.MagicMock,
+    ) -> None:
+        """
+        Validates that a monitor can be upserted but have the check-in dropped
+        when the PermitCheckInStatus is ACCEPTED_FOR_UPSERT and a seat is
+        unable to be allocated with a Outcome.RATE_LIMITED
+        """
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.ACCEPTED_FOR_UPSERT
+        assign_seat.return_value = Outcome.RATE_LIMITED
+
+        self.send_checkin(
+            "my-monitor",
+            monitor_config={"schedule": {"type": "crontab", "value": "13 * * * *"}},
+            environment="my-environment",
+            expected_error=ProcessingErrorsException(
+                [{"type": ProcessingErrorType.MONITOR_DISABLED_NO_QUOTA}]
+            ),
+            expected_monitor_slug="my-monitor",
+        )
+
+        # Check-in was not produced as we could not assign a monitor seat
+        assert not MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+        # Monitor was created, but is disabled
+        monitor = Monitor.objects.get(slug="my-monitor")
+        assert monitor is not None
+        assert monitor.status == ObjectStatus.DISABLED
+        detector = get_detector_for_monitor(monitor)
+        assert detector is not None
+        assert not detector.enabled
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+        assign_seat.assert_called_with(seat_object=monitor)
+
+    @mock.patch("sentry.quotas.backend.assign_seat")
+    @mock.patch("sentry.quotas.backend.check_accept_monitor_checkin")
+    def test_monitor_accept_upsert_existing_monitor(
+        self,
+        check_accept_monitor_checkin: mock.MagicMock,
+        assign_seat: mock.MagicMock,
+    ) -> None:
+        """
+        Validate the unusual casse where a seat does not already exist but a
+        monitor does exist. We should ensure assign_seat is called
+        """
+        check_accept_monitor_checkin.return_value = PermitCheckInStatus.ACCEPTED_FOR_UPSERT
+        assign_seat.return_value = Outcome.RATE_LIMITED
+
+        monitor = self._create_monitor(slug="my-monitor")
+        self.send_checkin("my-monitor", environment="my-environment")
+
+        # Check-in was not produced as we could not assign a monitor seat
+        assert not MonitorCheckIn.objects.filter(guid=self.guid).exists()
+
+        # Monitor was created, but is disabled
+        monitor = Monitor.objects.get(slug="my-monitor")
+        assert monitor is not None
+        assert monitor.status == ObjectStatus.DISABLED
+
+        check_accept_monitor_checkin.assert_called_with(self.project.id, monitor.slug)
+        assign_seat.assert_called_with(seat_object=monitor)

@@ -1,0 +1,99 @@
+import type {Docs} from 'sentry/components/onboarding/gettingStartedDoc/types';
+import {featureFlag} from 'sentry/gettingStartedDocs/javascript/featureFlag';
+import {logsFullStack} from 'sentry/gettingStartedDocs/javascript/logs';
+import {metricsFullStack} from 'sentry/gettingStartedDocs/javascript/metrics';
+import {profilingFullStack} from 'sentry/gettingStartedDocs/javascript/profiling';
+import {agentMonitoring} from 'sentry/gettingStartedDocs/node/agentMonitoring';
+import {tct} from 'sentry/locale';
+
+import {crashReport} from './crashReport';
+import {feedback} from './feedback';
+import {mcp} from './mcp';
+import {onboarding} from './onboarding';
+import {performance} from './performance';
+import {replay} from './replay';
+
+export const docs: Docs = {
+  onboarding,
+  feedbackOnboardingNpm: feedback,
+  replayOnboarding: replay,
+  performanceOnboarding: performance,
+  crashReportOnboarding: crashReport,
+  featureFlagOnboarding: featureFlag,
+  profilingOnboarding: profilingFullStack({
+    packageName: '@sentry/nextjs',
+    browserProfilingLink:
+      'https://docs.sentry.io/platforms/javascript/guides/nextjs/profiling/browser-profiling/',
+    nodeProfilingLink:
+      'https://docs.sentry.io/platforms/javascript/guides/nextjs/profiling/node-profiling/',
+    getProfilingHeaderContent: () => [
+      {
+        type: 'text',
+        text: tct(
+          'In Next.js you can configure document response headers via the headers option in [code:next.config.(js|mjs|ts)]. Import [code:withSentryConfig] from [code:@sentry/nextjs/config]:',
+          {
+            code: <code />,
+          }
+        ),
+      },
+      {
+        type: 'code',
+        tabs: [
+          {
+            label: 'ESM',
+            language: 'javascript',
+            filename: 'next.config.mjs',
+            code: `
+import { withSentryConfig } from "@sentry/nextjs/config";
+
+export default withSentryConfig({
+  async headers() {
+    return [{
+      source: "/:path*",
+      headers: [{
+        key: "Document-Policy",
+        value: "js-profiling",
+      }],
+    }];
+  },
+  // ... other Next.js config options
+});`,
+          },
+          {
+            label: 'CJS',
+            language: 'javascript',
+            filename: 'next.config.js',
+            code: `
+const { withSentryConfig } = require("@sentry/nextjs/config");
+
+module.exports = withSentryConfig({
+  async headers() {
+    return [{
+      source: "/:path*",
+      headers: [{
+        key: "Document-Policy",
+        value: "js-profiling",
+      }],
+    }];
+  },
+  // ... other Next.js config options
+});`,
+          },
+        ],
+      },
+    ],
+  }),
+  logsOnboarding: logsFullStack({
+    docsPlatform: 'nextjs',
+    packageName: '@sentry/nextjs',
+  }),
+  metricsOnboarding: metricsFullStack({
+    docsPlatform: 'nextjs',
+    packageName: '@sentry/nextjs',
+  }),
+  agentMonitoringOnboarding: agentMonitoring({
+    packageName: '@sentry/nextjs',
+    configFileName: 'sentry.server.config.(ts|js)',
+  }),
+  mcpOnboarding: mcp,
+};

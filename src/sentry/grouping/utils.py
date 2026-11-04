@@ -1,34 +1,39 @@
-import re
+from __future__ import annotations
 
+from collections.abc import Iterable
 from hashlib import md5
+from itertools import islice
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from django.utils.encoding import force_bytes
 
+from sentry.utils import metrics
 from sentry.utils.safe import get_path
-from sentry.stacktraces.processing import get_crash_frame_from_event_data
+
+if TYPE_CHECKING:
+    from sentry.grouping.component import ExceptionGroupingComponent
+    from sentry.grouping.context import GroupingContext
+    from sentry.services.eventstore.models import BaseEvent
 
 
-_fingerprint_var_re = re.compile(r"\{\{\s*(\S+)\s*\}\}")
-
-
-def parse_fingerprint_var(value):
-    match = _fingerprint_var_re.match(value)
-    if match is not None and match.end() == len(value):
-        return match.group(1)
-
-
-def is_default_fingerprint_var(value):
-    return parse_fingerprint_var(value) == "default"
-
-
-def hash_from_values(values):
+def hash_from_values(values: Iterable[str | int | UUID | ExceptionGroupingComponent]) -> str:
+    """
+    Primarily used at the end of the grouping process, to get a final hash value once the all of the
+    variants have been constructed, but also used as a hack to compare exception components (by
+    stringifying their reprs) when calculating variants for chained exceptions.
+    """
     result = md5()
     for value in values:
         result.update(force_bytes(value, errors="replace"))
     return result.hexdigest()
 
 
-def get_rule_bool(value):
+def bool_from_string(value: str) -> bool | None:
+    """
+    Convert various string representations of boolean values ("1", "yes", "true", "0", "no",
+    "false") into actual booleans. Return `None` for all other inputs.
+    """
     if value:
         value = value.lower()
         if value in ("1", "yes", "true"):
@@ -36,76 +41,105 @@ def get_rule_bool(value):
         elif value in ("0", "no", "false"):
             return False
 
+    return None
 
-def get_fingerprint_value(var, data):
-    if var == "transaction":
-        return data.get("transaction") or "<no-transaction>"
-    elif var == "message":
-        message = (
-            get_path(data, "logentry", "formatted")
-            or get_path(data, "logentry", "message")
-            or get_path(data, "exception", "values", -1, "value")
+
+# TODO: We should strip whitespace no matter what, whether or not we're trimming. Right now we don't
+# do so in either case. (The `.strip()` used during trimming filters out empty lines, but doesn't
+# actually strip non-empty ones.) This will require a new grouping config, since unstripped and
+# stripped messages won't group together.
+#
+# TODO: Both here during trimming and in the message strategy (where we check if the message has
+# been changed), we assume the kind of change which has happened. Here we add "...", and there we
+# say we "stripped event-specific values," even if all we've done in either case is remove empty
+# lines.
+@metrics.wraps("grouping.normalize_message_for_grouping")
+def normalize_message_for_grouping(
+    message: str, context: GroupingContext, *, reason: str, trim_message: bool
+) -> str:
+    """
+    Replace values from a event's message with placeholders (in order to improve grouping). If
+    `trim_message` is True, trim the message to at most 2 lines.
+    """
+    # Since we very often use event messages multiple times during grouping (in some combo of app
+    # and system variants, message components, and fingerprints), and always use them at least once,
+    # we prepopulate a parameterized message cache when we initialize the context. Thus we always
+    # expect to find the message here.
+    if message in context.message_parameterization_map:
+        parameterized = context.message_parameterization_map[message]
+
+        # Before we mark the message as having been seen, check if it's already marked that way. If
+        # so, that means our use of the parameterized value here is at least the second use, thus
+        # proving the caching worthwhile.
+        if message in context.messages_seen:
+            # This represents a saved call to `parameterizer.parameterize`
+            metrics.incr("grouping.cached_param_result_used")
+
+        context.messages_seen.add(message)
+
+    else:  # Fallback - should no longer land here
+        parameterized = context.parameterizer.parameterize(message)
+
+        # TODO: Now that we're caching parameterizations for all event messages (and therefore
+        # shouldn't ever land in this branch), we could probably get rid of this metric, as well as
+        # `context.cached_parameterizer_used`.
+        #
+        # Before we mark the parameterizer as having been used, check if it's already marked that
+        # way. If so, that means our use of it here is at least the second use, thus proving the
+        # caching worthwhile.
+        if context.cached_parameterizer_used:
+            # This represents a saved call to `in_rollout_group` on the project vis-à-vis
+            # experimental parameterization
+            metrics.incr("grouping.cached_parameterizer_used")
+
+        context.cached_parameterizer_used = True
+
+    metrics.incr("grouping.message_used", tags={"reason": reason})
+
+    return _trim_extra_lines(parameterized) if trim_message else parameterized
+
+
+def _trim_extra_lines(input_str: str) -> str:
+    """
+    Trim the given string by removing blank lines and then trimming the result to 2 lines.
+
+    This is a no-op for single-line strings and strings containing two non-empty lines.
+    """
+    trimmed = "\n".join(
+        islice(
+            (x for x in input_str.splitlines() if x.strip()),
+            2,
         )
-        return message or "<no-message>"
-    elif var in ("type", "error.type"):
-        ty = get_path(data, "exception", "values", -1, "type")
-        return ty or "<no-type>"
-    elif var in ("value", "error.value"):
-        value = get_path(data, "exception", "values", -1, "value")
-        return value or "<no-value>"
-    elif var in ("function", "stack.function"):
-        frame = get_crash_frame_from_event_data(data)
-        func = frame.get("function") if frame else None
-        return func or "<no-function>"
-    elif var in ("path", "stack.abs_path"):
-        frame = get_crash_frame_from_event_data(data)
-        func = frame.get("abs_path") or frame.get("filename") if frame else None
-        return func or "<no-abs-path>"
-    elif var == "stack.filename":
-        frame = get_crash_frame_from_event_data(data)
-        func = frame.get("filename") or frame.get("abs_path") if frame else None
-        return func or "<no-filename>"
-    elif var in ("module", "stack.module"):
-        frame = get_crash_frame_from_event_data(data)
-        mod = frame.get("module") if frame else None
-        return mod or "<no-module>"
-    elif var in ("package", "stack.package"):
-        frame = get_crash_frame_from_event_data(data)
-        pkg = frame.get("package") if frame else None
-        if pkg:
-            pkg = pkg.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        return pkg or "<no-package>"
-    elif var == "level":
-        return data.get("level") or "<no-level>"
-    elif var == "logger":
-        return data.get("logger") or "<no-logger>"
-    elif var.startswith("tags."):
-        tag = var[5:]
-        for t, value in data.get("tags") or ():
-            if t == tag:
-                return value
-        return "<no-value-for-tag-%s>" % tag
+    )
+    if trimmed != input_str:
+        trimmed += "..."
+    return trimmed
 
 
-def resolve_fingerprint_values(values, event_data):
-    def _get_fingerprint_value(value):
-        var = parse_fingerprint_var(value)
-        if var is None:
-            return value
-        rv = get_fingerprint_value(var, event_data)
-        if rv is None:
-            return value
-        return rv
+def get_canonical_message_from_event(event: BaseEvent) -> str:
+    """
+    Get the event's message for purposes of grouping, i.e., what would be used as the value for
+    the `{{ message }}` variable. Returns an empty string if no message can be found.
+    """
+    return (
+        get_path(event.data, "logentry", "formatted")
+        or get_path(event.data, "logentry", "message")
+        or get_path(event.data, "exception", "values", -1, "value")
+        or ""
+    )
 
-    return [_get_fingerprint_value(x) for x in values]
 
+def get_all_messages_from_event(event: BaseEvent) -> set[str]:
+    """
+    Get all messages contained in the event. Looks at log messages and exceptions, including
+    exception chains.
+    """
+    exceptions = get_path(event.data, "exception", "values", filter=True) or []
+    messages = {
+        get_canonical_message_from_event(event),  # This will grab a log message if available
+        *(exc.get("value") for exc in exceptions),
+    }
+    messages.discard("")  # In case `get_canonical_message_from_event` came up empty
+    messages.discard(None)  # In case any of the `get` calls came up empty
 
-def expand_title_template(template, event_data):
-    def _handle_match(match):
-        var = match.group(1)
-        rv = get_fingerprint_value(var, event_data)
-        if rv is not None:
-            return rv
-        return match.group(0)
-
-    return _fingerprint_var_re.sub(_handle_match, template)
+    return messages

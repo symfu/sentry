@@ -1,10 +1,12 @@
-from sentry.utils.compat import mock
+from typing import Any
+from unittest import mock
+
 import pytest
 
 from sentry.utils import metrics
 
 
-def test_timer_success():
+def test_timer_success() -> None:
     with mock.patch("sentry.utils.metrics.timing") as timing:
         with metrics.timer("key", tags={"foo": True}) as tags:
             tags["bar"] = False
@@ -19,7 +21,7 @@ class ExpectedError(Exception):
     pass
 
 
-def test_timer_failure():
+def test_timer_failure() -> None:
     with mock.patch("sentry.utils.metrics.timing") as timing:
         with pytest.raises(ExpectedError):
             with metrics.timer("key", tags={"foo": True}):
@@ -31,13 +33,13 @@ def test_timer_failure():
         assert args[3] == {"foo": True, "result": "failure"}
 
 
-def test_wraps():
+def test_wraps() -> None:
     @metrics.wraps("key", tags={"foo": True})
-    def thing(a):
+    def thing(a: Any) -> Any:
         return a
 
     with mock.patch("sentry.utils.metrics.timing") as timing:
-        thing(10) == 10
+        assert thing(10) == 10
 
         assert timing.call_count == 1
         args, kwargs = timing.call_args

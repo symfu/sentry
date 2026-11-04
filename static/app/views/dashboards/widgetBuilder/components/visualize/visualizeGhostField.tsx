@@ -1,0 +1,223 @@
+import {Fragment, useMemo} from 'react';
+import styled from '@emotion/styled';
+import {IconDelete} from '@sentry/icons/delete';
+
+import {Button} from '@sentry/scraps/button';
+import type {SelectValue} from '@sentry/scraps/select';
+
+import {DragReorderButton} from 'sentry/components/dnd/dragReorderButton';
+import {t} from 'sentry/locale';
+import type {QueryFieldValue} from 'sentry/utils/discover/fields';
+import {AggregateParameterField} from 'sentry/views/dashboards/widgetBuilder/components/visualize/aggregateParameterField';
+import {
+  AggregateCompactSelect,
+  ColumnCompactSelect,
+  FieldBar,
+  FieldExtras,
+  FieldRow,
+  LegendAliasInput,
+  ParameterRefinements,
+  PrimarySelectRow,
+  StyledArithmeticInput,
+} from 'sentry/views/dashboards/widgetBuilder/components/visualize/utils';
+import {FieldValueKind, type FieldValue} from 'sentry/views/discover/table/types';
+import {parseConditionalAggregate} from 'sentry/views/explore/utils/parseConditionalAggregate';
+
+type VisualizeGhostFieldProps = {
+  activeId: number;
+  aggregates: Array<SelectValue<FieldValue>>;
+  fields: QueryFieldValue[];
+  isBigNumberWidget: boolean;
+  isTimeSeriesWidget: boolean;
+  stringFields: string[];
+};
+
+export function VisualizeGhostField({
+  isTimeSeriesWidget,
+  isBigNumberWidget,
+  fields,
+  activeId,
+  aggregates,
+  stringFields,
+}: VisualizeGhostFieldProps) {
+  const draggingField = useMemo(() => {
+    return fields?.[Number(activeId)];
+  }, [activeId, fields]);
+
+  // Strip Explore-style `_if` filters so the overlay matches live SelectRow
+  // (avg_if(`span.op:db`,span.duration) → avg / span.duration).
+  const parsedDraggingFunction = parseConditionalAggregate(
+    stringFields?.[Number(activeId)] ?? ''
+  );
+
+  const draggableMatchingAggregate = useMemo(() => {
+    let matchingAggregate: any;
+    if (
+      draggingField!.kind === FieldValueKind.FUNCTION &&
+      FieldValueKind.FUNCTION in draggingField!
+    ) {
+      matchingAggregate = aggregates.find(
+        option => option.value.meta.name === parsedDraggingFunction?.name
+      );
+    }
+
+    return matchingAggregate;
+  }, [draggingField, aggregates, parsedDraggingFunction?.name]);
+
+  const draggableHasColumnParameter = useMemo(() => {
+    const isApdexOrUserMisery =
+      draggableMatchingAggregate?.value.meta.name === 'apdex' ||
+      draggableMatchingAggregate?.value.meta.name === 'user_misery';
+
+    return (
+      (draggingField!.kind === FieldValueKind.FUNCTION &&
+        !isApdexOrUserMisery &&
+        draggableMatchingAggregate?.value.meta.parameters.length !== 0) ||
+      draggingField!.kind === FieldValueKind.FIELD
+    );
+  }, [draggableMatchingAggregate, draggingField]);
+
+  const draggableParameterRefinements = useMemo(() => {
+    return draggableMatchingAggregate?.value.meta.parameters.length > 1
+      ? draggableMatchingAggregate?.value.meta.parameters.slice(1)
+      : [];
+  }, [draggableMatchingAggregate]);
+
+  const isDraggableApdexOrUserMisery = useMemo(() => {
+    return (
+      draggableMatchingAggregate?.value.meta.name === 'apdex' ||
+      draggableMatchingAggregate?.value.meta.name === 'user_misery'
+    );
+  }, [draggableMatchingAggregate]);
+
+  return (
+    <Ghost>
+      <FieldRow>
+        <StyledDragReorderButton />
+        <FieldBar>
+          {draggingField?.kind === FieldValueKind.EQUATION ? (
+            <StyledArithmeticInput
+              name="arithmetic"
+              key="parameter:text"
+              type="text"
+              placeholder={t('Equation')}
+              value={draggingField?.field ?? ''}
+              onUpdate={() => {}}
+            />
+          ) : (
+            <Fragment>
+              <PrimarySelectRow hasColumnParameter={draggableHasColumnParameter}>
+                <AggregateCompactSelect
+                  hasColumnParameter={draggableHasColumnParameter}
+                  disabled
+                  options={[
+                    {
+                      label: parsedDraggingFunction?.name ?? '',
+                      value: parsedDraggingFunction?.name ?? '',
+                    },
+                  ]}
+                  value={parsedDraggingFunction?.name ?? ''}
+                  onChange={() => {}}
+                />
+                {draggableHasColumnParameter && (
+                  <ColumnCompactSelect
+                    position="bottom-start"
+                    disabled
+                    options={[
+                      {
+                        label:
+                          draggingField?.kind === FieldValueKind.FUNCTION
+                            ? (parsedDraggingFunction?.arguments[0] ?? '')
+                            : draggingField?.field,
+                        value:
+                          draggingField?.kind === FieldValueKind.FUNCTION
+                            ? (parsedDraggingFunction?.arguments[0] ?? '')
+                            : draggingField?.field!,
+                      },
+                    ]}
+                    value={
+                      draggingField?.kind === FieldValueKind.FUNCTION
+                        ? (parsedDraggingFunction?.arguments[0] ?? '')
+                        : draggingField?.field
+                    }
+                    onChange={() => {}}
+                  />
+                )}
+              </PrimarySelectRow>
+              {draggingField?.kind === FieldValueKind.FUNCTION &&
+                draggableParameterRefinements.length > 0 && (
+                  <ParameterRefinements>
+                    {draggableParameterRefinements.map(
+                      (parameter: any, parameterIndex: number) => {
+                        const currentValue =
+                          draggingField?.function[parameterIndex + 2] || '';
+                        const key = `${draggingField.function.join('_')}-${parameterIndex}`;
+
+                        return (
+                          <AggregateParameterField
+                            key={key}
+                            parameter={parameter}
+                            fieldValue={draggingField}
+                            currentValue={currentValue}
+                            onChange={() => {}}
+                          />
+                        );
+                      }
+                    )}
+                  </ParameterRefinements>
+                )}
+              {isDraggableApdexOrUserMisery &&
+                draggingField?.kind === FieldValueKind.FUNCTION && (
+                  <AggregateParameterField
+                    parameter={draggableMatchingAggregate?.value.meta.parameters[0]}
+                    fieldValue={draggingField}
+                    currentValue={draggingField?.function[1]}
+                    onChange={() => {}}
+                  />
+                )}
+            </Fragment>
+          )}
+        </FieldBar>
+        <FieldExtras compact={isTimeSeriesWidget || isBigNumberWidget}>
+          {!isTimeSeriesWidget && !isBigNumberWidget && (
+            <LegendAliasInput
+              type="text"
+              name="name"
+              placeholder={t('Add Alias')}
+              value={draggingField?.alias ?? ''}
+              onChange={() => {}}
+            />
+          )}
+          <Button
+            variant="transparent"
+            icon={<IconDelete />}
+            size="zero"
+            disabled
+            onClick={() => {}}
+            aria-label={t('Remove field')}
+          />
+        </FieldExtras>
+      </FieldRow>
+    </Ghost>
+  );
+}
+
+const Ghost = styled('div')`
+  position: absolute;
+  background: ${p => p.theme.tokens.background.primary};
+  padding: ${p => p.theme.space.xs};
+  border-radius: ${p => p.theme.radius.md};
+  box-shadow: 0 0 15px rgba(0, 0, 0, 0.15);
+  opacity: 0.8;
+  cursor: grabbing;
+  width: 100%;
+
+  button {
+    cursor: grabbing;
+  }
+`;
+
+const StyledDragReorderButton = styled(DragReorderButton)`
+  height: ${p => p.theme.form.md.height};
+  cursor: grabbing;
+`;

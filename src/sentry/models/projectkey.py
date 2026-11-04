@@ -1,28 +1,45 @@
-import petname
+from __future__ import annotations
+
+import enum
 import re
-
-from bitfield import BitField
-from uuid import uuid4
-
-from django.conf import settings
-from django.core.urlresolvers import reverse
-from django.db import models
-from django.utils import timezone
-from django.utils.translation import ugettext_lazy as _
+import secrets
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from urllib.parse import urlparse
 
-from sentry import options, features
+import petname
+from django.conf import settings
+from django.db import ProgrammingError, models
+from django.db.models.signals import pre_delete
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from bitfield import TypedClassBitField
+from sentry import features, options
+from sentry.backup.dependencies import ImportKind
+from sentry.backup.helpers import ImportFlags
+from sentry.backup.scopes import ImportScope, RelocationScope
 from sentry.db.models import (
-    Model,
-    BaseManager,
     BoundedPositiveIntegerField,
     FlexibleForeignKey,
-    JSONField,
+    cell_silo_model,
     sane_repr,
 )
-from sentry.tasks.relay import schedule_update_config_cache
+from sentry.db.models.fields.bounded import I64_MAX
+from sentry.db.models.fields.jsonfield import LegacyTextJSONField
+from sentry.hybridcloud.outbox.base import CellOutboxProducingManager, ReplicatedCellModel
+from sentry.hybridcloud.outbox.category import OutboxCategory
+from sentry.silo.base import SiloMode
+from sentry.tasks.relay import schedule_invalidate_project_config
 
-_uuid4_re = re.compile(r"^[a-f0-9]{32}$")
+if TYPE_CHECKING:
+    from rest_framework.request import Request
+
+    from sentry.models.organization import Organization
+    from sentry.models.project import Project
+
+_token_re = re.compile(r"^[a-f0-9]{32}$")
 
 # TODO(dcramer): pull in enum library
 
@@ -32,34 +49,65 @@ class ProjectKeyStatus:
     INACTIVE = 1
 
 
-class ProjectKeyManager(BaseManager):
-    def post_save(self, instance, **kwargs):
-        schedule_update_config_cache(
-            project_id=instance.project_id, generate=True, update_reason="projectkey.post_save"
+class ProjectKeyManager(CellOutboxProducingManager["ProjectKey"]):
+    def post_save(self, *, instance: ProjectKey, created: bool, **kwargs: object) -> None:
+        schedule_invalidate_project_config(
+            public_key=instance.public_key, trigger="projectkey.post_save"
         )
 
-    def post_delete(self, instance, **kwargs):
-        schedule_update_config_cache(
-            project_id=instance.project_id, generate=True, update_reason="projectkey.post_delete"
+    def post_delete(self, instance: ProjectKey, **kwargs: object) -> None:
+        schedule_invalidate_project_config(
+            public_key=instance.public_key, trigger="projectkey.post_delete"
         )
 
+    def for_request(self, request: Request) -> models.QuerySet[ProjectKey]:
+        """Return objects that the given request user is allowed to access"""
+        from sentry.auth.superuser import is_active_superuser
 
-class ProjectKey(Model):
-    __core__ = True
+        qs = self.get_queryset()
+        if not is_active_superuser(request):
+            qs = qs.filter(use_case=UseCase.USER.value)
+
+        return qs
+
+
+class UseCase(enum.Enum):
+    """What the DSN is used for (user vs. internal submissions)"""
+
+    """A user-visible project key"""
+    USER = "user"
+    """An internal project key for submitting aggregate function metrics."""
+    PROFILING = "profiling"
+    """ An internal project key for submitting events from tempest."""
+    TEMPEST = "tempest"
+    """ An internal project key for demo mode."""
+    DEMO = "demo"
+
+
+@cell_silo_model
+class ProjectKey(ReplicatedCellModel):
+    __relocation_scope__ = RelocationScope.Organization
+
+    category = OutboxCategory.PROJECT_KEY_UPDATE
 
     project = FlexibleForeignKey("sentry.Project", related_name="key_set")
     label = models.CharField(max_length=64, blank=True, null=True)
     public_key = models.CharField(max_length=32, unique=True, null=True)
     secret_key = models.CharField(max_length=32, unique=True, null=True)
-    roles = BitField(
-        flags=(
-            # access to post events to the store endpoint
-            ("store", "Event API access"),
-            # read/write access to rest API
-            ("api", "Web API access"),
-        ),
-        default=["store"],
-    )
+
+    class roles(TypedClassBitField):
+        # WARNING: Only add flags to the bottom of this list
+        # bitfield flags are dependent on their order and inserting/removing
+        # flags from the middle of the list will cause bits to shift corrupting
+        # existing data.
+
+        # access to post events to the store endpoint
+        store: bool
+        # read/write access to rest API
+        api: bool
+
+        bitfield_default = ["store"]
+
     status = BoundedPositiveIntegerField(
         default=0,
         choices=(
@@ -73,14 +121,21 @@ class ProjectKey(Model):
     rate_limit_count = BoundedPositiveIntegerField(null=True)
     rate_limit_window = BoundedPositiveIntegerField(null=True)
 
-    objects = ProjectKeyManager(
+    objects: ClassVar[ProjectKeyManager] = ProjectKeyManager(
         cache_fields=("public_key", "secret_key"),
         # store projectkeys in memcached for longer than other models,
         # specifically to make the relay_projectconfig endpoint faster.
         cache_ttl=60 * 30,
     )
 
-    data = JSONField()
+    data = LegacyTextJSONField(default=dict)
+
+    use_case = models.CharField(
+        max_length=32,
+        choices=[(v.value, v.value) for v in UseCase],
+        default=UseCase.USER.value,
+        db_default=UseCase.USER.value,
+    )
 
     # support legacy project keys in API
     scopes = (
@@ -99,34 +154,34 @@ class ProjectKey(Model):
 
     __repr__ = sane_repr("project_id", "public_key")
 
-    def __str__(self):
+    def __str__(self) -> str:
         return str(self.public_key)
 
     @classmethod
-    def generate_api_key(cls):
-        return uuid4().hex
+    def generate_api_key(cls) -> str:
+        return secrets.token_hex(nbytes=16)
 
     @classmethod
-    def looks_like_api_key(cls, key):
-        return bool(_uuid4_re.match(key))
+    def looks_like_api_key(cls, key: str) -> bool:
+        return bool(_token_re.match(key))
 
     @classmethod
-    def from_dsn(cls, dsn):
+    def from_dsn(cls, dsn: str) -> ProjectKey:
         urlparts = urlparse(dsn)
 
         public_key = urlparts.username
         project_id = urlparts.path.rsplit("/", 1)[-1]
 
-        try:
-            return ProjectKey.objects.get(public_key=public_key, project=project_id)
-        except ValueError:
-            # ValueError would come from a non-integer project_id,
-            # which is obviously a DoesNotExist. We catch and rethrow this
-            # so anything downstream expecting DoesNotExist works fine
+        # A non-integer or out-of-range project_id (e.g. a corrupted DSN with
+        # extra digits) can never match, and would otherwise fail the bounded
+        # field's assertion. Raise DoesNotExist so callers can return a 4xx.
+        if not project_id.isdecimal() or int(project_id) > I64_MAX:
             raise ProjectKey.DoesNotExist("ProjectKey matching query does not exist.")
 
+        return ProjectKey.objects.get(public_key=public_key, project=cast(int, project_id))
+
     @classmethod
-    def get_default(cls, project):
+    def get_default(cls, project: Project | int) -> ProjectKey | None:
         return cls.objects.filter(
             project=project,
             roles=models.F("roles").bitor(cls.roles.store),
@@ -134,83 +189,139 @@ class ProjectKey(Model):
         ).first()
 
     @property
-    def is_active(self):
+    def is_active(self) -> bool:
         return self.status == ProjectKeyStatus.ACTIVE
 
     @property
-    def rate_limit(self):
+    def rate_limit(self) -> tuple[int, int]:
         if self.rate_limit_count and self.rate_limit_window:
             return (self.rate_limit_count, self.rate_limit_window)
         return (0, 0)
 
-    def save(self, *args, **kwargs):
+    def payload_for_update(self) -> dict[str, Any] | None:
+        return {"public_key": self.public_key}
+
+    @classmethod
+    def handle_async_deletion(
+        cls, identifier: int, shard_identifier: int, payload: Mapping[str, Any] | None
+    ) -> None:
+        from sentry.hybridcloud.services.replica import control_replica_service
+        from sentry.types.cell import get_local_cell
+
+        control_replica_service.delete_project_key_mapping(
+            project_key_id=identifier,
+            cell_name=get_local_cell().name,
+        )
+
+    def handle_async_replication(self, shard_identifier: int) -> None:
+        from sentry.hybridcloud.services.project_key_mapping import RpcProjectKeyMapping
+        from sentry.hybridcloud.services.replica import control_replica_service
+        from sentry.types.cell import get_local_cell
+
+        control_replica_service.upsert_project_key_mapping(
+            project_key=RpcProjectKeyMapping(
+                id=self.id,
+                public_key=self.public_key,
+                cell_name=get_local_cell().name,
+            ),
+        )
+
+    def save(self, *args: object, **kwargs: object) -> None:
         if not self.public_key:
             self.public_key = ProjectKey.generate_api_key()
         if not self.secret_key:
             self.secret_key = ProjectKey.generate_api_key()
         if not self.label:
-            self.label = petname.Generate(2, " ", letters=10).title()
+            self.label = petname.generate(2, " ", letters=10).title()
         super().save(*args, **kwargs)
 
-    def get_dsn(self, domain=None, secure=True, public=False):
-        urlparts = urlparse(self.get_endpoint(public=public))
+    def get_dsn(self, domain: str | None = None, secure: bool = True, public: bool = False) -> str:
+        urlparts = urlparse(self.get_endpoint())
 
         if not public:
             key = f"{self.public_key}:{self.secret_key}"
         else:
+            assert self.public_key is not None
             key = self.public_key
 
         # If we do not have a scheme or domain/hostname, dsn is never valid
         if not urlparts.netloc or not urlparts.scheme:
             return ""
 
-        return "{}://{}@{}/{}".format(
-            urlparts.scheme,
-            key,
-            urlparts.netloc + urlparts.path,
-            self.project_id,
-        )
+        return f"{urlparts.scheme}://{key}@{urlparts.netloc + urlparts.path}/{self.project_id}"
 
     @property
-    def organization_id(self):
+    def organization_id(self) -> int:
         return self.project.organization_id
 
     @property
-    def organization(self):
+    def organization(self) -> Organization:
         return self.project.organization
 
     @property
-    def dsn_private(self):
+    def dsn_private(self) -> str:
         return self.get_dsn(public=False)
 
     @property
-    def dsn_public(self):
+    def dsn_public(self) -> str:
         return self.get_dsn(public=True)
 
     @property
-    def csp_endpoint(self):
+    def csp_endpoint(self) -> str:
         endpoint = self.get_endpoint()
 
         return f"{endpoint}/api/{self.project_id}/csp-report/?sentry_key={self.public_key}"
 
     @property
-    def security_endpoint(self):
+    def security_endpoint(self) -> str:
         endpoint = self.get_endpoint()
 
         return f"{endpoint}/api/{self.project_id}/security/?sentry_key={self.public_key}"
 
     @property
-    def minidump_endpoint(self):
+    def nel_endpoint(self) -> str:
+        endpoint = self.get_endpoint()
+
+        return f"{endpoint}/api/{self.project_id}/nel/?sentry_key={self.public_key}"
+
+    @property
+    def minidump_endpoint(self) -> str:
         endpoint = self.get_endpoint()
 
         return f"{endpoint}/api/{self.project_id}/minidump/?sentry_key={self.public_key}"
 
     @property
-    def unreal_endpoint(self):
+    def playstation_endpoint(self) -> str:
+        endpoint = self.get_endpoint()
+
+        return f"{endpoint}/api/{self.project_id}/playstation/?sentry_key={self.public_key}"
+
+    @property
+    def integration_endpoint(self) -> str:
+        endpoint = self.get_endpoint()
+        return f"{endpoint}/api/{self.project_id}/integration/"
+
+    def build_integration_endpoint(self, integration_name: str, postfix: str = "") -> str:
+        return f"{self.integration_endpoint}{integration_name}/{postfix}"
+
+    @property
+    def otlp_traces_endpoint(self) -> str:
+        return self.build_integration_endpoint("otlp", "v1/traces")
+
+    @property
+    def otlp_logs_endpoint(self) -> str:
+        return self.build_integration_endpoint("otlp", "v1/logs")
+
+    @property
+    def unreal_endpoint(self) -> str:
         return f"{self.get_endpoint()}/api/{self.project_id}/unreal/{self.public_key}/"
 
     @property
-    def js_sdk_loader_cdn_url(self):
+    def crons_endpoint(self) -> str:
+        return f"{self.get_endpoint()}/api/{self.project_id}/cron/___MONITOR_SLUG___/{self.public_key}/"
+
+    @property
+    def js_sdk_loader_cdn_url(self) -> str:
         if settings.JS_SDK_LOADER_CDN_URL:
             return f"{settings.JS_SDK_LOADER_CDN_URL}{self.public_key}.min.js"
         else:
@@ -220,35 +331,50 @@ class ProjectKey(Model):
                 reverse("sentry-js-sdk-loader", args=[self.public_key, ".min"]),
             )
 
-    def get_endpoint(self, public=True):
-        if public:
-            endpoint = settings.SENTRY_PUBLIC_ENDPOINT or settings.SENTRY_ENDPOINT
-        else:
-            endpoint = settings.SENTRY_ENDPOINT
+    def get_endpoint(self) -> str:
+        from sentry.api.utils import generate_locality_url
 
+        # Apply the org's relay-dsn-endpoint override when set.
+        override = self.organization.get_option("sentry:relay_dsn_endpoint")
+        if override:
+            return override
+
+        endpoint = settings.SENTRY_ENDPOINT
         if not endpoint:
-            endpoint = options.get("system.url-prefix")
+            if SiloMode.get_current_mode() == SiloMode.CELL:
+                endpoint = generate_locality_url()
+            else:
+                endpoint = options.get("system.url-prefix")
+            assert endpoint is not None
 
-        if features.has("organizations:org-subdomains", self.project.organization):
+        try:
+            has_org_subdomain = features.has(
+                "organizations:org-ingest-subdomains", self.project.organization
+            )
+        except ProgrammingError:
+            # This happens during migration generation for the organization model.
+            has_org_subdomain = False
+
+        if has_org_subdomain:
             urlparts = urlparse(endpoint)
             if urlparts.scheme and urlparts.netloc:
                 endpoint = "{}://{}.{}{}".format(
-                    urlparts.scheme,
+                    str(urlparts.scheme),
                     settings.SENTRY_ORG_SUBDOMAIN_TEMPLATE.format(
                         organization_id=self.project.organization_id
                     ),
-                    urlparts.netloc,
-                    urlparts.path,
+                    str(urlparts.netloc),
+                    str(urlparts.path),
                 )
 
         return endpoint
 
-    def get_allowed_origins(self):
+    def get_allowed_origins(self) -> frozenset[str]:
         from sentry.utils.http import get_origins
 
         return get_origins(self.project)
 
-    def get_audit_log_data(self):
+    def get_audit_log_data(self) -> dict[str, object]:
         return {
             "label": self.label,
             "public_key": self.public_key,
@@ -259,5 +385,27 @@ class ProjectKey(Model):
             "rate_limit_window": self.rate_limit_window,
         }
 
-    def get_scopes(self):
+    def get_scopes(self) -> tuple[str, ...]:
         return self.scopes
+
+    def write_relocation_import(
+        self, _s: ImportScope, _f: ImportFlags
+    ) -> tuple[int, ImportKind] | None:
+        # If there is a key collision, generate new keys.
+        matching_public_key = self.__class__.objects.filter(public_key=self.public_key).first()
+        if not self.public_key or matching_public_key:
+            self.public_key = self.generate_api_key()
+        matching_secret_key = self.__class__.objects.filter(secret_key=self.secret_key).first()
+        if not self.secret_key or matching_secret_key:
+            self.secret_key = self.generate_api_key()
+
+        self.save(force_insert=True)
+        return (self.pk, ImportKind.Inserted)
+
+
+# Also handle cascade deletes — Django's collector bypasses model delete().
+pre_delete.connect(
+    lambda instance, **k: instance.outbox_for_update().save(),
+    sender=ProjectKey,
+    weak=False,
+)

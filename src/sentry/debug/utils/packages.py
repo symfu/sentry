@@ -1,32 +1,21 @@
+import importlib.metadata
 import sys
-from sentry.utils.compat import map
-
-try:
-    import pkg_resources
-except ImportError:
-    pkg_resources = None  # NOQA
 
 
-def get_package_version(module_name, app):
-    version = None
+def get_package_version(module_name: str, app: object) -> str | None:
+    version: object = None
 
-    # Try to pull version from pkg_resource first
+    # Try to pull version from importlib.metadata first
     # as it is able to detect version tagged with egg_info -b
-    if pkg_resources is not None:
-        # pull version from pkg_resources if distro exists
-        try:
-            return pkg_resources.get_distribution(module_name).version
-        except Exception:
-            pass
+    try:
+        return importlib.metadata.version(module_name)
+    except Exception:
+        pass
 
-    if hasattr(app, "get_version"):
-        version = app.get_version
-    elif hasattr(app, "__version__"):
-        version = app.__version__
-    elif hasattr(app, "VERSION"):
-        version = app.VERSION
-    elif hasattr(app, "version"):
-        version = app.version
+    for attr in ("get_version", "__version__", "VERSION", "version"):
+        if hasattr(app, attr):
+            version = getattr(app, attr)
+            break
 
     if callable(version):
         try:
@@ -46,9 +35,9 @@ def get_package_version(module_name, app):
     return str(version)
 
 
-def get_all_package_versions():
+def get_all_package_versions() -> dict[str, str]:
     packages = {}
-    for module_name, app in sys.modules.items():
+    for module_name, app in sys.modules.copy().items():
         # ignore items that look like submodules
         if "." in module_name:
             continue

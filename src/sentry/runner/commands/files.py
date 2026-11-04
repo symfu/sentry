@@ -1,18 +1,21 @@
 import click
+import yaml
+
 from sentry.runner.decorators import configuration
+from sentry.utils import json
 
 
 @click.group()
-def files():
-    "Manage files from filestore."
+def files() -> None:
+    """Manage files from filestore."""
 
 
 @files.command()
 @click.argument("id", type=click.INT, metavar="FILE_ID")
 @configuration
-def get(id):
-    "Fetch a file's contents by id."
-    from sentry.models import File
+def get(id: int) -> None:
+    """Fetch a file's contents by id."""
+    from sentry.models.files.file import File
 
     try:
         file = File.objects.get(id=id)
@@ -30,9 +33,9 @@ def get(id):
 @click.argument("id", type=click.INT, metavar="FILE_ID")
 @click.option("--format", default="json", type=click.Choice(("json", "yaml")))
 @configuration
-def info(id, format):
-    "Show a file's metadata by id."
-    from sentry.models import File
+def info(id: int, format: str) -> None:
+    """Show a file's metadata by id."""
+    from sentry.models.files.file import File
 
     try:
         file = File.objects.get(id=id)
@@ -51,11 +54,7 @@ def info(id, format):
     stdout = click.get_text_stream("stdout")
 
     if format == "yaml":
-        from sentry.utils import yaml
-
         yaml.safe_dump(obj, stdout)
     elif format == "json":
-        from sentry.utils import json
-
         json.dump(obj, stdout)
         stdout.write("\n")

@@ -1,16 +1,29 @@
-import logging
+from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
+from time import time
+from typing import Any, cast
+
+import orjson
 
 from sentry import http
 from sentry.auth.exceptions import IdentityNotValid
-from sentry.http import safe_urlopen, safe_urlread
+from sentry.http import safe_urlread
 from sentry.identity.oauth2 import OAuth2Provider
-from sentry.utils import json
+from sentry.identity.services.identity import identity_service
+from sentry.identity.services.identity.model import RpcIdentity
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.shared_integrations.exceptions import ApiError
+from sentry.users.models.identity import Identity
+from sentry.utils.http import absolute_uri
 
 logger = logging.getLogger("sentry.integration.gitlab")
 
+ACCESS_TOKEN_LIFETIME_S = 2 * 60 * 60
 
-def get_oauth_data(payload):
+
+def get_oauth_data(payload: Mapping[str, object]) -> dict[str, object]:
     data = {"access_token": payload["access_token"]}
 
     # https://docs.gitlab.com/ee/api/oauth2.html#2-requesting-access-token
@@ -20,25 +33,30 @@ def get_oauth_data(payload):
     #   "token_type": "bearer",
     #   "refresh_token": "29f43sdfsk22fsj929",
     #   "created_at": 1536798907,
+    #   "expires_in": 7200,
     #   "scope": "api"
     # }
+    # Measured on our clock rather than from GitLab's created_at, since it's compared against
+    # our clock. GitLab before 15.0 can issue a token without an expiry, and gives it one when
+    # the instance upgrades; assuming the usual lifetime refreshes it often enough either way.
+    data["expires_in"] = int(cast(int, payload.get("expires_in", ACCESS_TOKEN_LIFETIME_S)))
+    data["expires"] = int(time()) + cast(int, data["expires_in"])
     if "refresh_token" in payload:
         data["refresh_token"] = payload["refresh_token"]
     if "token_type" in payload:
         data["token_type"] = payload["token_type"]
     if "created_at" in payload:
-        data["created_at"] = int(payload["created_at"])
-
+        data["created_at"] = int(cast(int, payload["created_at"]))
     return data
 
 
-def get_user_info(access_token, installation_data):
-    session = http.build_session()
-    resp = session.get(
-        "{}/api/v4/user".format(installation_data["url"]),
-        headers={"Accept": "application/json", "Authorization": "Bearer %s" % access_token},
-        verify=installation_data["verify_ssl"],
-    )
+def get_user_info(access_token: str, installation_data: Mapping[str, object]) -> dict[str, object]:
+    with http.build_session() as session:
+        resp = session.get(
+            f"{installation_data['url']}/api/v4/user",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {access_token}"},
+            verify=cast(bool, installation_data["verify_ssl"]),
+        )
     try:
         resp.raise_for_status()
     except Exception as e:
@@ -49,34 +67,47 @@ def get_user_info(access_token, installation_data):
                 "verify_ssl": installation_data["verify_ssl"],
                 "client_id": installation_data["client_id"],
                 "error_status": getattr(resp, "status_code"),  # error might not be an HTTP error
-                "error_message": str(e),
+                "error_message": f"{e}",
             },
         )
-        raise e
-    return resp.json()
+        raise
+    data = resp.json()
+    return data
 
 
 class GitlabIdentityProvider(OAuth2Provider):
-    key = "gitlab"
+    key = IntegrationProviderSlug.GITLAB.value
     name = "Gitlab"
 
     oauth_scopes = ("api",)
 
-    def build_identity(self, data):
-        data = data["data"]
+    def build_identity(self, data: Mapping[str, object]) -> Mapping[str, object]:
+        identity_data = cast(Mapping[str, object], data["data"])
+        user = cast(Mapping[str, object], identity_data["user"])
 
         return {
-            "type": "gitlab",
-            "id": data["user"]["id"],
-            "email": data["user"]["email"],
-            "scopes": sorted(data["scope"].split(",")),
-            "data": self.get_oauth_data(data),
+            "type": IntegrationProviderSlug.GITLAB.value,
+            "id": user["id"],
+            "email": user["email"],
+            "scopes": sorted(cast(str, identity_data["scope"]).split(",")),
+            "data": self.get_oauth_data(identity_data),
         }
 
-    def get_refresh_token_params(self, refresh_token, *args, **kwargs):
-        return {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    def get_refresh_token_params(
+        self, refresh_token: str, identity: Identity | RpcIdentity, **kwargs: Any
+    ) -> dict[str, str | None]:
+        client_id = identity.data.get("client_id")
+        client_secret = identity.data.get("client_secret")
 
-    def refresh_identity(self, identity, *args, **kwargs):
+        return {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "redirect_uri": absolute_uri("/extensions/gitlab/setup/"),
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+
+    def refresh_identity(self, identity: Identity | RpcIdentity, **kwargs: Any) -> None:
         refresh_token = identity.data.get("refresh_token")
         refresh_token_url = kwargs.get("refresh_token_url")
 
@@ -86,25 +117,35 @@ class GitlabIdentityProvider(OAuth2Provider):
         if not refresh_token_url:
             raise IdentityNotValid("Missing refresh token url")
 
-        data = self.get_refresh_token_params(refresh_token, *args, **kwargs)
-
-        req = safe_urlopen(url=refresh_token_url, headers={}, data=data)
+        req = self.get_refresh_token(
+            refresh_token=refresh_token,
+            url=refresh_token_url,
+            identity=identity,
+            verify_ssl=kwargs["verify_ssl"],
+        )
 
         try:
             body = safe_urlread(req)
-            payload = json.loads(body)
+            payload = orjson.loads(body)
         except Exception as e:
-            self.logger(
+            # JSONDecodeError's will happen when we get a 301
+            # from GitLab, and won't have the `code` attribute
+            # we use the req.status_code instead in that case
+            error_status = getattr(e, "code", req.status_code)
+            self.logger.info(
                 "gitlab.refresh-identity-failure",
                 extra={
                     "identity_id": identity.id,
-                    "error_status": e.code,
+                    "error_status": error_status,
                     "error_message": str(e),
                 },
             )
             payload = {}
 
-        self.handle_refresh_error(req, payload)
+        if "access_token" not in payload:
+            raise ApiError(
+                "GitLab answered the token refresh without an access token", code=req.status_code
+            )
 
         identity.data.update(get_oauth_data(payload))
-        return identity.update(data=identity.data)
+        identity_service.update_data(identity_id=identity.id, data=identity.data)

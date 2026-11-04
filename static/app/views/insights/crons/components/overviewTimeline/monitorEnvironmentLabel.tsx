@@ -1,0 +1,97 @@
+import styled from '@emotion/styled';
+import {IconCheckmark} from '@sentry/icons/checkmark';
+import {IconFire} from '@sentry/icons/fire';
+import {IconFix} from '@sentry/icons/fix';
+import {IconMute} from '@sentry/icons/mute';
+import {IconTimer} from '@sentry/icons/timer';
+import {IconUnsubscribed} from '@sentry/icons/unsubscribed';
+
+import {Text} from '@sentry/scraps/text';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {t} from 'sentry/locale';
+import {
+  MonitorStatus,
+  type MonitorEnvironment,
+  type StatusNotice,
+} from 'sentry/views/insights/crons/types';
+
+interface Props {
+  monitorEnv: MonitorEnvironment;
+}
+
+const statusIconColorMap: Record<MonitorStatus, StatusNotice> = {
+  ok: {
+    icon: <IconCheckmark variant="success" />,
+    variant: 'success',
+  },
+  error: {
+    icon: <IconFire variant="danger" />,
+    variant: 'danger',
+  },
+  active: {
+    icon: <IconTimer variant="muted" />,
+    variant: 'muted',
+    label: t('Waiting For Check-In'),
+  },
+  disabled: {
+    icon: <IconUnsubscribed variant="muted" size="xs" />,
+    variant: 'muted',
+    label: t('Muted'),
+  },
+};
+
+const userNotifiedDisplay: StatusNotice = {
+  label: t(
+    'This environment is likely broken due to being in an error state for multiple days.'
+  ),
+  icon: <IconFix variant="muted" />,
+  variant: 'muted',
+};
+
+const envMutedDisplay: StatusNotice = {
+  label: t(
+    'This environment is likely broken due to being in an error state for multiple days. It has been automatically muted.'
+  ),
+  icon: <IconMute variant="muted" />,
+  variant: 'muted',
+};
+
+export function MonitorEnvironmentLabel({monitorEnv}: Props) {
+  const {name, status, isMuted, activeIncident} = monitorEnv;
+  const {userNotifiedTimestamp, environmentMutedTimestamp} =
+    activeIncident?.brokenNotice ?? {};
+  const envStatus = isMuted ? MonitorStatus.DISABLED : status;
+  const {label, icon, variant} = environmentMutedTimestamp
+    ? envMutedDisplay
+    : userNotifiedTimestamp
+      ? userNotifiedDisplay
+      : statusIconColorMap[envStatus];
+
+  return (
+    <EnvWithStatus>
+      <Tooltip skipWrapper showOnlyOnOverflow title={name}>
+        <MonitorEnvLabel>
+          <Text variant={variant}>{name}</Text>
+        </MonitorEnvLabel>
+      </Tooltip>
+      <Tooltip disabled={!label} title={label} skipWrapper>
+        {icon}
+      </Tooltip>
+    </EnvWithStatus>
+  );
+}
+
+const EnvWithStatus = styled('div')`
+  display: grid;
+  grid-template-columns: 1fr max-content;
+  gap: ${p => p.theme.space.xs};
+  align-items: center;
+`;
+
+const MonitorEnvLabel = styled('div')`
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+`;

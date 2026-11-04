@@ -1,24 +1,18 @@
-from sentry.signals import project_created
+from typing import Any
 
-from sentry.models import Rule
+from django.db.models.signals import pre_save
+from django.dispatch import receiver
 
-DEFAULT_RULE_LABEL = "Send a notification for new issues"
-DEFAULT_RULE_DATA = {
-    "match": "all",
-    "conditions": [{"id": "sentry.rules.conditions.first_seen_event.FirstSeenEventCondition"}],
-    "actions": [
-        {
-            "id": "sentry.mail.actions.NotifyEmailAction",
-            "targetType": "IssueOwners",
-            "targetIdentifier": None,
-        }
-    ],
-}
+from sentry.models.rule import Rule
 
 
-def create_default_rules(project, default_rules=True, RuleModel=Rule, **kwargs):
-    if default_rules:
-        RuleModel.objects.create(project=project, label=DEFAULT_RULE_LABEL, data=DEFAULT_RULE_DATA)
+def clean_rule_data(data: list[dict[str, Any]]) -> None:
+    for datum in data:
+        if datum.get("name"):
+            del datum["name"]
 
 
-project_created.connect(create_default_rules, dispatch_uid="create_default_rules", weak=False)
+@receiver(pre_save, sender=Rule, dispatch_uid="pre_save_rule")
+def pre_save_rule(instance: Rule, **kwargs: Any) -> None:
+    clean_rule_data(instance.data.get("conditions", []))
+    clean_rule_data(instance.data.get("actions", []))

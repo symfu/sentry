@@ -1,286 +1,1896 @@
+from __future__ import annotations
+
+from typing import Any, cast
+from unittest.mock import Mock, patch
+
+import orjson
+import pytest
 import responses
+from django.core.cache import cache
+from django.test import override_settings
+from django.urls import reverse
+from requests import PreparedRequest
 
-from urllib.parse import parse_qs, urlencode, urlparse
-from sentry.utils.compat.mock import patch, Mock
-
-from sentry.integrations.gitlab import GitlabIntegrationProvider
-from sentry.models import (
-    Identity,
-    IdentityProvider,
-    IdentityStatus,
-    Integration,
-    OrganizationIntegration,
-    Repository,
+from fixtures.gitlab import GET_COMMIT_RESPONSE, GitLabTestCase
+from sentry.constants import ObjectStatus
+from sentry.deletions.models.scheduleddeletion import ScheduledDeletion
+from sentry.integrations.gitlab.client import GitLabApiClient, GitLabSetupApiClient
+from sentry.integrations.gitlab.integration import GitlabIntegration, GitlabIntegrationProvider
+from sentry.integrations.gitlab.metrics import GitLabWebhookUpdateHaltReason
+from sentry.integrations.gitlab.tasks import update_all_project_webhooks
+from sentry.integrations.gitlab.utils import build_integration_external_id
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.models.integration_external_project import IntegrationExternalProject
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.pipeline import IntegrationPipeline
+from sentry.integrations.services.integration import integration_service
+from sentry.integrations.source_code_management.sync_repos import sync_repos_for_org
+from sentry.integrations.types import ExternalProviders
+from sentry.models.group import Group
+from sentry.models.organization import Organization
+from sentry.models.repository import Repository
+from sentry.shared_integrations.exceptions import (
+    ApiForbiddenError,
+    IntegrationConfigurationError,
+    IntegrationError,
 )
-from sentry.testutils import IntegrationTestCase
+from sentry.silo.base import SiloMode
+from sentry.silo.util import PROXY_BASE_PATH, PROXY_OI_HEADER, PROXY_SIGNATURE_HEADER
+from sentry.testutils.cases import APITestCase, IntegrationTestCase
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.helpers.integrations import get_installation_of_type
+from sentry.testutils.silo import assume_test_silo_mode, control_silo_test
+from sentry.users.models.identity import Identity
+from sentry.users.services.user import RpcUser
+from sentry.users.services.user.serial import serialize_rpc_user
+from sentry.utils import json
+from tests.sentry.integrations.test_helpers import add_control_silo_proxy_response
 
 
-class GitlabIntegrationTest(IntegrationTestCase):
+def assert_proxy_request(request: PreparedRequest, is_proxy: bool = True) -> None:
+    url = cast(str, request.url)
+    assert (PROXY_BASE_PATH in url) == is_proxy
+    assert (PROXY_OI_HEADER in request.headers) == is_proxy
+    assert (PROXY_SIGNATURE_HEADER in request.headers) == is_proxy
+    # The following Gitlab headers don't appear in proxied requests
+    assert ("Authorization" in request.headers) != is_proxy
+    if is_proxy:
+        assert request.headers[PROXY_OI_HEADER] is not None
+
+
+@override_settings(
+    SENTRY_SUBNET_SECRET="hush-hush-im-invisible",
+    SENTRY_CONTROL_ADDRESS="http://controlserver",
+)
+class GitlabSetupApiClientTest(IntegrationTestCase):
     provider = GitlabIntegrationProvider
-    config = {
-        # Trailing slash is intentional to ensure that valid
-        # URLs are generated even if the user inputs a trailing /
-        "url": "https://gitlab.example.com/",
-        "name": "Test App",
-        "group": "cool-group",
-        "verify_ssl": True,
-        "client_id": "client_id",
-        "client_secret": "client_secret",
-        "include_subgroups": True,
-    }
-
+    base_url = "https://gitlab.example.com"
+    access_token = "xxxxx-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx"
     default_group_id = 4
 
-    def setUp(self):
-        super().setUp()
-        self.init_path_without_guide = f"{self.init_path}?completed_installation_guide"
-
-    def assert_setup_flow(self, user_id="user_id_1"):
-        resp = self.client.get(self.init_path)
-        assert resp.status_code == 200
-        self.assertContains(resp, "you will need to create a Sentry app in your GitLab instance")
-        resp = self.client.get(self.init_path_without_guide)
-        assert resp.status_code == 200
-        resp = self.client.post(self.init_path_without_guide, data=self.config)
-        assert resp.status_code == 302
-        redirect = urlparse(resp["Location"])
-        assert redirect.scheme == "https"
-        assert redirect.netloc == "gitlab.example.com"
-        assert redirect.path == "/oauth/authorize"
-
-        params = parse_qs(redirect.query)
-        assert params["state"]
-        assert params["redirect_uri"] == ["http://testserver/extensions/gitlab/setup/"]
-        assert params["response_type"] == ["code"]
-        assert params["client_id"] == ["client_id"]
-        # once we've asserted on it, switch to a singular values to make life
-        # easier
-        authorize_params = {k: v[0] for k, v in params.items()}
-
-        access_token = "xxxxx-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx"
-
-        responses.add(
-            responses.POST,
-            "https://gitlab.example.com/oauth/token",
-            json={"access_token": access_token},
-        )
-        responses.add(responses.GET, "https://gitlab.example.com/api/v4/user", json={"id": user_id})
+    @responses.activate
+    def test_integration_proxy_is_active(self) -> None:
+        response_payload = {
+            "id": self.default_group_id,
+            "full_name": "Cool",
+            "full_path": "cool-group",
+            "web_url": "https://gitlab.example.com/groups/cool-group",
+            "avatar_url": "https://gitlab.example.com/uploads/group/avatar/4/foo.jpg",
+        }
         responses.add(
             responses.GET,
             "https://gitlab.example.com/api/v4/groups/cool-group",
-            json={
-                "id": self.default_group_id,
-                "full_name": "Cool",
-                "full_path": "cool-group",
-                "web_url": "https://gitlab.example.com/groups/cool-group",
-                "avatar_url": "https://gitlab.example.com/uploads/group/avatar/4/foo.jpg",
+            json=response_payload,
+        )
+
+        responses.add(
+            responses.GET,
+            "http://controlserver/api/0/internal/integration-proxy/api/v4/groups/cool-group",
+            json=response_payload,
+        )
+
+        class GitLabSetupTestClient(GitLabSetupApiClient):
+            _use_proxy_url_for_tests = True
+
+        with override_settings(SILO_MODE=SiloMode.MONOLITH):
+            client = GitLabSetupTestClient(
+                base_url=self.base_url,
+                access_token=self.access_token,
+                verify_ssl=False,
+            )
+            client.get_group(group="cool-group")
+            request = responses.calls[0].request
+
+            assert "https://gitlab.example.com/api/v4/groups/cool-group" == request.url
+            assert client.base_url in request.url
+            assert_proxy_request(request, is_proxy=False)
+
+        responses.calls.reset()
+        with override_settings(SILO_MODE=SiloMode.CONTROL):
+            client = GitLabSetupTestClient(
+                base_url=self.base_url,
+                access_token=self.access_token,
+                verify_ssl=False,
+            )
+            client.get_group(group="cool-group")
+            request = responses.calls[0].request
+
+            assert "https://gitlab.example.com/api/v4/groups/cool-group" == request.url
+            assert client.base_url in request.url
+            assert_proxy_request(request, is_proxy=False)
+
+
+@override_settings(
+    SENTRY_SUBNET_SECRET="hush-hush-im-invisible",
+    SENTRY_CONTROL_ADDRESS="http://controlserver",
+)
+class GitlabApiClientTest(GitLabTestCase):
+    @responses.activate
+    def test_integration_proxy_is_active(self) -> None:
+        gitlab_id = 123
+        commit = "a" * 40
+        gitlab_response = responses.add(
+            method=responses.GET,
+            url=f"https://example.gitlab.com/api/v4/projects/{gitlab_id}/repository/commits/{commit}",
+            json=orjson.loads(GET_COMMIT_RESPONSE),
+        )
+
+        control_proxy_response = add_control_silo_proxy_response(
+            method=responses.GET,
+            path=f"api/v4/projects/{gitlab_id}/repository/commits/{commit}",
+            json=orjson.loads(GET_COMMIT_RESPONSE),
+        )
+
+        class GitLabApiTestClient(GitLabApiClient):
+            _use_proxy_url_for_tests = True
+
+        with override_settings(SILO_MODE=SiloMode.MONOLITH):
+            client = GitLabApiTestClient(self.installation)
+            client.get_commit(gitlab_id, commit)
+            request = responses.calls[0].request
+
+            assert (
+                f"https://example.gitlab.com/api/v4/projects/{gitlab_id}/repository/commits/{commit}"
+                == request.url
+            )
+            assert client.base_url in request.url
+            assert gitlab_response.call_count == 1
+            assert_proxy_request(request, is_proxy=False)
+
+        responses.calls.reset()
+        cache.clear()
+        with override_settings(SILO_MODE=SiloMode.CONTROL):
+            client = GitLabApiTestClient(self.installation)
+            client.get_commit(gitlab_id, commit)
+            request = responses.calls[0].request
+
+            assert (
+                f"https://example.gitlab.com/api/v4/projects/{gitlab_id}/repository/commits/{commit}"
+                == request.url
+            )
+            assert client.base_url in request.url
+            assert gitlab_response.call_count == 2
+            assert_proxy_request(request, is_proxy=False)
+
+        responses.calls.reset()
+        cache.clear()
+        with override_settings(SILO_MODE=SiloMode.CELL):
+            client = GitLabApiTestClient(self.installation)
+            client.get_commit(gitlab_id, commit)
+            request = responses.calls[0].request
+
+            assert control_proxy_response.call_count == 1
+            assert client.base_url not in request.url
+            assert_proxy_request(request, is_proxy=True)
+
+
+@control_silo_test
+class GitlabSourceUrlMatchesTest(GitLabTestCase):
+    def get_installation_for(self, base_url: str, domain_name: str) -> GitlabIntegration:
+        self.integration.update(
+            metadata={
+                **self.integration.metadata,
+                "base_url": base_url,
+                "domain_name": domain_name,
+            }
+        )
+        return get_installation_of_type(GitlabIntegration, self.integration, self.organization.id)
+
+    def test_gitlab_com(self) -> None:
+        installation = self.get_installation_for("https://gitlab.com", "gitlab.com/group-x")
+
+        assert installation.source_url_matches(
+            "https://gitlab.com/group-x/repo/blob/main/src/app.py"
+        )
+        assert installation.source_url_matches(
+            "https://gitlab.com/group-x/subgroup/repo/-/blob/main/src/app.py"
+        )
+        assert not installation.source_url_matches(
+            "https://gitlab.com/group-y/repo/blob/main/src/app.py"
+        )
+        assert not installation.source_url_matches(
+            "https://notgitlab.com/group-x/repo/blob/main/src/app.py"
+        )
+
+    def test_group_with_shared_name_prefix(self) -> None:
+        installation = self.get_installation_for("https://gitlab.com", "gitlab.com/group-x")
+
+        assert not installation.source_url_matches(
+            "https://gitlab.com/group-xy/repo/blob/main/src/app.py"
+        )
+
+    def test_http_instance(self) -> None:
+        installation = self.get_installation_for(
+            "http://gitlab.example.com", "gitlab.example.com/group-x"
+        )
+
+        assert installation.source_url_matches(
+            "http://gitlab.example.com/group-x/repo/blob/main/src/app.py"
+        )
+        assert installation.source_url_matches(
+            "https://gitlab.example.com/group-x/repo/blob/main/src/app.py"
+        )
+        assert not installation.source_url_matches(
+            "http://gitlab.example.com/group-y/repo/blob/main/src/app.py"
+        )
+
+    def test_instance_with_path_prefix(self) -> None:
+        installation = self.get_installation_for(
+            "https://example.com/gitlab", "example.com/group-x"
+        )
+
+        assert installation.source_url_matches(
+            "https://example.com/gitlab/group-x/repo/blob/main/src/app.py"
+        )
+        assert not installation.source_url_matches(
+            "https://example.com/gitlab/group-y/repo/blob/main/src/app.py"
+        )
+        assert not installation.source_url_matches(
+            "https://example.com/group-x/repo/blob/main/src/app.py"
+        )
+
+    def test_base_url_with_trailing_slash(self) -> None:
+        installation = self.get_installation_for("https://example.com/", "example.com/group-x")
+
+        assert installation.source_url_matches(
+            "https://example.com/group-x/repo/blob/main/src/app.py"
+        )
+
+    def test_integration_without_group(self) -> None:
+        installation = self.get_installation_for("https://example.com/gitlab", "example.com")
+
+        assert installation.source_url_matches(
+            "https://example.com/gitlab/any-group/repo/blob/main/src/app.py"
+        )
+        assert not installation.source_url_matches(
+            "https://example.com/gitlab-other/any-group/repo/blob/main/src/app.py"
+        )
+
+    def test_matches_own_source_links(self) -> None:
+        installation = self.get_installation_for("http://example.com/gitlab", "example.com/group-x")
+        repo = Repository(config={"path": "group-x/repo"})
+
+        assert installation.source_url_matches(
+            installation.format_source_url(repo, "src/app.py", "main")
+        )
+
+
+@control_silo_test
+class GitlabIssueSyncTest(GitLabTestCase):
+    def _setup_assignee_sync_test(
+        self,
+        user_email: str = "foo@example.com",
+        external_name: str = "@gitlab_user",
+        external_id: str | None = None,
+        issue_key: str = "example.gitlab.com/group-x:cool-group/sentry#45",
+        create_external_user: bool = True,
+    ) -> tuple[RpcUser, GitlabIntegration, ExternalIssue, Integration, Group]:
+        """
+        Common setup for assignee sync tests.
+
+        Returns:
+            tuple: (user, installation, external_issue, integration, group)
+        """
+
+        user = self.create_user(email=user_email)
+        integration = Integration.objects.get(provider=self.provider)
+
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        group = self.create_group()
+
+        if create_external_user:
+            self.create_external_user(
+                user=user,
+                organization=self.organization,
+                integration=integration,
+                provider=ExternalProviders.GITLAB.value,
+                external_name=external_name,
+                external_id=external_id,
+            )
+
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key=issue_key,
+        )
+
+        return serialize_rpc_user(user), installation, external_issue, integration, group
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_get_organization_config(self) -> None:
+        """Test that organization config fields are returned correctly"""
+
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        fields = installation.get_organization_config()
+
+        assert [field["name"] for field in fields] == [
+            "sync_status_forward",
+            "sync_reverse_assignment",
+            "sync_forward_assignment",
+            "sync_comments",
+            "sync_status_reverse",
+            "resolution_strategy",
+            "pr_comments",
+        ]
+        # pr_comments must not be gated behind integrations-issue-sync.
+        pr_field = next(f for f in fields if f["name"] == "pr_comments")
+        assert "disabled" not in pr_field
+
+    @responses.activate
+    def test_update_organization_config(self) -> None:
+        """Test updating organization config saves to org_integration"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        # Initial config should be empty
+        assert org_integration.config == {}
+
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ):
+            # Update configuration
+            data = {"sync_reverse_assignment": True, "other_option": "test_value"}
+            installation.update_organization_config(data)
+
+        # Refresh from database
+        org_integration.refresh_from_db()
+
+        # Check that config was updated
+        assert org_integration.config["sync_reverse_assignment"] is True
+        assert org_integration.config["other_option"] == "test_value"
+
+    @responses.activate
+    def test_update_organization_config_preserves_existing(self) -> None:
+        """Test that updating org config preserves existing keys"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        org_integration.config = {
+            "existing_key": "existing_value",
+            "sync_reverse_assignment": False,
+        }
+        org_integration.save()
+
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ):
+            # Update configuration with new data
+            data = {"sync_reverse_assignment": True, "new_key": "new_value"}
+            installation.update_organization_config(data)
+
+        org_integration.refresh_from_db()
+
+        # Check that config was updated and existing keys preserved
+        assert org_integration.config["existing_key"] == "existing_value"
+        assert org_integration.config["sync_reverse_assignment"] is True
+        assert org_integration.config["new_key"] == "new_value"
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound(self) -> None:
+        """Test assigning a GitLab issue to a user with linked GitLab account"""
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test()
+
+        # Mock user search endpoint
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/users?username=gitlab_user",
+            json=[{"id": 123, "username": "gitlab_user", "name": "GitLab User"}],
+            status=200,
+        )
+
+        # Mock issue update endpoint
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"assignees": [{"id": 123}]},
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=True)
+
+        assert len(responses.calls) == 2
+        # First call searches for user
+        assert "users?username=gitlab_user" in responses.calls[0].request.url
+        # Second call updates issue
+        request = responses.calls[1].request
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == request.url
+        )
+        assert orjson.loads(request.body) == {"assignee_ids": [123]}
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound_strips_at_symbol(self) -> None:
+        """Test that @ symbol is stripped from external_name when syncing"""
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test()
+
+        # Mock user search endpoint - note the username without @
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/users?username=gitlab_user",
+            json=[{"id": 123, "username": "gitlab_user", "name": "GitLab User"}],
+            status=200,
+        )
+
+        # Mock issue update endpoint
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"assignees": [{"id": 123}]},
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=True)
+
+        assert len(responses.calls) == 2
+        # Verify @ was stripped in user search
+        assert "users?username=gitlab_user" in responses.calls[0].request.url
+        assert "@" not in responses.calls[0].request.url
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound_unassign(self) -> None:
+        """Test unassigning a GitLab issue"""
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test()
+
+        # Mock issue update endpoint
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"assignees": []},
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=False)
+
+        assert len(responses.calls) == 1
+        request = responses.calls[0].request
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == request.url
+        )
+        assert orjson.loads(request.body) == {"assignee_ids": []}
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound_no_external_actor(self) -> None:
+        """Test that sync no-ops when user has no GitLab account linked."""
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test(
+            create_external_user=False
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=True)
+
+        # Should not make any API calls
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound_invalid_key_format(self) -> None:
+        """Test that sync handles invalid external issue key format gracefully"""
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test(
+            issue_key="invalid-key-format"
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=True)
+
+        # Should not make any API calls
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_sync_assignee_outbound_with_none_user(self) -> None:
+        """Test that assigning with no user unassigns the issue"""
+        integration = Integration.objects.get(provider=self.provider)
+
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        group = self.create_group()
+
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="example.gitlab.com/group-x:cool-group/sentry#45",
+        )
+
+        # Mock issue update endpoint - when user is None, it unassigns
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"assignees": []},
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, None, assign=True)
+
+        # Should make API call to unassign when user is None
+        assert len(responses.calls) == 1
+        request = responses.calls[0].request
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == request.url
+        )
+        assert orjson.loads(request.body) == {"assignee_ids": []}
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound_user_not_found(self) -> None:
+        """Test that sync handles case when GitLab user is not found"""
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test()
+
+        # Mock user search endpoint returning empty list
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/users?username=gitlab_user",
+            json=[],
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=True)
+
+        # Should only call user search, not issue update
+        assert len(responses.calls) == 1
+        assert "users?username=gitlab_user" in responses.calls[0].request.url
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_assignee_outbound_user_search_failed(self) -> None:
+        user, installation, external_issue, _, _ = self._setup_assignee_sync_test()
+
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/users?username=gitlab_user",
+            json={"message": "Internal server error"},
+            status=500,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_assignee_outbound(external_issue, user, assign=True)
+
+        assert len(responses.calls) == 1
+        assert "users?username=gitlab_user" in responses.calls[0].request.url
+
+    def test_create_comment(self) -> None:
+        """Test creating a comment on a GitLab issue"""
+        self.user.name = "Sentry Admin"
+        self.user.save()
+        installation = self.installation
+
+        group_note = Mock()
+        comment = "hello world\nThis is a comment.\n\n\n    Glad it's quoted"
+        group_note.data = {"text": comment}
+
+        with patch.object(
+            installation.get_client().__class__, "create_comment"
+        ) as mock_create_comment:
+            installation.create_comment(
+                "example.gitlab.com/group-x:cool-group/sentry#123", self.user.id, group_note
+            )
+            # The project_id will be URL-encoded by create_comment
+            assert mock_create_comment.call_args[0][0] == "cool-group%2Fsentry"
+            assert mock_create_comment.call_args[0][1] == "123"
+            assert mock_create_comment.call_args[0][2] == {
+                "body": "**Sentry Admin** wrote:\n\n> hello world\n> This is a comment.\n> \n> \n>     Glad it's quoted"
+            }
+
+    def test_split_external_issue_key_invalid(self) -> None:
+        """Test splitting an invalid external issue key"""
+        installation = self.installation
+
+        project_id, issue_iid = installation.split_external_issue_key("invalid-key-format")
+
+        assert project_id is None
+        assert issue_iid is None
+
+    def test_create_comment_attribution(self) -> None:
+        """Test comment attribution formatting"""
+        self.user.name = "Test User"
+        self.user.save()
+        installation = self.installation
+
+        comment_text = "This is a comment\nWith multiple lines"
+        result = installation.create_comment_attribution(self.user.id, comment_text)
+
+        assert result == "**Test User** wrote:\n\n> This is a comment\n> With multiple lines"
+
+    def test_get_repositories_unauthorized_raises_integration_configuration_error(self) -> None:
+        installation = self.installation
+
+        with patch.object(installation, "get_client") as mock_get_client:
+            mock_get_client.return_value.search_projects.side_effect = ApiForbiddenError(
+                text=json.dumps({"message": "unauthorized"})
+            )
+            with pytest.raises(IntegrationConfigurationError) as exception_info:
+                installation.get_repositories()
+        assert (
+            str(exception_info.value) == "Error Communicating with GitLab (HTTP 403): unauthorized"
+        )
+
+    def test_every_config_save_schedules_webhook_reconciliation(self) -> None:
+        self.assert_config_schedules_reconciliation({})
+
+    def test_legacy_version_does_not_gate_webhook_reconciliation(self) -> None:
+        self.assert_config_schedules_reconciliation({"gitlab_webhook_version": 2})
+
+    def assert_config_schedules_reconciliation(self, config: dict[str, Any]) -> None:
+        integration = Integration.objects.get(provider=self.provider)
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+        org_integration.update(config=config)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ) as schedule:
+            installation.update_organization_config({"sync_comments": True})
+            schedule.assert_called_once_with(
+                organization_id=self.organization.id, integration_id=integration.id
+            )
+            schedule.reset_mock()
+            installation.update_organization_config({"sync_reverse_assignment": True})
+            schedule.assert_called_once_with(
+                organization_id=self.organization.id, integration_id=integration.id
+            )
+        org_integration.refresh_from_db()
+        assert org_integration.config == {
+            **config,
+            "sync_comments": True,
+            "sync_reverse_assignment": True,
+        }
+
+    @responses.activate
+    def test_update_organization_config_preserves_other_config_values(self) -> None:
+        """Test that updating org config preserves other configuration values"""
+
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = integration_service.get_organization_integration(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+        assert org_integration is not None
+
+        # Set some existing config
+        org_integration = integration_service.update_organization_integration(
+            org_integration_id=org_integration.id,
+            config={
+                "existing_key": "existing_value",
+                "sync_forward_assignment": True,
             },
         )
+
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ):
+            # Update configuration
+            data = {"sync_comments": True}
+            installation.update_organization_config(data)
+
+        # Verify all config values are preserved
+        org_integration = integration_service.get_organization_integration(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+        assert org_integration is not None
+        assert org_integration.config["existing_key"] == "existing_value"
+        assert org_integration.config["sync_forward_assignment"] is True
+        assert org_integration.config["sync_comments"] is True
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_update_organization_config_status_sync(self) -> None:
+        """Test that status sync configuration creates IntegrationExternalProject records"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        # No external projects initially
+        assert (
+            IntegrationExternalProject.objects.filter(
+                organization_integration_id=org_integration.id
+            ).count()
+            == 0
+        )
+
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ):
+            # Configure status sync for two projects
+            data = {
+                "sync_status_forward": {
+                    "my-group/project-1": {"on_resolve": "closed", "on_unresolve": "opened"},
+                    "my-group/project-2": {"on_resolve": "closed", "on_unresolve": "opened"},
+                }
+            }
+            installation.update_organization_config(data)
+
+        # Verify IntegrationExternalProject records were created
+        external_projects = IntegrationExternalProject.objects.filter(
+            organization_integration_id=org_integration.id
+        )
+        assert external_projects.count() == 2
+
+        project1 = external_projects.get(external_id="my-group/project-1")
+        assert project1.name == "my-group/project-1"
+        assert project1.resolved_status == "closed"
+        assert project1.unresolved_status == "opened"
+
+        project2 = external_projects.get(external_id="my-group/project-2")
+        assert project2.name == "my-group/project-2"
+        assert project2.resolved_status == "closed"
+        assert project2.unresolved_status == "opened"
+
+        # Verify the boolean flag is set
+        org_integration.refresh_from_db()
+        assert org_integration.config["sync_status_forward"] is True
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_update_organization_config_invalid_status(self) -> None:
+        """Test that invalid status values raise IntegrationError"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ):
+            # Try to configure with invalid status
+            data = {
+                "sync_status_forward": {
+                    "my-group/project": {"on_resolve": "invalid_status", "on_unresolve": "opened"}
+                }
+            }
+
+            with pytest.raises(IntegrationError) as exc_info:
+                installation.update_organization_config(data)
+
+            assert "Invalid resolve status" in str(exc_info.value)
+            assert "invalid_status" in str(exc_info.value)
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_update_organization_config_missing_status(self) -> None:
+        """Test that missing on_resolve/on_unresolve raises IntegrationError"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        with patch(
+            "sentry.integrations.gitlab.integration.repository_service.schedule_update_gitlab_project_webhooks"
+        ):
+            # Try to configure with missing on_unresolve
+            data = {"sync_status_forward": {"my-group/project": {"on_resolve": "closed"}}}
+
+            with pytest.raises(IntegrationError) as exc_info:
+                installation.update_organization_config(data)
+
+            assert "Resolve and unresolve status are required" in str(exc_info.value)
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_get_config_data_returns_status_mappings(self) -> None:
+        """Test that get_config_data returns status mappings correctly"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        # Create some IntegrationExternalProject records
+        IntegrationExternalProject.objects.create(
+            organization_integration_id=org_integration.id,
+            external_id="my-group/project-1",
+            name="my-group/project-1",
+            resolved_status="closed",
+            unresolved_status="opened",
+        )
+        IntegrationExternalProject.objects.create(
+            organization_integration_id=org_integration.id,
+            external_id="my-group/project-2",
+            name="my-group/project-2",
+            resolved_status="closed",
+            unresolved_status="opened",
+        )
+
+        # Get config data
+        config_data = installation.get_config_data()
+
+        # Verify status mappings are returned
+        assert "sync_status_forward" in config_data
+        mappings = config_data["sync_status_forward"]
+        assert len(mappings) == 2
+        assert mappings["my-group/project-1"] == {"on_resolve": "closed", "on_unresolve": "opened"}
+        assert mappings["my-group/project-2"] == {"on_resolve": "closed", "on_unresolve": "opened"}
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_status_outbound_resolve(self) -> None:
+        """Test resolving a Sentry issue closes the GitLab issue"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        # Create IntegrationExternalProject for status mapping
+        IntegrationExternalProject.objects.create(
+            organization_integration_id=org_integration.id,
+            external_id="cool-group/sentry",
+            name="cool-group/sentry",
+            resolved_status="closed",
+            unresolved_status="opened",
+        )
+
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="example.gitlab.com/group-x:cool-group/sentry#45",
+        )
+
+        # Mock get issue endpoint to return current state
         responses.add(
-            responses.POST, "https://gitlab.example.com/api/v4/hooks", json={"id": "webhook-id-1"}
+            responses.GET,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"iid": 45, "state": "opened", "title": "Test Issue"},
+            status=200,
         )
 
-        resp = self.client.get(
-            "{}?{}".format(
-                self.setup_path,
-                urlencode({"code": "oauth-code", "state": authorize_params["state"]}),
-            )
+        # Mock update issue status endpoint
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"iid": 45, "state": "closed", "title": "Test Issue"},
+            status=200,
         )
 
-        mock_access_token_request = responses.calls[0].request
-        req_params = parse_qs(mock_access_token_request.body)
-        assert req_params["grant_type"] == ["authorization_code"]
-        assert req_params["code"] == ["oauth-code"]
-        assert req_params["redirect_uri"] == ["http://testserver/extensions/gitlab/setup/"]
-        assert req_params["client_id"] == ["client_id"]
-        assert req_params["client_secret"] == ["client_secret"]
+        responses.calls.reset()
 
-        assert resp.status_code == 200
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_status_outbound(external_issue, is_resolved=True, project_id=1)
 
-        self.assertDialogSuccess(resp)
+        assert len(responses.calls) == 2
+        # First call gets current state
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == responses.calls[0].request.url
+        )
+        # Second call updates state
+        request = responses.calls[1].request
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == request.url
+        )
+        assert orjson.loads(request.body) == {"state_event": "close"}
 
     @responses.activate
-    @patch("sentry.integrations.gitlab.integration.sha1_text")
-    def test_basic_flow(self, mock_sha):
-        sha = Mock()
-        sha.hexdigest.return_value = "secret-token"
-        mock_sha.return_value = sha
-
-        self.assert_setup_flow()
-
-        integration = Integration.objects.get(provider=self.provider.key)
-
-        assert integration.external_id == "gitlab.example.com:4"
-        assert integration.name == "Cool"
-        assert integration.metadata == {
-            "instance": "gitlab.example.com",
-            "scopes": ["api"],
-            "icon": "https://gitlab.example.com/uploads/group/avatar/4/foo.jpg",
-            "domain_name": "gitlab.example.com/cool-group",
-            "verify_ssl": True,
-            "base_url": "https://gitlab.example.com",
-            "webhook_secret": "secret-token",
-            "group_id": self.default_group_id,
-            "include_subgroups": True,
-        }
-        oi = OrganizationIntegration.objects.get(
-            integration=integration, organization=self.organization
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_status_outbound_unresolve(self) -> None:
+        """Test unresolving a Sentry issue reopens the GitLab issue"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
         )
-        assert oi.config == {}
 
-        idp = IdentityProvider.objects.get(type="gitlab")
-        identity = Identity.objects.get(
-            idp=idp, user=self.user, external_id="gitlab.example.com:user_id_1"
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
         )
-        assert identity.status == IdentityStatus.VALID
-        assert identity.data == {"access_token": "xxxxx-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx"}
 
-    def test_goback_to_instructions(self):
-        # Go to instructions
-        resp = self.client.get(self.init_path)
-        assert resp.status_code == 200
-        self.assertContains(resp, "Step 1")
+        # Create IntegrationExternalProject for status mapping
+        IntegrationExternalProject.objects.create(
+            organization_integration_id=org_integration.id,
+            external_id="cool-group/sentry",
+            name="cool-group/sentry",
+            resolved_status="closed",
+            unresolved_status="opened",
+        )
 
-        # Go to setup form
-        resp = self.client.get(self.init_path_without_guide)
-        assert resp.status_code == 200
-        self.assertContains(resp, "Step 2")
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="example.gitlab.com/group-x:cool-group/sentry#45",
+        )
 
-        # Go to back to instructions
-        resp = self.client.get(self.init_path + "?goback=1")
-        assert resp.status_code == 200
-        self.assertContains(resp, "Step 1")
+        # Mock get issue endpoint to return current state
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"iid": 45, "state": "closed", "title": "Test Issue"},
+            status=200,
+        )
+
+        # Mock update issue status endpoint
+        responses.add(
+            responses.PUT,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"iid": 45, "state": "opened", "title": "Test Issue"},
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_status_outbound(external_issue, is_resolved=False, project_id=1)
+
+        assert len(responses.calls) == 2
+        # First call gets current state
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == responses.calls[0].request.url
+        )
+        # Second call updates state
+        request = responses.calls[1].request
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == request.url
+        )
+        assert orjson.loads(request.body) == {"state_event": "reopen"}
 
     @responses.activate
-    def test_setup_missing_group(self):
-        resp = self.client.get(self.init_path_without_guide)
-        assert resp.status_code == 200
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_status_outbound_no_mapping(self) -> None:
+        """Test that sync returns early if no IntegrationExternalProject exists"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
 
-        resp = self.client.post(self.init_path_without_guide, data=self.config)
-        assert resp.status_code == 302
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="example.gitlab.com/group-x:cool-group/sentry#45",
+        )
 
-        redirect = urlparse(resp["Location"])
-        assert redirect.scheme == "https"
-        assert redirect.netloc == "gitlab.example.com"
-        assert redirect.path == "/oauth/authorize"
+        responses.calls.reset()
 
-        params = parse_qs(redirect.query)
-        authorize_params = {k: v[0] for k, v in params.items()}
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_status_outbound(external_issue, is_resolved=True, project_id=1)
 
+        # Should not make any API calls
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_status_outbound_already_in_state(self) -> None:
+        """Test that sync skips update if GitLab issue is already in desired state"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        # Create IntegrationExternalProject for status mapping
+        IntegrationExternalProject.objects.create(
+            organization_integration_id=org_integration.id,
+            external_id="cool-group/sentry",
+            name="cool-group/sentry",
+            resolved_status="closed",
+            unresolved_status="opened",
+        )
+
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="example.gitlab.com/group-x:cool-group/sentry#45",
+        )
+
+        # Mock get issue endpoint to return state already closed
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"iid": 45, "state": "closed", "title": "Test Issue"},
+            status=200,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_status_outbound(external_issue, is_resolved=True, project_id=1)
+
+        # Should only call GET, not PUT since already in correct state
+        assert len(responses.calls) == 1
+        assert (
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45"
+            == responses.calls[0].request.url
+        )
+        assert responses.calls[0].request.method == "GET"
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_status_outbound_invalid_key(self) -> None:
+        """Test that sync handles malformed external issue keys gracefully"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="invalid-key-format",
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            installation.sync_status_outbound(external_issue, is_resolved=True, project_id=1)
+
+        # Should not make any API calls
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    @with_feature("organizations:integrations-gitlab-project-management")
+    def test_sync_status_outbound_api_error(self) -> None:
+        """Test that sync handles API errors gracefully"""
+        integration = Integration.objects.get(provider=self.provider)
+        installation = get_installation_of_type(
+            GitlabIntegration, integration, self.organization.id
+        )
+
+        org_integration = OrganizationIntegration.objects.get(
+            integration=integration, organization_id=self.organization.id
+        )
+
+        # Create IntegrationExternalProject for status mapping
+        IntegrationExternalProject.objects.create(
+            organization_integration_id=org_integration.id,
+            external_id="cool-group/sentry",
+            name="cool-group/sentry",
+            resolved_status="closed",
+            unresolved_status="opened",
+        )
+
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group,
+            integration=integration,
+            key="example.gitlab.com/group-x:cool-group/sentry#45",
+        )
+
+        # Mock get issue endpoint to return error
+        responses.add(
+            responses.GET,
+            "https://example.gitlab.com/api/v4/projects/cool-group%2Fsentry/issues/45",
+            json={"message": "404 Not Found"},
+            status=404,
+        )
+
+        responses.calls.reset()
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            with pytest.raises(IntegrationError):
+                installation.sync_status_outbound(external_issue, is_resolved=True, project_id=1)
+
+
+@control_silo_test
+class GitLabIntegrationApiPipelineTest(APITestCase):
+    endpoint = "sentry-api-0-organization-pipeline"
+    method = "post"
+
+    gitlab_url = "https://gitlab.example.com"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(self.user)
+        self.client_id = "app-id-abc123"
+        self.client_secret = "secret-xyz789"
+
+    def tearDown(self) -> None:
+        responses.reset()
+        super().tearDown()
+
+    def _get_pipeline_url(self, organization: Organization | None = None) -> str:
+        return reverse(
+            self.endpoint,
+            args=[(organization or self.organization).slug, IntegrationPipeline.pipeline_name],
+        )
+
+    def _initialize_pipeline(self, organization: Organization | None = None) -> Any:
+        return self.client.post(
+            self._get_pipeline_url(organization),
+            data={"action": "initialize", "provider": "gitlab"},
+            format="json",
+        )
+
+    def _get_step_info(self) -> Any:
+        return self.client.get(self._get_pipeline_url())
+
+    def _advance_step(self, data: dict[str, Any], organization: Organization | None = None) -> Any:
+        return self.client.post(self._get_pipeline_url(organization), data=data, format="json")
+
+    def _stub_gitlab_oauth(self) -> None:
         responses.add(
             responses.POST,
-            "https://gitlab.example.com/oauth/token",
-            json={"access_token": "access-token-value"},
+            f"{self.gitlab_url}/oauth/token",
+            json={
+                "access_token": "test-access-token",
+                "token_type": "bearer",
+                "refresh_token": "test-refresh-token",
+                "created_at": 1536798907,
+                "scope": "api",
+            },
         )
-        responses.add(responses.GET, "https://gitlab.example.com/api/v4/user", json={"id": 9})
+
+    def _stub_gitlab_user(self) -> None:
         responses.add(
-            responses.GET, "https://gitlab.example.com/api/v4/groups/cool-group", status=404
+            responses.GET,
+            f"{self.gitlab_url}/api/v4/user",
+            json={
+                "id": 42,
+                "username": "testuser",
+                "email": "test@example.com",
+                "name": "Test User",
+            },
         )
-        resp = self.client.get(
-            "{}?{}".format(
-                self.setup_path,
-                urlencode({"code": "oauth-code", "state": authorize_params["state"]}),
-            )
+
+    def _stub_gitlab_group(self) -> None:
+        responses.add(
+            responses.GET,
+            f"{self.gitlab_url}/api/v4/groups/my-group",
+            json={
+                "id": 1,
+                "full_name": "My Group",
+                "full_path": "my-group",
+                "avatar_url": "https://gitlab.example.com/avatar.png",
+                "web_url": "https://gitlab.example.com/my-group",
+            },
         )
+
+    def _submit_config(self, organization: Organization | None = None, **overrides: Any) -> Any:
+        data = {
+            "url": self.gitlab_url,
+            "group": "my-group",
+            "includeSubgroups": False,
+            "verifySsl": True,
+            "clientId": self.client_id,
+            "clientSecret": self.client_secret,
+        }
+        data.update(overrides)
+        return self._advance_step(data, organization)
+
+    def _get_pipeline_signature(self, resp: Any) -> str:
+        oauth_url = resp.data["data"]["oauthUrl"]
+        if not isinstance(oauth_url, str):
+            raise TypeError("GitLab pipeline response carries no OAuth URL")
+        return oauth_url.split("state=")[1].split("&")[0]
+
+    def _run_pipeline(self, organization: Organization | None = None, **overrides: Any) -> Any:
+        self._stub_gitlab_oauth()
+        self._stub_gitlab_user()
+        self._stub_gitlab_group()
+
+        self._initialize_pipeline(organization)
+        resp = self._submit_config(organization, **overrides)
+        pipeline_signature = self._get_pipeline_signature(resp)
+        return self._advance_step(
+            {"code": "gitlab-auth-code", "state": pipeline_signature}, organization
+        )
+
+    def _schedule_installation_deletion(
+        self, status: int, *, in_progress: bool = False
+    ) -> tuple[Integration, OrganizationIntegration]:
+        self._run_pipeline()
+        integration = Integration.objects.get(provider="gitlab")
+        organization_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id,
+            integration=integration,
+        )
+        organization_integration.update(status=status)
+        deletion = ScheduledDeletion.schedule(organization_integration, days=0)
+        if in_progress:
+            deletion.update(in_progress=True)
+        return integration, organization_integration
+
+    def _create_group_keyed_integration(
+        self,
+        organization_id: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        **org_integration_fields: Any,
+    ) -> Integration:
+        integration = self.create_provider_integration(
+            provider="gitlab",
+            external_id="gitlab.example.com:1",
+            name="My Group",
+            metadata=metadata
+            or {"instance": "gitlab.example.com", "webhook_secret": "existing-secret"},
+        )
+        self.create_organization_integration(
+            organization_id=organization_id or self.organization.id,
+            integration=integration,
+            **org_integration_fields,
+        )
+        return integration
+
+    @responses.activate
+    def test_initialize_pipeline(self) -> None:
+        resp = self._initialize_pipeline()
         assert resp.status_code == 200
-        self.assertContains(resp, "GitLab group could not be found")
+        assert resp.data["step"] == "installation_config"
+        assert resp.data["stepIndex"] == 0
+        assert resp.data["totalSteps"] == 2
+        assert resp.data["provider"] == "gitlab"
 
     @responses.activate
-    def test_get_group_id(self):
-        self.assert_setup_flow()
-        integration = Integration.objects.get(provider=self.provider.key)
-
-        installation = integration.get_installation(self.organization.id)
-        assert self.default_group_id == installation.get_group_id()
+    def test_config_step_data(self) -> None:
+        resp = self._initialize_pipeline()
+        data = resp.data["data"]
+        defaults = data["defaults"]
+        assert defaults["verifySsl"] is True
+        assert defaults["includeSubgroups"] is False
+        setup_values = data["setupValues"]
+        labels = [v["label"] for v in setup_values]
+        assert "Name" in labels
+        assert "Redirect URI" in labels
+        assert "Scopes" in labels
 
     @responses.activate
-    def test_get_stacktrace_link(self):
-        self.assert_setup_flow()
-        external_id = 4
-        integration = Integration.objects.get(provider=self.provider.key)
-        instance = integration.metadata["instance"]
-        repo = Repository.objects.create(
+    def test_config_step_validation_missing_required_fields(self) -> None:
+        self._initialize_pipeline()
+        resp = self._advance_step({"url": self.gitlab_url})
+        assert resp.status_code == 400
+        assert resp.data["clientId"] == ["This field is required."]
+        assert resp.data["clientSecret"] == ["This field is required."]
+
+    @responses.activate
+    def test_config_step_advance_to_oauth(self) -> None:
+        self._initialize_pipeline()
+        resp = self._submit_config()
+        assert resp.status_code == 200
+        assert resp.data["status"] == "advance"
+        assert resp.data["step"] == "oauth_login"
+        assert resp.data["stepIndex"] == 1
+        assert "oauthUrl" in resp.data["data"]
+        oauth_url = resp.data["data"]["oauthUrl"]
+        assert self.gitlab_url in oauth_url
+        assert "client_id=" in oauth_url
+
+    @responses.activate
+    def test_oauth_step_invalid_state(self) -> None:
+        self._initialize_pipeline()
+        self._submit_config()
+        resp = self._advance_step({"code": "abc123", "state": "wrong-state"})
+        assert resp.status_code == 400
+        assert resp.data["status"] == "error"
+
+    @responses.activate
+    def test_oauth_step_missing_code(self) -> None:
+        self._initialize_pipeline()
+        self._submit_config()
+        resp = self._advance_step({})
+        assert resp.status_code == 400
+        assert resp.data["code"] == ["This field is required."]
+        assert resp.data["state"] == ["This field is required."]
+
+    @responses.activate
+    def test_full_pipeline_flow(self) -> None:
+        self._stub_gitlab_oauth()
+        self._stub_gitlab_user()
+        self._stub_gitlab_group()
+
+        resp = self._initialize_pipeline()
+        assert resp.data["step"] == "installation_config"
+
+        resp = self._submit_config()
+        assert resp.data["step"] == "oauth_login"
+        pipeline_signature = self._get_pipeline_signature(resp)
+
+        resp = self._advance_step({"code": "gitlab-auth-code", "state": pipeline_signature})
+        assert resp.status_code == 200
+        assert resp.data["status"] == "complete"
+        assert "data" in resp.data
+
+        integration = Integration.objects.get(provider="gitlab")
+        assert integration.external_id == build_integration_external_id(
+            "gitlab.example.com", 1, self.organization.id
+        )
+        assert integration.metadata["base_url"] == self.gitlab_url
+        assert integration.metadata["group_id"] == 1
+
+        assert OrganizationIntegration.objects.filter(
             organization_id=self.organization.id,
-            name="Get Sentry / Example Repo",
-            external_id=f"{instance}:{external_id}",
-            url="https://gitlab.example.com/getsentry/projects/example-repo",
-            config={"project_id": external_id, "path": "getsentry/example-repo"},
+            integration=integration,
+        ).exists()
+
+    @responses.activate
+    def test_install_same_group_in_two_orgs_creates_separate_integrations(self) -> None:
+        self._run_pipeline()
+        first = Integration.objects.get(provider="gitlab")
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            other_org = self.create_organization(name="other-org", owner=self.user)
+        resp = self._run_pipeline(other_org)
+
+        assert resp.data["status"] == "complete"
+        second = Integration.objects.exclude(id=first.id).get(provider="gitlab")
+        assert second.external_id == build_integration_external_id(
+            "gitlab.example.com", 1, other_org.id
+        )
+        assert second.metadata["webhook_secret"] != first.metadata["webhook_secret"]
+
+    @responses.activate
+    def test_install_does_not_join_group_keyed_integration_of_another_org(self) -> None:
+        with assume_test_silo_mode(SiloMode.CELL):
+            other_org = self.create_organization(name="other-org")
+        group_keyed = self._create_group_keyed_integration(organization_id=other_org.id)
+
+        self._run_pipeline(verifySsl=False)
+
+        assert Integration.objects.filter(
+            provider="gitlab",
+            external_id=build_integration_external_id(
+                "gitlab.example.com", 1, self.organization.id
+            ),
+        ).exists()
+        group_keyed.refresh_from_db()
+        assert group_keyed.metadata == {
+            "instance": "gitlab.example.com",
+            "webhook_secret": "existing-secret",
+        }
+
+    @responses.activate
+    def test_reinstall_rejects_group_keyed_pending_deletion(self) -> None:
+        group_keyed = self._create_group_keyed_integration(status=ObjectStatus.PENDING_DELETION)
+        group_installation = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id,
+            integration=group_keyed,
+        )
+        ScheduledDeletion.schedule(group_installation, days=0)
+
+        resp = self._run_pipeline()
+
+        assert resp.data["status"] == "error"
+        assert "contact Sentry Support" in resp.data["data"]["detail"]
+        assert Integration.objects.filter(provider="gitlab").count() == 1
+        group_installation.refresh_from_db()
+        assert group_installation.status == ObjectStatus.PENDING_DELETION
+        assert ScheduledDeletion.objects.filter(
+            model_name="OrganizationIntegration",
+            object_id=group_installation.id,
+        ).exists()
+
+    @responses.activate
+    def test_reinstall_rejects_group_keyed_deletion_in_progress(self) -> None:
+        group_keyed = self._create_group_keyed_integration(status=ObjectStatus.DELETION_IN_PROGRESS)
+        group_installation = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id,
+            integration=group_keyed,
+        )
+        deletion = ScheduledDeletion.schedule(group_installation, days=0)
+        deletion.update(in_progress=True)
+
+        resp = self._run_pipeline()
+
+        assert resp.data["status"] == "error"
+        assert "contact Sentry Support" in resp.data["data"]["detail"]
+        assert Integration.objects.filter(provider="gitlab").count() == 1
+
+    @responses.activate
+    def test_config_step_rejects_blank_group(self) -> None:
+        self._initialize_pipeline()
+        resp = self._submit_config(group="")
+        assert resp.status_code == 400
+        assert resp.data["group"] == ["This field may not be blank."]
+        assert not Integration.objects.filter(provider="gitlab").exists()
+
+    @responses.activate
+    def test_config_step_rejects_missing_group(self) -> None:
+        self._initialize_pipeline()
+        data = {
+            "url": self.gitlab_url,
+            "clientId": self.client_id,
+            "clientSecret": self.client_secret,
+        }
+        resp = self._advance_step(data)
+        assert resp.status_code == 400
+        assert resp.data["group"] == ["This field is required."]
+        assert not Integration.objects.filter(provider="gitlab").exists()
+
+    @responses.activate
+    def test_build_integration_without_group_in_state_does_not_install(self) -> None:
+        self._stub_gitlab_oauth()
+        self._stub_gitlab_user()
+
+        self._initialize_pipeline()
+        resp = self._submit_config()
+        pipeline_signature = self._get_pipeline_signature(resp)
+
+        # Simulate state that bypassed the config step's validation.
+        original_build = GitlabIntegrationProvider.build_integration
+
+        def build_without_group(provider: Any, state: Any) -> Any:
+            installation_data = {**state["installation_data"], "group": ""}
+            return original_build(provider, {**state, "installation_data": installation_data})
+
+        with patch.object(GitlabIntegrationProvider, "build_integration", build_without_group):
+            resp = self._advance_step({"code": "gitlab-auth-code", "state": pipeline_signature})
+
+        assert resp.status_code == 400
+        assert resp.data["status"] == "error"
+        assert "group is required" in resp.data["data"]["detail"]
+        assert not Integration.objects.filter(provider="gitlab").exists()
+
+    @responses.activate
+    def test_config_strips_trailing_slash(self) -> None:
+        self._stub_gitlab_oauth()
+        self._stub_gitlab_user()
+        self._stub_gitlab_group()
+
+        self._initialize_pipeline()
+        resp = self._submit_config(url=f"{self.gitlab_url}///")
+        assert resp.data["status"] == "advance"
+        oauth_url = resp.data["data"]["oauthUrl"]
+        assert "gitlab.example.com/oauth/authorize" in oauth_url
+        assert "///" not in oauth_url
+
+    @responses.activate
+    def test_install_generates_webhook_secret(self) -> None:
+        self._run_pipeline()
+
+        integration = Integration.objects.get(provider="gitlab")
+        secret = integration.metadata["webhook_secret"]
+        assert secret
+        # The inbound webhook token is "<instance>:<group>:<secret>".
+        assert ":" not in secret
+
+    @responses.activate
+    def test_install_syncs_repositories_and_schedules_webhook_update(self) -> None:
+        with (
+            patch("sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay") as schedule,
+            patch(
+                "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+            ) as sync,
+        ):
+            resp = self._run_pipeline()
+
+        assert resp.data["status"] == "complete"
+        integration = Integration.objects.get(provider="gitlab")
+        schedule.assert_called_once_with(
+            organization_id=self.organization.id, integration_id=integration.id, force=True
+        )
+        org_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id, integration=integration
+        )
+        sync.assert_called_once_with(organization_integration_id=org_integration.id)
+        with (
+            assume_test_silo_mode(SiloMode.CELL),
+            patch("sentry.integrations.gitlab.tasks.update_project_webhook.delay") as update,
+            patch("sentry.integrations.utils.metrics.EventLifecycle.record_halt") as halt,
+        ):
+            update_all_project_webhooks(**schedule.call_args.kwargs)
+
+        halt.assert_called_once_with(GitLabWebhookUpdateHaltReason.NO_REPOSITORIES)
+        update.assert_not_called()
+
+        responses.add(
+            responses.GET,
+            f"{self.gitlab_url}/api/v4/groups/1/projects",
+            json=[
+                {
+                    "id": 101,
+                    "name_with_namespace": "My Group / Example",
+                    "path_with_namespace": "my-group/example",
+                    "web_url": f"{self.gitlab_url}/my-group/example",
+                }
+            ],
+        )
+        hook = responses.add(
+            responses.POST,
+            f"{self.gitlab_url}/api/v4/projects/101/hooks",
+            json={"id": 99},
+        )
+        with self.tasks():
+            sync_repos_for_org(**sync.call_args.kwargs)
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            repo = Repository.objects.get(organization_id=self.organization.id)
+            assert repo.integration_id == integration.id
+            assert repo.external_id == "gitlab.example.com:101"
+            assert repo.config["webhook_id"] == 99
+        assert hook.call_count == 1
+
+    @responses.activate
+    def test_reinstall_sync_relinks_repositories_with_overlapping_webhook_updates(self) -> None:
+        self._run_pipeline()
+        integration = Integration.objects.get(provider="gitlab")
+        org_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id, integration=integration
+        )
+        org_integration.delete()
+        repo = self.create_repo(
+            project=self.project,
+            provider="integrations:gitlab",
+            external_id="gitlab.example.com:101",
+            name="My Group / Example",
+        )
+        with assume_test_silo_mode(SiloMode.CELL):
+            repo.update(config={"project_id": 101, "webhook_id": 99})
+
+        with (
+            patch("sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay") as update,
+            patch(
+                "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+            ) as sync,
+        ):
+            resp = self._run_pipeline()
+
+        assert resp.data["status"] == "complete"
+        new_org_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id, integration=integration
+        )
+        sync.assert_called_once_with(organization_integration_id=new_org_integration.id)
+        update.assert_called_once_with(
+            organization_id=self.organization.id, integration_id=integration.id, force=True
+        )
+        responses.add(
+            responses.GET,
+            f"{self.gitlab_url}/api/v4/groups/1/projects",
+            json=[
+                {
+                    "id": 101,
+                    "name_with_namespace": "My Group / Example",
+                    "path_with_namespace": "my-group/example",
+                    "web_url": f"{self.gitlab_url}/my-group/example",
+                }
+            ],
+        )
+        hook = responses.add(
+            responses.PUT,
+            f"{self.gitlab_url}/api/v4/projects/101/hooks/99",
+            json={"id": 99},
+            match=[
+                responses.matchers.json_params_matcher(
+                    {
+                        "token": f"{integration.external_id}:{integration.metadata['webhook_secret']}"
+                    },
+                    strict_match=False,
+                )
+            ],
+        )
+
+        # The fan-out may run before relinking, after it, or again on retry.
+        with assume_test_silo_mode(SiloMode.CELL), self.tasks():
+            update_all_project_webhooks(**update.call_args.kwargs)
+        with self.tasks():
+            sync_repos_for_org(**sync.call_args.kwargs)
+        with assume_test_silo_mode(SiloMode.CELL), self.tasks():
+            update_all_project_webhooks(**update.call_args.kwargs)
+            update_all_project_webhooks(**update.call_args.kwargs)
+            repo.refresh_from_db()
+            assert repo.integration_id == integration.id
+            assert repo.config["webhook_id"] == 99
+            assert Repository.objects.filter(organization_id=self.organization.id).count() == 1
+
+        assert hook.call_count >= 2
+
+    @responses.activate
+    def test_install_webhook_update_disabled(self) -> None:
+        with (
+            self.options({"gitlab.webhook-update-on-install.enabled": False}),
+            patch("sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay") as schedule,
+            patch(
+                "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+            ) as sync,
+        ):
+            resp = self._run_pipeline()
+
+        assert resp.data["status"] == "complete"
+        schedule.assert_not_called()
+        sync.assert_not_called()
+
+    @responses.activate
+    def test_reinstall_bypasses_settings_reconcile_debounce(self) -> None:
+        self._run_pipeline()
+        integration = Integration.objects.get(provider="gitlab")
+        org_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id, integration=integration
+        )
+        config = {"sync_comments": True}
+        org_integration.update(config=config)
+        repo = self.create_repo(
+            project=self.project,
             provider="integrations:gitlab",
             integration_id=integration.id,
+            external_id="gitlab.example.com:101",
         )
-        installation = integration.get_installation(self.organization.id)
+        with assume_test_silo_mode(SiloMode.CELL):
+            repo.update(config={"project_id": 101, "webhook_id": 99})
+        hook = responses.add(
+            responses.PUT,
+            f"{self.gitlab_url}/api/v4/projects/101/hooks/99",
+            json={"id": 99},
+        )
 
-        filepath = "README.md"
-        ref = "master"
-        version = "12345678"
-        responses.add(
-            responses.HEAD,
-            f"https://gitlab.example.com/api/v4/projects/{external_id}/repository/files/{filepath}?ref={version}",
+        # A settings save just reconciled this integration; reinstall must still run.
+        with assume_test_silo_mode(SiloMode.CELL), self.tasks():
+            update_all_project_webhooks(
+                organization_id=self.organization.id, integration_id=integration.id
+            )
+        assert hook.call_count == 1
+
+        with patch(
+            "sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay"
+        ) as schedule:
+            resp = self._run_pipeline()
+
+        assert resp.data["status"] == "complete"
+        schedule.assert_called_once_with(
+            organization_id=self.organization.id, integration_id=integration.id, force=True
         )
-        source_url = installation.get_stacktrace_link(repo, "README.md", ref, version)
-        assert (
-            source_url
-            == "https://gitlab.example.com/getsentry/example-repo/blob/12345678/README.md"
+        org_integration.refresh_from_db()
+        assert org_integration.config == config
+        with assume_test_silo_mode(SiloMode.CELL), self.tasks():
+            repo.refresh_from_db()
+            assert repo.integration_id == integration.id
+            update_all_project_webhooks(**schedule.call_args.kwargs)
+
+        assert hook.call_count == 2
+        payload = orjson.loads(responses.calls[-1].request.body)
+        assert payload["token"] == (
+            f"{integration.external_id}:{integration.metadata['webhook_secret']}"
+        )
+
+    @responses.activate
+    def test_failed_reinstall_preserves_pending_deletion(self) -> None:
+        _, organization_integration = self._schedule_installation_deletion(
+            ObjectStatus.PENDING_DELETION
+        )
+        with (
+            patch.object(Integration, "add_organization", return_value=None),
+            patch("sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay") as schedule,
+            patch(
+                "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+            ) as sync,
+        ):
+            resp = self._run_pipeline()
+
+        assert resp.data["status"] == "error"
+        schedule.assert_not_called()
+        sync.assert_not_called()
+        organization_integration.refresh_from_db()
+        assert organization_integration.status == ObjectStatus.PENDING_DELETION
+        assert ScheduledDeletion.objects.filter(
+            model_name="OrganizationIntegration",
+            object_id=organization_integration.id,
+        ).exists()
+
+    @responses.activate
+    def test_reinstall_preserves_webhook_secret(self) -> None:
+        self._run_pipeline()
+        integration = Integration.objects.get(provider="gitlab")
+        secret = integration.metadata["webhook_secret"]
+
+        resp = self._run_pipeline(clientId="app-id-def456", verifySsl=False)
+        assert resp.data["status"] == "complete"
+
+        assert Integration.objects.filter(provider="gitlab").count() == 1
+        integration.refresh_from_db()
+        assert integration.metadata["webhook_secret"] == secret
+        assert integration.metadata["verify_ssl"] is False
+        assert integration.metadata["scopes"] == ["api"]
+
+    @responses.activate
+    def test_reinstall_preserves_disabled_organization_integration(self) -> None:
+        self._run_pipeline()
+        organization_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id,
+            integration__provider="gitlab",
+        )
+        organization_integration.update(status=ObjectStatus.DISABLED)
+
+        resp = self._run_pipeline()
+
+        assert resp.data["status"] == "complete"
+        organization_integration.refresh_from_db()
+        assert organization_integration.status == ObjectStatus.DISABLED
+
+    @responses.activate
+    def test_reinstall_rejects_pending_deletion(self) -> None:
+        integration, organization_integration = self._schedule_installation_deletion(
+            ObjectStatus.PENDING_DELETION
+        )
+        metadata = integration.metadata
+
+        resp = self._run_pipeline()
+
+        assert resp.data["status"] == "error"
+        assert "being removed" in resp.data["data"]["detail"]
+        organization_integration.refresh_from_db()
+        assert organization_integration.status == ObjectStatus.PENDING_DELETION
+        assert ScheduledDeletion.objects.filter(
+            model_name="OrganizationIntegration",
+            object_id=organization_integration.id,
+        ).exists()
+        integration.refresh_from_db()
+        assert integration.metadata == metadata
+
+    def _assert_reinstall_rejects_deletion(self, status: int, *, in_progress: bool) -> None:
+        integration, organization_integration = self._schedule_installation_deletion(
+            status,
+            in_progress=in_progress,
+        )
+        metadata = integration.metadata
+        assert organization_integration.default_auth_id is not None
+        identity = Identity.objects.get(id=organization_integration.default_auth_id)
+        identity_data = identity.data
+
+        resp = self._run_pipeline(clientId="app-id-def456", verifySsl=False)
+
+        assert resp.data["status"] == "error"
+        assert "being removed" in resp.data["data"]["detail"]
+        organization_integration.refresh_from_db()
+        assert organization_integration.status == status
+        integration.refresh_from_db()
+        assert integration.metadata == metadata
+        identity.refresh_from_db()
+        assert identity.data == identity_data
+
+    @responses.activate
+    def test_reinstall_rejects_selected_deletion(self) -> None:
+        self._assert_reinstall_rejects_deletion(
+            ObjectStatus.PENDING_DELETION,
+            in_progress=True,
         )
 
     @responses.activate
-    def test_get_stacktrace_link_file_doesnt_exist(self):
-        self.assert_setup_flow()
-        external_id = 4
-        integration = Integration.objects.get(provider=self.provider.key)
-        instance = integration.metadata["instance"]
-        repo = Repository.objects.create(
-            organization_id=self.organization.id,
-            name="Get Sentry / Example Repo",
-            external_id=f"{instance}:{external_id}",
-            url="https://gitlab.example.com/getsentry/projects/example-repo",
-            config={"project_id": external_id, "path": "getsentry/example-repo"},
-            provider="integrations:gitlab",
-            integration_id=integration.id,
+    def test_reinstall_rejects_deletion_in_progress(self) -> None:
+        self._assert_reinstall_rejects_deletion(
+            ObjectStatus.DELETION_IN_PROGRESS,
+            in_progress=True,
         )
-        installation = integration.get_installation(self.organization.id)
-
-        filepath = "README.md"
-        ref = "master"
-        version = None
-        responses.add(
-            responses.HEAD,
-            f"https://gitlab.example.com/api/v4/projects/{external_id}/repository/files/{filepath}?ref={ref}",
-            status=404,
-        )
-        source_url = installation.get_stacktrace_link(repo, "README.md", ref, version)
-        assert not source_url
 
     @responses.activate
-    def test_get_stacktrace_link_use_default_if_version_404(self):
-        self.assert_setup_flow()
-        external_id = 4
-        integration = Integration.objects.get(provider=self.provider.key)
-        instance = integration.metadata["instance"]
-        repo = Repository.objects.create(
-            organization_id=self.organization.id,
-            name="Get Sentry / Example Repo",
-            external_id=f"{instance}:{external_id}",
-            url="https://gitlab.example.com/getsentry/projects/example-repo",
-            config={"project_id": external_id, "path": "getsentry/example-repo"},
-            provider="integrations:gitlab",
-            integration_id=integration.id,
-        )
-        installation = integration.get_installation(self.organization.id)
+    def test_reinstall_rejects_active_group_keyed_integration(self) -> None:
+        integration = self._create_group_keyed_integration()
 
-        filepath = "README.md"
-        ref = "master"
-        version = "12345678"
-        responses.add(
-            responses.HEAD,
-            f"https://gitlab.example.com/api/v4/projects/{external_id}/repository/files/{filepath}?ref={version}",
-            status=404,
-        )
-        responses.add(
-            responses.HEAD,
-            f"https://gitlab.example.com/api/v4/projects/{external_id}/repository/files/{filepath}?ref={ref}",
-        )
-        source_url = installation.get_stacktrace_link(repo, "README.md", ref, version)
-        assert (
-            source_url == "https://gitlab.example.com/getsentry/example-repo/blob/master/README.md"
-        )
+        with assume_test_silo_mode(SiloMode.CELL):
+            other_org = self.create_organization(name="other-org")
+        self.create_organization_integration(organization_id=other_org.id, integration=integration)
+
+        with patch(
+            "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+        ) as sync:
+            resp = self._run_pipeline(clientId="app-id-def456")
+
+        assert resp.data["status"] == "error"
+        assert "contact Sentry Support" in resp.data["data"]["detail"]
+        sync.assert_not_called()
+
+        assert Integration.objects.filter(provider="gitlab").count() == 1
+        assert OrganizationIntegration.objects.filter(
+            organization_id=other_org.id, integration=integration
+        ).exists()
+
+    @responses.activate
+    def test_install_after_deleting_group_keyed_integration_link(self) -> None:
+        group_keyed = self._create_group_keyed_integration()
+        OrganizationIntegration.objects.get(
+            organization_id=self.organization.id,
+            integration=group_keyed,
+        ).delete()
+
+        resp = self._run_pipeline()
+
+        assert resp.data["status"] == "complete"
+        assert OrganizationIntegration.objects.filter(
+            organization_id=self.organization.id,
+            integration__external_id=build_integration_external_id(
+                "gitlab.example.com", 1, self.organization.id
+            ),
+        ).exists()
+
+    @responses.activate
+    def test_reinstall_preserves_webhook_secret_when_integration_is_disabled(self) -> None:
+        self._run_pipeline()
+        integration = Integration.objects.get(provider="gitlab")
+        secret = integration.metadata["webhook_secret"]
+        integration.update(status=ObjectStatus.DISABLED)
+
+        self._run_pipeline(clientId="app-id-def456")
+
+        integration.refresh_from_db()
+        assert integration.metadata["webhook_secret"] == secret
+        assert integration.status == ObjectStatus.ACTIVE
+
+    @responses.activate
+    def test_install_backfills_missing_webhook_secret(self) -> None:
+        self._run_pipeline()
+        integration = Integration.objects.get(provider="gitlab")
+        integration.update(metadata={"instance": "gitlab.example.com"})
+
+        self._run_pipeline()
+
+        integration.refresh_from_db()
+        assert integration.metadata["webhook_secret"]

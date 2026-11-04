@@ -1,0 +1,83 @@
+import orderBy from 'lodash/orderBy';
+
+import {Stack} from '@sentry/scraps/layout';
+
+import type {Relay, RelayActivity} from 'sentry/types/relay';
+
+import {ActivityList} from './activityList';
+import {CardHeader} from './cardHeader';
+import {getRelaysByPublicKey} from './utils';
+import {WaitingActivity} from './waitingActivity';
+
+type CardHeaderProps = React.ComponentProps<typeof CardHeader>;
+type WaitingActivityProps = React.ComponentProps<typeof WaitingActivity>;
+
+type Props = {
+  disabled: boolean;
+  relayActivities: RelayActivity[];
+  relays: Relay[];
+  registerKeyAction?: React.ReactNode;
+} & Pick<CardHeaderProps, 'onDelete' | 'onEdit'> &
+  Pick<WaitingActivityProps, 'onRefresh'>;
+
+function RelayCardContent({
+  activities,
+  disabled,
+  onRefresh,
+}: {
+  activities: RelayActivity[];
+  disabled: boolean;
+  onRefresh: WaitingActivityProps['onRefresh'];
+}) {
+  if (!activities.length) {
+    return <WaitingActivity onRefresh={onRefresh} disabled={disabled} />;
+  }
+
+  return <ActivityList activities={activities} />;
+}
+
+export function List({
+  relays,
+  relayActivities,
+  onRefresh,
+  onDelete,
+  onEdit,
+  disabled,
+  registerKeyAction,
+}: Props) {
+  const orderedRelays = orderBy(relays, relay => relay.created, ['desc']);
+
+  const relaysByPublicKey = getRelaysByPublicKey(orderedRelays, relayActivities);
+
+  return (
+    <Stack gap="xl">
+      {Object.keys(relaysByPublicKey).map(relayByPublicKey => {
+        const {name, description, created, activities} =
+          relaysByPublicKey[relayByPublicKey]!;
+        return (
+          <Stack key={relayByPublicKey} gap="md">
+            <CardHeader
+              publicKey={relayByPublicKey}
+              name={name}
+              description={description}
+              created={created}
+              onEdit={onEdit}
+              onDelete={onDelete}
+              disabled={disabled}
+              extraAction={
+                relayByPublicKey === orderedRelays[0]?.publicKey
+                  ? registerKeyAction
+                  : undefined
+              }
+            />
+            <RelayCardContent
+              activities={activities}
+              disabled={disabled}
+              onRefresh={onRefresh}
+            />
+          </Stack>
+        );
+      })}
+    </Stack>
+  );
+}

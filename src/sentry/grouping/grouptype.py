@@ -1,0 +1,65 @@
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from sentry.issues.grouptype import GroupCategory, GroupType
+from sentry.models.group import DEFAULT_TYPE_ID
+from sentry.types.group import PriorityLevel
+from sentry.workflow_engine.endpoints.validators.error_detector import ErrorDetectorValidator
+from sentry.workflow_engine.handlers.detector.base import (
+    BaseDetectorHandler,
+    DetectorEvaluations,
+    DetectorGroupValues,
+    DetectorOccurrence,
+    EventData,
+)
+from sentry.workflow_engine.models.data_source import DataPacket
+from sentry.workflow_engine.processors import DetectorEvaluation
+from sentry.workflow_engine.registry import detector_settings_registry
+from sentry.workflow_engine.types import (
+    DetectorGroupKey,
+    DetectorSettings,
+    DetectorType,
+)
+
+
+# This class allows error issues to be associated with a detector. However,
+# user-defined logic for fingerprinting and auto-resolve rules are stored in project settings.
+# TODO: Move these project settings to the detector configuration
+class ErrorDetectorHandler(BaseDetectorHandler[object, object]):
+    """
+    Placeholder handler for error group types.
+
+    Packets never contain anything for it to evaluate, so it never creates occurrences.
+    """
+
+    def extract_value(self, data_packet: DataPacket[object]) -> DetectorGroupValues[object]:
+        return DetectorGroupValues()
+
+    def evaluate(
+        self, data_packet: DataPacket[object], values: Mapping[DetectorGroupKey, object]
+    ) -> DetectorEvaluations:
+        return DetectorEvaluations(evaluations={}, tainted=False)
+
+    def create_occurrence(
+        self,
+        evaluation: DetectorEvaluation,
+        data_packet: DataPacket[object],
+    ) -> tuple[DetectorOccurrence, EventData]:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ErrorGroupType(GroupType):
+    type_id = DEFAULT_TYPE_ID
+    slug = "error"
+    description = "Error"
+    category = GroupCategory.ERROR.value
+    default_priority = PriorityLevel.MEDIUM
+    released = True
+
+
+@detector_settings_registry.register(DetectorType.ERROR)
+class ErrorDetectorSettings(DetectorSettings):
+    handler = ErrorDetectorHandler
+    validator = ErrorDetectorValidator
+    config_schema = {"type": "object", "additionalProperties": False}

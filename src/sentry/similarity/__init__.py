@@ -1,11 +1,17 @@
+from __future__ import annotations
+
 import logging
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, cast
 
 from django.conf import settings
 
+from sentry import features as feature_flags
 from sentry.interfaces.stacktrace import Frame
+from sentry.similarity.backends.abstract import AbstractIndexBackend
 from sentry.similarity.backends.dummy import DummyIndexBackend
 from sentry.similarity.backends.metrics import MetricsWrapper
-from sentry.similarity.backends.redis import RedisScriptMinHashIndexBackend
+from sentry.similarity.backends.redis import Cluster, RedisScriptMinHashIndexBackend
 from sentry.similarity.encoder import Encoder
 from sentry.similarity.features import (
     ExceptionFeature,
@@ -14,27 +20,27 @@ from sentry.similarity.features import (
     MessageFeature,
     get_application_chunks,
 )
-from sentry.similarity.featuresv2 import GroupingBasedFeatureSet
 from sentry.similarity.signatures import MinHashSignatureBuilder
 from sentry.utils import redis
-from sentry.utils.compat import map
 from sentry.utils.datastructures import BidirectionalMapping
 from sentry.utils.iterators import shingle
-from sentry import features as feature_flags
+
+if TYPE_CHECKING:
+    from sentry.models.project import Project
 
 logger = logging.getLogger(__name__)
 
 
-def text_shingle(n, value):
-    return map("".join, shingle(n, value))
+def text_shingle(n: int, value: str) -> list[str]:
+    return ["".join(part) for part in shingle(n, value)]
 
 
 class FrameEncodingError(ValueError):
     pass
 
 
-def get_frame_attributes(frame):
-    attributes = {}
+def get_frame_attributes(frame: Frame) -> dict[str, object]:
+    attributes: dict[str, object] = {}
 
     if frame.function in {"<lambda>", None}:
         if frame.context_line is None:
@@ -59,7 +65,7 @@ def get_frame_attributes(frame):
     return attributes
 
 
-def _make_index_backend(cluster, namespace="sim:1"):
+def _make_index_backend(cluster: object, namespace: str = "sim:1") -> AbstractIndexBackend:
     if isinstance(cluster, str):
         cluster_id = cluster
 
@@ -67,12 +73,18 @@ def _make_index_backend(cluster, namespace="sim:1"):
             cluster = redis.redis_clusters.get(cluster_id)
         except KeyError:
             index = DummyIndexBackend()
-            logger.info(f"No redis cluster provided for similarity, using {index!r}.")
+            logger.info("No redis cluster provided for similarity, using %s.", repr(index))
             return index
 
     return MetricsWrapper(
         RedisScriptMinHashIndexBackend(
-            cluster, namespace, MinHashSignatureBuilder(16, 0xFFFF), 8, 60 * 60 * 24 * 30, 3, 5000
+            cast("Cluster", cluster),
+            namespace,
+            MinHashSignatureBuilder(16, 0xFFFF),
+            8,
+            60 * 60 * 24 * 30,
+            3,
+            5000,
         ),
         scope_tag_name=None,
     )
@@ -84,13 +96,16 @@ features = FeatureSet(
         namespace="sim:1",
     ),
     Encoder({Frame: get_frame_attributes}),
-    BidirectionalMapping(
-        {
-            "exception:message:character-shingles": "a",
-            "exception:stacktrace:application-chunks": "b",
-            "exception:stacktrace:pairs": "c",
-            "message:message:character-shingles": "d",
-        }
+    cast(
+        "Mapping[str, str]",
+        BidirectionalMapping(
+            {
+                "exception:message:character-shingles": "a",
+                "exception:stacktrace:application-chunks": "b",
+                "exception:stacktrace:pairs": "c",
+                "message:message:character-shingles": "d",
+            }
+        ),
     ),
     {
         "exception:message:character-shingles": ExceptionFeature(
@@ -110,27 +125,13 @@ features = FeatureSet(
     expected_encoding_errors=(FrameEncodingError,),
 )
 
-features2 = GroupingBasedFeatureSet(
-    _make_index_backend(
-        getattr(settings, "SENTRY_SIMILARITY2_INDEX_REDIS_CLUSTER", None)
-        or getattr(settings, "SENTRY_SIMILARITY_INDEX_REDIS_CLUSTER", None)
-        or "similarity",
-        namespace="sim:2",
-    )
-)
 
-
-def _build_dispatcher(methodname):
-    # TODO: Delete when features2 supersedes features.
+def _build_dispatcher(methodname: str) -> Callable[..., None]:
     v1_method = getattr(features, methodname)
-    v2_method = getattr(features2, methodname)
 
-    def inner(project, *args, **kwargs):
+    def inner(project: Project | None, *args: object, **kwargs: object) -> None:
         if project is None or feature_flags.has("projects:similarity-indexing", project):
             v1_method(*args, **kwargs)
-
-        if project is None or feature_flags.has("projects:similarity-indexing-v2", project):
-            v2_method(*args, **kwargs)
 
     inner.__name__ = methodname
 

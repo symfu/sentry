@@ -1,58 +1,288 @@
+from __future__ import annotations
+
+import bisect
+import functools
 import re
-from collections import namedtuple, defaultdict
-from copy import deepcopy
+from collections.abc import Callable, Generator, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeIs, overload
 
+import re2
 from django.utils.functional import cached_property
-from parsimonious.expressions import Optional
-from parsimonious.exceptions import IncompleteParseError, ParseError
-from parsimonious.nodes import Node, RegexNode
-from parsimonious.grammar import Grammar, NodeVisitor
-from sentry_relay.consts import SPAN_STATUS_NAME_TO_CODE
+from parsimonious.exceptions import IncompleteParseError
+from parsimonious.grammar import Grammar
+from parsimonious.nodes import Node, NodeVisitor, RegexNode
 
-from sentry import eventstore
-from sentry.discover.models import KeyTransaction
-from sentry.models import Project
-from sentry.models.group import Group
+from sentry.exceptions import IncompatibleMetricsQuery, InvalidSearchQuery
+from sentry.search.events.constants import (
+    DURATION_UNITS,
+    NOT_HAS_FILTER_ERROR_MESSAGE,
+    OPERATOR_NEGATION_MAP,
+    SEARCH_MAP,
+    SEMVER_ALIAS,
+    SEMVER_BUILD_ALIAS,
+    SIZE_UNITS,
+    TAG_KEY_RE,
+    TEAM_KEY_TRANSACTION_ALIAS,
+    WILDCARD_OPERATOR_MAP,
+)
+from sentry.search.events.fields import FIELD_ALIASES, FUNCTIONS
+from sentry.search.events.types import ParamsType, QueryBuilderConfig
 from sentry.search.utils import (
-    parse_duration,
-    parse_percentage,
+    InvalidQuery,
     parse_datetime_range,
     parse_datetime_string,
     parse_datetime_value,
+    parse_duration,
     parse_numeric_value,
-    parse_release,
-    InvalidQuery,
+    parse_percentage,
+    parse_size,
 )
 from sentry.snuba.dataset import Dataset
-from sentry.utils.dates import to_timestamp
-from sentry.utils.snuba import (
-    DATASETS,
-    FUNCTION_TO_OPERATOR,
-    get_json_type,
-    is_measurement,
-    is_duration_measurement,
-    OPERATOR_TO_FUNCTION,
-    SNUBA_AND,
-    SNUBA_OR,
+from sentry.utils.snuba import is_duration_measurement, is_measurement, is_span_op_breakdown
+from sentry.utils.validators import is_event_id, is_span_id
+
+# A wildcard is an asterisk prefixed by an even number of back slashes.
+# If there are an odd number of back slashes, then the back slash immediately
+# before the asterisk is actually escaping the asterisk.
+WILDCARD_CHARS = re.compile(r"(?<!\\)(\\\\)*\*")
+
+event_search_grammar = Grammar(
+    r"""
+search = spaces term*
+
+term = (boolean_operator / paren_group / filter / free_text) spaces
+
+boolean_operator = or_operator / and_operator
+
+paren_group = open_paren spaces term+ closed_paren
+
+free_text          = free_text_quoted / free_text_unquoted
+free_text_unquoted = (!filter !boolean_operator (free_parens / ~r"[^()\n ]+") spaces)+
+free_text_quoted   = quoted_value
+free_parens        = open_paren free_text? closed_paren
+
+# All key:value filter types
+filter = date_filter
+       / specific_date_filter
+       / rel_date_filter
+       / duration_filter
+       / size_filter
+       / boolean_filter
+       / numeric_in_filter
+       / numeric_filter
+       / aggregate_duration_filter
+       / aggregate_percentage_filter
+       / aggregate_numeric_filter
+       / aggregate_size_filter
+       / aggregate_date_filter
+       / aggregate_rel_date_filter
+       / has_in_filter
+       / has_filter
+       / is_filter
+       / regex_filter
+       / array_includes_filter
+       / text_in_filter
+       / text_filter
+
+# filter for dates
+date_filter = search_key sep operator iso_8601_date_format
+
+# exact date filter for dates
+specific_date_filter = search_key sep iso_8601_date_format
+
+# filter for relative dates
+rel_date_filter = search_key sep rel_date_format
+
+# filter for durations
+duration_filter = negation? search_key sep operator? duration_format
+
+# filter for size
+size_filter = negation? search_key sep operator? size_format
+
+# boolean comparison filter
+boolean_filter = negation? search_key sep boolean_value
+
+# numeric in filter
+numeric_in_filter = negation? search_key sep numeric_in_list
+
+# numeric comparison filter
+numeric_filter = negation? search_key sep operator? numeric_value
+
+# aggregate duration filter
+aggregate_duration_filter = negation? aggregate_key sep operator? duration_format
+
+# aggregate size filter
+aggregate_size_filter = negation? aggregate_key sep operator? size_format
+
+# aggregate percentage filter
+aggregate_percentage_filter = negation? aggregate_key sep operator? percentage_format
+
+# aggregate numeric filter
+aggregate_numeric_filter = negation? aggregate_key sep operator? numeric_value
+
+# aggregate for dates
+aggregate_date_filter = negation? aggregate_key sep operator? iso_8601_date_format
+
+# aggregate for relative dates
+aggregate_rel_date_filter = negation? aggregate_key sep operator? rel_date_format
+
+# has filter for not null type checks (single or comma-separated keys)
+has_in_filter = negation? &"has:" search_key sep has_in_list
+
+# has filter for not null type checks
+has_filter = negation? &"has:" search_key sep has_item
+
+# is filter. Specific to issue search
+is_filter = negation? &"is:" search_key sep search_value
+
+# in filter key:[val1, val2]
+text_in_filter = negation? text_key sep wildcard_op? text_in_list
+
+# standard key:val filter
+text_filter = negation? text_key sep wildcard_op? operator? search_value
+
+key         = ~r"[a-zA-Z0-9_.-]+"
+escaped_key = ~r"[a-zA-Z0-9_.:-]+"
+quoted_key  = '"' escaped_key '"'
+
+# the quoted variant is here to for backwards compatibility,
+# and can be removed once we're sure it's no longer in use
+explicit_flag_key         = "flags" open_bracket escaped_key closed_bracket
+explicit_string_flag_key  = "flags" open_bracket escaped_key spaces comma spaces "string" closed_bracket
+explicit_number_flag_key  = "flags" open_bracket escaped_key spaces comma spaces "number" closed_bracket
+
+explicit_tag_key        = "tags" open_bracket escaped_key closed_bracket
+explicit_string_tag_key = "tags" open_bracket escaped_key spaces comma spaces "string" closed_bracket
+explicit_number_tag_key = "tags" open_bracket escaped_key spaces comma spaces "number" closed_bracket
+explicit_boolean_tag_key = "tags" open_bracket escaped_key spaces comma spaces "boolean" closed_bracket
+
+aggregate_key                    = key open_paren spaces function_args? spaces closed_paren
+function_args                    = aggregate_param (spaces comma spaces !comma aggregate_param?)*
+aggregate_param                  = explicit_tag_key_aggregate_param / query_aggregate_param / quoted_aggregate_param / raw_aggregate_param
+query_aggregate_param            = "`" (quoted_value / ~r"[^`\"]+")* "`"
+raw_aggregate_param              = ~r"[^()\t\n, \"]+"
+quoted_aggregate_param           = '"' ('\\"' / ~r'[^\t\n\"]')* '"'
+explicit_tag_key_aggregate_param = explicit_tag_key / explicit_number_tag_key / explicit_string_tag_key / explicit_boolean_tag_key
+
+search_key             = explicit_number_flag_key / explicit_number_tag_key / explicit_boolean_tag_key / key / quoted_key
+text_key               = explicit_flag_key / explicit_string_flag_key / explicit_tag_key / explicit_string_tag_key  / search_key
+value                  = ~r"[^()\t\n ]*"
+quoted_value           = '"' ('\\"' / ~r'[^"]')* '"'
+in_value               = (&in_value_termination in_value_char)+
+text_in_value          = quoted_value / in_value
+search_value           = quoted_value / value
+numeric_value          = "-"? numeric numeric_unit? &(end_value / comma / closed_bracket)
+boolean_value          = ~r"(true|1|false|0)"i &end_value
+text_in_list           = open_bracket text_in_value (spaces comma spaces !comma text_in_value?)* closed_bracket &end_value
+numeric_in_list        = open_bracket numeric_value (spaces comma spaces !comma numeric_value?)* closed_bracket &end_value
+
+has_item               = text_key / search_value
+has_in_list            = open_bracket has_item (spaces comma spaces !comma has_item?)* closed_bracket &end_value
+
+# TODO: Wildcard will be special index syntax for array.
+array_includes_suffix = open_bracket "*" closed_bracket
+array_includes_tag_key = "tags" open_bracket escaped_key array_includes_suffix spaces comma spaces "array" closed_bracket
+array_includes_attr_key = (key/ quoted_key) array_includes_suffix
+
+array_includes_key = array_includes_attr_key / array_includes_tag_key
+array_includes_filter = negation? array_includes_key sep wildcard_op? operator? search_value
+
+# key://pattern// runs to the first `//` that ends the value, so patterns can hold spaces and
+# parens unquoted. A quoted "//...//" stays a literal. There's no IN-list form, since `a|b`
+# already covers it. The scan cap only keeps a query full of unclosed `key://` values from
+# rescanning the rest of the line at every one of them; SearchVisitor enforces the real
+# MAX_REGEX_PATTERN_LENGTH, including for patterns too long to scan.
+regex_filter = negation? (array_includes_key / text_key) sep regex_value
+regex_value  = ~r"//(?!//(?:[\t\n )]|$))([^\n]{1,1024}?)//(?=[\t\n )]|$)"
+
+# NOTE: These wildcard operators are internal implementation details and
+# should not be included in product docs. Users should use `*` instead.
+wildcard_op            = wildcard_unicode (contains / starts_with / ends_with) wildcard_unicode
+
+# See: https://stackoverflow.com/a/39617181/790169
+in_value_termination = in_value_char (!in_value_end in_value_char)* in_value_end
+in_value_char        = ~r"[^(), ]"
+in_value_end         = closed_bracket / (spaces comma)
+
+# Formats
+date_format = ~r"\d{4}-\d{2}-\d{2}"
+time_format = ~r"T\d{2}:\d{2}:\d{2}" ("." ms_format)?
+ms_format   = ~r"\d{1,6}"
+tz_format   = ~r"[+-]\d{2}:\d{2}"
+
+
+iso_8601_date_format = date_format time_format? ("Z" / tz_format)? &end_value
+rel_date_format      = ~r"[+-][0-9]+[wdhm]" &end_value
+duration_format      = numeric ("ms"/"s"/"min"/"m"/"hr"/"h"/"day"/"d"/"wk"/"w") &end_value
+size_format          = numeric (size_unit) &end_value
+percentage_format    = numeric "%"
+
+numeric_unit         = ~r"[kmb]"i
+size_unit            = bits / bytes
+bits                 = ~r"bit|kib|mib|gib|tib|pib|eib|zib|yib"i
+bytes                = ~r"bytes|nb|kb|mb|gb|tb|pb|eb|zb|yb"i
+
+# NOTE: the order in which these operators are listed matters because for
+# example, if < comes before <= it will match that even if the operator is <=
+operator             = ">=" / "<=" / ">" / "<" / "=" / "!="
+or_operator          = ~r"OR"i  &end_value
+and_operator         = ~r"AND"i &end_value
+numeric              = ~r"[0-9]+(?:\.[0-9]*)?"
+open_paren           = "("
+closed_paren         = ")"
+open_bracket         = "["
+closed_bracket       = "]"
+sep                  = ":"
+negation             = "!"
+# Note: wildcard unicode is defined in src/sentry/search/events/constants.py
+# NOTE: These wildcard operators are internal implementation details and
+# should not be included in product docs. Users should use `*` instead.
+wildcard_unicode     = "\uF00D"
+contains             = "Contains"
+starts_with          = "StartsWith"
+ends_with            = "EndsWith"
+comma                = ","
+spaces               = " "*
+
+end_value = ~r"[\t\n )]|$"
+"""
 )
-from sentry.utils.compat import filter, map, zip
+
+MAX_REGEX_PATTERN_LENGTH = 64
+
+# Each regex filter compiles on the web worker before any Snuba query runs, so we
+# bound how many (potentially expensive) filters can take parsing time per query
+MAX_REGEX_FILTERS_PER_QUERY = 16
+
+# Pattern length doesn't bound compile cost: `\p{L}{100}` is 10 characters but expands to over a
+# hundred thousand instructions. RE2 stops compiling once a program outgrows its budget, which
+# keeps the worst case to tens of milliseconds per pattern.
+MAX_REGEX_PROGRAM_MEMORY = 1024 * 1024
+
+# A newline ends the line a pattern can span, so it's tracked alongside closing delimiters
+REGEX_CLOSING_DELIMITER_OR_NEWLINE = re.compile(r"\n|//(?=[\t\n )]|\Z)")
+
+REGEX_ESCAPE_SEQUENCE = re.compile(r"\\.")
 
 
-WILDCARD_CHARS = re.compile(r"[\*]")
-NEGATION_MAP = {
-    "=": "!=",
-    "<": ">=",
-    "<=": ">",
-    ">": "<=",
-    ">=": "<",
-}
-
-RESULT_TYPES = {"duration", "string", "number", "integer", "percentage", "date"}
+def regex_pattern_length(pattern: str) -> int:
+    # An escape like `\.` or `\/` reads as one character, and the search bar adds `\/\/` escapes
+    # of its own, so counting backslashes would reject patterns users see as within the limit
+    return len(REGEX_ESCAPE_SEQUENCE.sub("_", pattern))
 
 
-def translate(pat):
-    """Translate a shell PATTERN to a regular expression.
+def regex_pattern_too_long_error(key: str) -> InvalidSearchQuery:
+    return InvalidSearchQuery(
+        f"{key}: Regex patterns are limited to {MAX_REGEX_PATTERN_LENGTH} characters. "
+        'To search for a literal value that starts with //, quote it: "//..."'
+    )
+
+
+def translate_wildcard(pat: str) -> str:
+    """
+    Translate a shell PATTERN to a regular expression.
     modified from: https://github.com/python/cpython/blob/2.7/Lib/fnmatch.py#L85
     """
 
@@ -64,37 +294,14 @@ def translate(pat):
         # fnmatch.translate has no way to handle escaping metacharacters.
         # Applied this basic patch to handle it:
         # https://bugs.python.org/file27570/issue8402.1.patch
-        if c == "\\" and i < n:
-            res += re.escape(pat[i])
-            i += 1
+        if c == "\\":
+            if i < n:
+                res += re.escape(pat[i])
+                i += 1
+            elif i == n:
+                raise InvalidSearchQuery("Search terms cannot end with an escape character")
         elif c == "*":
             res += ".*"
-        # TODO: We're disabling everything except for wildcard matching for the
-        # moment. Just commenting this code out for the moment, since there's a
-        # reasonable chance we'll add this back in in the future.
-        # elif c == '?':
-        #     res = res + '.'
-        # elif c == '[':
-        #     j = i
-        #     if j < n and pat[j] == '!':
-        #         j = j + 1
-        #     if j < n and pat[j] == ']':
-        #         j = j + 1
-        #     while j < n and pat[j] != ']':
-        #         j = j + 1
-        #     if j >= n:
-        #         res = res + '\\['
-        #     else:
-        #         stuff = pat[i:j].replace('\\', '\\\\')
-        #         i = j + 1
-        #         if stuff[0] == '!':
-        #             stuff = '^' + stuff[1:]
-        #         elif stuff[0] == '^':
-        #             stuff = '\\' + stuff
-        #         res = '%s[%s]' % (res, stuff)
-        # In py3.7 only characters that can have special meaning in a regular expression are escaped
-        # introduced that here so we don't escape those either
-        # https://github.com/python/cpython/blob/3.7/Lib/re.py#L252
         elif c in "()[]?*+-|^$\\.&~# \t\n\r\v\f":
             res += re.escape(c)
         else:
@@ -102,488 +309,783 @@ def translate(pat):
     return "^" + res + "$"
 
 
-# Explanation of quoted string regex, courtesy of Matt
-# "              // literal quote
-# (              // begin capture group
-#   (?:          // begin uncaptured group
-#     [^"]       // any character that's not quote
-#     |          // or
-#     (?<=\\)["] // A quote, preceded by a \ (for escaping)
-#   )            // end uncaptured group
-#   *            // repeat the uncaptured group
-# )              // end captured group
-# ?              // allow to be empty (allow empty quotes)
-# "              // quote literal
+def translate_wildcard_as_clickhouse_pattern(pattern: str) -> str:
+    """
+    Translate a wildcard pattern to clickhouse pattern.
 
-event_search_grammar = Grammar(
-    r"""
-search               = (boolean_operator / paren_term / search_term)*
-boolean_operator     = spaces (or_operator / and_operator) spaces
-paren_term           = spaces open_paren spaces (paren_term / boolean_operator / search_term)+ spaces closed_paren spaces
-search_term          = key_val_term / quoted_raw_search / raw_search
-key_val_term         = spaces (tag_filter / time_filter / rel_time_filter / specific_time_filter
-                       / duration_filter / boolean_filter / numeric_filter
-                       / aggregate_filter / aggregate_date_filter / aggregate_rel_date_filter
-                       / has_filter / is_filter / quoted_basic_filter / basic_filter)
-                       spaces
-raw_search           = (!key_val_term ~r"\ *(?!(?i)OR(?![^\s]))(?!(?i)AND(?![^\s]))([^\ ^\n ()]+)\ *" )*
-quoted_raw_search    = spaces quoted_value spaces
+    See https://clickhouse.com/docs/en/sql-reference/functions/string-search-functions#like
+    """
+    chars: list[str] = []
 
-# standard key:val filter
-basic_filter         = negation? search_key sep search_value
-quoted_basic_filter  = negation? search_key sep quoted_value
-# filter for dates
-time_filter          = search_key sep? operator (date_format / alt_date_format)
-# filter for relative dates
-rel_time_filter      = search_key sep rel_date_format
-# filter for durations
-duration_filter      = search_key sep operator? duration_format
-# exact time filter for dates
-specific_time_filter = search_key sep (date_format / alt_date_format)
-# Numeric comparison filter
-numeric_filter       = search_key sep operator? numeric_value
-# Boolean comparison filter
-boolean_filter       = negation? search_key sep boolean_value
-# Aggregate numeric filter
-aggregate_filter          = negation? aggregate_key sep operator? (duration_format / numeric_value / percentage_format)
-aggregate_date_filter     = negation? aggregate_key sep operator? (date_format / alt_date_format)
-aggregate_rel_date_filter = negation? aggregate_key sep operator? rel_date_format
+    i = 0
+    n = len(pattern)
 
-# has filter for not null type checks
-has_filter           = negation? "has" sep (search_key / search_value)
-is_filter            = negation? "is" sep search_value
-tag_filter           = negation? "tags[" search_key "]" sep search_value
+    while i < n:
+        c = pattern[i]
+        i += 1
+        if c == "\\":
+            if i < n:
+                c = pattern[i]
+                if c not in {"*", "\\"}:
+                    raise InvalidSearchQuery(f"Unexpected escape character: {c}")
+                chars.append(c)
+            elif i == n:
+                raise InvalidSearchQuery("Search terms cannot end with an escape character")
+            i += 1
+        elif c == "*":
+            # sql uses % as the wildcard character
+            chars.append("%")
+        elif c in {"%", "_"}:
+            # these are special characters and need to be escaped
+            chars.append("\\")
+            chars.append(c)
+        else:
+            chars.append(c)
 
-aggregate_key        = key open_paren function_arg* closed_paren
-search_key           = key / quoted_key
-search_value         = quoted_value / value
-value                = ~r"[^()\s]*"
-numeric_value        = ~r"([-]?[0-9\.]+)([k|m|b])?(?=\s|\)|$)"
-boolean_value        = ~r"(true|1|false|0)(?=\s|\)|$)"i
-quoted_value         = ~r"\"((?:[^\"]|(?<=\\)[\"])*)?\""s
-key                  = ~r"[a-zA-Z0-9_\.-]+"
-function_arg         = space? key? comma? space?
-# only allow colons in quoted keys
-quoted_key           = ~r"\"([a-zA-Z0-9_\.:-]+)\""
-
-date_format          = ~r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,6})?)?Z?(?=\s|\)|$)"
-alt_date_format      = ~r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(\+\d{2}:\d{2})?)?(?=\s|\)|$)"
-rel_date_format      = ~r"[\+\-][0-9]+[wdhm](?=\s|\)|$)"
-duration_format      = ~r"([0-9\.]+)(ms|s|min|m|hr|h|day|d|wk|w)(?=\s|\)|$)"
-percentage_format    = ~r"([0-9\.]+)%"
-
-# NOTE: the order in which these operators are listed matters
-# because for example, if < comes before <= it will match that
-# even if the operator is <=
-or_operator          = ~r"OR(?![^\s])"i
-and_operator         = ~r"AND(?![^\s])"i
-operator             = ">=" / "<=" / ">" / "<" / "=" / "!="
-open_paren           = "("
-closed_paren         = ")"
-sep                  = ":"
-space                = " "
-negation             = "!"
-comma                = ","
-spaces               = ~r"\ *"
-"""
-)
+    return "".join(chars)
 
 
-# Create the known set of fields from the issue properties
-# and the transactions and events dataset mapping definitions.
-SEARCH_MAP = {
-    "start": "start",
-    "end": "end",
-    "project_id": "project_id",
-    "first_seen": "first_seen",
-    "last_seen": "last_seen",
-    "times_seen": "times_seen",
-}
-SEARCH_MAP.update(**DATASETS[Dataset.Events])
-SEARCH_MAP.update(**DATASETS[Dataset.Discover])
-
-no_conversion = {"start", "end"}
-
-PROJECT_NAME_ALIAS = "project.name"
-PROJECT_ALIAS = "project"
-ISSUE_ALIAS = "issue"
-ISSUE_ID_ALIAS = "issue.id"
-RELEASE_ALIAS = "release"
-USER_DISPLAY_ALIAS = "user.display"
-ERROR_UNHANDLED_ALIAS = "error.unhandled"
-KEY_TRANSACTION_ALIAS = "key_transaction"
-ARRAY_FIELDS = {
-    "error.mechanism",
-    "error.type",
-    "error.value",
-    "stack.abs_path",
-    "stack.colno",
-    "stack.filename",
-    "stack.function",
-    "stack.in_app",
-    "stack.lineno",
-    "stack.module",
-    "stack.package",
-    "stack.stack_level",
-}
+def wrap_free_text(string: str, autowrap: bool) -> str:
+    if not autowrap:
+        return string
+    # Free text already had wildcarding on it, leave it alone
+    if string.startswith("*") or string.endswith("*"):
+        return string
+    # Otherwise always wrap it with wildcarding
+    else:
+        return f"*{string}*"
 
 
-class InvalidSearchQuery(Exception):
-    pass
+def translate_escape_sequences(string: str) -> str:
+    """
+    A non-wildcard pattern can contain escape sequences that we need to handle.
+    - \\* because a single asterisk represents a wildcard, so it needs to be escaped
+    """
+
+    i, n = 0, len(string)
+    res = ""
+    while i < n:
+        c = string[i]
+        i = i + 1
+        if c == "\\" and i < n:
+            d = string[i]
+            if d == "*":
+                i += 1
+                res += d
+            else:
+                res += c
+        else:
+            res += c
+    return res
 
 
-class SearchBoolean(namedtuple("SearchBoolean", "left_term operator right_term")):
+type QueryOp = Literal["AND", "OR"]
+type QueryToken = QueryOp | SearchFilter | AggregateFilter | ParenExpression
+
+type _RecursiveList[T] = list[T] | list[_RecursiveList[T]]
+
+
+def flatten[T](children: _RecursiveList[T]) -> list[T]:
+    def _flatten(seq: _RecursiveList[T]) -> Generator[T]:
+        # there is a list from search_term and one from free_text, so flatten them.
+        # Flatten each group in the list, since nodes can return multiple items
+        for item in seq:
+            if isinstance(item, list):
+                yield from _flatten(item)
+            else:
+                yield item
+
+    return [_f for _f in _flatten(children) if _f]
+
+
+def remove_optional_nodes[T](children: list[T]) -> list[T]:
+    return [
+        item
+        for item in children
+        if not (isinstance(item, Node) and not item.text)
+        if not (isinstance(item, str) and item.isspace())
+    ]
+
+
+def process_list[T](
+    first: T, remaining: tuple[tuple[object, object, object, object, tuple[T]], ...]
+) -> list[T]:
+    # Empty values become blank nodes
+    if any(isinstance(item[4], Node) for item in remaining):
+        raise InvalidSearchQuery("Lists should not have empty values")
+
+    return [
+        first,
+        *(item[4][0] for item in remaining),
+    ]
+
+
+def is_negated(node: Node | tuple[Node]) -> bool:
+    # Because negations are always optional, parsimonious returns a list of nodes
+    # containing one node when a negation exists, and a single node when it doesn't.
+    if isinstance(node, Node):
+        text = node.text
+    else:
+        text = node[0].text
+
+    return text == "!"
+
+
+def handle_negation(negation: Node | tuple[Node], operator: Node | str | tuple[str]) -> str:
+    operator = get_operator_value(operator)
+    if is_negated(negation):
+        return OPERATOR_NEGATION_MAP.get(operator, "!=")
+    return operator
+
+
+def get_operator_value(operator: Node | list[str] | tuple[str] | str) -> str:
+    if isinstance(operator, Node):
+        return operator.text or "="
+    elif isinstance(operator, (list, tuple)):
+        return operator[0]
+    else:
+        return operator
+
+
+def has_wildcard_op(node: Node | Sequence[Node]) -> bool:
+    if isinstance(node, Node):
+        return node.text in WILDCARD_OPERATOR_MAP.values()
+    if isinstance(node, Sequence) and len(node) > 0:
+        return node[0].text in WILDCARD_OPERATOR_MAP.values()
+    return False
+
+
+def get_wildcard_op(node: Node | Sequence[Node]) -> str:
+    if isinstance(node, Node):
+        return node.text
+    if isinstance(node, Sequence) and len(node) > 0:
+        return node[0].text
+    return ""
+
+
+_re2_options = re2.Options()
+_re2_options.log_errors = False
+_re2_options.max_mem = MAX_REGEX_PROGRAM_MEMORY
+
+RE2_PATTERN_TOO_LARGE = "pattern too large - compile failed"
+
+
+def validate_regex_pattern(key: str, pattern: str) -> None:
+    # ClickHouse matches with RE2, which rejects syntax Python's `re` accepts (lookaround,
+    # backreferences) and accepts syntax it rejects (`\pL`, `\z`), so only RE2 can vouch for a
+    # pattern before it reaches ClickHouse
+    try:
+        re2.compile(pattern, _re2_options)
+    except re2.error as exc:
+        detail = exc.args[0].decode() if isinstance(exc.args[0], bytes) else str(exc.args[0])
+        if detail == RE2_PATTERN_TOO_LARGE:
+            raise InvalidSearchQuery(
+                f"{key}: Regex is too complex. Try fewer repetitions or narrower character classes."
+            )
+        raise InvalidSearchQuery(f"{key}: Invalid regex (RE2 syntax): {detail}")
+
+
+def add_leading_wildcard(value: str) -> str:
+    if value.startswith('"') and value.endswith('"'):
+        return f"*{value[1:-1]}"
+    return f"*{value}"
+
+
+def add_trailing_wildcard(value: str) -> str:
+    if value.startswith('"') and value.endswith('"'):
+        return f"{value[1:-1]}*"
+    return f"{value}*"
+
+
+def handle_backslash(value: str) -> str:
+    # when working with one of the wildcard operators,
+    # we need to ensure we properly handle backslashes
+    # by escaping them
+
+    v = []
+    n = len(value)
+
+    i = 0
+    while i < n:
+        c = value[i]
+        if c == "\\":
+            j = i + 1
+            if j < n and value[j] in {"*", "\\"}:
+                # found an escaped * or \
+                v.append(c)
+                i += 1
+                c = value[i]
+            else:
+                # found just a \
+                v.append("\\")
+        v.append(c)
+        i += 1
+
+    return "".join(v)
+
+
+def gen_wildcard_value(value: str, wildcard_op: str) -> str:
+    if value == "" or wildcard_op == "":
+        return value
+    value = handle_backslash(value)
+    value = re.sub(r"(?<!\\)\*", r"\\*", value)
+    if wildcard_op == WILDCARD_OPERATOR_MAP["contains"]:
+        value = add_leading_wildcard(value)
+        value = add_trailing_wildcard(value)
+    elif wildcard_op == WILDCARD_OPERATOR_MAP["starts_with"]:
+        value = add_trailing_wildcard(value)
+    elif wildcard_op == WILDCARD_OPERATOR_MAP["ends_with"]:
+        value = add_leading_wildcard(value)
+    return value
+
+
+class SearchBoolean:
     BOOLEAN_AND = "AND"
     BOOLEAN_OR = "OR"
 
     @staticmethod
-    def is_operator(value):
-        return value == SearchBoolean.BOOLEAN_AND or value == SearchBoolean.BOOLEAN_OR
+    def is_or_operator(value: object) -> TypeIs[Literal["OR"]]:
+        return value == SearchBoolean.BOOLEAN_OR
+
+    @staticmethod
+    def is_operator(value: object) -> TypeIs[QueryOp]:
+        return value == SearchBoolean.BOOLEAN_AND or SearchBoolean.is_or_operator(value)
 
 
-class ParenExpression(namedtuple("ParenExpression", "children")):
-    pass
+class ParenExpression(NamedTuple):
+    children: Sequence[QueryToken]
+
+    def to_query_string(self) -> str:
+        inner = " ".join(
+            child if isinstance(child, str) else child.to_query_string() for child in self.children
+        )
+        return f"({inner})"
 
 
-class SearchFilter(namedtuple("SearchFilter", "key operator value")):
-    def __str__(self):
-        return "".join(map(str, (self.key.name, self.operator, self.value.raw_value)))
+class SearchKey(NamedTuple):
+    name: str
 
-    @cached_property
-    def is_negation(self):
+    @property
+    def is_tag(self) -> bool:
+        return bool(TAG_KEY_RE.match(self.name)) or (
+            self.name not in SEARCH_MAP
+            and self.name not in FIELD_ALIASES
+            and not self.is_measurement
+            and not self.is_span_op_breakdown
+        )
+
+    @property
+    def is_measurement(self) -> bool:
+        return is_measurement(self.name) and self.name not in SEARCH_MAP
+
+    @property
+    def is_span_op_breakdown(self) -> bool:
+        return is_span_op_breakdown(self.name) and self.name not in SEARCH_MAP
+
+
+def _is_wildcard(raw_value: object) -> TypeIs[str]:
+    if not isinstance(raw_value, str):
+        return False
+    return bool(WILDCARD_CHARS.search(raw_value))
+
+
+class SearchValue(NamedTuple):
+    raw_value: str | float | datetime | Sequence[float] | Sequence[str] | None
+    # Used for top events where we don't want to modify the raw value at all
+    use_raw_value: bool = False
+    is_regex: bool = False
+
+    @property
+    def value(self) -> Any:
+        if self.use_raw_value:
+            return self.raw_value
+        elif self.is_wildcard() and isinstance(self.raw_value, str):
+            return translate_wildcard(self.raw_value)
+        elif self.is_wildcard() and isinstance(self.raw_value, (list, tuple)):
+            return f"({'|'.join(map(translate_wildcard, self.raw_value))})"
+        elif isinstance(self.raw_value, str):
+            return translate_escape_sequences(self.raw_value)
+        elif isinstance(self.raw_value, (list, tuple)):
+            # Non-wildcard lists should also have escape sequences translated
+            return [
+                translate_escape_sequences(v) if isinstance(v, str) else v for v in self.raw_value
+            ]
+        return self.raw_value
+
+    def to_query_string(self) -> str:
+        # for any sequence (but not string) we want to iterate over the items
+        # we do that because a simple str() would not be usable for strings
+        # str(["a","b"]) == "['a', 'b']" but we would like "[a,b]"
+        if isinstance(self.raw_value, (list, tuple)):
+            ret_val = ", ".join(str(x) for x in self.raw_value)
+            ret_val = f"[{ret_val}]"
+            return ret_val
+        elif isinstance(self.raw_value, datetime):
+            return self.raw_value.isoformat()
+        else:
+            return str(self.value)
+
+    def is_wildcard(self) -> bool:
+        # If we're using the raw value only it'll never be a wildcard
+        if self.use_raw_value:
+            return False
+        if self.is_str_sequence():
+            return isinstance(self.raw_value, list) and any(
+                _is_wildcard(value) for value in self.raw_value
+            )
+        return _is_wildcard(self.raw_value)
+
+    def is_str_sequence(self) -> bool:
+        return isinstance(self.raw_value, list) and all(isinstance(e, str) for e in self.raw_value)
+
+    def split_wildcards(self) -> tuple[list[str], list[str]] | None:
+        if not self.is_str_sequence():
+            return None
+        wildcards = []
+        non_wildcards = []
+        assert isinstance(self.raw_value, list)
+        for s in self.raw_value:
+            assert isinstance(s, str)
+            if _is_wildcard(s) is True:
+                wildcards.append(s)
+            else:
+                non_wildcards.append(s)
+        return (non_wildcards, wildcards)
+
+    def classify_and_format_wildcard(
+        self,
+    ) -> (
+        tuple[Literal["prefix", "infix", "suffix"], str]
+        | tuple[Literal["other"], str | float | datetime | Sequence[float] | Sequence[str]]
+    ):
+        if not _is_wildcard(self.raw_value):
+            return "other", self.value
+
+        ret = WILDCARD_CHARS.finditer(self.raw_value)
+
+        leading_wildcard = False
+        trailing_wildcard = False
+        middle_wildcard = False
+
+        for x in ret:
+            start, end = x.span()
+            if start == 0 and end == 1:
+                # It must span exactly [0, 1) because if it spans further,
+                # the pattern also matched on some leading slashes.
+                leading_wildcard = True
+            elif end == len(self.raw_value):
+                # It only needs to match on end because if it matches on
+                # some slashes before the *, that's okay.
+                trailing_wildcard = True
+            else:
+                # The wildcard happens somewhere in the middle of the value.
+                # We care about this because when this happens, it's not
+                # trivial to optimize the query, so let it fall back to
+                # the existing regex approach.
+                middle_wildcard = True
+
+        if not middle_wildcard:
+            if leading_wildcard and trailing_wildcard:
+                # If it's an infix wildcard, we strip off the first and last character
+                # which is always a `*` and match on the rest.
+                # no lower() here because we can use `positionCaseInsensitive`
+                return "infix", translate_escape_sequences(self.raw_value[1:-1])
+            elif leading_wildcard:
+                # If it's a suffix wildcard, we strip off the first character
+                # which is always a `*` and match on the rest.
+                return "suffix", translate_escape_sequences(self.raw_value[1:]).lower()
+            elif trailing_wildcard:
+                # If it's a prefix wildcard, we strip off the last character
+                # which is always a `*` and match on the rest.
+                return "prefix", translate_escape_sequences(self.raw_value[:-1]).lower()
+
+        return "other", self.value
+
+    def is_event_id(self) -> bool:
+        """Return whether the current value is a valid event id
+
+        Empty strings are valid, so that it can be used for has:id queries
+        """
+        if isinstance(self.raw_value, list):
+            return all(isinstance(value, str) and is_event_id(value) for value in self.raw_value)
+        if not isinstance(self.raw_value, str):
+            return False
+        return is_event_id(self.raw_value) or self.raw_value == ""
+
+    def is_span_id(self) -> bool:
+        """Return whether the current value is a valid span id
+
+        Empty strings are valid, so that it can be used for has:trace.span queries
+        """
+        if isinstance(self.raw_value, list):
+            return all(isinstance(value, str) and is_span_id(value) for value in self.raw_value)
+        if not isinstance(self.raw_value, str):
+            return False
+        return is_span_id(self.raw_value) or self.raw_value == ""
+
+
+class SearchFilter(NamedTuple):
+    key: SearchKey
+    operator: str
+    value: SearchValue
+
+    def __str__(self) -> str:
+        return f"{self.key.name}{self.operator}{self.value.raw_value}"
+
+    def to_query_string(self) -> str:
+        if self.value.is_regex:
+            negation = "!" if self.operator == "!=" else ""
+            return f"{negation}{self.key.name}://{self.value.raw_value}//"
+        if self.operator == "IN":
+            return f"{self.key.name}:{self.value.to_query_string()}"
+        elif self.operator == "NOT IN":
+            return f"!{self.key.name}:{self.value.to_query_string()}"
+        else:
+            return f"{self.key.name}:{self.operator}{self.value.to_query_string()}"
+
+    @property
+    def is_negation(self) -> bool:
         # Negations are mostly just using != operators. But we also have
         # negations on has: filters, which translate to = '', so handle that
         # case as well.
-        return (
+        return bool(
             self.operator == "!="
             and self.value.raw_value != ""
             or self.operator == "="
             and self.value.raw_value == ""
+            or self.operator == "NOT IN"
+            and self.value.raw_value
         )
 
-
-class SearchKey(namedtuple("SearchKey", "name")):
-    @cached_property
-    def is_tag(self):
-        return TAG_KEY_RE.match(self.name) or (
-            self.name not in SEARCH_MAP and not self.is_measurement
-        )
-
-    @cached_property
-    def is_measurement(self):
-        return is_measurement(self.name) and self.name not in SEARCH_MAP
-
-
-class AggregateFilter(namedtuple("AggregateFilter", "key operator value")):
-    def __str__(self):
-        return "".join(map(str, (self.key.name, self.operator, self.value.raw_value)))
-
-
-class AggregateKey(namedtuple("AggregateKey", "name")):
-    pass
-
-
-class SearchValue(namedtuple("SearchValue", "raw_value")):
     @property
-    def value(self):
-        if self.is_wildcard():
-            return translate(self.raw_value)
-        return self.raw_value
-
-    def is_wildcard(self):
-        if not isinstance(self.raw_value, str):
-            return False
-        return bool(WILDCARD_CHARS.search(self.raw_value))
+    def is_in_filter(self) -> bool:
+        return self.operator in ("IN", "NOT IN")
 
 
-class SearchVisitor(NodeVisitor):
-    # A list of mappers that map source keys to a target name. Format is
-    # <target_name>: [<list of source names>],
-    key_mappings = {}
-    duration_keys = {"transaction.duration"}
-    percentage_keys = {"percentage"}
-    numeric_keys = {
-        "project_id",
-        "project.id",
-        "issue.id",
-        "stack.colno",
-        "stack.lineno",
-        "stack.stack_level",
-        "transaction.duration",
-        "apdex",
-        "p75",
-        "p95",
-        "p99",
-        "failure_rate",
-        "user_misery",
-    }
-    date_keys = {
-        "start",
-        "end",
-        "first_seen",
-        "last_seen",
-        "time",
-        "timestamp",
-        "transaction.start_time",
-        "transaction.end_time",
-    }
-    boolean_keys = {"error.handled", "error.unhandled", "stack.in_app", KEY_TRANSACTION_ALIAS}
+class AggregateKey(NamedTuple):
+    name: str
 
-    unwrapped_exceptions = (InvalidSearchQuery,)
 
-    def __init__(self, allow_boolean=True, params=None):
-        self.allow_boolean = allow_boolean
-        self.params = params if params is not None else {}
+class AggregateFilter(NamedTuple):
+    key: AggregateKey
+    operator: str
+    value: SearchValue
+
+    def to_query_string(self) -> str:
+        return f"{self.key.name}:{self.operator}{self.value.to_query_string()}"
+
+    def __str__(self) -> str:
+        return f"{self.key.name}{self.operator}{self.value.raw_value}"
+
+
+@dataclass  # pycqa/pycodestyle#1277
+class SearchConfig[TAllowBoolean: (Literal[True], Literal[False]) = Literal[True]]:  # noqa: E251
+    """
+    Configures how the search parser interprets a search query
+    """
+
+    # <target_name>: [<list of source names>]
+    key_mappings: Mapping[str, list[str]] = field(default_factory=dict)
+
+    # Text keys we allow operators to be used on
+    text_operator_keys: set[str] = field(default_factory=set)
+
+    # Keys which are considered valid for duration filters
+    duration_keys: set[str] = field(default_factory=set)
+
+    # Keys considered valid for numeric filter types
+    numeric_keys: set[str] = field(default_factory=set)
+
+    # Keys considered valid for date filter types
+    date_keys: set[str] = field(default_factory=set)
+
+    # Keys considered valid for boolean filter types
+    boolean_keys: set[str] = field(default_factory=set)
+
+    # A mapping of string values that may be provided to `is:<value>` which
+    # translates to a pair of SearchKey + SearchValue's. An empty list disables
+    # this feature for the search
+    is_filter_translation: Mapping[str, tuple[str, Any]] = field(default_factory=dict)
+
+    # Enables boolean filtering (AND / OR)
+    allow_boolean: TAllowBoolean = True  # type: ignore[assignment]  # python/mypy#18812
+
+    # Allows us to specify an allowlist of keys we will accept for this search.
+    # If empty, allow all keys.
+    allowed_keys: set[str] = field(default_factory=set)
+
+    # Allows us to specify a list of keys we will not accept for this search.
+    blocked_keys: set[str] = field(default_factory=set)
+
+    # Which key we should return any free text under
+    free_text_key = "message"
+
+    # Whether to wrap free_text_keys in asterisks
+    wildcard_free_text: bool = False
+
+    # Only the logs resolver compiles key://pattern// values, so other searches read them as the
+    # literals they have always been
+    allow_regex: bool = False
+
+    # Disallow the use of the !has filter
+    allow_not_has_filter: bool = True
+
+    # What the value for has filters should be
+    has_filter_value: str | None = ""
+
+    @overload
+    @classmethod
+    def create_from[
+        TBool: (
+            Literal[True],
+            Literal[False],
+        )
+    ](
+        cls: type[SearchConfig[Any]],
+        search_config: SearchConfig[Any],
+        *,
+        allow_boolean: TBool,
+        **overrides: Any,
+    ) -> SearchConfig[TBool]: ...
+
+    @overload
+    @classmethod
+    def create_from[
+        TBool: (
+            Literal[True],
+            Literal[False],
+        )
+    ](
+        cls: type[SearchConfig[Any]],
+        search_config: SearchConfig[TBool],
+        **overrides: Any,
+    ) -> SearchConfig[TBool]: ...
+
+    @classmethod
+    def create_from(
+        cls: type[SearchConfig[Any]], search_config: SearchConfig[Any], **overrides: Any
+    ) -> SearchConfig[Any]:
+        config = cls(**asdict(search_config))
+        for key, val in overrides.items():
+            setattr(config, key, val)
+        return config
+
+
+class SearchVisitor(NodeVisitor[list[QueryToken]]):
+    # `tuple[...]` is used for the typing of `children` because there isn't
+    # a way to represent positional-heterogenous lists -- but they are
+    # actually lists
+
+    unwrapped_exceptions = (InvalidSearchQuery, IncompatibleMetricsQuery)
+
+    def __init__(
+        self,
+        config: SearchConfig[Any],
+        params: ParamsType | None = None,
+        get_field_type: Callable[[str], str | None] | None = None,
+        get_function_result_type: Callable[[str], str | None] | None = None,
+    ) -> None:
         super().__init__()
 
+        self.config = config
+        self._regex_closing_or_newline_offsets: list[int] | None = None
+        self._regex_filter_count = 0
+
+        if TYPE_CHECKING:
+            from sentry.search.events.builder.discover import UnresolvedQuery
+
+        @functools.cache
+        def _get_fallback_builder() -> UnresolvedQuery:
+            # Avoid circular import
+            from sentry.search.events.builder.discover import UnresolvedQuery
+
+            # TODO: read dataset from config
+            return UnresolvedQuery(
+                dataset=Dataset.Discover,
+                params=params if params is not None else {},
+                config=QueryBuilderConfig(functions_acl=list(FUNCTIONS)),
+            )
+
+        if get_field_type is not None:
+            self.get_field_type = get_field_type
+        else:
+            self.get_field_type = _get_fallback_builder().get_field_type
+        if get_function_result_type is not None:
+            self.get_function_result_type = get_function_result_type
+        else:
+            self.get_function_result_type = _get_fallback_builder().get_function_result_type
+
     @cached_property
-    def key_mappings_lookup(self):
-        lookup = {}
-        for target_field, source_fields in self.key_mappings.items():
-            for source_field in source_fields:
-                lookup[source_field] = target_field
-        return lookup
+    def key_mappings_lookup(self) -> dict[str, str]:
+        return {
+            source_field: target_field
+            for target_field, source_fields in self.config.key_mappings.items()
+            for source_field in source_fields
+        }
 
-    def flatten(self, children):
-        def _flatten(seq):
-            # there is a list from search_term and one from raw_search, so flatten them.
-            # Flatten each group in the list, since nodes can return multiple items
-            for item in seq:
-                if isinstance(item, list):
-                    yield from _flatten(item)
-                else:
-                    yield item
+    def is_numeric_key(self, key: str) -> bool:
+        return (
+            key in self.config.numeric_keys
+            or is_measurement(key)
+            or is_span_op_breakdown(key)
+            or self.get_field_type(key) in ["number", "integer", "currency"]
+            or self.is_duration_key(key)
+            or self.is_size_key(key)
+        )
 
-        if not (children and isinstance(children, list) and isinstance(children[0], list)):
-            return children
+    def is_duration_key(self, key: str) -> bool:
+        duration_types = [*DURATION_UNITS, "duration"]
+        return (
+            key in self.config.duration_keys
+            or is_duration_measurement(key)
+            or is_span_op_breakdown(key)
+            or self.get_field_type(key) in duration_types
+        )
 
-        children = [child for group in children for child in _flatten(group)]
-        children = [_f for _f in _flatten(children) if _f]
+    def is_size_key(self, key: str) -> bool:
+        return self.get_field_type(key) in SIZE_UNITS
 
-        return children
+    def is_date_key(self, key: str) -> bool:
+        return key in self.config.date_keys
 
-    def remove_optional_nodes(self, children):
-        def is_not_optional(child):
-            return not (isinstance(child, Node) and isinstance(child.expr, Optional))
+    def is_boolean_key(self, key: str) -> bool:
+        return key in self.config.boolean_keys
 
-        return filter(is_not_optional, children)
-
-    def remove_space(self, children):
-        def is_not_space(child):
-            return not (isinstance(child, Node) and child.text == " " * len(child.text))
-
-        return filter(is_not_space, children)
-
-    def is_numeric_key(self, key):
-        return key in self.numeric_keys or is_measurement(key)
-
-    def is_duration_key(self, key):
-        return key in self.duration_keys or is_duration_measurement(key)
-
-    def is_percentage_key(self, key):
-        return key in self.percentage_keys
-
-    def visit_search(self, node, children):
-        return self.flatten(children)
-
-    def visit_key_val_term(self, node, children):
-        _, key_val_term, _ = children
-        # key_val_term is a list because of group
-        return key_val_term[0]
-
-    def visit_raw_search(self, node, children):
-        value = node.text.strip(" ")
-        if not value:
-            return None
-
-        return SearchFilter(SearchKey("message"), "=", SearchValue(value))
-
-    def visit_quoted_raw_search(self, node, children):
-        value = children[1]
-        if not value:
-            return None
-        return SearchFilter(SearchKey("message"), "=", SearchValue(value))
-
-    def visit_paren_term(self, node, children):
-        if not self.allow_boolean:
-            # It's possible to have a valid search that includes parens, so we can't just error out when we find a paren expression.
-            return self.visit_raw_search(node, children)
-
-        children = self.remove_space(self.remove_optional_nodes(self.flatten(children)))
-        children = self.flatten(children[1])
-        if len(children) == 0:
-            return node.text
-
-        return ParenExpression(children)
-
-    def visit_boolean_filter(self, node, children):
-        (negation, search_key, sep, search_value) = children
-        is_negated = self.is_negated(negation)
-
-        # Numeric and boolean filters overlap on 1 and 0 values.
-        if self.is_numeric_key(search_key.name):
-            return self.visit_numeric_filter(node, (search_key, sep, "=", search_value))
-
-        if search_key.name in self.boolean_keys:
-            if search_value.text.lower() in ("true", "1"):
-                search_value = SearchValue(0 if is_negated else 1)
-            elif search_value.text.lower() in ("false", "0"):
-                search_value = SearchValue(1 if is_negated else 0)
-            else:
-                raise InvalidSearchQuery(f"Invalid boolean field: {search_key}")
-            return SearchFilter(search_key, "=", search_value)
+    def visit_search(
+        self,
+        node: Node,
+        children: tuple[str, Node | _RecursiveList[QueryToken]],
+    ) -> list[QueryToken]:
+        if isinstance(children[1], Node):  # empty search
+            return []
         else:
-            search_value = SearchValue(search_value.text)
-            return self._handle_basic_filter(
-                search_key, "=" if not is_negated else "!=", search_value
+            return remove_optional_nodes(flatten(children[1]))
+
+    def visit_term(
+        self,
+        node: Node,
+        children: tuple[_RecursiveList[QueryToken], str],
+    ) -> list[QueryToken]:
+        return remove_optional_nodes(flatten(children[0]))
+
+    def visit_boolean_operator(self, node: Node, children: tuple[QueryOp]) -> QueryOp:
+        self._validate_boolean_support()
+        return children[0]
+
+    def _validate_boolean_support(self) -> None:
+        if not self.config.allow_boolean:
+            raise InvalidSearchQuery(
+                'Boolean statements containing "OR" or "AND" are not supported in this search'
             )
 
-    def visit_numeric_filter(self, node, children):
-        (search_key, _, operator, search_value) = children
-        operator = operator[0] if not isinstance(operator, Node) else "="
+    def visit_free_text_unquoted(self, node: Node, children: object) -> str | None:
+        return node.text.strip(" ") or None
 
-        if self.is_numeric_key(search_key.name):
-            try:
-                search_value = SearchValue(parse_numeric_value(*search_value.match.groups()))
-            except InvalidQuery as exc:
-                raise InvalidSearchQuery(str(exc))
-            return SearchFilter(search_key, operator, search_value)
-        else:
-            search_value = SearchValue(
-                operator + search_value.text if operator != "=" else search_value.text
+    def visit_free_text(self, node: Node, children: tuple[str]) -> SearchFilter | None:
+        if not children[0]:
+            return None
+        # Free text searches need to be treated like they were wildcards
+        return SearchFilter(
+            SearchKey(self.config.free_text_key),
+            "=",
+            SearchValue(wrap_free_text(children[0], self.config.wildcard_free_text)),
+        )
+
+    def visit_paren_group(
+        self,
+        node: Node,
+        children: tuple[
+            str,
+            str,
+            _RecursiveList[QueryToken],
+            str,
+        ],
+    ) -> SearchFilter | ParenExpression | list[QueryToken]:
+        if not self.config.allow_boolean:
+            # It's possible to have a valid search that includes parens, so we
+            # can't just error out when we find a paren expression.
+            return SearchFilter(
+                SearchKey(self.config.free_text_key),
+                "=",
+                SearchValue(wrap_free_text(node.text, self.config.wildcard_free_text)),
             )
-            return self._handle_basic_filter(search_key, "=", search_value)
 
-    def handle_negation(self, negation, operator):
-        operator = operator[0] if not isinstance(operator, Node) else "="
-        if self.is_negated(negation):
-            return NEGATION_MAP.get(operator, "!=")
-        return operator
+        flattened = remove_optional_nodes(flatten(children[2]))
+        if len(flattened) == 0:
+            return []
 
-    def visit_aggregate_filter(self, node, children):
-        (negation, search_key, _, operator, search_value) = children
-        operator = self.handle_negation(negation, operator)
-        search_value = search_value[0] if not isinstance(search_value, RegexNode) else search_value
+        return ParenExpression(flattened)
+
+    # --- Start of filter visitors
+
+    def _handle_basic_filter(
+        self, search_key: SearchKey, operator: str, search_value: SearchValue
+    ) -> SearchFilter:
+        # If a date or numeric key gets down to the basic filter, then it means
+        # that the value wasn't in a valid format, so raise here.
+        if self.is_date_key(search_key.name):
+            raise InvalidSearchQuery(
+                f"{search_key.name}: Invalid date: {search_value.raw_value}. Expected +/-duration (e.g. +1h) or ISO 8601-like (e.g. {datetime.now().isoformat()[:-4]})."
+            )
+        if self.is_boolean_key(search_key.name):
+            raise InvalidSearchQuery(
+                f"{search_key.name}: Invalid boolean: {search_value.raw_value}. Expected true, 1, false, or 0."
+            )
+        if self.is_numeric_key(search_key.name):
+            raise InvalidSearchQuery(
+                f"{search_key.name}: Invalid number: {search_value.raw_value}. Expected number then optional k, m, or b suffix (e.g. 500k)."
+            )
+
+        return SearchFilter(search_key, operator, search_value)
+
+    def _handle_numeric_filter(
+        self, search_key: SearchKey, operator: str, search_value: tuple[str, str]
+    ) -> SearchFilter:
+        operator = get_operator_value(operator)
 
         try:
-            aggregate_value = None
-            if search_value.expr_name in ["duration_format", "percentage_format"]:
-                # Even if the search value matches duration format, only act as duration for certain columns
-                function = resolve_field(
-                    search_key.name, self.params, functions_acl=FUNCTIONS.keys()
-                )
-                if function.aggregate is not None:
-                    if search_value.expr_name == "percentage_format" and self.is_percentage_key(
-                        function.aggregate[0]
-                    ):
-                        aggregate_value = parse_percentage(*search_value.match.groups())
-                    # Extract column and function name out so we can check if we should parse as duration
-                    elif search_value.expr_name == "duration_format" and self.is_duration_key(
-                        function.aggregate[1]
-                    ):
-                        aggregate_value = parse_duration(*search_value.match.groups())
-
-            if aggregate_value is None:
-                aggregate_value = parse_numeric_value(*search_value.match.groups())
-        except ValueError:
-            raise InvalidSearchQuery(f"Invalid aggregate query condition: {search_key}")
+            search_value_obj = SearchValue(parse_numeric_value(*search_value))
         except InvalidQuery as exc:
             raise InvalidSearchQuery(str(exc))
-        return AggregateFilter(search_key, operator, SearchValue(aggregate_value))
+        return SearchFilter(search_key, operator, search_value_obj)
 
-    def visit_aggregate_date_filter(self, node, children):
-        (negation, search_key, _, operator, search_value) = children
-        search_value = search_value[0]
-        operator = self.handle_negation(negation, operator)
-        is_date_aggregate = any(key in search_key.name for key in self.date_keys)
-        if is_date_aggregate:
+    def visit_date_filter(
+        self,
+        node: Node,
+        children: tuple[
+            SearchKey,
+            Node,  # :
+            str,  # operator
+            str,  # datetime value
+        ],
+    ) -> SearchFilter:
+        (search_key, _, operator, search_value_s) = children
+
+        if self.is_date_key(search_key.name):
             try:
-                search_value = parse_datetime_string(search_value)
+                search_value_dt = parse_datetime_string(search_value_s)
             except InvalidQuery as exc:
                 raise InvalidSearchQuery(str(exc))
-            return AggregateFilter(search_key, operator, SearchValue(search_value))
-        else:
-            search_value = operator + search_value if operator != "=" else search_value
-            return AggregateFilter(search_key, "=", SearchValue(search_value))
+            return SearchFilter(search_key, operator, SearchValue(search_value_dt))
 
-    def visit_aggregate_rel_date_filter(self, node, children):
-        (negation, search_key, _, operator, search_value) = children
-        operator = self.handle_negation(negation, operator)
-        is_date_aggregate = any(key in search_key.name for key in self.date_keys)
-        if is_date_aggregate:
-            try:
-                from_val, to_val = parse_datetime_range(search_value.text)
-            except InvalidQuery as exc:
-                raise InvalidSearchQuery(str(exc))
+        search_value_s = operator + search_value_s if operator != "=" else search_value_s
+        return self._handle_basic_filter(search_key, "=", SearchValue(search_value_s))
 
-            if from_val is not None:
-                operator = ">="
-                search_value = from_val[0]
-            else:
-                operator = "<="
-                search_value = to_val[0]
-
-            return AggregateFilter(search_key, operator, SearchValue(search_value))
-        else:
-            search_value = operator + search_value.text if operator != "=" else search_value
-            return AggregateFilter(search_key, "=", SearchValue(search_value))
-
-    def visit_time_filter(self, node, children):
-        (search_key, _, operator, search_value) = children
-        search_value = search_value[0]
-        if search_key.name in self.date_keys:
-            try:
-                search_value = parse_datetime_string(search_value)
-            except InvalidQuery as exc:
-                raise InvalidSearchQuery(str(exc))
-            return SearchFilter(search_key, operator, SearchValue(search_value))
-        else:
-            search_value = operator + search_value if operator != "=" else search_value
-            return self._handle_basic_filter(search_key, "=", SearchValue(search_value))
-
-    def visit_duration_filter(self, node, children):
-        (search_key, sep, operator, search_value) = children
-
-        operator = operator[0] if not isinstance(operator, Node) else "="
-        if self.is_duration_key(search_key.name):
-            try:
-                search_value = parse_duration(*search_value.match.groups())
-            except InvalidQuery as exc:
-                raise InvalidSearchQuery(str(exc))
-            return SearchFilter(search_key, operator, SearchValue(search_value))
-        elif self.is_numeric_key(search_key.name):
-            return self.visit_numeric_filter(node, (search_key, sep, operator, search_value))
-        else:
-            search_value = operator + search_value.text if operator != "=" else search_value.text
-            return self._handle_basic_filter(search_key, "=", SearchValue(search_value))
-
-    def visit_rel_time_filter(self, node, children):
-        (search_key, _, value) = children
-        if search_key.name in self.date_keys:
-            try:
-                from_val, to_val = parse_datetime_range(value.text)
-            except InvalidQuery as exc:
-                raise InvalidSearchQuery(str(exc))
-
-            # TODO: Handle negations
-            if from_val is not None:
-                operator = ">="
-                search_value = from_val[0]
-            else:
-                operator = "<="
-                search_value = to_val[0]
-            return SearchFilter(search_key, operator, SearchValue(search_value))
-        else:
-            return self._handle_basic_filter(search_key, "=", SearchValue(value.text))
-
-    def visit_specific_time_filter(self, node, children):
+    def visit_specific_date_filter(
+        self,
+        node: Node,
+        children: tuple[
+            SearchKey,
+            Node,  # :
+            str,  # date value
+        ],
+    ) -> SearchFilter | list[SearchFilter]:
         # If we specify a specific date, it means any event on that day, and if
         # we specify a specific datetime then it means a few minutes interval
         # on either side of that datetime
         (search_key, _, date_value) = children
-        date_value = date_value[0]
 
-        if search_key.name not in self.date_keys:
+        if not self.is_date_key(search_key.name):
             return self._handle_basic_filter(search_key, "=", SearchValue(date_value))
 
         try:
@@ -600,115 +1102,731 @@ class SearchVisitor(NodeVisitor):
             SearchFilter(search_key, "<", SearchValue(to_val[0])),
         ]
 
-    def visit_operator(self, node, children):
-        return node.text
+    def visit_rel_date_filter(
+        self,
+        node: Node,
+        children: tuple[
+            SearchKey,
+            Node,  # :
+            Node,  # date filter value
+        ],
+    ) -> SearchFilter:
+        (search_key, _, value) = children
 
-    def visit_date_format(self, node, children):
-        return node.text
+        if self.is_date_key(search_key.name):
+            try:
+                dt_range = parse_datetime_range(value.text)
+            except InvalidQuery as exc:
+                raise InvalidSearchQuery(str(exc))
 
-    def visit_alt_date_format(self, node, children):
-        return node.text
+            # TODO: Handle negations
+            if dt_range[0] is not None:
+                operator = ">="
+                search_value = dt_range[0][0]
+            else:
+                operator = "<="
+                search_value = dt_range[1][0]
+            return SearchFilter(search_key, operator, SearchValue(search_value))
 
-    def is_negated(self, node):
-        # Because negations are always optional, parsimonious returns a list of nodes
-        # containing one node when a negation exists, and a single node when it doesn't.
-        if isinstance(node, list):
-            node = node[0]
+        return self._handle_basic_filter(search_key, "=", SearchValue(value.text))
 
-        return node.text == "!"
+    def visit_duration_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            tuple[str, str],  # value and unit
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _, operator, search_value) = children
+        if self.is_duration_key(search_key.name) or self.is_numeric_key(search_key.name):
+            operator_s = handle_negation(negation, operator)
+        else:
+            operator_s = get_operator_value(operator)
+        if self.is_duration_key(search_key.name):
+            try:
+                search_value_f = parse_duration(*search_value)
+            except InvalidQuery as exc:
+                raise InvalidSearchQuery(str(exc))
+            return SearchFilter(search_key, operator_s, SearchValue(search_value_f))
 
-    def visit_quoted_basic_filter(self, node, children):
-        (negation, search_key, _, search_value) = children
-        operator = "!=" if self.is_negated(negation) else "="
-        search_value = SearchValue(search_value)
-        return self._handle_basic_filter(search_key, operator, search_value)
-
-    def visit_basic_filter(self, node, children):
-        (negation, search_key, _, search_value) = children
-        operator = "!=" if self.is_negated(negation) else "="
-        if not search_value.raw_value:
-            raise InvalidSearchQuery(f"Empty string after '{search_key.name}:'")
-
-        return self._handle_basic_filter(search_key, operator, search_value)
-
-    def _handle_basic_filter(self, search_key, operator, search_value):
-        # If a date or numeric key gets down to the basic filter, then it means
-        # that the value wasn't in a valid format, so raise here.
-        if search_key.name in self.date_keys:
-            raise InvalidSearchQuery(f"{search_key.name}: Invalid format for date field")
-        if search_key.name in self.boolean_keys:
-            raise InvalidSearchQuery(f"{search_key.name}: Invalid format for boolean field")
+        # Durations overlap with numeric `m` suffixes
         if self.is_numeric_key(search_key.name):
-            raise InvalidSearchQuery(f"{search_key.name}: Invalid format for numeric field")
+            return self._handle_numeric_filter(search_key, operator_s, search_value)
+
+        search_value_s = "".join(search_value)
+        search_value_s = (
+            operator_s + search_value_s if operator_s not in ("=", "!=") else search_value_s
+        )
+        operator_s = "!=" if is_negated(negation) else "="
+        return self._handle_basic_filter(search_key, operator_s, SearchValue(search_value_s))
+
+    def visit_size_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            tuple[str, str],  # value and unit
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _, operator, search_value) = children
+        # The only size keys we have are custom measurements right now
+        if self.is_size_key(search_key.name):
+            operator_s = handle_negation(negation, operator)
+        else:
+            operator_s = get_operator_value(operator)
+
+        if self.is_size_key(search_key.name):
+            search_value_f = parse_size(*search_value)
+            return SearchFilter(search_key, operator_s, SearchValue(search_value_f))
+
+        search_value_s = "".join(search_value)
+        search_value_s = (
+            operator_s + search_value_s if operator_s not in ("=", "!=") else search_value_s
+        )
+        operator_s = "!=" if is_negated(negation) else "="
+        return self._handle_basic_filter(search_key, operator_s, SearchValue(search_value_s))
+
+    def visit_boolean_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            Node,  # boolean value
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, sep, search_value_node) = children
+        negated = is_negated(negation)
+
+        # Numeric and boolean filters overlap on 1 and 0 values.
+        if self.is_numeric_key(search_key.name):
+            return self._handle_numeric_filter(
+                search_key, "!=" if negated else "=", (search_value_node.text, "")
+            )
+
+        if self.is_boolean_key(search_key.name):
+            if search_value_node.text.lower() in ("true", "1"):
+                search_value = SearchValue(0 if negated else 1)
+            elif search_value_node.text.lower() in ("false", "0"):
+                search_value = SearchValue(1 if negated else 0)
+            else:
+                raise AssertionError(f"unreachable: {search_value_node.text}")
+            return SearchFilter(search_key, "=", search_value)
+
+        search_value = SearchValue(search_value_node.text)
+        return self._handle_basic_filter(search_key, "=" if not negated else "!=", search_value)
+
+    def visit_numeric_in_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            list[tuple[str, str]],  # values
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _, search_values) = children
+        operator = handle_negation(negation, "IN")
+
+        if self.is_numeric_key(search_key.name):
+            search_value = SearchValue([parse_numeric_value(*val) for val in search_values])
+            return SearchFilter(search_key, operator, search_value)
+
+        search_value = SearchValue(["".join(value) for value in search_values])
+        return self._handle_basic_filter(search_key, operator, search_value)
+
+    def visit_numeric_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            tuple[str, str],  # value and unit
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _, operator, raw_search_value) = children
+        if (
+            self.is_numeric_key(search_key.name)
+            or search_key.name in self.config.text_operator_keys
+        ):
+            operator_s = handle_negation(negation, operator)
+        else:
+            operator_s = get_operator_value(operator)
+
+        if self.is_numeric_key(search_key.name):
+            return self._handle_numeric_filter(search_key, operator_s, raw_search_value)
+
+        search_value = SearchValue("".join(raw_search_value))
+        if operator_s not in ("=", "!=") and search_key.name not in self.config.text_operator_keys:
+            search_value = search_value._replace(raw_value=f"{operator_s}{search_value.raw_value}")
+
+        if search_key.name not in self.config.text_operator_keys:
+            operator_s = "!=" if is_negated(negation) else "="
+        return self._handle_basic_filter(search_key, operator_s, search_value)
+
+    def visit_aggregate_duration_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            AggregateKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            tuple[str, str],  # value and unit
+        ],
+    ) -> AggregateFilter:
+        (negation, search_key, _, operator, search_value) = children
+        operator_s = handle_negation(negation, operator)
+
+        # Even if the search value matches duration format, only act as
+        # duration for certain columns
+        result_type = self.get_function_result_type(search_key.name)
+
+        if result_type == "duration" or result_type in DURATION_UNITS:
+            try:
+                aggregate_value = parse_duration(*search_value)
+            except InvalidQuery as exc:
+                raise InvalidSearchQuery(str(exc))
+        else:
+            # Duration overlaps with numeric values with `m` (million vs
+            # minutes). So we fall through to numeric if it's not a
+            # duration key
+            #
+            # TODO(epurkhiser): Should we validate that the field is
+            # numeric and do some other fallback if it's not?
+            try:
+                aggregate_value = parse_numeric_value(*search_value)
+            except InvalidQuery as exc:
+                raise InvalidSearchQuery(str(exc))
+
+        return AggregateFilter(search_key, operator_s, SearchValue(aggregate_value))
+
+    def visit_aggregate_size_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            AggregateKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            tuple[str, str],  # value + unit
+        ],
+    ) -> AggregateFilter:
+        (negation, search_key, _, operator, search_value) = children
+        operator_s = handle_negation(negation, operator)
+        aggregate_value = parse_size(*search_value)
+        return AggregateFilter(search_key, operator_s, SearchValue(aggregate_value))
+
+    def visit_aggregate_percentage_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            AggregateKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            str,  # percentage value
+        ],
+    ) -> AggregateFilter:
+        (negation, search_key, _, operator, search_value) = children
+        operator_s = handle_negation(negation, operator)
+
+        # Even if the search value matches percentage format, only act as
+        # percentage for certain columns
+        result_type = self.get_function_result_type(search_key.name)
+        if result_type == "percentage":
+            aggregate_value = parse_percentage(search_value)
+            return AggregateFilter(search_key, operator_s, SearchValue(aggregate_value))
+
+        # Invalid formats fall back to text match
+        search_value = operator_s + search_value if operator_s != "=" else search_value
+        return AggregateFilter(search_key, "=", SearchValue(search_value))
+
+    def visit_aggregate_numeric_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            AggregateKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            tuple[str, str],  # value
+        ],
+    ) -> AggregateFilter:
+        (negation, search_key, _, operator, search_value) = children
+        operator_s = handle_negation(negation, operator)
+        aggregate_value = parse_numeric_value(*search_value)
+        return AggregateFilter(search_key, operator_s, SearchValue(aggregate_value))
+
+    def visit_aggregate_date_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            AggregateKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            str,  # value
+        ],
+    ) -> AggregateFilter:
+        (negation, search_key, _, operator, search_value) = children
+        operator_s = handle_negation(negation, operator)
+        is_date_aggregate = any(key in search_key.name for key in self.config.date_keys)
+        if is_date_aggregate:
+            try:
+                search_value_dt = parse_datetime_string(search_value)
+            except InvalidQuery as exc:
+                raise InvalidSearchQuery(str(exc))
+            return AggregateFilter(search_key, operator_s, SearchValue(search_value_dt))
+
+        # Invalid formats fall back to text match
+        search_value = operator_s + search_value if operator_s != "=" else search_value
+        return AggregateFilter(search_key, "=", SearchValue(search_value))
+
+    def visit_aggregate_rel_date_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            AggregateKey,
+            Node,  # :
+            Node | tuple[str],  # operator if present
+            Node,  # value
+        ],
+    ) -> AggregateFilter:
+        (negation, search_key, _, operator, search_value) = children
+        operator_s = handle_negation(negation, operator)
+        is_date_aggregate = any(key in search_key.name for key in self.config.date_keys)
+        if is_date_aggregate:
+            try:
+                dt_range = parse_datetime_range(search_value.text)
+            except InvalidQuery as exc:
+                raise InvalidSearchQuery(str(exc))
+
+            if dt_range[0] is not None:
+                operator_s = ">="
+                search_value_dt = dt_range[0][0]
+            else:
+                operator_s = "<="
+                search_value_dt = dt_range[1][0]
+
+            return AggregateFilter(search_key, operator_s, SearchValue(search_value_dt))
+
+        # Invalid formats fall back to text match
+        search_value_s = operator_s + search_value.text if operator_s != "=" else search_value.text
+        return AggregateFilter(search_key, "=", SearchValue(search_value_s))
+
+    def visit_has_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],
+            Node,
+            SearchKey,
+            Node,
+            SearchKey,
+        ],
+    ) -> SearchFilter:
+        # the key is has here, which we don't need
+        negation, _, _, _, search_key = children
+        (search_key,) = self._validate_has_search_keys(negation, [search_key])
+
+        operator = "=" if is_negated(negation) else "!="
+        return SearchFilter(search_key, operator, SearchValue(self.config.has_filter_value))
+
+    def _validate_has_search_keys(
+        self, negation: Node | tuple[Node], search_keys: Sequence[SearchKey]
+    ) -> list[SearchKey]:
+        validated_search_keys = []
+        for search_key in search_keys:
+            if isinstance(search_key, SearchValue):
+                raise InvalidSearchQuery(
+                    'Invalid format for "has" search: was expecting a field or tag instead'
+                )
+            validated_search_keys.append(search_key)
+
+        # Some datasets do not support the !has filter, but we allow
+        # team_key_transaction because we control that field and special
+        # case the way it's processed in search.
+        if (
+            not self.config.allow_not_has_filter
+            and is_negated(negation)
+            and not (
+                len(validated_search_keys) == 1
+                and validated_search_keys[0].name == TEAM_KEY_TRANSACTION_ALIAS
+            )
+        ):
+            raise IncompatibleMetricsQuery(NOT_HAS_FILTER_ERROR_MESSAGE)
+
+        return validated_search_keys
+
+    def visit_is_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            Node,  # is: lookahead
+            SearchKey,  # SearchKey('is')
+            Node,  # :
+            SearchValue,
+        ],
+    ) -> SearchFilter:
+        negation, _, _, _, search_value = children
+
+        translators = self.config.is_filter_translation
+
+        if not translators:
+            raise InvalidSearchQuery('"is:" queries are not supported in this search.')
+
+        if search_value.raw_value.startswith("["):  # type: ignore[union-attr]  # in progress fixing the value type here
+            raise InvalidSearchQuery('"in" syntax invalid for "is" search')
+
+        if search_value.raw_value not in translators:
+            valid_keys = sorted(translators.keys())
+            raise InvalidSearchQuery(
+                f'Invalid value for "is" search, valid values are {valid_keys}'
+            )
+
+        search_key_s, search_value_v = translators[search_value.raw_value]  # type: ignore[index]   # in progress fixing the value type here
+
+        operator = "!=" if is_negated(negation) else "="
+        search_key = SearchKey(search_key_s)
+        search_value = SearchValue(search_value_v)
 
         return SearchFilter(search_key, operator, search_value)
 
-    def visit_has_filter(self, node, children):
-        # the key is has here, which we don't need
-        negation, _, _, (search_key,) = children
+    def visit_text_in_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            Node | Sequence[Node],  # wildcard_op if present
+            list[str],
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _sep, wildcard_op, search_value_lst) = children
+        operator = "IN"
+        search_value = SearchValue(search_value_lst)
 
-        # if it matched search value instead, it's not a valid key
-        if isinstance(search_key, SearchValue):
-            raise InvalidSearchQuery(
-                'Invalid format for "has" search: was expecting a field or tag instead'
+        operator = handle_negation(negation, operator)
+
+        if has_wildcard_op(wildcard_op) and isinstance(search_value.raw_value, list):
+            wildcarded_values = []
+            found_wildcard_op = get_wildcard_op(wildcard_op)
+            for value in search_value.raw_value:
+                if isinstance(value, str):
+                    wildcarded_values.append(gen_wildcard_value(value, found_wildcard_op))
+
+            search_value = search_value._replace(raw_value=wildcarded_values)
+
+        return self._handle_basic_filter(search_key, operator, search_value)
+
+    def visit_text_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            SearchKey,
+            Node,  # :
+            Node | Sequence[Node],  # wildcard_op if present
+            Node | tuple[str],  # operator if present
+            SearchValue,
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _sep, wildcard_op, operator, search_value) = children
+        self._raise_if_regex_pattern_is_too_long_to_scan(node, search_key)
+        operator_s = get_operator_value(operator)
+
+        # XXX: We check whether the text in the node itself is actually empty, so
+        # we can tell the difference between an empty quoted string and no string
+        if not search_value.raw_value and not node.children[5].text:
+            raise InvalidSearchQuery(f"Empty string after '{search_key.name}:'")
+
+        if operator_s not in ("=", "!=") and search_key.name not in self.config.text_operator_keys:
+            # Operators are not supported in text_filter.
+            # Push it back into the value before handing the negation.
+            search_value = search_value._replace(raw_value=f"{operator_s}{search_value.raw_value}")
+            operator_s = "="
+
+        operator_s = handle_negation(negation, operator_s)
+
+        if has_wildcard_op(wildcard_op) and isinstance(search_value.raw_value, str):
+            wildcarded_value = gen_wildcard_value(
+                search_value.raw_value, get_wildcard_op(wildcard_op)
             )
+            search_value = search_value._replace(raw_value=wildcarded_value)
 
-        operator = "=" if self.is_negated(negation) else "!="
-        return SearchFilter(search_key, operator, SearchValue(""))
+        return self._handle_basic_filter(search_key, operator_s, search_value)
 
-    def visit_tag_filter(self, node, children):
-        (negation, _, search_key, _, sep, search_value) = children
-        operator = "!=" if self.is_negated(negation) else "="
-        return SearchFilter(SearchKey(f"tags[{search_key.name}]"), operator, search_value)
+    def visit_regex_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # ! if present
+            tuple[SearchKey],
+            Node,  # :
+            str,  # pattern
+        ],
+    ) -> SearchFilter:
+        (negation, (search_key,), _sep, pattern) = children
+        operator = handle_negation(negation, "=")
+        if not self.config.allow_regex:
+            literal = self.visit_value(node.children[3], [])
+            return self._handle_basic_filter(search_key, operator, SearchValue(literal))
 
-    def visit_is_filter(self, node, children):
-        raise InvalidSearchQuery('"is:" queries are only supported in issue search.')
+        self._regex_filter_count += 1
+        if self._regex_filter_count > MAX_REGEX_FILTERS_PER_QUERY:
+            raise InvalidSearchQuery(
+                f"Queries are limited to {MAX_REGEX_FILTERS_PER_QUERY} regex filters."
+            )
+        if regex_pattern_length(pattern) > MAX_REGEX_PATTERN_LENGTH:
+            raise regex_pattern_too_long_error(search_key.name)
+        validate_regex_pattern(search_key.name, pattern)
+        # Escape sequences and `*` mean something to the regex engine, so the pattern skips
+        # wildcard and escape translation
+        return SearchFilter(
+            search_key, operator, SearchValue(pattern, use_raw_value=True, is_regex=True)
+        )
 
-    def visit_search_key(self, node, children):
-        key = children[0]
-        return SearchKey(self.key_mappings_lookup.get(key, key))
+    def visit_regex_value(self, node: RegexNode, children: object) -> str:
+        return node.match.group(1)
 
-    def visit_aggregate_key(self, node, children):
-        children = self.flatten(children)
-        children = self.remove_optional_nodes(children)
-        children = self.remove_space(children)
+    def _raise_if_regex_pattern_is_too_long_to_scan(
+        self, node: Node, search_key: SearchKey
+    ) -> None:
+        """A pattern longer than regex_value's scan cap lands in a text filter instead. It shows
+        up there as an unquoted `//` value, with no operator, whose closing `//` sits further
+        along the same line."""
+        wildcard_op, operator, value = node.children[3:6]
+        if (
+            not self.config.allow_regex
+            or wildcard_op.text
+            or operator.text
+            or not value.text.startswith("//")
+        ):
+            return
 
-        if len(children) == 3:
-            (function_name, open_paren, close_paren) = children
-            args = ""
-        else:
-            (function_name, open_paren, args, close_paren) = children
+        text = node.full_text
+        if self._regex_closing_or_newline_offsets is None:
+            self._regex_closing_or_newline_offsets = [
+                match.start() for match in REGEX_CLOSING_DELIMITER_OR_NEWLINE.finditer(text)
+            ]
+        offsets = self._regex_closing_or_newline_offsets
+        index = bisect.bisect_left(offsets, value.start + 3)
+        if index < len(offsets) and text[offsets[index]] == "/":
+            raise regex_pattern_too_long_error(search_key.name)
+
+    # --- End of filter visitors
+
+    def visit_key(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_escaped_key(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_quoted_key(self, node: Node, children: tuple[Node, str, Node]) -> str:
+        return children[1]
+
+    def visit_explicit_tag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "tags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"tags[{children[2]}]")
+
+    def visit_explicit_string_tag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "tags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # ' '
+            Node,  # ','
+            str,  # ' '
+            Node,  # "string"
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"tags[{children[2]},string]")
+
+    def visit_explicit_number_tag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "tags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # ' '
+            Node,  # ','
+            str,  # ' '
+            Node,  # "number"
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"tags[{children[2]},number]")
+
+    def visit_explicit_boolean_tag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "tags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # ' '
+            Node,  # ','
+            str,  # ' '
+            Node,  # "boolean"
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"tags[{children[2]},boolean]")
+
+    def visit_explicit_flag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "flags"
+            str,  # [
+            str,  # escaped_key
+            str,  # ]
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"flags[{children[2]}]")
+
+    def visit_explicit_string_flag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "flags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # ' '
+            Node,  # ','
+            str,  # ' '
+            Node,  # "string"
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"flags[{children[2]},string]")
+
+    def visit_explicit_number_flag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "flags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # ' '
+            Node,  # ','
+            str,  # ' '
+            Node,  # "number"
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"flags[{children[2]},number]")
+
+    def visit_aggregate_key(
+        self,
+        node: Node,
+        children: tuple[
+            str,  # function name
+            str,  # open paren
+            str,  # space
+            Node | tuple[list[str]],  # args if present
+            str,  # space
+            str,  # close paren
+        ],
+    ) -> AggregateKey:
+        function_name, open_paren, _, args, _, close_paren = children
 
         if isinstance(args, Node):
-            args = ""
-        elif isinstance(args, list):
-            args = "".join(args)
+            args_s = ""
+        else:
+            args_s = ", ".join(args[0])
 
-        key = "".join([function_name, open_paren, args, close_paren])
+        key = "".join([function_name, open_paren, args_s, close_paren])
         return AggregateKey(self.key_mappings_lookup.get(key, key))
 
-    def visit_function_arg(self, node, children):
+    def visit_function_args(
+        self,
+        node: Node,
+        children: tuple[
+            str,  # value
+            (Node | tuple[tuple[str, Node, str, Node, tuple[str]], ...]),  # no match  # repeat
+        ],
+    ) -> list[str]:
+        if isinstance(children[1], Node):
+            return [children[0]]
+        else:
+            return process_list(children[0], children[1])
+
+    def visit_aggregate_param(self, node: Node, children: tuple[str]) -> str:
+        return children[0]
+
+    def visit_query_aggregate_param(self, node: Node, children: object) -> str:
         return node.text
 
-    def visit_search_value(self, node, children):
-        return SearchValue(children[0])
-
-    def visit_closed_paren(self, node, children):
+    def visit_raw_aggregate_param(self, node: Node, children: object) -> str:
         return node.text
 
-    def visit_open_paren(self, node, children):
-        return node.text
+    def visit_quoted_aggregate_param(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "
+            Node | _RecursiveList[Node],  # content
+            Node,  # "
+        ],
+    ) -> str:
+        if isinstance(children[1], Node):  # empty string
+            value = ""
+        else:
+            value = "".join(node.text for node in flatten(children[1]))
 
-    def visit_boolean_operator(self, node, children):
-        if not self.allow_boolean:
-            raise InvalidSearchQuery(
-                'Boolean statements containing "OR" or "AND" are not supported in this search'
-            )
+        return f'"{value}"'
 
-        children = self.flatten(self.remove_space(children))
-        return children[0].text.upper()
+    def visit_explicit_tag_key_aggregate_param(
+        self,
+        node: Node,
+        children: tuple[SearchKey],
+    ) -> str:
+        return children[0].name
 
-    def visit_value(self, node, children):
+    def visit_search_key(self, node: Node, children: tuple[str | SearchKey]) -> SearchKey:
+        key = children[0]
+        if (
+            self.config.allowed_keys
+            and key not in self.config.allowed_keys
+            or key in self.config.blocked_keys
+        ):
+            raise InvalidSearchQuery(f"Invalid key for this search: {key}")
+        if isinstance(key, SearchKey):
+            return key
+        return SearchKey(self.key_mappings_lookup.get(key, key))
+
+    def visit_text_key(self, node: Node, children: tuple[SearchKey]) -> SearchKey:
+        return children[0]
+
+    def visit_value(self, node: Node, children: object) -> str:
         # A properly quoted value will match the quoted value regex, so any unescaped
         # quotes are errors.
         value = node.text
@@ -729,2072 +1847,333 @@ class SearchVisitor(NodeVisitor):
 
         return node.text.replace('\\"', '"')
 
-    def visit_key(self, node, children):
+    def visit_quoted_value(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "
+            Node | _RecursiveList[Node],  # content
+            Node,  # "
+        ],
+    ) -> str:
+        if isinstance(children[1], Node):  # empty string
+            value = ""
+        else:
+            value = "".join(node.text for node in flatten(children[1]))
+        value = value.replace('\\"', '"')
+
+        return value
+
+    def visit_in_value(self, node: Node, children: object) -> str:
+        return node.text.replace('\\"', '"')
+
+    def visit_text_in_value(self, node: Node, children: tuple[str]) -> str:
+        return children[0]
+
+    def visit_search_value(self, node: Node, children: tuple[str]) -> SearchValue:
+        return SearchValue(children[0])
+
+    def visit_numeric_value(
+        self,
+        node: Node,
+        children: tuple[
+            Node | list[Node],  # sign
+            str,  # value
+            Node | list[Node],  # unit
+            Node,  # terminating lookahead
+        ],
+    ) -> list[str]:
+        (sign, value, suffix, _) = children
+        sign_s = sign[0].text if isinstance(sign, list) else ""
+        suffix_s = suffix[0].text if isinstance(suffix, list) else ""
+
+        return [f"{sign_s}{value}", suffix_s]
+
+    def visit_boolean_value(self, node: Node, children: object) -> Node:
+        return node
+
+    def visit_text_in_list(
+        self,
+        node: Node,
+        children: tuple[
+            str,  # '['
+            str,  # value
+            tuple[tuple[str, Node, str, Node, tuple[str]], ...],  # repeat
+            str,  # ']'
+            Node,  # terminating lookahead
+        ],
+    ) -> list[str]:
+        return process_list(children[1], children[2])
+
+    def visit_numeric_in_list(
+        self,
+        node: Node,
+        children: tuple[
+            str,  # '['
+            tuple[str, str],  # value
+            tuple[tuple[str, Node, str, Node, tuple[tuple[str, str]]], ...],  # repeat
+            str,  # ']'
+            Node,  # terminating lookahead
+        ],
+    ) -> list[tuple[str, str]]:
+        return process_list(children[1], children[2])
+
+    def visit_has_item(self, node: Node, children: tuple[SearchKey]) -> SearchKey:
+        return children[0]
+
+    def visit_iso_8601_date_format(self, node: Node, children: object) -> str:
         return node.text
 
-    def visit_quoted_value(self, node, children):
-        return node.match.groups()[0].replace('\\"', '"')
+    def visit_rel_date_format(self, node: Node, children: object) -> Node:
+        return node
 
-    def visit_quoted_key(self, node, children):
-        return node.match.groups()[0]
+    def visit_duration_format(
+        self, node: Node, children: tuple[str, tuple[Node], Node]
+    ) -> list[str]:
+        return [children[0], children[1][0].text]
 
-    def generic_visit(self, node, children):
+    def visit_size_format(self, node: Node, children: tuple[str, tuple[Node]]) -> list[str]:
+        return [children[0], children[1][0].text]
+
+    def visit_percentage_format(self, node: Node, children: tuple[str, Node]) -> str:
+        return children[0]
+
+    def visit_operator(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_or_operator(self, node: Node, children: object) -> str:
+        return node.text.upper()
+
+    def visit_and_operator(self, node: Node, children: object) -> str:
+        return node.text.upper()
+
+    def visit_numeric(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_open_paren(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_closed_paren(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_open_bracket(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_closed_bracket(self, node: Node, children: object) -> str:
+        return node.text
+
+    def visit_sep(self, node: Node, children: object) -> Node:
+        return node
+
+    def visit_negation(self, node: Node, children: object) -> Node:
+        return node
+
+    def visit_wildcard_op(self, node: Node, children: object) -> Node:
+        return node
+
+    def visit_comma(self, node: Node, children: object) -> Node:
+        return node
+
+    def visit_spaces(self, node: Node, children: object) -> str:
+        return " "
+
+    def visit_has_in_list(
+        self,
+        node: Node,
+        children: tuple[
+            str,
+            SearchKey,
+            tuple[tuple[str, Node, str, Node, tuple[SearchKey]], ...],
+            str,
+            Node,
+        ],
+    ) -> list[SearchKey]:
+        return process_list(children[1], children[2])
+
+    def visit_has_in_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],
+            Node,
+            SearchKey,
+            Node,
+            list[SearchKey],
+        ],
+    ) -> SearchFilter | ParenExpression:
+        (negation, _, _, _, search_keys) = children
+        search_keys = self._validate_has_search_keys(negation, search_keys)
+
+        operator = "=" if is_negated(negation) else "!="
+        search_value = SearchValue(self.config.has_filter_value)
+        all_filters = [
+            SearchFilter(search_key, operator, search_value) for search_key in search_keys
+        ]
+        if not self.config.allow_boolean:
+            if len(all_filters) > 1:
+                self._validate_boolean_support()
+            return all_filters[0]
+
+        joining_operator: QueryOp = "AND" if is_negated(negation) else "OR"
+        tokens: list[QueryToken] = []
+        for index, search_filter in enumerate(all_filters):
+            tokens.append(search_filter)
+            if index != len(all_filters) - 1:
+                tokens.append(joining_operator)
+        return ParenExpression(tokens)
+
+    def visit_array_includes_suffix(self, node: Node, children: object) -> str:
+        return "[*]"
+
+    def visit_array_includes_tag_key(
+        self,
+        node: Node,
+        children: tuple[
+            Node,  # "tags"
+            str,  # '['
+            str,  # escaped_key
+            str,  # "[*]" (array_includes_suffix)
+            str,  # ' '
+            Node,  # ','
+            str,  # ' '
+            Node,  # "array"
+            str,  # ']'
+        ],
+    ) -> SearchKey:
+        return SearchKey(f"tags[{children[2]},array]")
+
+    def visit_array_includes_attr_key(
+        self,
+        node: Node,
+        children: tuple[Any, str],
+    ) -> SearchKey:
+        inner, _ = children
+        if isinstance(inner, list):
+            inner = inner[0]
+        return SearchKey(f"{inner}")
+
+    def visit_array_includes_key(self, node: Node, children: tuple[SearchKey]) -> SearchKey:
+        return children[0]
+
+    def visit_array_includes_filter(
+        self,
+        node: Node,
+        children: tuple[
+            Node | tuple[Node],  # negation
+            SearchKey,
+            Node,  # :
+            Node | Sequence[Node],  # wildcard_op
+            Node | tuple[str],  # operator
+            SearchValue,
+        ],
+    ) -> SearchFilter:
+        (negation, search_key, _, wildcard_op, operator, search_value) = children
+        self._raise_if_regex_pattern_is_too_long_to_scan(node, search_key)
+        operator_s = get_operator_value(operator)
+        if not search_value.raw_value:
+            raise InvalidSearchQuery(f"Empty value for {search_key.name}[*]")
+
+        if operator_s not in ("=", "!=") and not node.children[5].text:
+            raise InvalidSearchQuery("In Array Queries, only EQUAL/NOT_EQUAL operators are allowed")
+        operator_s = handle_negation(negation, operator_s)
+
+        if has_wildcard_op(wildcard_op) and isinstance(search_value.raw_value, str):
+            wildcard_value = gen_wildcard_value(
+                search_value.raw_value, get_wildcard_op(wildcard_op)
+            )
+            search_value = search_value._replace(raw_value=wildcard_value)
+        return SearchFilter(search_key, operator_s, search_value)
+
+    def generic_visit(self, node: Node, children: Sequence[Any]) -> Any:
         return children or node
 
 
-def parse_search_query(query, allow_boolean=True, params=None):
+default_config = SearchConfig(
+    duration_keys={"transaction.duration"},
+    text_operator_keys={SEMVER_ALIAS, SEMVER_BUILD_ALIAS},
+    # do not put aggregate functions in this list
+    numeric_keys={
+        "project_id",
+        "project.id",
+        "issue.id",
+        "stack.colno",
+        "stack.lineno",
+        "stack.stack_level",
+        "transaction.duration",
+    },
+    date_keys={
+        "start",
+        "end",
+        "last_seen()",
+        "time",
+        "timestamp",
+        "timestamp.to_hour",
+        "timestamp.to_day",
+        "error.received",
+    },
+    boolean_keys={
+        "error.handled",
+        "error.unhandled",
+        "error.main_thread",
+        "stack.in_app",
+        "is_application",
+        "symbolicated_in_app",
+        TEAM_KEY_TRANSACTION_ALIAS,
+    },
+)
+
+
+@overload
+def parse_search_query(
+    query: str,
+    *,
+    config: SearchConfig[Literal[False]],
+    params: ParamsType | None = None,
+    get_field_type: Callable[[str], str | None] | None = None,
+    get_function_result_type: Callable[[str], str | None] | None = None,
+) -> Sequence[SearchFilter | AggregateFilter]: ...
+
+
+@overload
+def parse_search_query(
+    query: str,
+    *,
+    config: SearchConfig[Literal[True]] | None = None,
+    params: ParamsType | None = None,
+    get_field_type: Callable[[str], str | None] | None = None,
+    get_function_result_type: Callable[[str], str | None] | None = None,
+) -> Sequence[QueryToken]: ...
+
+
+def parse_search_query(
+    query: str,
+    *,
+    config: SearchConfig[Any] | None = None,
+    params: ParamsType | None = None,
+    get_field_type: Callable[[str], str | None] | None = None,
+    get_function_result_type: Callable[[str], str | None] | None = None,
+) -> Sequence[QueryToken]:
+    if config is None:
+        config = default_config
+
     try:
         tree = event_search_grammar.parse(query)
     except IncompleteParseError as e:
         idx = e.column()
         prefix = query[max(0, idx - 5) : idx]
         suffix = query[idx : (idx + 5)]
-        raise InvalidSearchQuery(
+        err = InvalidSearchQuery(
             "{} {}".format(
                 f"Parse error at '{prefix}{suffix}' (column {e.column():d}).",
                 "This is commonly caused by unmatched parentheses. Enclose any text in double quotes.",
-            )
-        )
-    return SearchVisitor(allow_boolean, params=params).visit(tree)
-
-
-def convert_aggregate_filter_to_snuba_query(aggregate_filter, params):
-    name = aggregate_filter.key.name
-    value = aggregate_filter.value.value
-
-    if params is not None and name in params.get("aliases", {}):
-        return params["aliases"][name].converter(aggregate_filter)
-
-    value = (
-        int(to_timestamp(value)) if isinstance(value, datetime) and name != "timestamp" else value
-    )
-
-    if aggregate_filter.operator in ("=", "!=") and aggregate_filter.value.value == "":
-        return [["isNull", [name]], aggregate_filter.operator, 1]
-
-    function = resolve_field(name, params, functions_acl=FUNCTIONS.keys())
-    if function.aggregate is not None:
-        name = function.aggregate[-1]
-
-    condition = [name, aggregate_filter.operator, value]
-    return condition
-
-
-def convert_search_filter_to_snuba_query(search_filter, key=None, params=None):
-    name = search_filter.key.name if key is None else key
-    value = search_filter.value.value
-
-    # We want to use group_id elsewhere so shouldn't be removed from the dataset
-    # but if a user has a tag with the same name we want to make sure that works
-    if name in {"group_id"}:
-        name = f"tags[{name}]"
-
-    if name in no_conversion:
-        return
-    elif name == "id" and search_filter.value.is_wildcard():
-        raise InvalidSearchQuery("Wildcard conditions are not permitted on `id` field.")
-    elif name == "environment":
-        # conditions added to env_conditions are OR'd
-        env_conditions = []
-
-        values = set(value if isinstance(value, (list, tuple)) else [value])
-        # the "no environment" environment is null in snuba
-        if "" in values:
-            values.remove("")
-            operator = "IS NULL" if search_filter.operator == "=" else "IS NOT NULL"
-            env_conditions.append(["environment", operator, None])
-        if len(values) == 1:
-            operator = "=" if search_filter.operator == "=" else "!="
-            env_conditions.append(["environment", operator, values.pop()])
-        elif values:
-            operator = "IN" if search_filter.operator == "=" else "NOT IN"
-            env_conditions.append(["environment", operator, values])
-        return env_conditions
-    elif name == "message":
-        if search_filter.value.is_wildcard():
-            # XXX: We don't want the '^$' values at the beginning and end of
-            # the regex since we want to find the pattern anywhere in the
-            # message. Strip off here
-            value = search_filter.value.value[1:-1]
-            return [["match", ["message", f"'(?i){value}'"]], search_filter.operator, 1]
-        elif value == "":
-            operator = "=" if search_filter.operator == "=" else "!="
-            return [["equals", ["message", f"{value}"]], operator, 1]
-        else:
-            # https://clickhouse.yandex/docs/en/query_language/functions/string_search_functions/#position-haystack-needle
-            # positionCaseInsensitive returns 0 if not found and an index of 1 or more if found
-            # so we should flip the operator here
-            operator = "=" if search_filter.operator == "!=" else "!="
-            # make message search case insensitive
-            return [["positionCaseInsensitive", ["message", f"'{value}'"]], operator, 0]
-    elif (
-        name.startswith("stack.") or name.startswith("error.")
-    ) and search_filter.value.is_wildcard():
-        # Escape and convert meta characters for LIKE expressions.
-        raw_value = search_filter.value.raw_value
-        like_value = raw_value.replace("%", "\\%").replace("_", "\\_").replace("*", "%")
-        operator = "LIKE" if search_filter.operator == "=" else "NOT LIKE"
-        return [name, operator, like_value]
-    elif name == "transaction.status":
-        # Handle "has" queries
-        if search_filter.value.raw_value == "":
-            return [["isNull", [name]], search_filter.operator, 1]
-
-        internal_value = SPAN_STATUS_NAME_TO_CODE.get(search_filter.value.raw_value)
-        if internal_value is None:
-            raise InvalidSearchQuery(
-                "Invalid value for transaction.status condition. Accepted values are {}".format(
-                    ", ".join(SPAN_STATUS_NAME_TO_CODE.keys())
-                )
-            )
-        return [name, search_filter.operator, internal_value]
-    elif name == "issue.id":
-        # Handle "has" queries
-        if search_filter.value.raw_value == "":
-            if search_filter.operator == "=":
-                # The state of having no issues is represented differently on transactions vs
-                # other events. On the transactions table, it is represented by 0 whereas it is
-                # represented by NULL everywhere else. This means we have to check for both 0
-                # or NULL.
-                return [
-                    [["isNull", [name]], search_filter.operator, 1],
-                    [name, search_filter.operator, 0],
-                ]
-            else:
-                # Based the reasoning above, we should be checking that it is not 0 and not NULL.
-                # However, because NULL != 0 evaluates to NULL in Clickhouse, we can simplify it
-                # to check just not 0.
-                return [name, search_filter.operator, 0]
-
-        # Skip isNull check on group_id value as we want to
-        # allow snuba's prewhere optimizer to find this condition.
-        return [name, search_filter.operator, value]
-    elif name == USER_DISPLAY_ALIAS:
-        user_display_expr = FIELD_ALIASES[USER_DISPLAY_ALIAS].get_expression(params)
-
-        # Handle 'has' condition
-        if search_filter.value.raw_value == "":
-            return [["isNull", [user_display_expr]], search_filter.operator, 1]
-        if search_filter.value.is_wildcard():
-            return [
-                ["match", [user_display_expr, f"'(?i){value}'"]],
-                search_filter.operator,
-                1,
-            ]
-        return [user_display_expr, search_filter.operator, value]
-    elif name == ERROR_UNHANDLED_ALIAS:
-        # This field is the inversion of error.handled, otherwise the logic is the same.
-        if search_filter.value.raw_value == "":
-            output = 0 if search_filter.operator == "!=" else 1
-            return [["isHandled", []], "=", output]
-        if value in ("1", 1):
-            return [["notHandled", []], "=", 1]
-        if value in ("0", 0):
-            return [["isHandled", []], "=", 1]
-        raise InvalidSearchQuery(
-            "Invalid value for error.unhandled condition. Accepted values are 1, 0"
-        )
-    elif name == "error.handled":
-        # Treat has filter as equivalent to handled
-        if search_filter.value.raw_value == "":
-            output = 1 if search_filter.operator == "!=" else 0
-            return [["isHandled", []], "=", output]
-        # Null values and 1 are the same, and both indicate a handled error.
-        if value in ("1", 1):
-            return [["isHandled", []], "=", 1]
-        if value in (
-            "0",
-            0,
-        ):
-            return [["notHandled", []], "=", 1]
-        raise InvalidSearchQuery(
-            "Invalid value for error.handled condition. Accepted values are 1, 0"
-        )
-    elif name == KEY_TRANSACTION_ALIAS:
-        key_transaction_expr = FIELD_ALIASES[KEY_TRANSACTION_ALIAS].get_expression(params)
-
-        if search_filter.value.raw_value == "":
-            operator = "!=" if search_filter.operator == "!=" else "="
-            return [key_transaction_expr, operator, 0]
-        if value in ("1", 1):
-            return [key_transaction_expr, "=", 1]
-        if value in ("0", 0):
-            return [key_transaction_expr, "=", 0]
-        raise InvalidSearchQuery(
-            "Invalid value for key_transaction condition. Accepted values are 1, 0"
-        )
-    elif name in ARRAY_FIELDS and search_filter.value.raw_value == "":
-        return [["notEmpty", [name]], "=", 1 if search_filter.operator == "!=" else 0]
-    else:
-        value = (
-            int(to_timestamp(value)) * 1000
-            if isinstance(value, datetime) and name != "timestamp"
-            else value
-        )
-        # Tags are never null, but promoted tags are columns and so can be null.
-        # To handle both cases, use `ifNull` to convert to an empty string and
-        # compare so we need to check for empty values.
-        if search_filter.key.is_tag:
-            name = ["ifNull", [name, "''"]]
-
-        # Handle checks for existence
-        if search_filter.operator in ("=", "!=") and search_filter.value.value == "":
-            if search_filter.key.is_tag:
-                return [name, search_filter.operator, value]
-            else:
-                # If not a tag, we can just check that the column is null.
-                return [["isNull", [name]], search_filter.operator, 1]
-
-        is_null_condition = None
-        if search_filter.operator == "!=" and not search_filter.key.is_tag:
-            # Handle null columns on inequality comparisons. Any comparison
-            # between a value and a null will result to null, so we need to
-            # explicitly check for whether the condition is null, and OR it
-            # together with the inequality check.
-            # We don't need to apply this for tags, since if they don't exist
-            # they'll always be an empty string.
-            is_null_condition = [["isNull", [name]], "=", 1]
-
-        if search_filter.value.is_wildcard():
-            condition = [["match", [name, f"'(?i){value}'"]], search_filter.operator, 1]
-        else:
-            condition = [name, search_filter.operator, value]
-
-        # We only want to return as a list if we have the check for null
-        # present. Returning as a list causes these conditions to be ORed
-        # together. Otherwise just return the raw condition, so that it can be
-        # used correctly in aggregates.
-        if is_null_condition:
-            return [is_null_condition, condition]
-        else:
-            return condition
-
-
-def to_list(value):
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
-def format_search_filter(term, params):
-    project_to_filter = None  # Used to avoid doing multiple conditions on project ID
-    conditions = []
-    group_ids = None
-    name = term.key.name
-    value = term.value.value
-    if name in (PROJECT_ALIAS, PROJECT_NAME_ALIAS):
-        if term.operator == "=" and value == "":
-            raise InvalidSearchQuery("Invalid query for 'has' search: 'project' cannot be empty.")
-        project = None
-        try:
-            project = Project.objects.get(id__in=params.get("project_id", []), slug=value)
-        except Exception as e:
-            if not isinstance(e, Project.DoesNotExist) or term.operator != "!=":
-                raise InvalidSearchQuery(
-                    f"Invalid query. Project {value} does not exist or is not an actively selected project."
-                )
-        else:
-            # Create a new search filter with the correct values
-            term = SearchFilter(SearchKey("project_id"), term.operator, SearchValue(project.id))
-            converted_filter = convert_search_filter_to_snuba_query(term)
-            if converted_filter:
-                if term.operator == "=":
-                    project_to_filter = project.id
-
-                conditions.append(converted_filter)
-    elif name == ISSUE_ID_ALIAS and value != "":
-        # A blank term value means that this is a has filter
-        group_ids = to_list(value)
-    elif name == ISSUE_ALIAS:
-        operator = term.operator
-        if value == "unknown":
-            # `unknown` is a special value for when there is no issue associated with the event
-            operator = "=" if term.operator == "=" else "!="
-            value = ""
-        elif value != "" and params and "organization_id" in params:
-            try:
-                group = Group.objects.by_qualified_short_id(params["organization_id"], value)
-            except Exception:
-                raise InvalidSearchQuery(f"Invalid value '{value}' for 'issue:' filter")
-            else:
-                value = group.id
-        term = SearchFilter(SearchKey("issue.id"), operator, SearchValue(value))
-        converted_filter = convert_search_filter_to_snuba_query(term)
-        conditions.append(converted_filter)
-    elif name == RELEASE_ALIAS and params and value == "latest":
-        converted_filter = convert_search_filter_to_snuba_query(
-            SearchFilter(
-                term.key,
-                term.operator,
-                SearchValue(
-                    parse_release(
-                        value,
-                        params["project_id"],
-                        params.get("environment_objects"),
-                        params.get("organization_id"),
-                    )
-                ),
-            )
-        )
-        if converted_filter:
-            conditions.append(converted_filter)
-    else:
-        converted_filter = convert_search_filter_to_snuba_query(term, params=params)
-        if converted_filter:
-            conditions.append(converted_filter)
-
-    return conditions, project_to_filter, group_ids
-
-
-def convert_condition_to_function(cond):
-    function = OPERATOR_TO_FUNCTION.get(cond[1])
-    if not function:
-        # It's hard to make this error more specific without exposing internals to the end user
-        raise InvalidSearchQuery(f"Operator {cond[1]} is not a valid condition operator.")
-
-    return [function, [cond[0], cond[2]]]
-
-
-def convert_function_to_condition(func):
-    operator = FUNCTION_TO_OPERATOR.get(func[0])
-    if not operator:
-        return [func, "=", 1]
-
-    return [func[1][0], operator, func[1][1]]
-
-
-def convert_array_to_tree(operator, terms):
-    """
-    Convert an array of conditions into a binary tree joined by the operator.
-    """
-    if len(terms) == 1:
-        return terms[0]
-    elif len(terms) == 2:
-        return [operator, terms]
-
-    return [operator, [terms[0], convert_array_to_tree(operator, terms[1:])]]
-
-
-def flatten_condition_tree(tree, condition_function):
-    """
-    Take a binary tree of conditions, and flatten all of the terms using the condition function.
-    E.g. f( and(and(b, c), and(d, e)), and ) -> [b, c, d, e]
-    """
-    stack = [tree]
-    flattened = []
-    while len(stack) > 0:
-        item = stack.pop(0)
-        if item[0] == condition_function:
-            stack.extend(item[1])
-        else:
-            flattened.append(item)
-
-    return flattened
-
-
-def is_condition(term):
-    return isinstance(term, (tuple, list)) and len(term) == 3 and term[1] in OPERATOR_TO_FUNCTION
-
-
-def convert_snuba_condition_to_function(term, params=None):
-    if isinstance(term, ParenExpression):
-        return convert_search_boolean_to_snuba_query(term.children, params)
-
-    group_ids = []
-    projects_to_filter = []
-    if isinstance(term, SearchFilter):
-        conditions, project_to_filter, group_ids = format_search_filter(term, params)
-        projects_to_filter = [project_to_filter] if project_to_filter else []
-        group_ids = group_ids if group_ids else []
-        if conditions:
-            conditions_to_and = []
-            for cond in conditions:
-                if is_condition(cond):
-                    conditions_to_and.append(convert_condition_to_function(cond))
-                else:
-                    conditions_to_and.append(
-                        convert_array_to_tree(
-                            SNUBA_OR, [convert_condition_to_function(c) for c in cond]
-                        )
-                    )
-
-            condition_tree = None
-            if len(conditions_to_and) == 1:
-                condition_tree = conditions_to_and[0]
-            elif len(conditions_to_and) > 1:
-                condition_tree = convert_array_to_tree(SNUBA_AND, conditions_to_and)
-            return condition_tree, None, projects_to_filter, group_ids
-    elif isinstance(term, AggregateFilter):
-        converted_filter = convert_aggregate_filter_to_snuba_query(term, params)
-        return None, convert_condition_to_function(converted_filter), projects_to_filter, group_ids
-
-    return None, None, projects_to_filter, group_ids
-
-
-def convert_search_boolean_to_snuba_query(terms, params=None):
-    if len(terms) == 1:
-        return convert_snuba_condition_to_function(terms[0], params)
-
-    # Filter out any ANDs since we can assume anything without an OR is an AND. Also do some
-    # basic sanitization of the query: can't have two operators next to each other, and can't
-    # start or end a query with an operator.
-    prev = None
-    new_terms = []
-    for term in terms:
-        if prev:
-            if SearchBoolean.is_operator(prev) and SearchBoolean.is_operator(term):
-                raise InvalidSearchQuery(
-                    f"Missing condition in between two condition operators: '{prev} {term}'"
-                )
-        else:
-            if SearchBoolean.is_operator(term):
-                raise InvalidSearchQuery(
-                    f"Condition is missing on the left side of '{term}' operator"
-                )
-
-        if term != SearchBoolean.BOOLEAN_AND:
-            new_terms.append(term)
-        prev = term
-    if SearchBoolean.is_operator(term):
-        raise InvalidSearchQuery(f"Condition is missing on the right side of '{term}' operator")
-    terms = new_terms
-
-    # We put precedence on AND, which sort of counter-intuitevely means we have to split the query
-    # on ORs first, so the ANDs are grouped together. Search through the query for ORs and split the
-    # query on each OR.
-    # We want to maintain a binary tree, so split the terms on the first OR we can find and recurse on
-    # the two sides. If there is no OR, split the first element out to AND
-    index = None
-    lhs, rhs = None, None
-    operator = None
-    try:
-        index = terms.index(SearchBoolean.BOOLEAN_OR)
-        lhs, rhs = terms[:index], terms[index + 1 :]
-        operator = SNUBA_OR
-    except Exception:
-        lhs, rhs = terms[:1], terms[1:]
-        operator = SNUBA_AND
-
-    (
-        lhs_condition,
-        lhs_having,
-        projects_to_filter,
-        group_ids,
-    ) = convert_search_boolean_to_snuba_query(lhs, params)
-    (
-        rhs_condition,
-        rhs_having,
-        rhs_projects_to_filter,
-        rhs_group_ids,
-    ) = convert_search_boolean_to_snuba_query(rhs, params)
-
-    projects_to_filter.extend(rhs_projects_to_filter)
-    group_ids.extend(rhs_group_ids)
-
-    if operator == SNUBA_OR and (lhs_condition or rhs_condition) and (lhs_having or rhs_having):
-        raise InvalidSearchQuery(
-            "Having an OR between aggregate filters and normal filters is invalid."
-        )
-
-    condition, having = None, None
-    if lhs_condition or rhs_condition:
-        args = filter(None, [lhs_condition, rhs_condition])
-        if not args:
-            condition = None
-        elif len(args) == 1:
-            condition = args[0]
-        else:
-            condition = [operator, args]
-
-    if lhs_having or rhs_having:
-        args = filter(None, [lhs_having, rhs_having])
-        if not args:
-            having = None
-        elif len(args) == 1:
-            having = args[0]
-        else:
-            having = [operator, args]
-
-    return condition, having, projects_to_filter, group_ids
-
-
-def get_filter(query=None, params=None):
-    """
-    Returns an eventstore filter given the search text provided by the user and
-    URL params
-    """
-    # NOTE: this function assumes project permissions check already happened
-    parsed_terms = []
-    if query is not None:
-        try:
-            parsed_terms = parse_search_query(query, allow_boolean=True, params=params)
-        except ParseError as e:
-            raise InvalidSearchQuery(f"Parse error: {e.expr.name} (column {e.column():d})")
-
-    kwargs = {
-        "start": None,
-        "end": None,
-        "conditions": [],
-        "having": [],
-        "user_id": None,
-        "organization_id": None,
-        "project_ids": [],
-        "group_ids": [],
-        "condition_aggregates": [],
-        "aliases": params.get("aliases", {}) if params is not None else {},
-    }
-
-    projects_to_filter = []
-    if any(
-        isinstance(term, ParenExpression) or SearchBoolean.is_operator(term)
-        for term in parsed_terms
-    ):
-        (
-            condition,
-            having,
-            found_projects_to_filter,
-            group_ids,
-        ) = convert_search_boolean_to_snuba_query(parsed_terms, params)
-
-        if condition:
-            and_conditions = flatten_condition_tree(condition, SNUBA_AND)
-            for func in and_conditions:
-                kwargs["conditions"].append(convert_function_to_condition(func))
-        if having:
-            kwargs["condition_aggregates"] = [
-                term.key.name for term in parsed_terms if isinstance(term, AggregateFilter)
-            ]
-            and_having = flatten_condition_tree(having, SNUBA_AND)
-            for func in and_having:
-                kwargs["having"].append(convert_function_to_condition(func))
-        if found_projects_to_filter:
-            projects_to_filter = list(set(found_projects_to_filter))
-        if group_ids is not None:
-            kwargs["group_ids"].extend(list(set(group_ids)))
-    else:
-        for term in parsed_terms:
-            if isinstance(term, SearchFilter):
-                conditions, found_project_to_filter, group_ids = format_search_filter(term, params)
-                if len(conditions) > 0:
-                    kwargs["conditions"].extend(conditions)
-                if found_project_to_filter:
-                    projects_to_filter = [found_project_to_filter]
-                if group_ids is not None:
-                    kwargs["group_ids"].extend(group_ids)
-            elif isinstance(term, AggregateFilter):
-                converted_filter = convert_aggregate_filter_to_snuba_query(term, params)
-                kwargs["condition_aggregates"].append(term.key.name)
-                if converted_filter:
-                    kwargs["having"].append(converted_filter)
-
-    # Keys included as url params take precedent if same key is included in search
-    # They are also considered safe and to have had access rules applied unlike conditions
-    # from the query string.
-    if params:
-        for key in ("start", "end"):
-            kwargs[key] = params.get(key, None)
-        # OrganizationEndpoint.get_filter() uses project_id, but eventstore.Filter uses project_ids
-        if "user_id" in params:
-            kwargs["user_id"] = params["user_id"]
-        if "organization_id" in params:
-            kwargs["organization_id"] = params["organization_id"]
-        if "project_id" in params:
-            if projects_to_filter:
-                kwargs["project_ids"] = projects_to_filter
-            else:
-                kwargs["project_ids"] = params["project_id"]
-        if "environment" in params:
-            term = SearchFilter(SearchKey("environment"), "=", SearchValue(params["environment"]))
-            kwargs["conditions"].append(convert_search_filter_to_snuba_query(term))
-        if "group_ids" in params:
-            kwargs["group_ids"] = to_list(params["group_ids"])
-        # Deprecated alias, use `group_ids` instead
-        if ISSUE_ID_ALIAS in params:
-            kwargs["group_ids"] = to_list(params["issue.id"])
-
-    return eventstore.Filter(**kwargs)
-
-
-class PseudoField:
-    def __init__(self, name, alias, expression=None, expression_fn=None, result_type=None):
-        self.name = name
-        self.alias = alias
-        self.expression = expression
-        self.expression_fn = expression_fn
-        self.result_type = result_type
-
-        self.validate()
-
-    def get_expression(self, params):
-        if isinstance(self.expression, (list, tuple)):
-            return deepcopy(self.expression)
-        elif self.expression_fn is not None:
-            return self.expression_fn(params)
-        return None
-
-    def get_field(self, params=None):
-        expression = self.get_expression(params)
-        if expression is not None:
-            expression.append(self.alias)
-            return expression
-        return self.alias
-
-    def validate(self):
-        assert self.alias is not None, f"{self.name}: alias is required"
-        assert (
-            self.expression is None or self.expression_fn is None
-        ), f"{self.name}: only one of expression, expression_fn is allowed"
-
-
-def key_transaction_expression(user_id, organization_id, project_ids):
-    """
-    This function may be called multiple times, making for repeated data bases queries.
-    Lifting the query higher to earlier in the call stack will require a lot more changes
-    as there are numerous entry points. So we will leave the duplicate query alone for now.
-    """
-    if user_id is None or organization_id is None or project_ids is None:
-        raise InvalidSearchQuery("Missing necessary meta for key transaction field.")
-
-    key_transactions = (
-        KeyTransaction.objects.filter(
-            owner_id=user_id,
-            organization_id=organization_id,
-            project_id__in=project_ids,
-        )
-        .order_by("transaction", "project_id")
-        .values("project_id", "transaction")
-    )
-
-    # if there are no key transactions, the value should always be 0
-    if not len(key_transactions):
-        return ["toInt64", [0]]
-
-    return [
-        "has",
-        [
-            [
-                "array",
-                [
-                    [
-                        "tuple",
-                        [
-                            ["toUInt64", [transaction["project_id"]]],
-                            "'{}'".format(transaction["transaction"]),
-                        ],
-                    ]
-                    for transaction in key_transactions
-                ],
-            ],
-            ["tuple", ["project_id", "transaction"]],
-        ],
-    ]
-
-
-# When adding aliases to this list please also update
-# static/app/utils/discover/fields.tsx so that
-# the UI builder stays in sync.
-FIELD_ALIASES = {
-    field.name: field
-    for field in [
-        PseudoField("project", "project.id"),
-        PseudoField("issue", "issue.id"),
-        PseudoField(
-            "timestamp.to_hour", "timestamp.to_hour", expression=["toStartOfHour", ["timestamp"]]
-        ),
-        PseudoField(
-            "timestamp.to_day", "timestamp.to_day", expression=["toStartOfDay", ["timestamp"]]
-        ),
-        PseudoField(ERROR_UNHANDLED_ALIAS, ERROR_UNHANDLED_ALIAS, expression=["notHandled", []]),
-        PseudoField(
-            USER_DISPLAY_ALIAS,
-            USER_DISPLAY_ALIAS,
-            expression=["coalesce", ["user.email", "user.username", "user.ip"]],
-        ),
-        # the key transaction field is intentially not added to the discover/fields list yet
-        # because there needs to be some work on the front end to integrate this into discover
-        PseudoField(
-            KEY_TRANSACTION_ALIAS,
-            KEY_TRANSACTION_ALIAS,
-            expression_fn=lambda params: key_transaction_expression(
-                params.get("user_id"),
-                params.get("organization_id"),
-                params.get("project_id"),
             ),
-            result_type="boolean",
-        ),
-    ]
-}
-
-
-def get_json_meta_type(field_alias, snuba_type, function=None):
-    alias_definition = FIELD_ALIASES.get(field_alias)
-    if alias_definition and alias_definition.result_type is not None:
-        return alias_definition.result_type
-
-    snuba_json = get_json_type(snuba_type)
-    if snuba_json != "string":
-        if function is not None:
-            result_type = function.instance.get_result_type(function.field, function.arguments)
-            if result_type is not None:
-                return result_type
-
-        function_match = FUNCTION_ALIAS_PATTERN.match(field_alias)
-        if function_match:
-            function_definition = FUNCTIONS.get(function_match.group(1))
-            if function_definition:
-                result_type = function_definition.get_result_type()
-                if result_type is not None:
-                    return result_type
-
-    if "duration" in field_alias or is_duration_measurement(field_alias):
-        return "duration"
-    if is_measurement(field_alias):
-        return "number"
-    if field_alias == "transaction.status":
-        return "string"
-    return snuba_json
-
-
-# Based on general/src/protocol/tags.rs in relay
-VALID_FIELD_PATTERN = re.compile(r"^[a-zA-Z0-9_.:-]*$")
-
-# The regex for alias here is to match any word, but exclude anything that is only digits
-# eg. 123 doesn't match, but test_123 will match
-ALIAS_REGEX = r"(\w+)?(?!\d+)\w+"
-
-ALIAS_PATTERN = re.compile(fr"{ALIAS_REGEX}$")
-FUNCTION_PATTERN = re.compile(
-    fr"^(?P<function>[^\(]+)\((?P<columns>.*)\)( (as|AS) (?P<alias>{ALIAS_REGEX}))?$"
-)
-
-
-class InvalidFunctionArgument(Exception):
-    pass
-
-
-class ArgValue:
-    def __init__(self, arg):
-        self.arg = arg
-
-
-class FunctionArg:
-    def __init__(self, name):
-        self.name = name
-        self.has_default = False
-
-    def get_default(self, params):
-        raise InvalidFunctionArgument(f"{self.name} has no defaults")
-
-    def normalize(self, value, params):
-        return value
-
-    def get_type(self, value):
-        raise InvalidFunctionArgument(f"{self.name} has no type defined")
-
-
-class FunctionAliasArg(FunctionArg):
-    def normalize(self, value, params):
-        if not ALIAS_PATTERN.match(value):
-            raise InvalidFunctionArgument(f"{value} is not a valid function alias")
-        return value
-
-
-class NullColumn(FunctionArg):
-    """
-    Convert the provided column to null so that we
-    can drop it. Used to make count() not have a
-    required argument that we ignore.
-    """
-
-    def __init__(self, name):
-        super().__init__(name)
-        self.has_default = True
-
-    def get_default(self, params):
-        return None
-
-    def normalize(self, value, params):
-        return None
-
-
-class CountColumn(FunctionArg):
-    def __init__(self, name):
-        super().__init__(name)
-        self.has_default = True
-
-    def get_default(self, params):
-        return None
-
-    def normalize(self, value, params):
-        if value is None:
-            raise InvalidFunctionArgument("a column is required")
-
-        if value not in FIELD_ALIASES:
-            return value
-
-        field = FIELD_ALIASES[value]
-
-        # If the alias has an expression prefer that over the column alias
-        # This enables user.display to work in aggregates
-        expression = field.get_expression(params)
-        if expression is not None:
-            return expression
-        elif field.alias is not None:
-            return field.alias
-        return value
-
-
-class FieldColumn(CountColumn):
-    """ Allow any field column, of any type """
-
-    def get_type(self, value):
-        if is_duration_measurement(value):
-            return "duration"
-        elif value == "transaction.duration":
-            return "duration"
-        elif value == "timestamp":
-            return "date"
-        return "string"
-
-
-class StringArg(FunctionArg):
-    def __init__(self, name, unquote=False, unescape_quotes=False):
-        super().__init__(name)
-        self.unquote = unquote
-        self.unescape_quotes = unescape_quotes
-
-    def normalize(self, value, params):
-        if self.unquote:
-            if len(value) < 2 or value[0] != '"' or value[-1] != '"':
-                raise InvalidFunctionArgument("string should be quoted")
-            value = value[1:-1]
-        if self.unescape_quotes:
-            value = re.sub(r'\\"', '"', value)
-        return f"'{value}'"
-
-
-class DateArg(FunctionArg):
-    date_format = "%Y-%m-%dT%H:%M:%S"
-
-    def normalize(self, value, params):
-        try:
-            datetime.strptime(value, self.date_format)
-        except ValueError:
-            raise InvalidFunctionArgument(
-                f"{value} is in the wrong format, expected a date like 2020-03-14T15:14:15"
-            )
-        return f"'{value}'"
-
-
-class ConditionArg(FunctionArg):
-    # List and not a set so the error message is consistent
-    VALID_CONDITIONS = [
-        "equals",
-        "notEquals",
-        "lessOrEquals",
-        "greaterOrEquals",
-        "less",
-        "greater",
-    ]
-
-    def normalize(self, value, params):
-        if value not in self.VALID_CONDITIONS:
-            raise InvalidFunctionArgument(
-                "{} is not a valid condition, the only supported conditions are: {}".format(
-                    value,
-                    ",".join(self.VALID_CONDITIONS),
-                )
-            )
-
-        return value
-
-
-class Column(FunctionArg):
-    def __init__(self, name, allowed_columns=None):
-        super().__init__(name)
-        # make sure to map the allowed columns to their snuba names
-        self.allowed_columns = [SEARCH_MAP.get(col) for col in allowed_columns]
-
-    def normalize(self, value, params):
-        snuba_column = SEARCH_MAP.get(value)
-        if not snuba_column:
-            raise InvalidFunctionArgument(f"{value} is not a valid column")
-        elif self.allowed_columns is not None and snuba_column not in self.allowed_columns:
-            raise InvalidFunctionArgument(f"{value} is not an allowed column")
-        return snuba_column
-
-
-class ColumnNoLookup(Column):
-    def __init__(self, name, allowed_columns=None):
-        super().__init__(name, allowed_columns=allowed_columns)
-
-    def normalize(self, value, params):
-        super().normalize(value, params)
-        return value
-
-
-class NumericColumn(FunctionArg):
-    def _normalize(self, value):
-        # This method is written in this way so that `get_type` can always call
-        # this even in child classes where `normalize` have been overridden.
-
-        snuba_column = SEARCH_MAP.get(value)
-        if not snuba_column and is_measurement(value):
-            return value
-        if not snuba_column:
-            raise InvalidFunctionArgument(f"{value} is not a valid column")
-        elif snuba_column not in ["time", "timestamp", "duration"]:
-            raise InvalidFunctionArgument(f"{value} is not a numeric column")
-        return snuba_column
-
-    def normalize(self, value, params):
-        return self._normalize(value)
-
-    def get_type(self, value):
-        snuba_column = self._normalize(value)
-        if is_duration_measurement(snuba_column):
-            return "duration"
-        elif snuba_column == "duration":
-            return "duration"
-        elif snuba_column == "timestamp":
-            return "date"
-        return "number"
-
-
-class NumericColumnNoLookup(NumericColumn):
-    def __init__(self, name, allow_measurements_value=False):
-        super().__init__(name)
-        self.allow_measurements_value = allow_measurements_value
-
-    def normalize(self, value, params):
-        # `measurement_value` is actually an array of Float64s. But when used
-        # in this context, we always want to expand it using `arrayJoin`. The
-        # resulting column will be a numeric column of type Float64.
-        if self.allow_measurements_value and value == "measurements_value":
-            return ["arrayJoin", ["measurements_value"]]
-
-        super().normalize(value, params)
-        return value
-
-
-class DurationColumn(FunctionArg):
-    def normalize(self, value, params):
-        snuba_column = SEARCH_MAP.get(value)
-        if not snuba_column and is_duration_measurement(value):
-            return value
-        if not snuba_column:
-            raise InvalidFunctionArgument(f"{value} is not a valid column")
-        elif snuba_column != "duration":
-            raise InvalidFunctionArgument(f"{value} is not a duration column")
-        return snuba_column
-
-
-class DurationColumnNoLookup(DurationColumn):
-    def normalize(self, value, params):
-        super().normalize(value, params)
-        return value
-
-
-class StringArrayColumn(FunctionArg):
-    def normalize(self, value, params):
-        if value in ["tags.key", "tags.value", "measurements_key"]:
-            return value
-        raise InvalidFunctionArgument(f"{value} is not a valid string array column")
-
-
-class NumberRange(FunctionArg):
-    def __init__(self, name, start, end):
-        super().__init__(name)
-        self.start = start
-        self.end = end
-
-    def normalize(self, value, params):
-        try:
-            value = float(value)
-        except ValueError:
-            raise InvalidFunctionArgument(f"{value} is not a number")
-
-        if self.start and value < self.start:
-            raise InvalidFunctionArgument(
-                f"{value:g} must be greater than or equal to {self.start:g}"
-            )
-        elif self.end and value >= self.end:
-            raise InvalidFunctionArgument(f"{value:g} must be less than {self.end:g}")
-
-        return value
-
-
-class IntervalDefault(NumberRange):
-    def __init__(self, name, start, end):
-        super().__init__(name, start, end)
-        self.has_default = True
-
-    def get_default(self, params):
-        if not params or not params.get("start") or not params.get("end"):
-            raise InvalidFunctionArgument("function called without default")
-        elif not isinstance(params.get("start"), datetime) or not isinstance(
-            params.get("end"), datetime
-        ):
-            raise InvalidFunctionArgument("function called with invalid default")
-
-        interval = (params["end"] - params["start"]).total_seconds()
-        return int(interval)
-
-
-def with_default(default, argument):
-    argument.has_default = True
-    argument.get_default = lambda *_: default
-    return argument
-
-
-class Function:
-    def __init__(
-        self,
-        name,
-        required_args=None,
-        optional_args=None,
-        calculated_args=None,
-        column=None,
-        aggregate=None,
-        transform=None,
-        result_type_fn=None,
-        default_result_type=None,
-        redundant_grouping=False,
-        private=False,
-    ):
-        """
-        Specifies a function interface that must be followed when defining new functions
-
-        :param str name: The name of the function, this refers to the name to invoke.
-        :param list[FunctionArg] required_args: The list of required arguments to the function.
-            If any of these arguments are not specified, an error will be raised.
-        :param list[FunctionArg] optional_args: The list of optional arguments to the function.
-            If any of these arguments are not specified, they will be filled using their default value.
-        :param list[obj] calculated_args: The list of calculated arguments to the function.
-            These arguments will be computed based on the list of specified arguments.
-        :param [str, [any], str or None] column: The column to be passed to snuba once formatted.
-            The arguments will be filled into the column where needed. This must not be an aggregate.
-        :param [str, [any], str or None] aggregate: The aggregate to be passed to snuba once formatted.
-            The arguments will be filled into the aggregate where needed. This must be an aggregate.
-        :param str transform: NOTE: Use aggregate over transform whenever possible.
-            An aggregate string to be passed to snuba once formatted. The arguments
-            will be filled into the string using `.format(...)`.
-        :param str result_type_fn: A function to call with in order to determine the result type.
-            This function will be passed the list of argument classes and argument values. This should
-            be tried first as the source of truth if available.
-        :param str default_result_type: The default resulting type of this function. Must be a type
-            defined by RESULTS_TYPES.
-        :param bool redundant_grouping: This function will result in redundant grouping if its column
-            is included as a field as well.
-        :param bool private: Whether or not this function should be disabled for general use.
-        """
-
-        self.name = name
-        self.required_args = [] if required_args is None else required_args
-        self.optional_args = [] if optional_args is None else optional_args
-        self.calculated_args = [] if calculated_args is None else calculated_args
-        self.column = column
-        self.aggregate = aggregate
-        self.transform = transform
-        self.result_type_fn = result_type_fn
-        self.default_result_type = default_result_type
-        self.redundant_grouping = redundant_grouping
-        self.private = private
-
-        self.validate()
-
-    @property
-    def required_args_count(self):
-        return len(self.required_args)
-
-    @property
-    def optional_args_count(self):
-        return len(self.optional_args)
-
-    @property
-    def total_args_count(self):
-        return self.required_args_count + self.optional_args_count
-
-    @property
-    def args(self):
-        return self.required_args + self.optional_args
-
-    def alias_as(self, name):
-        """ Create a copy of this function to be used as an alias """
-        alias = deepcopy(self)
-        alias.name = name
-        return alias
-
-    def add_default_arguments(self, field, columns, params):
-        # make sure to validate the argument count first to
-        # ensure the right number of arguments have been passed
-        self.validate_argument_count(field, columns)
-
-        columns = [column for column in columns]
-
-        # use default values to populate optional arguments if any
-        for argument in self.args[len(columns) :]:
-            try:
-                default = argument.get_default(params)
-            except InvalidFunctionArgument as e:
-                raise InvalidSearchQuery(f"{field}: invalid arguments: {e}")
-
-            # Hacky, but we expect column arguments to be strings so easiest to convert it back
-            columns.append(str(default) if default else default)
-
-        return columns
-
-    def format_as_arguments(self, field, columns, params):
-        columns = self.add_default_arguments(field, columns, params)
-
-        arguments = {}
-
-        # normalize the arguments before putting them in a dict
-        for argument, column in zip(self.args, columns):
-            try:
-                arguments[argument.name] = argument.normalize(column, params)
-            except InvalidFunctionArgument as e:
-                raise InvalidSearchQuery(f"{field}: {argument.name} argument invalid: {e}")
-
-        # populate any computed args
-        for calculation in self.calculated_args:
-            arguments[calculation["name"]] = calculation["fn"](arguments)
-
-        return arguments
-
-    def get_result_type(self, field=None, arguments=None):
-        if field is None or arguments is None or self.result_type_fn is None:
-            return self.default_result_type
-
-        result_type = self.result_type_fn(self.args, arguments)
-        if result_type is None:
-            return self.default_result_type
-
-        self.validate_result_type(result_type)
-        return result_type
-
-    def validate(self):
-        # assert that all optional args have defaults available
-        for i, arg in enumerate(self.optional_args):
-            assert (
-                arg.has_default
-            ), f"{self.name}: optional argument at index {i} does not have default"
-
-        # assert that the function has only one of the following specified
-        # `column`, `aggregate`, or `transform`
-        assert (
-            sum([self.column is not None, self.aggregate is not None, self.transform is not None])
-            == 1
-        ), f"{self.name}: only one of column, aggregate, or transform is allowed"
-
-        # assert that no duplicate argument names are used
-        names = set()
-        for arg in self.args:
-            assert (
-                arg.name not in names
-            ), f"{self.name}: argument {arg.name} specified more than once"
-            names.add(arg.name)
-
-        for calculation in self.calculated_args:
-            assert (
-                calculation["name"] not in names
-            ), "{}: argument {} specified more than once".format(self.name, calculation["name"])
-            names.add(calculation["name"])
-
-        self.validate_result_type(self.default_result_type)
-
-    def validate_argument_count(self, field, arguments):
-        """
-        Validate the number of required arguments the function defines against
-        provided arguments. Raise an exception if there is a mismatch in the
-        number of arguments. Do not return any values.
-
-        There are 4 cases:
-            1. provided # of arguments != required # of arguments AND provided # of arguments != total # of arguments (bad, raise an error)
-            2. provided # of arguments < required # of arguments (bad, raise an error)
-            3. provided # of arguments > total # of arguments (bad, raise an error)
-            4. required # of arguments <= provided # of arguments <= total # of arguments (good, pass the validation)
-        """
-        args_count = len(arguments)
-        total_args_count = self.total_args_count
-        if args_count != total_args_count:
-            required_args_count = self.required_args_count
-            if required_args_count == total_args_count:
-                raise InvalidSearchQuery(f"{field}: expected {total_args_count:g} argument(s)")
-            elif args_count < required_args_count:
-                raise InvalidSearchQuery(
-                    f"{field}: expected at least {required_args_count:g} argument(s)"
-                )
-            elif args_count > total_args_count:
-                raise InvalidSearchQuery(
-                    f"{field}: expected at most {total_args_count:g} argument(s)"
-                )
-
-    def validate_result_type(self, result_type):
-        assert (
-            result_type is None or result_type in RESULT_TYPES
-        ), f"{self.name}: result type {result_type} not one of {list(RESULT_TYPES)}"
-
-    def is_accessible(self, acl=None):
-        if not self.private:
-            return True
-        elif not acl:
-            return False
-        return self.name in acl
-
-
-def reflective_result_type(index=0):
-    def result_type_fn(function_arguments, parameter_values):
-        argument = function_arguments[index]
-        value = parameter_values[argument.name]
-        return argument.get_type(value)
-
-    return result_type_fn
-
-
-# When adding functions to this list please also update
-# static/sentry/app/utils/discover/fields.tsx so that
-# the UI builder stays in sync.
-FUNCTIONS = {
-    function.name: function
-    for function in [
-        Function(
-            "percentile",
-            required_args=[NumericColumnNoLookup("column"), NumberRange("percentile", 0, 1)],
-            aggregate=["quantile({percentile:g})", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "p50",
-            optional_args=[with_default("transaction.duration", NumericColumnNoLookup("column"))],
-            aggregate=["quantile(0.5)", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "p75",
-            optional_args=[with_default("transaction.duration", NumericColumnNoLookup("column"))],
-            aggregate=["quantile(0.75)", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "p95",
-            optional_args=[with_default("transaction.duration", NumericColumnNoLookup("column"))],
-            aggregate=["quantile(0.95)", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "p99",
-            optional_args=[with_default("transaction.duration", NumericColumnNoLookup("column"))],
-            aggregate=["quantile(0.99)", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "p100",
-            optional_args=[with_default("transaction.duration", NumericColumnNoLookup("column"))],
-            aggregate=["max", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "eps",
-            optional_args=[IntervalDefault("interval", 1, None)],
-            transform="divide(count(), {interval:g})",
-            default_result_type="number",
-        ),
-        Function(
-            "epm",
-            optional_args=[IntervalDefault("interval", 1, None)],
-            transform="divide(count(), divide({interval:g}, 60))",
-            default_result_type="number",
-        ),
-        Function(
-            "last_seen",
-            aggregate=["max", "timestamp", "last_seen"],
-            default_result_type="date",
-            redundant_grouping=True,
-        ),
-        Function(
-            "latest_event",
-            aggregate=["argMax", ["id", "timestamp"], "latest_event"],
-            default_result_type="string",
-        ),
-        Function(
-            "apdex",
-            required_args=[NumberRange("satisfaction", 0, None)],
-            transform="apdex(duration, {satisfaction:g})",
-            default_result_type="number",
-        ),
-        Function(
-            "user_misery",
-            required_args=[NumberRange("satisfaction", 0, None)],
-            calculated_args=[{"name": "tolerated", "fn": lambda args: args["satisfaction"] * 4.0}],
-            transform="uniqIf(user, greater(duration, {tolerated:g}))",
-            default_result_type="number",
-        ),
-        Function("failure_rate", transform="failure_rate()", default_result_type="percentage"),
-        Function(
-            "failure_count",
-            aggregate=[
-                "countIf",
-                [
-                    [
-                        "not",
-                        [
-                            [
-                                "has",
-                                [
-                                    [
-                                        "array",
-                                        [
-                                            SPAN_STATUS_NAME_TO_CODE[name]
-                                            for name in ["ok", "cancelled", "unknown"]
-                                        ],
-                                    ],
-                                    "transaction_status",
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-                None,
-            ],
-            default_result_type="integer",
-        ),
-        Function(
-            "array_join",
-            required_args=[StringArrayColumn("column")],
-            column=["arrayJoin", [ArgValue("column")], None],
-            default_result_type="string",
-            private=True,
-        ),
-        Function(
-            "histogram",
-            required_args=[
-                NumericColumnNoLookup("column", allow_measurements_value=True),
-                # the bucket_size and start_offset should already be adjusted
-                # using the multiplier before it is passed here
-                NumberRange("bucket_size", 0, None),
-                NumberRange("start_offset", 0, None),
-                NumberRange("multiplier", 1, None),
-            ],
-            # floor((x * multiplier - start_offset) / bucket_size) * bucket_size + start_offset
-            column=[
-                "plus",
-                [
-                    [
-                        "multiply",
-                        [
-                            [
-                                "floor",
-                                [
-                                    [
-                                        "divide",
-                                        [
-                                            [
-                                                "minus",
-                                                [
-                                                    [
-                                                        "multiply",
-                                                        [
-                                                            ArgValue("column"),
-                                                            ArgValue("multiplier"),
-                                                        ],
-                                                    ],
-                                                    ArgValue("start_offset"),
-                                                ],
-                                            ],
-                                            ArgValue("bucket_size"),
-                                        ],
-                                    ],
-                                ],
-                            ],
-                            ArgValue("bucket_size"),
-                        ],
-                    ],
-                    ArgValue("start_offset"),
-                ],
-                None,
-            ],
-            default_result_type="number",
-            private=True,
-        ),
-        Function(
-            "count_unique",
-            optional_args=[CountColumn("column")],
-            aggregate=["uniq", ArgValue("column"), None],
-            default_result_type="integer",
-        ),
-        Function(
-            "count",
-            optional_args=[NullColumn("column")],
-            aggregate=["count", None, None],
-            default_result_type="integer",
-        ),
-        Function(
-            "count_at_least",
-            required_args=[NumericColumnNoLookup("column"), NumberRange("threshold", 0, None)],
-            aggregate=[
-                "countIf",
-                [["greaterOrEquals", [ArgValue("column"), ArgValue("threshold")]]],
-                None,
-            ],
-            default_result_type="integer",
-        ),
-        Function(
-            "min",
-            required_args=[NumericColumnNoLookup("column")],
-            aggregate=["min", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "max",
-            required_args=[NumericColumnNoLookup("column")],
-            aggregate=["max", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "avg",
-            required_args=[NumericColumnNoLookup("column")],
-            aggregate=["avg", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-            redundant_grouping=True,
-        ),
-        Function(
-            "var",
-            required_args=[NumericColumnNoLookup("column")],
-            aggregate=["varSamp", ArgValue("column"), None],
-            default_result_type="number",
-            redundant_grouping=True,
-        ),
-        Function(
-            "stddev",
-            required_args=[NumericColumnNoLookup("column")],
-            aggregate=["stddevSamp", ArgValue("column"), None],
-            default_result_type="number",
-            redundant_grouping=True,
-        ),
-        Function(
-            "sum",
-            required_args=[NumericColumnNoLookup("column")],
-            aggregate=["sum", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            default_result_type="duration",
-        ),
-        Function(
-            "any",
-            required_args=[FieldColumn("column")],
-            aggregate=["min", ArgValue("column"), None],
-            result_type_fn=reflective_result_type(),
-            redundant_grouping=True,
-        ),
-        # Currently only being used by the baseline PoC
-        Function(
-            "absolute_delta",
-            required_args=[DurationColumnNoLookup("column"), NumberRange("target", 0, None)],
-            column=["abs", [["minus", [ArgValue("column"), ArgValue("target")]]], None],
-            default_result_type="duration",
-        ),
-        # These range functions for performance trends, these aren't If functions
-        # to avoid allowing arbitrary if statements
-        # Not yet supported in Discover, and shouldn't be added to fields.tsx
-        Function(
-            "percentile_range",
-            required_args=[
-                NumericColumnNoLookup("column"),
-                NumberRange("percentile", 0, 1),
-                ConditionArg("condition"),
-                DateArg("middle"),
-            ],
-            aggregate=[
-                "quantileIf({percentile:.2f})",
-                [
-                    ArgValue("column"),
-                    # NOTE: This condition is written in this seemingly backwards way
-                    # because of how snuba special cases the following syntax
-                    # ["a", ["b", ["c", ["d"]]]
-                    #
-                    # This array is can be interpreted 2 ways
-                    # 1. a(b(c(d))) the way snuba interprets it
-                    #   - snuba special cases it when it detects an array where the first
-                    #     element is a literal, and the second element is an array and
-                    #     treats it as a function call rather than 2 separate arguments
-                    # 2. a(b, c(d)) the way we want it to be interpreted
-                    #
-                    # Because of how snuba interprets this expression, it makes it impossible
-                    # to specify a function with 2 arguments whose first argument is a literal
-                    # and the second argument is an expression.
-                    #
-                    # Working with this limitation, we have to invert the conditions in
-                    # order to express a function whose first argument is an expression while
-                    # the second argument is a literal.
-                    [ArgValue("condition"), [["toDateTime", [ArgValue("middle")]], "timestamp"]],
-                ],
-                None,
-            ],
-            default_result_type="duration",
-        ),
-        Function(
-            "avg_range",
-            required_args=[
-                NumericColumnNoLookup("column"),
-                ConditionArg("condition"),
-                DateArg("middle"),
-            ],
-            aggregate=[
-                "avgIf",
-                [
-                    ArgValue("column"),
-                    # see `percentile_range` for why this condition feels backwards
-                    [ArgValue("condition"), [["toDateTime", [ArgValue("middle")]], "timestamp"]],
-                ],
-                None,
-            ],
-            default_result_type="duration",
-        ),
-        Function(
-            "variance_range",
-            required_args=[
-                NumericColumnNoLookup("column"),
-                ConditionArg("condition"),
-                DateArg("middle"),
-            ],
-            aggregate=[
-                "varSampIf",
-                [
-                    ArgValue("column"),
-                    # see `percentile_range` for why this condition feels backwards
-                    [ArgValue("condition"), [["toDateTime", [ArgValue("middle")]], "timestamp"]],
-                ],
-                None,
-            ],
-            default_result_type="duration",
-        ),
-        Function(
-            "count_range",
-            required_args=[ConditionArg("condition"), DateArg("middle")],
-            aggregate=[
-                "countIf",
-                # see `percentile_range` for why this condition feels backwards
-                [[ArgValue("condition"), [["toDateTime", [ArgValue("middle")]], "timestamp"]]],
-                None,
-            ],
-            default_result_type="integer",
-        ),
-        Function(
-            "percentage",
-            required_args=[FunctionArg("numerator"), FunctionArg("denominator")],
-            # Since percentage is only used on aggregates, it needs to be an aggregate and not a column
-            # This is because as a column it will be added to the `WHERE` clause instead of the `HAVING` clause
-            aggregate=[
-                "if(greater({denominator},0),divide({numerator},{denominator}),null)",
-                None,
-                None,
-            ],
-            default_result_type="percentage",
-        ),
-        # Calculate the Welch's t-test value, this is used to help identify which of our trends are significant or not
-        Function(
-            "t_test",
-            required_args=[
-                FunctionAliasArg("avg_1"),
-                FunctionAliasArg("avg_2"),
-                FunctionAliasArg("variance_1"),
-                FunctionAliasArg("variance_2"),
-                FunctionAliasArg("count_1"),
-                FunctionAliasArg("count_2"),
-            ],
-            aggregate=[
-                "divide(minus({avg_1},{avg_2}),sqrt(plus(divide({variance_1},{count_1}),divide({variance_2},{count_2}))))",
-                None,
-                "t_test",
-            ],
-            default_result_type="number",
-        ),
-        Function(
-            "minus",
-            required_args=[FunctionArg("minuend"), FunctionArg("subtrahend")],
-            aggregate=["minus", [ArgValue("minuend"), ArgValue("subtrahend")], None],
-            default_result_type="duration",
-        ),
-        Function(
-            "absolute_correlation",
-            aggregate=[
-                "abs",
-                [["corr", [["toUnixTimestamp", ["timestamp"]], "transaction.duration"]]],
-                None,
-            ],
-            default_result_type="number",
-        ),
-        Function(
-            "compare_numeric_aggregate",
-            required_args=[
-                FunctionAliasArg("aggregate_alias"),
-                ConditionArg("condition"),
-                NumberRange("value", 0, None),
-            ],
-            aggregate=[
-                # snuba json syntax isn't compatible with this query here
-                # this function can't be a column, since we want to use this with aggregates
-                "{condition}({aggregate_alias},{value})",
-                None,
-                None,
-            ],
-            default_result_type="number",
-        ),
-        Function(
-            "to_other",
-            required_args=[
-                ColumnNoLookup("column", allowed_columns=["release", "trace.parent_span"]),
-                StringArg("value", unquote=True, unescape_quotes=True),
-            ],
-            optional_args=[
-                with_default("that", StringArg("that")),
-                with_default("this", StringArg("this")),
-            ],
-            column=[
-                "if",
-                [
-                    ["equals", [ArgValue("column"), ArgValue("value")]],
-                    ArgValue("this"),
-                    ArgValue("that"),
-                ],
-            ],
-        ),
-    ]
-}
-# In Performance TPM is used as an alias to EPM
-FUNCTION_ALIASES = {
-    "tpm": "epm",
-    "tps": "eps",
-}
-for alias, name in FUNCTION_ALIASES.items():
-    FUNCTIONS[alias] = FUNCTIONS[name].alias_as(alias)
-
-
-FUNCTION_ALIAS_PATTERN = re.compile(r"^({}).*".format("|".join(list(FUNCTIONS.keys()))))
-
-
-def is_function(field):
-    function_match = FUNCTION_PATTERN.search(field)
-    if function_match:
-        return function_match
-
-    return None
-
-
-def get_function_alias(field):
-    match = FUNCTION_PATTERN.search(field)
-    if match is None:
-        return field
-
-    if match.group("alias") is not None:
-        return match.group("alias")
-    function = match.group("function")
-    columns = parse_arguments(function, match.group("columns"))
-    return get_function_alias_with_columns(function, columns)
-
-
-def get_function_alias_with_columns(function_name, columns):
-    columns = re.sub(r"[^\w]", "_", "_".join(columns))
-    return f"{function_name}_{columns}".rstrip("_")
-
-
-def format_column_arguments(column_args, arguments):
-    for i in range(len(column_args)):
-        if isinstance(column_args[i], (list, tuple)):
-            if isinstance(column_args[i][0], ArgValue):
-                column_args[i][0] = arguments[column_args[i][0].arg]
-            format_column_arguments(column_args[i][1], arguments)
-        elif isinstance(column_args[i], str):
-            column_args[i] = column_args[i].format(**arguments)
-        elif isinstance(column_args[i], ArgValue):
-            column_args[i] = arguments[column_args[i].arg]
-
-
-def parse_arguments(function, columns):
-    """
-    The to_other function takes a quoted string for one of its arguments
-    that may contain commas, so it requires special handling.
-    """
-    if function != "to_other":
-        return [c.strip() for c in columns.split(",") if len(c.strip()) > 0]
-
-    args = []
-
-    quoted = False
-    escaped = False
-
-    i, j = 0, 0
-
-    while j < len(columns):
-        if i == j and columns[j] == '"':
-            # when we see a quote at the beginning of
-            # an argument, then this is a quoted string
-            quoted = True
-        elif quoted and not escaped and columns[j] == "\\":
-            # when we see a slash inside a quoted string,
-            # the next character is an escape character
-            escaped = True
-        elif quoted and not escaped and columns[j] == '"':
-            # when we see a non-escaped quote while inside
-            # of a quoted string, we should end it
-            quoted = False
-        elif quoted and escaped:
-            # when we are inside a quoted string and have
-            # begun an escape character, we should end it
-            escaped = False
-        elif quoted and columns[j] == ",":
-            # when we are inside a quoted string and see
-            # a comma, it should not be considered an
-            # argument separator
-            pass
-        elif columns[j] == ",":
-            # when we see a comma outside of a quoted string
-            # it is an argument separator
-            args.append(columns[i:j].strip())
-            i = j + 1
-        j += 1
-
-    if i != j:
-        # add in the last argument if any
-        args.append(columns[i:].strip())
-
-    return [arg for arg in args if arg]
-
-
-def parse_function(field, match=None, err_msg=None):
-    if not match:
-        match = is_function(field)
-
-    if not match or match.group("function") not in FUNCTIONS:
-        if err_msg is None:
-            err_msg = f"{field} is not a valid function"
-        raise InvalidSearchQuery(err_msg)
-
-    function = match.group("function")
-    return (
-        function,
-        parse_arguments(function, match.group("columns")),
-        match.group("alias"),
-    )
-
-
-FunctionDetails = namedtuple("FunctionDetails", "field instance arguments")
-ResolvedFunction = namedtuple("ResolvedFunction", "details column aggregate")
-
-
-def resolve_function(field, match=None, params=None, functions_acl=False):
-    if params is not None and field in params.get("aliases", {}):
-        alias = params["aliases"][field]
-        return ResolvedFunction(
-            FunctionDetails(field, FUNCTIONS["percentage"], []),
-            None,
-            alias.aggregate,
         )
-    function_name, columns, alias = parse_function(field, match)
-    function = FUNCTIONS[function_name]
-    if not function.is_accessible(functions_acl):
-        raise InvalidSearchQuery(f"{function.name}: no access to private function")
+        err.extra = {"idx": idx}
+        raise err
 
-    arguments = function.format_as_arguments(field, columns, params)
-    details = FunctionDetails(field, function, arguments)
-
-    if function.transform is not None:
-        snuba_string = function.transform.format(**arguments)
-        if alias is None:
-            alias = get_function_alias_with_columns(function.name, columns)
-        return ResolvedFunction(
-            details,
-            None,
-            [snuba_string, None, alias],
-        )
-    elif function.aggregate is not None:
-        aggregate = deepcopy(function.aggregate)
-
-        aggregate[0] = aggregate[0].format(**arguments)
-        if isinstance(aggregate[1], (list, tuple)):
-            format_column_arguments(aggregate[1], arguments)
-        elif isinstance(aggregate[1], ArgValue):
-            arg = aggregate[1].arg
-            # The aggregate function has only a single argument
-            # however that argument is an expression, so we have
-            # to make sure to nest it so it doesn't get treated
-            # as a list of arguments by snuba.
-            if isinstance(arguments[arg], (list, tuple)):
-                aggregate[1] = [arguments[arg]]
-            else:
-                aggregate[1] = arguments[arg]
-
-        if alias is not None:
-            aggregate[2] = alias
-        elif aggregate[2] is None:
-            aggregate[2] = get_function_alias_with_columns(function.name, columns)
-
-        return ResolvedFunction(details, None, aggregate)
-    elif function.column is not None:
-        # These can be very nested functions, so we need to iterate through all the layers
-        addition = deepcopy(function.column)
-        addition[0] = addition[0].format(**arguments)
-        if isinstance(addition[1], (list, tuple)):
-            format_column_arguments(addition[1], arguments)
-        if len(addition) < 3:
-            if alias is not None:
-                addition.append(alias)
-            else:
-                addition.append(get_function_alias_with_columns(function.name, columns))
-        elif len(addition) == 3:
-            if alias is not None:
-                addition[2] = alias
-            elif addition[2] is None:
-                addition[2] = get_function_alias_with_columns(function.name, columns)
-            else:
-                addition[2] = addition[2].format(**arguments)
-        return ResolvedFunction(details, addition, None)
-
-
-def resolve_orderby(orderby, fields, aggregations):
-    """
-    We accept column names, aggregate functions, and aliases as order by
-    values. Aggregates and field aliases need to be resolve/validated.
-
-    TODO(mark) Once we're no longer using the dataset selection function
-    should allow all non-tag fields to be used as sort clauses, instead of only
-    those that are currently selected.
-    """
-    orderby = orderby if isinstance(orderby, (list, tuple)) else [orderby]
-    validated = []
-    for column in orderby:
-        bare_column = column.lstrip("-")
-
-        if bare_column in fields:
-            validated.append(column)
-            continue
-
-        if is_function(bare_column):
-            bare_column = get_function_alias(bare_column)
-
-        found = [agg[2] for agg in aggregations if agg[2] == bare_column]
-        if found:
-            prefix = "-" if column.startswith("-") else ""
-            validated.append(prefix + bare_column)
-            continue
-
-        if (
-            bare_column in FIELD_ALIASES
-            and FIELD_ALIASES[bare_column].alias
-            and bare_column != PROJECT_ALIAS
-        ):
-            prefix = "-" if column.startswith("-") else ""
-            validated.append(prefix + FIELD_ALIASES[bare_column].alias)
-            continue
-
-        found = [
-            col[2]
-            for col in fields
-            if isinstance(col, (list, tuple)) and col[2].strip("`") == bare_column
-        ]
-        if found:
-            prefix = "-" if column.startswith("-") else ""
-            validated.append(prefix + bare_column)
-
-    if len(validated) == len(orderby):
-        return validated
-
-    raise InvalidSearchQuery("Cannot order by a field that is not selected.")
-
-
-def get_aggregate_alias(match):
-    column = match.group("column").replace(".", "_")
-    return "{}_{}".format(match.group("function"), column).rstrip("_")
-
-
-def resolve_field(field, params=None, functions_acl=None):
-    if not isinstance(field, str):
-        raise InvalidSearchQuery("Field names must be strings")
-
-    match = is_function(field)
-    if match:
-        return resolve_function(field, match, params, functions_acl)
-
-    if field in FIELD_ALIASES:
-        special_field = FIELD_ALIASES[field]
-        return ResolvedFunction(None, special_field.get_field(params), None)
-
-    tag_match = TAG_KEY_RE.search(field)
-    tag_field = tag_match.group("tag") if tag_match else field
-
-    if VALID_FIELD_PATTERN.match(tag_field):
-        return ResolvedFunction(None, field, None)
-    else:
-        raise InvalidSearchQuery(f"Invalid characters in field {field}")
-
-
-def resolve_field_list(
-    fields, snuba_filter, auto_fields=True, auto_aggregations=False, functions_acl=None
-):
-    """
-    Expand a list of fields based on aliases and aggregate functions.
-
-    Returns a dist of aggregations, selected_columns, and
-    groupby that can be merged into the result of get_snuba_query_args()
-    to build a more complete snuba query based on event search conventions.
-
-    Auto aggregates are aggregates that will be automatically added to the
-    list of aggregations when they're used in a condition. This is so that
-    they can be used in a condition without having to manually add the
-    aggregate to a field.
-    """
-    aggregations = []
-    aggregate_fields = defaultdict(set)
-    columns = []
-    groupby = []
-    project_key = ""
-    functions = {}
-
-    # If project is requested, we need to map ids to their names since snuba only has ids
-    if "project" in fields:
-        fields.remove("project")
-        project_key = "project"
-    # since project.name is more specific, if both are included use project.name instead of project
-    if PROJECT_NAME_ALIAS in fields:
-        fields.remove(PROJECT_NAME_ALIAS)
-        project_key = PROJECT_NAME_ALIAS
-    if project_key:
-        if "project.id" not in fields:
-            fields.append("project.id")
-
-    for field in fields:
-        if isinstance(field, str) and field.strip() == "":
-            continue
-        function = resolve_field(field, snuba_filter.params, functions_acl)
-        if function.column is not None and function.column not in columns:
-            columns.append(function.column)
-            if function.details is not None and isinstance(function.column, (list, tuple)):
-                functions[function.column[-1]] = function.details
-        elif function.aggregate is not None:
-            aggregations.append(function.aggregate)
-            if function.details is not None and isinstance(function.aggregate, (list, tuple)):
-                functions[function.aggregate[-1]] = function.details
-                if function.details.instance.redundant_grouping:
-                    aggregate_fields[function.aggregate[1]].add(field)
-
-    # Only auto aggregate when there's one other so the group by is not unexpectedly changed
-    if auto_aggregations and snuba_filter.having and len(aggregations) > 0:
-        for agg in snuba_filter.condition_aggregates:
-            if agg not in snuba_filter.aliases:
-                function = resolve_field(agg, snuba_filter.params, functions_acl)
-                if function.aggregate is not None and function.aggregate not in aggregations:
-                    aggregations.append(function.aggregate)
-                    if function.details is not None and isinstance(
-                        function.aggregate, (list, tuple)
-                    ):
-                        functions[function.aggregate[-1]] = function.details
-
-                        if function.details.instance.redundant_grouping:
-                            aggregate_fields[function.aggregate[1]].add(field)
-
-    rollup = snuba_filter.rollup
-    if not rollup and auto_fields:
-        # Ensure fields we require to build a functioning interface
-        # are present. We don't add fields when using a rollup as the additional fields
-        # would be aggregated away.
-        if not aggregations and "id" not in columns:
-            columns.append("id")
-        if "id" in columns and "project.id" not in columns:
-            columns.append("project.id")
-            project_key = PROJECT_NAME_ALIAS
-
-    if project_key:
-        # Check to see if there's a condition on project ID already, to avoid unnecessary lookups
-        filtered_project_ids = None
-        if snuba_filter.conditions:
-            for cond in snuba_filter.conditions:
-                if cond[0] == "project_id":
-                    filtered_project_ids = [cond[2]] if cond[1] == "=" else cond[2]
-
-        project_ids = filtered_project_ids or snuba_filter.filter_keys.get("project_id", [])
-        projects = Project.objects.filter(id__in=project_ids).values("slug", "id")
-        # Clickhouse gets confused when the column contains a period
-        # This is specifically for project.name and should be removed once we can stop supporting it
-        if "." in project_key:
-            project_key = f"`{project_key}`"
-        columns.append(
-            [
-                "transform",
-                [
-                    # This is a workaround since having the column by itself currently is being treated as a function
-                    ["toString", ["project_id"]],
-                    ["array", ["'{}'".format(project["id"]) for project in projects]],
-                    ["array", ["'{}'".format(project["slug"]) for project in projects]],
-                    # Default case, what to do if a project id without a slug is found
-                    "''",
-                ],
-                project_key,
-            ]
-        )
-
-    if rollup and columns and not aggregations:
-        raise InvalidSearchQuery("You cannot use rollup without an aggregate field.")
-
-    orderby = snuba_filter.orderby
-    # Only sort if there are columns. When there are only aggregates there's no need to sort
-    if orderby and len(columns) > 0:
-        orderby = resolve_orderby(orderby, columns, aggregations)
-    else:
-        orderby = None
-
-    # If aggregations are present all columns
-    # need to be added to the group by so that the query is valid.
-    if aggregations:
-        for column in columns:
-            if isinstance(column, (list, tuple)):
-                if column[0] == "transform":
-                    # When there's a project transform, we already group by project_id
-                    continue
-                if column[2] == USER_DISPLAY_ALIAS:
-                    # user.display needs to be grouped by its coalesce function
-                    groupby.append(column)
-                    continue
-                groupby.append(column[2])
-            else:
-                if column in aggregate_fields:
-                    conflicting_functions = list(aggregate_fields[column])
-                    raise InvalidSearchQuery(
-                        "A single field cannot be used both inside and outside a function in the same query. To use {field} you must first remove the function(s): {function_msg}".format(
-                            field=column,
-                            function_msg=", ".join(conflicting_functions[:2])
-                            + (
-                                f" and {len(conflicting_functions) - 2} more."
-                                if len(conflicting_functions) > 2
-                                else ""
-                            ),
-                        )
-                    )
-                groupby.append(column)
-
-    return {
-        "selected_columns": columns,
-        "aggregations": aggregations,
-        "groupby": groupby,
-        "orderby": orderby,
-        "functions": functions,
-    }
-
-
-TAG_KEY_RE = re.compile(r"^tags\[(?P<tag>.*)\]$")
+    return SearchVisitor(
+        config,
+        params=params,
+        get_field_type=get_field_type,
+        get_function_result_type=get_function_result_type,
+    ).visit(tree)

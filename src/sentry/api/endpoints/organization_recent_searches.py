@@ -1,9 +1,15 @@
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.request import Request
 from rest_framework.response import Response
 
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
 from sentry.api.bases.organization import OrganizationEndpoint, OrganizationPermission
 from sentry.api.serializers import serialize
+from sentry.auth.principal import is_owned_by_acting_user, require_user
+from sentry.models.organization import Organization
 from sentry.models.recentsearch import RecentSearch, remove_excess_recent_searches
 from sentry.models.search_common import SearchType
 
@@ -15,15 +21,24 @@ class RecentSearchSerializer(serializers.Serializer):
 
 class OrganizationRecentSearchPermission(OrganizationPermission):
     scope_map = {
-        "GET": ["org:read", "org:write", "org:admin"],
-        "POST": ["org:read", "org:write", "org:admin"],
+        "GET": ["org:read", "org:write", "org:admin", "user_preference:read"],
+        "POST": ["org:read", "org:write", "org:admin", "user_preference:write"],
     }
 
+    # user_preference:read and user_preference:write replace org:read in orgs with granular scopes.
+    rejects_deprecated_scopes = True
 
+
+@cell_silo_endpoint
 class OrganizationRecentSearchesEndpoint(OrganizationEndpoint):
+    owner = ApiOwner.UNOWNED
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+        "POST": ApiPublishStatus.PRIVATE,
+    }
     permission_classes = (OrganizationRecentSearchPermission,)
 
-    def get(self, request, organization):
+    def get(self, request: Request, organization: Organization) -> Response:
         """
         List recent searches for a User within an Organization
         ``````````````````````````````````````````````````````
@@ -42,32 +57,38 @@ class OrganizationRecentSearchesEndpoint(OrganizationEndpoint):
         except ValueError as e:
             return Response({"detail": "Invalid input for `limit`. Error: %s" % str(e)}, status=400)
 
-        query_kwargs = {"organization": organization, "user": request.user, "type": search_type}
+        query_kwargs: dict[str, object] = {
+            "organization": organization,
+            "type": search_type,
+        }
 
         if "query" in request.GET:
             query_kwargs["query__icontains"] = request.GET["query"]
 
         recent_searches = list(
-            RecentSearch.objects.filter(**query_kwargs).order_by("-last_seen")[:limit]
+            RecentSearch.objects.filter(
+                is_owned_by_acting_user(request.user), **query_kwargs
+            ).order_by("-last_seen")[:limit]
         )
 
         return Response(serialize(recent_searches, request.user))
 
-    def post(self, request, organization):
+    def post(self, request: Request, organization: Organization) -> Response:
         serializer = RecentSearchSerializer(data=request.data)
 
         if serializer.is_valid():
             result = serializer.validated_data
+            user = require_user(request)
 
-            created = RecentSearch.objects.create_or_update(
-                organization=organization,
-                user=request.user,
+            _, created = RecentSearch.objects.update_or_create(
+                organization_id=organization.id,
+                user_id=user.id,
                 type=result["type"],
                 query=result["query"],
-                values={"last_seen": timezone.now()},
-            )[1]
+                defaults={"last_seen": timezone.now()},
+            )
             if created:
-                remove_excess_recent_searches(organization, request.user, result["type"])
+                remove_excess_recent_searches(organization, user, result["type"])
             status = 201 if created else 204
 
             return Response(status=status)

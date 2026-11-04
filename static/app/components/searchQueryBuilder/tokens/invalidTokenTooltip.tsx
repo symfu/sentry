@@ -1,0 +1,113 @@
+import type {ReactNode} from 'react';
+import type {ListState} from '@react-stately/list';
+import type {Node} from '@react-types/shared';
+
+import {Grid, type GridProps} from '@sentry/scraps/layout';
+import {Text} from '@sentry/scraps/text';
+import {Tooltip, type TooltipProps} from '@sentry/scraps/tooltip';
+
+import type {ParseResultToken} from 'sentry/components/searchSyntax/parser';
+import {t} from 'sentry/locale';
+import {defined} from 'sentry/utils/defined';
+
+interface InvalidTokenTooltipProps extends Omit<TooltipProps, 'title'> {
+  children: ReactNode;
+  item: Node<ParseResultToken>;
+  state: ListState<ParseResultToken>;
+  token: ParseResultToken;
+  warning?: ReactNode;
+}
+
+function getForceVisible({
+  isFocused,
+  isInvalid,
+  hasTokenWarning,
+  hasWarning,
+  forceVisible,
+}: {
+  hasTokenWarning: boolean;
+  hasWarning: boolean;
+  isFocused: boolean;
+  isInvalid: boolean;
+  forceVisible?: TooltipProps['forceVisible'];
+}) {
+  if (!isInvalid && !hasTokenWarning && !hasWarning) {
+    return false;
+  }
+
+  if (defined(forceVisible)) {
+    return forceVisible;
+  }
+
+  return isFocused ? true : undefined;
+}
+
+export function InvalidTokenTooltip({
+  children,
+  token,
+  state,
+  item,
+  forceVisible,
+  warning,
+  ...tooltipProps
+}: InvalidTokenTooltipProps) {
+  const invalid = 'invalid' in token ? token.invalid : null;
+  const tokenWarning = 'warning' in token ? token.warning : null;
+
+  const hasTokenWarning = Boolean(tokenWarning);
+  const hasWarning = Boolean(warning);
+  const isInvalid = Boolean(invalid);
+  const isFocused =
+    state.selectionManager.isFocused && state.selectionManager.focusedKey === item.key;
+
+  const title = warning ?? tokenWarning ?? invalid?.reason ?? t('This token is invalid');
+
+  return (
+    <Tooltip
+      skipWrapper
+      forceVisible={getForceVisible({
+        isFocused,
+        isInvalid,
+        hasTokenWarning,
+        hasWarning,
+        forceVisible,
+      })}
+      position="bottom"
+      title={title ? <Text wrap="pre-line">{title}</Text> : null}
+      {...tooltipProps}
+    >
+      {children}
+    </Tooltip>
+  );
+}
+
+type GridInvalidTokenTooltipProps = InvalidTokenTooltipProps &
+  Pick<GridProps, 'height' | 'minHeight'> & {
+    columnCount: number;
+  };
+
+// The token's height defaults to one line; pass `auto` with a `minHeight` for a
+// token whose content wraps.
+
+export function GridInvalidTokenTooltip({
+  children,
+  columnCount,
+  height = '22px',
+  minHeight,
+  ...props
+}: GridInvalidTokenTooltipProps) {
+  return (
+    <Grid
+      align="stretch"
+      height={height}
+      minHeight={minHeight}
+      columns={`repeat(${columnCount}, auto)`}
+    >
+      {styleProps => (
+        <InvalidTokenTooltip {...props} {...styleProps}>
+          {children}
+        </InvalidTokenTooltip>
+      )}
+    </Grid>
+  );
+}

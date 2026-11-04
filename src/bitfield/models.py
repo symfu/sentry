@@ -1,7 +1,18 @@
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, SupportsIndex, SupportsInt, TypeVar, cast
+
+from django.db.models import Model
 from django.db.models.fields import BigIntegerField
 
 from bitfield.query import BitQueryExactLookupStub
 from bitfield.types import Bit, BitHandler
+
+if TYPE_CHECKING:
+    _BigIntegerFieldBase = BigIntegerField[Any, Any]
+else:
+    _BigIntegerFieldBase = BigIntegerField
 
 # Count binary capacity. Truncate "0b" prefix from binary form.
 # Twice faster than bin(i)[2:] or math.floor(math.log(i))
@@ -9,43 +20,43 @@ MAX_FLAG_COUNT = int(len(bin(BigIntegerField.MAX_BIGINT)) - 2)
 
 
 class BitFieldFlags:
-    def __init__(self, flags):
+    def __init__(self, flags: Sequence[str]) -> None:
         if len(flags) > MAX_FLAG_COUNT:
             raise ValueError("Too many flags")
         self._flags = flags
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return repr(self._flags)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         yield from self._flags
 
-    def __getattr__(self, key):
+    def __getattr__(self, key: str) -> Bit:
         if key not in self._flags:
             raise AttributeError
         return Bit(self._flags.index(key))
 
     __getitem__ = __getattr__
 
-    def iteritems(self):
+    def iteritems(self) -> Iterator[tuple[str, Bit]]:
         for flag in self._flags:
             yield flag, Bit(self._flags.index(flag))
 
-    def iterkeys(self):
+    def iterkeys(self) -> Iterator[str]:
         yield from self._flags
 
-    def itervalues(self):
+    def itervalues(self) -> Iterator[Bit]:
         for flag in self._flags:
             yield Bit(self._flags.index(flag))
 
-    def items(self):
-        return list(self.iteritems())  # NOQA
+    def items(self) -> list[tuple[str, Bit]]:
+        return list(self.iteritems())
 
-    def keys(self):
-        return list(self.iterkeys())  # NOQA
+    def keys(self) -> list[str]:
+        return list(self.iterkeys())
 
-    def values(self):
-        return list(self.itervalues())  # NOQA
+    def values(self) -> list[Bit]:
+        return list(self.itervalues())
 
 
 class BitFieldCreator:
@@ -57,13 +68,15 @@ class BitFieldCreator:
     available (usually during deploys).
     """
 
-    def __init__(self, field):
+    def __init__(self, field: BitField) -> None:
         self.field = field
 
-    def __set__(self, obj, value):
+    def __set__(self, obj: Model, value: object) -> None:
         obj.__dict__[self.field.name] = self.field.to_python(value)
 
-    def __get__(self, obj, type=None):
+    def __get__(
+        self, obj: Model | None, type: type[Model] | None = None
+    ) -> BitFieldFlags | BitHandler:
         if obj is None:
             return BitFieldFlags(self.field.flags)
         retval = obj.__dict__[self.field.name]
@@ -73,12 +86,23 @@ class BitFieldCreator:
         return retval
 
 
-class BitField(BigIntegerField):
-    def contribute_to_class(self, cls, name, **kwargs):
-        super().contribute_to_class(cls, name, **kwargs)
+class BitField(_BigIntegerFieldBase):
+    flags: list[str]
+    labels: list[str]
+    _arg_flags: dict[int, str] | Sequence[str | tuple[str, str]]
+
+    def contribute_to_class(self, cls: type[Model], name: str, private_only: bool = False) -> None:
+        super().contribute_to_class(cls, name, private_only=private_only)
         setattr(cls, self.name, BitFieldCreator(self))
 
-    def __init__(self, flags, default=None, *args, **kwargs):
+    def __init__(
+        self,
+        flags: dict[int, str] | Sequence[str | tuple[str, str]],
+        default: object = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        flag_definitions: Sequence[str | tuple[str, str]]
         if isinstance(flags, dict):
             # Get only integer keys in correct range
             valid_keys = (
@@ -87,43 +111,50 @@ class BitField(BigIntegerField):
             if not valid_keys:
                 raise ValueError("Wrong keys or empty dictionary")
             # Fill list with values from dict or with empty values
-            flags = [flags.get(i, "") for i in range(max(valid_keys) + 1)]
+            flag_definitions = [flags.get(i, "") for i in range(max(valid_keys) + 1)]
+        else:
+            flag_definitions = flags
 
-        if len(flags) > MAX_FLAG_COUNT:
+        if len(flag_definitions) > MAX_FLAG_COUNT:
             raise ValueError("Too many flags")
 
-        self._arg_flags = flags
-        flags = list(flags)
-        labels = []
-        for num, flag in enumerate(flags):
+        self._arg_flags = flag_definitions
+
+        flags_list: list[str] = []
+        labels: list[str] = []
+        for flag in flag_definitions:
             if isinstance(flag, (tuple, list)):
-                flags[num] = flag[0]
+                flags_list.append(flag[0])
                 labels.append(flag[1])
             else:
+                flags_list.append(flag)
                 labels.append(flag)
 
         if isinstance(default, (list, tuple, set, frozenset)):
             new_value = 0
             for flag in default:
-                new_value |= Bit(flags.index(flag))
+                new_value |= Bit(flags_list.index(flag))
             default = new_value
 
-        BigIntegerField.__init__(self, default=default, *args, **kwargs)
-        self.flags = flags
+        kwargs["default"] = default
+        BigIntegerField.__init__(self, *args, **kwargs)
+        self.flags = flags_list
         self.labels = labels
 
-    def pre_save(self, instance, add):
-        value = getattr(instance, self.attname)
-        return value
+    def pre_save(self, instance: Model, add: bool) -> int:
+        return getattr(instance, self.attname)
 
-    def get_prep_value(self, value):
+    def get_prep_value(
+        self,
+        value: SupportsInt | SupportsIndex | str | bytes | bytearray | Bit | BitHandler | None,
+    ) -> int | None:
         if value is None:
             return None
         if isinstance(value, (BitHandler, Bit)):
             value = value.mask
         return int(value)
 
-    def to_python(self, value):
+    def to_python(self, value: object) -> BitHandler:
         if isinstance(value, Bit):
             value = value.mask
         if not isinstance(value, BitHandler):
@@ -133,19 +164,99 @@ class BitField(BigIntegerField):
             if isinstance(value, int) and value < 0:
                 new_value = 0
                 for bit_number, _ in enumerate(self.flags):
-                    new_value |= value & (2 ** bit_number)
+                    new_value |= value & (2**bit_number)
                 value = new_value
 
-            value = BitHandler(value, self.flags, self.labels)
+            value = BitHandler(
+                cast("SupportsInt | SupportsIndex | str | bytes | bytearray | None", value),
+                self.flags,
+                self.labels,
+            )
         else:
             # Ensure flags are consistent for unpickling
             value._keys = self.flags
         return value
 
-    def deconstruct(self):
+    def deconstruct(self) -> tuple[str, str, list[object], dict[str, object]]:
         name, path, args, kwargs = super().deconstruct()
-        args.insert(0, self._arg_flags)
+        args = [self._arg_flags, *args]
         return name, path, args, kwargs
+
+
+def flags_from_annotations(annotations: Mapping[str, object]) -> list[str]:
+    flags = []
+    for attr, ty in annotations.items():
+        assert ty in ("bool", bool), f"bitfields can only hold bools, {attr} is {ty!r}"
+        flags.append(attr)
+
+    return flags
+
+
+class TypedBitfieldMeta(type):
+    def __new__(
+        cls, name: str, bases: tuple[type, ...], clsdict: dict[str, object]
+    ) -> TypedBitfieldMeta:
+        if name == "TypedClassBitField":
+            return type.__new__(cls, name, bases, clsdict)
+
+        flags: dict[str, object] = {}
+        annotations = cast("dict[str, object]", clsdict["__annotations__"])
+        for attr, ty in annotations.items():
+            if attr.startswith("_"):
+                continue
+
+            if attr in ("bitfield_default", "bitfield_null", "bitfield_db_column"):
+                continue
+
+            flags[attr] = ty
+
+        return cast(
+            TypedBitfieldMeta,
+            BitField(
+                flags=flags_from_annotations(flags),
+                default=clsdict.get("bitfield_default"),
+                null=clsdict.get("bitfield_null") or False,
+                db_column=clsdict.get("bitfield_db_column"),
+            ),
+        )
+
+    def __int__(self) -> int:
+        raise NotImplementedError()
+
+
+class TypedClassBitField(metaclass=TypedBitfieldMeta):
+    """
+    A wrapper around BitField that allows you to access its fields as instance
+    attributes in a type-safe way.
+    """
+
+    bitfield_default: Any | None
+    bitfield_null: bool
+
+    _value: int
+
+
+T = TypeVar("T")
+
+
+def typed_dict_bitfield(definition: type[T], default: object = None, null: bool = False) -> T:
+    """
+    A wrapper around BitField that allows you to access its fields as
+    dictionary keys attributes in a type-safe way.
+
+    Prefer `TypedClassBitField` over this if you can help it. This function
+    only exists to make it simpler to type bitfields with fields that are not
+    valid Python identifiers, but has limitations for how far it can provide
+    type safety.
+    """
+    assert issubclass(definition, dict)
+
+    return cast(
+        T,
+        BitField(
+            flags=flags_from_annotations(definition.__annotations__), default=default, null=null
+        ),
+    )
 
 
 BitField.register_lookup(BitQueryExactLookupStub)

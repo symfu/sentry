@@ -1,0 +1,94 @@
+import re
+from unittest.mock import MagicMock, patch
+
+from django.http import HttpResponse
+
+from sentry.integrations.jira.views import SALT, UNABLE_TO_VERIFY_INSTALLATION
+from sentry.integrations.utils.atlassian_connect import (
+    AtlassianConnectTokenExpiredError,
+    AtlassianConnectValidationError,
+)
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.silo import control_silo_test
+from sentry.utils.http import absolute_uri
+from sentry.utils.signing import unsign
+
+REFRESH_REQUIRED = b"This page has expired, please refresh to configure your Sentry integration"
+CLICK_TO_FINISH = b"Finish Installation in Sentry"
+
+
+@control_silo_test
+class JiraSentryInstallationViewTestCase(APITestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.path = absolute_uri("extensions/jira/ui-hook/") + "?xdm_e=base_url"
+
+        self.user.name = "Sentry Admin"
+        self.user.save()
+
+        self.integration = self.create_provider_integration(
+            provider="jira",
+            name="Example Jira",
+            external_id="example-client-key",
+            metadata={
+                "oauth_client_id": "oauth-client-id",
+                "shared_secret": "a-super-secret-key-from-atlassian",
+                "base_url": "https://example.atlassian.net",
+                "domain_name": "example.atlassian.net",
+            },
+        )
+
+
+@control_silo_test
+class JiraSentryInstallationViewErrorsTest(JiraSentryInstallationViewTestCase):
+    @patch(
+        "sentry.integrations.jira.views.sentry_installation.get_integration_from_request",
+        side_effect=AtlassianConnectTokenExpiredError(),
+    )
+    def test_expired_signature_error(self, mock_get_integration_from_request: MagicMock) -> None:
+        response = self.client.get(self.path)
+        assert response.status_code == 200
+        assert REFRESH_REQUIRED in response.content
+
+    @patch(
+        "sentry.integrations.jira.views.sentry_installation.get_integration_from_request",
+        side_effect=AtlassianConnectValidationError(),
+    )
+    def test_expired_invalid_installation_error(
+        self, mock_get_integration_from_request: MagicMock
+    ) -> None:
+        response = self.client.get(self.path)
+        assert response.status_code == 200
+        assert UNABLE_TO_VERIFY_INSTALLATION.encode() in response.content
+
+
+@control_silo_test
+class JiraSentryInstallationViewTest(JiraSentryInstallationViewTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(self.user)
+
+    def assert_no_errors(self, response: HttpResponse) -> None:
+        assert REFRESH_REQUIRED not in response.content
+        assert UNABLE_TO_VERIFY_INSTALLATION.encode() not in response.content
+
+    @patch("sentry.integrations.jira.views.sentry_installation.get_integration_from_request")
+    def test_simple_get(self, mock_get_integration_from_request: MagicMock) -> None:
+        mock_get_integration_from_request.return_value = self.integration
+        response = self.client.get(self.path)
+        assert response.status_code == 200
+        self.assert_no_errors(response)
+        assert CLICK_TO_FINISH in response.content
+
+    @patch("sentry.integrations.jira.views.sentry_installation.get_integration_from_request")
+    def test_finish_link_only_identifies_installation(
+        self, mock_get_integration_from_request: MagicMock
+    ) -> None:
+        mock_get_integration_from_request.return_value = self.integration
+        response = self.client.get(self.path)
+        assert response.status_code == 200
+
+        match = re.search(rb"signed_params=([A-Za-z0-9_-]+)", response.content)
+        assert match is not None
+        assert unsign(match.group(1).decode(), salt=SALT) == {"external_id": "example-client-key"}
+        assert b"a-super-secret-key-from-atlassian" not in response.content

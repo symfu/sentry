@@ -1,20 +1,140 @@
+from collections.abc import Iterable
+from datetime import timedelta
+from typing import cast
+from unittest.mock import Mock, patch
+
 from django.contrib.auth.models import AnonymousUser
-from sentry.utils.compat.mock import Mock
+from django.http import HttpRequest
+from django.test import override_settings
+from django.utils import timezone
+from rest_framework.request import Request
 
+from sentry.api.permissions import SentryPermission
 from sentry.auth import access
-from sentry.models import AuthProvider, AuthIdentity, Organization, ObjectStatus
-from sentry.testutils import TestCase
+from sentry.auth.access import Access, NoAccess
+from sentry.auth.principal import set_request_principal
+from sentry.auth.providers.dummy import DummyProvider
+from sentry.auth.scope_declaration import (
+    bind_endpoint_scope_declaration,
+    update_permission_scope_declaration,
+)
+from sentry.auth.services.auth import AuthenticatedToken
+from sentry.auth.superuser import SUPERUSER_READONLY_SCOPES, SUPERUSER_SCOPES
+from sentry.constants import ObjectStatus
+from sentry.hybridcloud.rpc.service import dispatch_remote_call
+from sentry.models.apikey import ApiKey
+from sentry.models.authidentity import AuthIdentity
+from sentry.models.authprovider import AuthProvider
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.models.team import TeamStatus
+from sentry.organizations.services.organization import organization_service
+from sentry.organizations.services.organization.resources import get_active_resource_ids
+from sentry.service_accounts.auth import SERVICE_ACCOUNT_TOKEN_KIND
+from sentry.service_accounts.models import ServiceAccountProject
+from sentry.service_accounts.principal import ServiceAccountPrincipal
+from sentry.silo.base import SiloMode
+from sentry.testutils.asserts import assert_no_organization_resource_hydration
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers import with_feature
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.outbox import outbox_runner
+from sentry.testutils.requests import drf_request_from_request
+from sentry.testutils.silo import (
+    all_silo_test,
+    assume_test_silo_mode,
+    assume_test_silo_mode_of,
+    cell_silo_test,
+    no_silo_test,
+)
+from sentry.types.superuser import SuperuserAccess
+from sentry.users.models.user import User
 
 
-class FromUserTest(TestCase):
-    def test_no_access(self):
+def silo_from_user(
+    user: User | AnonymousUser,
+    organization: Organization | None = None,
+    scopes: Iterable[str] | None = None,
+    is_superuser: bool = False,
+    is_staff: bool = False,
+) -> Access:
+    rpc_user_org_context = None
+    if organization:
+        rpc_user_org_context = organization_service.get_organization_by_id(
+            id=organization.id, user_id=user.id, include_projects=False, include_teams=False
+        )
+    return access.from_user_and_rpc_user_org_context(
+        user=user,
+        rpc_user_org_context=rpc_user_org_context,
+        is_superuser=is_superuser,
+        is_staff=is_staff,
+        scopes=scopes,
+    )
+
+
+def silo_from_request(
+    request: HttpRequest,
+    organization: Organization | None = None,
+    scopes: Iterable[str] | None = None,
+) -> Access:
+    rpc_user_org_context = None
+    if organization:
+        rpc_user_org_context = access.get_organization_access_context(
+            request, organization_id=organization.id
+        )
+    return access.from_request_org_and_scopes(
+        request=request, rpc_user_org_context=rpc_user_org_context, scopes=scopes
+    )
+
+
+class AccessFactoryTestCase(TestCase):
+    def from_user(
+        self,
+        user: User | AnonymousUser,
+        organization: Organization | None = None,
+        scopes: Iterable[str] | None = None,
+        is_superuser: bool = False,
+        is_staff: bool = False,
+    ) -> Access:
+        if SiloMode.get_current_mode() == SiloMode.MONOLITH:
+            return access.from_user(user, organization, scopes, is_superuser, is_staff)
+        return silo_from_user(user, organization, scopes, is_superuser, is_staff)
+
+    def from_request(
+        self,
+        request: HttpRequest,
+        organization: Organization | None = None,
+        scopes: Iterable[str] | None = None,
+    ) -> Access:
+        if SiloMode.get_current_mode() == SiloMode.MONOLITH:
+            return access.from_request(cast(Request, request), organization, scopes)
+        return silo_from_request(request, organization, scopes)
+
+    @assume_test_silo_mode(SiloMode.CONTROL)
+    def create_api_key(self, organization: Organization, **kwds: object) -> ApiKey:
+        return ApiKey.objects.create(organization_id=organization.id, **kwds)
+
+    @assume_test_silo_mode(SiloMode.CONTROL)
+    def create_auth_provider(self, organization: Organization, **kwds: object) -> AuthProvider:
+        return AuthProvider.objects.create(organization_id=organization.id, **kwds)
+
+    @assume_test_silo_mode(SiloMode.CONTROL)
+    def create_auth_identity(
+        self, auth_provider: AuthProvider, user: User, **kwds: object
+    ) -> AuthIdentity:
+        return AuthIdentity.objects.create(auth_provider=auth_provider, user=user, **kwds)
+
+
+@all_silo_test
+class FromUserTest(AccessFactoryTestCase):
+    def test_no_access(self) -> None:
         organization = self.create_organization()
         team = self.create_team(organization=organization)
         project = self.create_project(organization=organization, teams=[team])
         user = self.create_user()
 
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert not result.sso_is_valid
@@ -26,26 +146,47 @@ class FromUserTest(TestCase):
             assert not result.has_projects_access([project])
             assert not result.has_project_scope(project, "project:read")
             assert not result.has_project_membership(project)
+            assert not result.permissions
 
-    def test_no_deleted_projects(self):
+    def test_no_deleted_projects(self) -> None:
         user = self.create_user()
         organization = self.create_organization(owner=self.user)
 
         team = self.create_team(organization=organization)
         self.create_member(organization=organization, user=user, role="owner", teams=[team])
-        project = self.create_project(
+        deleted_project = self.create_project(
             organization=organization, status=ObjectStatus.PENDING_DELETION, teams=[team]
         )
 
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
-            assert result.has_project_access(project) is True
-            assert result.has_project_membership(project) is False
-            assert len(result.projects) == 0
+            assert result.has_project_access(deleted_project) is False
+            assert result.has_project_membership(deleted_project) is False
+            assert len(result.project_ids_with_team_membership) == 0
 
-    def test_unique_projects(self):
+    def test_no_deleted_teams(self) -> None:
+        user = self.create_user()
+        organization = self.create_organization(owner=self.user)
+
+        team = self.create_team(organization=organization)
+        deleted_team = self.create_team(
+            organization=organization, status=TeamStatus.PENDING_DELETION
+        )
+        self.create_member(
+            organization=organization, user=user, role="owner", teams=[team, deleted_team]
+        )
+
+        request = self.make_request(user=user)
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
+
+        for result in results:
+            assert result.has_team_access(team) is True
+            assert result.has_team_access(deleted_team) is False
+            assert result.team_ids_with_membership == frozenset({team.id})
+
+    def test_unique_projects(self) -> None:
         user = self.create_user()
         organization = self.create_organization(owner=self.user)
 
@@ -57,13 +198,13 @@ class FromUserTest(TestCase):
         project = self.create_project(organization=organization, teams=[team, other_team])
 
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.has_project_access(project)
-            assert len(result.projects) == 1
+            assert len(result.project_ids_with_team_membership) == 1
 
-    def test_mixed_access(self):
+    def test_mixed_access(self) -> None:
         user = self.create_user()
         organization = self.create_organization(flags=0)  # disable default allow_joinleave
         team = self.create_team(organization=organization)
@@ -72,21 +213,21 @@ class FromUserTest(TestCase):
         project_no_access = self.create_project(organization=organization, teams=[team_no_access])
         self.create_member(organization=organization, user=user, teams=[team])
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.has_project_access(project)
             assert not result.has_project_access(project_no_access)
             assert not result.has_projects_access([project, project_no_access])
 
-    def test_owner_all_teams(self):
+    def test_owner_all_teams(self) -> None:
         user = self.create_user()
         organization = self.create_organization(owner=self.user)
         member = self.create_member(organization=organization, user=user, role="owner")
         team = self.create_team(organization=organization)
         project = self.create_project(organization=organization, teams=[team])
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.sso_is_valid
@@ -97,20 +238,23 @@ class FromUserTest(TestCase):
             assert result.has_project_access(project)
             assert result.has_projects_access([project])
             assert result.has_project_scope(project, "project:read")
+            assert result.has_any_project_scope(project, ["project:read", "project:admin"])
+
             # owners should have access but not membership
             assert result.has_project_membership(project) is False
 
-    def test_member_no_teams_closed_membership(self):
+    def test_member_no_teams_closed_membership(self) -> None:
         user = self.create_user()
         organization = self.create_organization(
-            owner=self.user, flags=0  # disable default allow_joinleave
+            owner=self.user,
+            flags=0,  # disable default allow_joinleave
         )
         member = self.create_member(organization=organization, user=user, role="member")
         team = self.create_team(organization=organization)
         project = self.create_project(organization=organization, teams=[team])
 
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.sso_is_valid
@@ -121,9 +265,10 @@ class FromUserTest(TestCase):
             assert not result.has_project_access(project)
             assert not result.has_projects_access([project])
             assert not result.has_project_scope(project, "project:read")
+            assert not result.has_any_project_scope(project, ["project:read", "project:admin"])
             assert not result.has_project_membership(project)
 
-    def test_member_no_teams_open_membership(self):
+    def test_member_no_teams_open_membership(self) -> None:
         user = self.create_user()
         organization = self.create_organization(
             owner=self.user, flags=Organization.flags.allow_joinleave
@@ -133,7 +278,7 @@ class FromUserTest(TestCase):
         project = self.create_project(organization=organization, teams=[team])
 
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.sso_is_valid
@@ -144,16 +289,19 @@ class FromUserTest(TestCase):
             assert result.has_project_access(project)
             assert result.has_projects_access([project])
             assert result.has_project_scope(project, "project:read")
+            assert not result.has_project_scope(project, "project:write")
+            assert result.has_any_project_scope(project, ["project:read", "project:write"])
+            assert not result.has_any_project_scope(project, ["project:write", "project:admin"])
             assert not result.has_project_membership(project)
 
-    def test_team_restricted_org_member_access(self):
+    def test_team_restricted_org_member_access(self) -> None:
         user = self.create_user()
         organization = self.create_organization()
         team = self.create_team(organization=organization)
         project = self.create_project(organization=organization, teams=[team])
         member = self.create_member(organization=organization, user=user, teams=[team])
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.sso_is_valid
@@ -164,67 +312,590 @@ class FromUserTest(TestCase):
             assert result.has_project_access(project)
             assert result.has_projects_access([project])
             assert result.has_project_scope(project, "project:read")
+            assert not result.has_project_scope(project, "project:write")
+            assert result.has_any_project_scope(project, ["project:read", "project:write"])
+            assert not result.has_any_project_scope(project, ["project:write", "project:admin"])
             assert result.has_project_membership(project)
 
-    def test_unlinked_sso(self):
+    @with_feature("organizations:team-roles")
+    def test_has_project_scope_from_team_role(self) -> None:
+        organization = self.create_organization()
+        team = self.create_team(organization=organization)
+        project = self.create_project(organization=organization, teams=[team])
+        team_other = self.create_team(organization=organization)
+        project_other = self.create_project(organization=organization, teams=[team_other])
+
+        # Team Contributor
+        user = self.create_user()
+        member = self.create_member(organization=organization, user=user)
+        self.create_team_membership(team, member, role="contributor")
+
+        request = self.make_request(user=user)
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
+
+        for result in results:
+            # Does not have scopes from org-role
+            assert not result.has_scope("team:admin")
+            assert not result.has_scope("team:write")
+            assert not result.has_scope("project:admin")
+            assert not result.has_scope("project:write")
+
+            # Has scopes from team-role
+            assert not result.has_team_scope(team, "team:admin")
+            assert not result.has_team_scope(team, "team:write")
+            assert result.has_team_scope(team, "team:read")
+            assert not result.has_project_scope(project, "project:admin")
+            assert not result.has_project_scope(project, "project:write")
+            assert result.has_project_scope(project, "project:read")
+
+        # Team Admin
+        user = self.create_user()
+        member = self.create_member(organization=organization, user=user)
+        self.create_team_membership(team, member, role="admin")
+
+        request = self.make_request(user=user)
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
+        for result in results:
+            # Does not have scopes from org-role
+            assert not result.has_scope("team:admin")
+            assert not result.has_scope("team:write")
+            assert not result.has_scope("project:admin")
+            assert not result.has_scope("project:write")
+
+            # Has scopes from team-role
+            assert result.has_team_scope(team, "team:admin")
+            assert result.has_team_scope(team, "team:write")
+            assert result.has_team_scope(team, "team:read")
+            assert result.has_project_scope(project, "project:admin")
+            assert result.has_project_scope(project, "project:write")
+            assert result.has_project_scope(project, "project:read")
+
+            # Does not have scope from other team
+            assert not result.has_team_scope(team_other, "team:admin")
+            assert not result.has_team_scope(team_other, "team:write")
+            assert result.has_team_scope(team_other, "team:read")
+            assert not result.has_project_scope(project_other, "project:admin")
+            assert not result.has_project_scope(project_other, "project:write")
+            assert result.has_project_scope(project_other, "project:read")
+
+    def test_unlinked_sso(self) -> None:
         user = self.create_user()
         organization = self.create_organization(owner=user)
         self.create_team(organization=organization)
-        ap = AuthProvider.objects.create(organization=organization, provider="dummy")
-        AuthIdentity.objects.create(auth_provider=ap, user=user)
+        ap = self.create_auth_provider(organization=organization, provider="dummy")
+        self.create_auth_identity(auth_provider=ap, user=user)
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert not result.sso_is_valid
             assert result.requires_sso
 
-    def test_unlinked_sso_with_no_owners(self):
+    def test_last_verified_sso(self) -> None:
+        user = self.create_user()
+        organization = self.create_organization(owner=user)
+        ap = self.create_auth_provider(organization=organization, provider="dummy")
+        ai = self.create_auth_identity(auth_provider=ap, user=user)
+
+        om = organization_service.check_membership_by_id(
+            organization_id=organization.id, user_id=ai.user_id
+        )
+        assert om
+        setattr(om.flags, "sso:linked", True)
+        organization_service.update_membership_flags(organization_member=om)
+
+        request = self.make_request(user=user)
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
+
+        for result in results:
+            assert result.sso_is_valid
+            assert result.requires_sso
+
+        # If the auth identity has not been updated in awhile, it is not valid.
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            ai.update(last_verified=timezone.now() - timedelta(days=10))
+
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
+        for result in results:
+            assert not result.sso_is_valid
+            assert result.requires_sso
+
+        # but it is valid if the requires_fresh is False
+        with patch.object(DummyProvider, "requires_refresh", False):
+            results = [self.from_user(user, organization), self.from_request(request, organization)]
+            for result in results:
+                assert result.sso_is_valid
+                assert result.requires_sso
+
+    def test_unlinked_sso_with_owner_from_team(self) -> None:
+        organization = self.create_organization()
+        ap = self.create_auth_provider(organization=organization, provider="dummy")
+        user = self.create_user()
+        owner_team = self.create_team(organization=organization)
+        self.create_member(organization=organization, user=user, teams=[owner_team])
+        self.create_auth_identity(auth_provider=ap, user=user)
+        request = self.make_request(user=user)
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
+
+        for result in results:
+            assert not result.sso_is_valid
+            assert result.requires_sso
+
+    def test_unlinked_sso_with_no_owners(self) -> None:
         user = self.create_user()
         organization = self.create_organization(owner=user)
         self.create_team(organization=organization)
-        AuthProvider.objects.create(organization=organization, provider="dummy")
+        self.create_auth_provider(organization=organization, provider="dummy")
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert not result.sso_is_valid
             assert not result.requires_sso
 
-    def test_sso_without_link_requirement(self):
+    def test_sso_without_link_requirement(self) -> None:
         user = self.create_user()
         organization = self.create_organization(owner=user)
         self.create_team(organization=organization)
-        AuthProvider.objects.create(
+        self.create_auth_provider(
             organization=organization, provider="dummy", flags=AuthProvider.flags.allow_unlinked
         )
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result.sso_is_valid
             assert not result.requires_sso
 
-    def test_anonymous_user(self):
+    def test_anonymous_user(self) -> None:
         user = self.create_user()
         anon_user = AnonymousUser()
         organization = self.create_organization(owner=user)
         # TODO: make test work with from_request
-        result = access.from_user(anon_user, organization)
+        result = self.from_user(anon_user, organization)
         assert result is access.DEFAULT
 
-    def test_inactive_user(self):
+    def test_inactive_user(self) -> None:
         user = self.create_user(is_active=False)
         organization = self.create_organization(owner=user)
         request = self.make_request(user=user)
-        results = [access.from_user(user, organization), access.from_request(request, organization)]
+        results = [self.from_user(user, organization), self.from_request(request, organization)]
 
         for result in results:
             assert result is access.DEFAULT
 
+    def test_user_permissions_as_superuser(self) -> None:
+        user = self.create_user(is_superuser=True)
+        self.add_user_permission(user, "test.permission")
 
-class FromSentryAppTest(TestCase):
-    def setUp(self):
+        result = self.from_user(user)
+        assert not result.has_permission("test.permission")
+
+        result = self.from_user(user, is_superuser=True)
+        assert result.has_permission("test.permission")
+
+    def test_user_permissions_as_staff(self) -> None:
+        user = self.create_user(is_staff=True)
+        self.add_user_permission(user, "test.permission")
+
+        result = self.from_user(user)
+        assert not result.has_permission("test.permission")
+
+        result = self.from_user(user, is_staff=True)
+        assert result.has_permission("test.permission")
+
+    @with_feature("organizations:team-roles")
+    def test_enforce_upper_bound_scope(self) -> None:
+        organization = self.create_organization()
+        team = self.create_team(organization=organization)
+        project = self.create_project(organization=organization, teams=[team])
+        team_other = self.create_team(organization=organization)
+        project_other = self.create_project(organization=organization, teams=[team_other])
+
+        # Team Admin
+        user = self.create_user()
+        member = self.create_member(organization=organization, user=user)
+        self.create_team_membership(team, member, role="admin")
+
+        request = self.make_request(user=user)
+
+        results = [
+            self.from_user(user, organization, scopes=["org:read", "team:admin"]),
+            self.from_request(request, organization, scopes=["org:read", "team:admin"]),
+        ]
+        for result in results:
+            # Does not have scopes from org-role
+            assert not result.has_scope("org:admin")
+            assert not result.has_scope("org:write")
+            assert result.has_scope("org:read")
+            assert not result.has_scope("team:admin")  # Org-member do not have team:admin scope
+            assert not result.has_scope("team:read")
+            assert not result.has_scope("team:write")
+            assert not result.has_scope("project:admin")
+            assert not result.has_scope("project:write")
+            assert not result.has_scope("project:read")
+
+            # Has scopes from team-role
+            assert result.has_team_scope(team, "team:admin")  # From being a team-admin
+            assert not result.has_team_scope(team, "team:write")
+            assert not result.has_team_scope(team, "team:read")
+            assert not result.has_project_scope(project, "project:admin")
+            assert not result.has_project_scope(project, "project:write")
+            assert not result.has_project_scope(project, "project:read")
+
+            # Does not have scope from other team
+            assert not result.has_team_scope(team_other, "team:admin")
+            assert not result.has_team_scope(team_other, "team:write")
+            assert not result.has_team_scope(team_other, "team:read")
+            assert not result.has_project_scope(project_other, "project:admin")
+            assert not result.has_project_scope(project_other, "project:write")
+            assert not result.has_project_scope(project_other, "project:read")
+
+    def test_token_only_scope_survives_upper_bound_intersection(self) -> None:
+        organization = self.create_organization()
+        user = self.create_user()
+        self.create_member(organization=organization, user=user)
+
+        request = self.make_request(user=user)
+
+        results = [
+            self.from_user(user, organization, scopes=["org:read", "org:ci"]),
+            self.from_request(request, organization, scopes=["org:read", "org:ci"]),
+        ]
+
+        for result in results:
+            assert result.scopes == frozenset({"org:read", "org:ci"})
+            assert not result.has_scope("project:read")
+
+    @with_feature("organizations:granular-permission-scopes")
+    @override_options({"auth.deprecated-scope-translation.enabled": True})
+    def test_deprecated_token_scope_translated_to_granular_scopes(self) -> None:
+        organization = self.create_organization()
+        user = self.create_user()
+        self.create_member(organization=organization, user=user)
+
+        request = self.make_request(user=user)
+        token_scopes = AuthenticatedToken(kind="api_token", scopes=["org:read"]).get_scopes()
+
+        results = [
+            self.from_user(user, organization, scopes=token_scopes),
+            self.from_request(request, organization, scopes=token_scopes),
+        ]
+
+        for result in results:
+            assert result.has_scope("org:read")
+            assert result.has_scope("dashboard:read")
+            assert result.has_scope("dashboard:write")
+
+    def test_deprecated_token_scope_translation_capped_by_role(self) -> None:
+        # Without granular roles the member holds no dashboard scopes, so the
+        # translated scopes are dropped by the member/token intersection.
+        organization = self.create_organization()
+        user = self.create_user()
+        self.create_member(organization=organization, user=user)
+
+        request = self.make_request(user=user)
+        token_scopes = AuthenticatedToken(kind="api_token", scopes=["org:read"]).get_scopes()
+
+        results = [
+            self.from_user(user, organization, scopes=token_scopes),
+            self.from_request(request, organization, scopes=token_scopes),
+        ]
+
+        for result in results:
+            assert result.has_scope("org:read")
+            assert not result.has_scope("dashboard:read")
+
+
+@all_silo_test
+class FromRequestTest(AccessFactoryTestCase):
+    def setUp(self) -> None:
+        self.superuser = self.create_user(is_superuser=True)
+        self.add_user_permission(self.superuser, "test.permission")
+        self.staff = self.create_user(is_staff=True)
+        self.add_user_permission(self.staff, "test.permission")
+
+        self.org = self.create_organization()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            AuthProvider.objects.create(organization_id=self.org.id)
+
+        self.team1 = self.create_team(organization=self.org)
+        self.project1 = self.create_project(organization=self.org, teams=[self.team1])
+        self.team2 = self.create_team(organization=self.org)
+        self.project2 = self.create_project(organization=self.org, teams=[self.team2])
+
+        super().setUp()
+
+    def _assert_memberships(self, result: Access) -> None:
+        assert result.role == "admin"
+
+        assert result.team_ids_with_membership == frozenset({self.team1.id})
+        assert result.has_team_access(self.team1)
+        assert result.project_ids_with_team_membership == frozenset({self.project1.id})
+        assert result.has_project_access(self.project1)
+        assert result.has_project_membership(self.project1)
+        assert not result.has_project_membership(self.project2)
+
+        # Even if not superuser/staff, still has these because of role.is_global
+        # which checks that open membership is on
+        assert result.has_global_access
+        assert result.has_team_access(self.team2)
+        assert result.has_project_access(self.project2)
+
+    def test_superuser_user_permissions(self) -> None:
+        request = self.make_request(user=self.superuser, is_superuser=False)
+        result = self.from_request(request)
+        assert not result.has_permission("test.permission")
+
+        request = self.make_request(user=self.superuser, is_superuser=True)
+        result = self.from_request(request)
+        assert result.has_permission("test.permission")
+
+    def test_staff_user_permissions(self) -> None:
+        request = self.make_request(user=self.staff, is_staff=False)
+        result = self.from_request(request)
+        assert not result.has_permission("test.permission")
+
+        request = self.make_request(user=self.staff, is_staff=True)
+        result = self.from_request(request)
+        assert result.has_permission("test.permission")
+
+    def test_superuser_scopes(self) -> None:
+        # superuser not in organization
+        request = self.make_request(user=self.superuser, is_superuser=True)
+
+        # needs org in request in order to assign any scopes
+        result = self.from_request(request, self.org)
+        assert result.scopes == SUPERUSER_SCOPES
+
+        # superuser in organization
+        self.create_member(user=self.superuser, organization=self.org, role="member")
+
+        result = self.from_request(request, self.org)
+        assert result.scopes == SUPERUSER_SCOPES
+
+    @override_options({"superuser.read-write.ga-rollout": True})
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_superuser_readonly_scopes(self) -> None:
+        # superuser not in organization
+        request = self.make_request(user=self.superuser, is_superuser=True)
+
+        result = self.from_request(request, self.org)
+        assert result.scopes == SUPERUSER_READONLY_SCOPES
+
+        # superuser in organization
+        member = self.create_member(user=self.superuser, organization=self.org, role="member")
+
+        # If superuser is a member of the organization, it should have both
+        # the member scopes and the superuser scopes
+        result = self.from_request(request, self.org)
+        assert result.scopes == set(member.get_scopes()).union(SUPERUSER_READONLY_SCOPES)
+
+        # readonly scopes does not override owner scopes if passed in
+        with assume_test_silo_mode(SiloMode.CELL):
+            member.update(role="owner")
+
+        result = self.from_request(request, self.org, scopes=member.get_scopes())
+        assert result.scopes == set(member.get_scopes()).union(SUPERUSER_READONLY_SCOPES)
+
+    @override_options({"superuser.read-write.ga-rollout": True})
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_superuser_write_scopes(self) -> None:
+        self.add_user_permission(self.superuser, "superuser.write")
+
+        # superuser not in organization
+        request = self.make_request(user=self.superuser, is_superuser=True)
+
+        result = self.from_request(request, self.org)
+        assert result.scopes == SUPERUSER_SCOPES
+
+        # superuser in organization
+        self.create_member(user=self.superuser, organization=self.org, role="member")
+
+        result = self.from_request(request, self.org)
+        assert result.scopes == SUPERUSER_SCOPES
+
+    @override_options({"superuser.read-write.ga-rollout": True})
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_superuser_in_organization_write_scopes(self) -> None:
+        self.add_user_permission(self.superuser, "superuser.write")
+
+        request = self.make_request(user=self.superuser, is_superuser=True)
+
+        result = self.from_request(request, self.org)
+        assert result.scopes == SUPERUSER_SCOPES
+
+    def test_superuser_in_organization(self) -> None:
+        self.create_member(
+            user=self.superuser, organization=self.org, role="admin", teams=[self.team1]
+        )
+
+        request = self.make_request(self.superuser, is_superuser=False)
+        result = self.from_request(request, self.org)
+        self._assert_memberships(result)
+        assert not result.has_permission("test.permission")
+        assert "org:superuser" not in result.scopes
+
+        request = self.make_request(user=self.superuser, is_superuser=True)
+        result = self.from_request(request, self.org)
+        self._assert_memberships(result)
+        assert result.has_permission("test.permission")
+        assert result.requires_sso
+        assert not result.sso_is_valid
+        # org:superuser is only attached when an org is present + active superuser
+        assert "org:superuser" in result.scopes
+
+    def test_staff_in_organization(self) -> None:
+        self.create_member(user=self.staff, organization=self.org, role="admin", teams=[self.team1])
+
+        request = self.make_request(self.staff, is_staff=False)
+        result = self.from_request(request, self.org)
+        self._assert_memberships(result)
+        assert not result.has_permission("test.permission")
+
+        request = self.make_request(user=self.staff, is_staff=True)
+        result = self.from_request(request, self.org)
+        self._assert_memberships(result)
+        assert result.has_permission("test.permission")
+        assert result.requires_sso
+        assert not result.sso_is_valid
+
+    def test_superuser_with_organization_without_membership(self) -> None:
+        request = self.make_request(user=self.superuser, is_superuser=True)
+        result = self.from_request(request, self.org)
+        assert result.has_permission("test.permission")
+        # org:superuser is only attached when an org is present + active superuser
+        assert "org:superuser" in result.scopes
+
+        assert not result.requires_sso
+        assert result.sso_is_valid
+        assert result.team_ids_with_membership == frozenset()
+        assert result.has_team_access(self.team1)
+        assert result.project_ids_with_team_membership == frozenset()
+        assert result.has_project_access(self.project1)
+        assert result.accessible_team_ids == frozenset({self.team1.id, self.team2.id})
+        assert result.accessible_project_ids == frozenset({self.project1.id, self.project2.id})
+
+    def test_staff_with_organization_without_membership(self) -> None:
+        request = self.make_request(user=self.staff, is_staff=True)
+        result = self.from_request(request, self.org)
+        assert result.has_permission("test.permission")
+
+        assert not result.requires_sso
+        # We do not allow staff who are not members of orgs bypass SSO.
+        assert not result.sso_is_valid
+        # Staff should not have team or project access for another organization
+        assert result.team_ids_with_membership == frozenset()
+        assert not result.has_team_access(self.team1)
+        assert result.project_ids_with_team_membership == frozenset()
+        assert not result.has_project_access(self.project1)
+
+    def test_member_role_in_organization_closed_membership(self) -> None:
+        # disable default allow_joinleave
+        with assume_test_silo_mode(SiloMode.CELL):
+            self.org.update(flags=0)
+        member_user = self.create_user(is_superuser=False)
+        self.create_member(
+            user=member_user, organization=self.org, role="member", teams=[self.team1]
+        )
+
+        request = self.make_request(member_user, is_superuser=False)
+        result = self.from_request(request, self.org)
+
+        assert result.role == "member"
+        assert result.team_ids_with_membership == frozenset({self.team1.id})
+        assert result.has_team_access(self.team1)
+        assert result.project_ids_with_team_membership == frozenset({self.project1.id})
+        assert result.has_project_access(self.project1)
+        assert result.has_project_membership(self.project1)
+        assert not result.has_project_membership(self.project2)
+
+        # member_user should not have visibility to other teams or projects
+        assert not result.has_global_access
+        assert not result.has_team_access(self.team2)
+        assert not result.has_project_access(self.project2)
+
+    def test_member_role_in_organization_open_membership(self) -> None:
+        with assume_test_silo_mode(SiloMode.CELL):
+            self.org.flags.allow_joinleave = True
+            self.org.save()
+        member_user = self.create_user(is_superuser=False)
+        self.create_member(
+            user=member_user, organization=self.org, role="member", teams=[self.team1]
+        )
+
+        request = self.make_request(member_user, is_superuser=False)
+        result = self.from_request(request, self.org)
+
+        assert result.role == "member"
+        assert result.team_ids_with_membership == frozenset({self.team1.id})
+        assert result.has_team_access(self.team1)
+        assert result.project_ids_with_team_membership == frozenset({self.project1.id})
+        assert result.has_project_access(self.project1)
+        assert result.has_project_membership(self.project1)
+        assert not result.has_project_membership(self.project2)
+
+        # member_user should have visibility to other teams or projects
+        assert result.has_global_access
+        assert result.has_team_access(self.team2)
+        assert result.has_project_access(self.project2)
+
+    def test_with_valid_auth(self) -> None:
+        user = self.create_user()
+        organization = self.create_organization()
+
+        member_team = self.create_team(organization=organization)
+        member_project = self.create_project(organization=organization, teams=[member_team])
+        non_member_team = self.create_team(organization=organization)
+        non_member_project = self.create_project(organization=organization, teams=[non_member_team])
+        self.create_member(user=user, organization=organization, role="admin", teams=[member_team])
+
+        request = self.make_request()
+        request.auth = cast(
+            AuthenticatedToken,
+            self.create_api_key(organization=organization, allowed_origins="*"),
+        )
+        result = self.from_request(request, organization)
+
+        assert result.team_ids_with_membership == frozenset({})
+        assert result.has_team_access(member_team)
+        assert result.has_team_access(non_member_team)
+        assert result.project_ids_with_team_membership == frozenset({})
+        assert result.has_project_access(member_project)
+        assert result.has_project_access(non_member_project)
+        assert result.has_project_membership(member_project) is False
+        assert result.has_project_membership(non_member_project) is False
+        assert result.has_global_access
+
+    def test_with_invalid_auth(self) -> None:
+        self.create_user()
+        organization = self.create_organization()
+        other_organization = self.create_organization()
+
+        team = self.create_team(organization=organization)
+        project = self.create_project(organization=organization, teams=[team])
+
+        request = self.make_request()
+        # Using an API key for another org should be invalid
+        request.auth = cast(
+            AuthenticatedToken,
+            self.create_api_key(organization=other_organization, allowed_origins="*"),
+        )
+        result = self.from_request(request, organization)
+
+        assert result == NoAccess()
+
+        assert result.team_ids_with_membership == frozenset({})
+        assert result.has_team_access(team) is False
+        assert result.project_ids_with_team_membership == frozenset({})
+        assert result.has_project_access(project) is False
+        assert result.has_project_membership(project) is False
+        assert result.has_global_access is False
+
+
+@all_silo_test
+class FromSentryAppTest(AccessFactoryTestCase):
+    def setUp(self) -> None:
         super().setUp()
 
         # Partner's normal Sentry account.
@@ -254,63 +925,435 @@ class FromSentryAppTest(TestCase):
         self.install = self.create_sentry_app_installation(
             organization=self.org, slug=self.sentry_app.slug, user=self.user
         )
+        # The installation factory also creates a project in the organization.
+        with assume_test_silo_mode_of(Project):
+            self.installation_project = (
+                Project.objects.filter(organization_id=self.org.id)
+                .exclude(id=self.project.id)
+                .get()
+            )
         self.install2 = self.create_sentry_app_installation(
             organization=self.org2, slug=self.sentry_app.slug, user=self.user
         )
 
-    def test_has_access(self):
+    def test_has_access(self) -> None:
         request = self.make_request(user=self.proxy_user)
-        result = access.from_request(request, self.org)
-        assert result.is_active
+        result = self.from_request(request, self.org)
+        assert result.has_global_access
         assert result.has_team_access(self.team)
-        assert result.teams == [self.team]
+        assert result.team_ids_with_membership == frozenset({self.team.id})
+        assert result.scopes == frozenset()
         assert result.has_project_access(self.project)
+        assert result.has_project_membership(self.project)
+        assert not result.has_project_access(self.out_of_scope_project)
+        assert not result.permissions
+        assert result.accessible_team_ids == frozenset({self.team.id})
+        expected_projects = frozenset({self.project.id, self.installation_project.id})
+        assert result.accessible_project_ids == expected_projects
+        assert result.project_ids_with_team_membership == expected_projects
+
+    def test_no_access_due_to_no_app(self) -> None:
+        user = self.create_user("integration2@example.com")
+        request = self.make_request(user=user)
+        result = self.from_request(request, self.org)
+        assert not result.has_team_access(self.team)
+        assert not result.has_team_access(self.team2)
+        assert not result.has_team_access(self.out_of_scope_team)
+        assert not result.has_project_access(self.project)
         assert not result.has_project_access(self.out_of_scope_project)
 
-    def test_no_access_due_to_no_installation_unowned(self):
+    def test_no_access_due_to_no_installation_unowned(self) -> None:
         request = self.make_request(user=self.proxy_user)
-        result = access.from_request(request, self.out_of_scope_org)
+        result = self.from_request(request, self.out_of_scope_org)
         assert not result.has_team_access(self.team)
         assert not result.has_team_access(self.team2)
         assert not result.has_team_access(self.out_of_scope_team)
         assert not result.has_project_access(self.project)
         assert not result.has_project_access(self.out_of_scope_project)
 
-    def test_no_access_due_to_no_installation_owned(self):
+    def test_no_access_due_to_no_installation_owned(self) -> None:
         request = self.make_request(user=self.out_of_scope_proxy_user)
-        result = access.from_request(request, self.out_of_scope_org)
+        result = self.from_request(request, self.out_of_scope_org)
         assert not result.has_team_access(self.team)
         assert not result.has_team_access(self.team2)
         assert not result.has_team_access(self.out_of_scope_team)
         assert not result.has_project_access(self.project)
         assert not result.has_project_access(self.out_of_scope_project)
 
-    def test_no_access_due_to_invalid_user(self):
+    def test_no_access_due_to_invalid_user(self) -> None:
         request = self.make_request(user=self.out_of_scope_proxy_user)
-        result = access.from_request(request, self.org)
+        result = self.from_request(request, self.org)
         assert not result.has_team_access(self.team)
         assert not result.has_team_access(self.team2)
         assert not result.has_team_access(self.out_of_scope_team)
         assert not result.has_project_access(self.project)
         assert not result.has_project_access(self.out_of_scope_project)
 
-    def test_no_deleted_projects(self):
+    def test_no_deleted_projects(self) -> None:
         self.create_member(organization=self.org, user=self.user, role="owner", teams=[self.team])
-        project = self.create_project(
+        deleted_project = self.create_project(
             organization=self.org, status=ObjectStatus.PENDING_DELETION, teams=[self.team]
         )
         request = self.make_request(user=self.proxy_user)
-        result = access.from_request(request, self.org)
-        assert result.has_project_access(project) is False
-        assert result.has_project_membership(project) is False
-        assert len(result.projects) == 1
-        assert list(result.projects)[0].id == self.project.id
+        result = self.from_request(request, self.org)
+        assert result.has_project_access(deleted_project) is False
+        assert result.has_project_membership(deleted_project) is False
+        assert deleted_project.id not in result.accessible_project_ids
+        assert deleted_project.id not in result.project_ids_with_team_membership
+
+    def test_no_deleted_teams(self) -> None:
+        deleted_team = self.create_team(organization=self.org, status=TeamStatus.PENDING_DELETION)
+        self.create_member(
+            organization=self.org, user=self.user, role="owner", teams=[self.team, deleted_team]
+        )
+        request = self.make_request(user=self.proxy_user)
+        result = self.from_request(request, self.org)
+        assert result.has_team_access(deleted_team) is False
+        assert deleted_team.id not in result.accessible_team_ids
+        assert deleted_team.id not in result.team_ids_with_membership
+
+    def test_has_app_scopes(self) -> None:
+        app_with_scopes = self.create_sentry_app(name="ScopeyTheApp", organization=self.org)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            app_with_scopes.update(scope_list=["team:read", "team:write"])
+        self.create_sentry_app_installation(
+            organization=self.org, slug=app_with_scopes.slug, user=self.user
+        )
+
+        request = self.make_request(user=app_with_scopes.proxy_user)
+        result = self.from_request(request, self.org)
+        assert result.scopes == frozenset({"team:read", "team:write"})
+        assert result.has_scope("team:read") is True
+        assert result.has_scope("team:write") is True
+        assert result.has_scope("team:admin") is False
 
 
+@all_silo_test
+class RpcGlobalAccessTest(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.org = self.create_organization()
+        self.team = self.create_team(organization=self.org)
+        self.project = self.create_project(organization=self.org, teams=[])
+        context = organization_service.get_access_context(
+            organization_id=self.org.id,
+            include_resource_ids=SiloMode.get_current_mode() == SiloMode.CONTROL,
+        )
+        assert context is not None
+        self.context = context
+        self.token = AuthenticatedToken(kind="org_auth_token", organization_id=self.org.id)
+
+    def test_control_prefetch_matches_access_kind(self) -> None:
+        owner = self.create_user()
+        member = self.create_user()
+        self.create_member(organization=self.org, user=owner, role="owner")
+        self.create_member(organization=self.org, user=member, role="member", teams=[self.team])
+        superuser = self.create_user(is_superuser=True)
+        staff = self.create_user(is_staff=True)
+        app = self.create_sentry_app(organization=self.org)
+        self.create_sentry_app_installation(
+            organization=self.org, slug=app.slug, user=owner, prevent_token_exchange=True
+        )
+        agent = AuthenticatedToken(
+            kind="agent_token", user_id=member.id, organization_id=self.org.id, scopes=["org:read"]
+        )
+        delegated = AuthenticatedToken(
+            kind="viewer_context",
+            user_id=superuser.id,
+            organization_id=self.org.id,
+            scopes=["org:read"],
+            superuser=SuperuserAccess(expires_at=int(timezone.now().timestamp()) + 60),
+        )
+        cases = (
+            ("member", self.make_request(user=member), False, False),
+            ("owner", self.make_request(user=owner), False, False),
+            ("staff", self.make_request(user=staff, is_staff=True), False, False),
+            ("agent", self.make_request(user=member, auth=agent), False, False),
+            ("system", self.make_request(auth=AuthenticatedToken(kind="system")), False, False),
+            ("org_token", self.make_request(auth=self.token), True, True),
+            ("sentry_app", self.make_request(user=app.proxy_user), True, True),
+            (
+                "delegated_superuser",
+                self.make_request(user=superuser, auth=delegated),
+                True,
+                True,
+            ),
+            (
+                "superuser",
+                self.make_request(user=superuser, is_superuser=True),
+                True,
+                True,
+            ),
+            (
+                "wrong_org_token",
+                self.make_request(
+                    auth=AuthenticatedToken(
+                        kind="org_auth_token", organization_id=self.create_organization().id
+                    )
+                ),
+                True,
+                False,
+            ),
+        )
+        with assume_test_silo_mode(SiloMode.CONTROL, can_be_monolith=False):
+            for kind, raw_request, prefetched, org_wide in cases:
+                with self.subTest(kind=kind):
+                    request = drf_request_from_request(raw_request)
+                    context = access.get_organization_access_context(
+                        request, organization_id=self.org.id
+                    )
+                    assert context is not None
+                    SentryPermission().determine_access(request, context)
+                    result = request.access
+                    assert (context.resource_ids is not None) == prefetched
+                    assert isinstance(result, access.ApiBackedOrganizationGlobalAccess) == org_wide
+                    with patch(
+                        "sentry.hybridcloud.rpc.service.dispatch_remote_call",
+                        side_effect=AssertionError("Resource enumeration must not make an RPC"),
+                    ) as rpc:
+                        _ = result.accessible_project_ids, result.accessible_team_ids
+                    rpc.assert_not_called()
+
+    def test_org_token_resource_ids(self) -> None:
+        other_org = self.create_organization()
+        other_project = self.create_project(organization=other_org)
+        other_team = self.create_team(organization=other_org)
+        self.create_project(organization=self.org, status=ObjectStatus.PENDING_DELETION)
+        self.create_project(organization=self.org, status=ObjectStatus.DELETION_IN_PROGRESS)
+        self.create_project(organization=self.org, status=ObjectStatus.DISABLED)
+        self.create_team(organization=self.org, status=TeamStatus.PENDING_DELETION)
+        self.create_team(organization=self.org, status=TeamStatus.DELETION_IN_PROGRESS)
+
+        result = access.from_rpc_auth(self.token, self.context)
+
+        assert result.accessible_project_ids == frozenset({self.project.id})
+        assert result.accessible_team_ids == frozenset({self.team.id})
+        assert result.has_project_access(self.project)
+        assert result.has_team_access(self.team)
+        assert not result.has_project_access(other_project)
+        assert not result.has_team_access(other_team)
+        assert result.project_ids_with_team_membership == frozenset()
+        assert result.team_ids_with_membership == frozenset()
+
+    def test_wrong_org_token_has_no_access(self) -> None:
+        token = AuthenticatedToken(
+            kind="org_auth_token", organization_id=self.create_organization().id
+        )
+
+        result = access.from_rpc_auth(token, self.context)
+
+        assert isinstance(result, NoAccess)
+        assert result.accessible_project_ids == frozenset()
+        assert result.accessible_team_ids == frozenset()
+        assert not result.has_project_access(self.project)
+        assert not result.has_team_access(self.team)
+
+    def test_cell_resource_ids_are_lazily_batched(self) -> None:
+        with assume_test_silo_mode(SiloMode.CELL, can_be_monolith=False):
+            context = organization_service.get_access_context(organization_id=self.org.id)
+            assert context is not None
+            with (
+                patch(
+                    "sentry.auth.access.get_active_resource_ids",
+                    wraps=get_active_resource_ids,
+                ) as resources,
+                patch(
+                    "sentry.hybridcloud.rpc.service.dispatch_remote_call",
+                    side_effect=AssertionError("Unexpected resource RPC"),
+                ) as rpc,
+            ):
+                result = access.from_rpc_auth(self.token, context)
+                assert result.has_project_access(self.project)
+                assert result.has_team_access(self.team)
+                resources.assert_not_called()
+
+                assert result.accessible_project_ids == frozenset({self.project.id})
+                assert result.accessible_team_ids == frozenset({self.team.id})
+                assert result.accessible_project_ids == frozenset({self.project.id})
+                resources.assert_called_once_with(organization_id=self.org.id)
+                rpc.assert_not_called()
+
+    def test_control_resource_ids_use_one_context_rpc(self) -> None:
+        with (
+            assume_test_silo_mode(SiloMode.CONTROL, can_be_monolith=False),
+            patch(
+                "sentry.hybridcloud.rpc.service.dispatch_remote_call", wraps=dispatch_remote_call
+            ) as rpc,
+        ):
+            context = organization_service.get_access_context(
+                organization_id=self.org.id, include_resource_ids=True
+            )
+            assert context is not None
+            result = access.from_rpc_auth(self.token, context)
+            assert result.accessible_project_ids == frozenset({self.project.id})
+            assert result.accessible_team_ids == frozenset({self.team.id})
+            assert result.accessible_team_ids == frozenset({self.team.id})
+
+        rpc.assert_called_once()
+        assert rpc.call_args.args[1:3] == ("organization", "get_access_context")
+
+
+@cell_silo_test(include_monolith_run=True)
+class FromDelegatedSuperuserTest(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.user = self.create_user(is_superuser=True)
+        self.org = self.create_organization()
+        self.team = self.create_team(organization=self.org)
+        self.project = self.create_project(organization=self.org, teams=[])
+        self.token = AuthenticatedToken(
+            kind="viewer_context",
+            user_id=self.user.id,
+            organization_id=self.org.id,
+            scopes=["org:read", "org:write", "project:read"],
+            superuser=SuperuserAccess(expires_at=int(timezone.now().timestamp()) + 60),
+        )
+
+    def test_access_omits_full_organization_resources(self) -> None:
+        other_project = self.create_project(organization=self.create_organization())
+        with assert_no_organization_resource_hydration():
+            result = access.from_auth(self.token, self.org)
+            assert result.accessible_project_ids == frozenset({self.project.id})
+            assert result.accessible_team_ids == frozenset({self.team.id})
+
+        assert result.has_scope("org:read")
+        assert not result.has_scope("org:write")
+        assert not result.has_scope("team:read")
+        assert result.has_project_access(self.project)
+        assert not result.has_project_access(other_project)
+
+    def test_expired_access_is_rejected(self) -> None:
+        self.token.superuser = SuperuserAccess(expires_at=int(timezone.now().timestamp()) - 60)
+
+        assert isinstance(access.from_auth(self.token, self.org), NoAccess)
+
+    def test_other_organization_is_rejected(self) -> None:
+        assert isinstance(access.from_auth(self.token, self.create_organization()), NoAccess)
+
+
+@no_silo_test
 class DefaultAccessTest(TestCase):
-    def test_no_access(self):
+    @patch("sentry.auth.scope_declaration.options.get")
+    def test_declared_scope_check_does_not_read_audit_option(self, options_get: Mock) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:read",)}
+
+        with bind_endpoint_scope_declaration(
+            endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+        ):
+            assert not access.DEFAULT.has_scope("org:read")
+
+        options_get.assert_not_called()
+
+    @patch("sentry.auth.scope_declaration.options.get")
+    def test_implied_scope_checks_do_not_read_audit_option(self, options_get: Mock) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:admin",)}
+
+        with bind_endpoint_scope_declaration(
+            endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+        ):
+            assert not access.DEFAULT.has_scope("org:read")
+            assert not access.DEFAULT.has_scope("org:write")
+            assert not access.DEFAULT.has_scope("org:integrations")
+
+        options_get.assert_not_called()
+
+    @patch("sentry.auth.scope_declaration.options.get")
+    def test_runtime_scope_map_expands_implied_scopes(self, options_get: Mock) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:read",)}
+
+        permission = Permission()
+        with bind_endpoint_scope_declaration(
+            endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+        ):
+            update_permission_scope_declaration(permission, {"GET": ("org:admin",)})
+            assert not access.DEFAULT.has_scope("org:write")
+
+        options_get.assert_not_called()
+
+    @patch("sentry.auth.scope_declaration.capture_message")
+    @patch("sentry.auth.scope_declaration.logger.warning")
+    @override_options({"api.permission-scope-audit.enabled": True})
+    def test_stronger_scope_check_is_still_reported(
+        self, warning: Mock, capture_message: Mock
+    ) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:write",)}
+
+        with bind_endpoint_scope_declaration(
+            endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+        ):
+            assert not access.DEFAULT.has_scope("org:admin")
+
+        assert warning.call_count == 1
+        assert warning.call_args.kwargs["extra"]["scope"] == "org:admin"
+        assert capture_message.call_count == 1
+
+    def test_disabled_scope_audit_reads_option_once_per_endpoint(self) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:read",)}
+
+        with (
+            patch("sentry.auth.scope_declaration.options.get", return_value=False) as options_get,
+            patch("sentry.auth.scope_declaration.logger.warning") as warning,
+            bind_endpoint_scope_declaration(
+                endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+            ),
+        ):
+            assert not access.DEFAULT.has_scope("project:read")
+            assert not access.DEFAULT.has_scope("project:write")
+
+        options_get.assert_called_once_with("api.permission-scope-audit.enabled")
+        warning.assert_not_called()
+
+    @patch("sentry.auth.scope_declaration.capture_message")
+    @patch("sentry.auth.scope_declaration.logger.warning")
+    @override_options({"api.permission-scope-audit.enabled": True})
+    def test_reports_project_and_team_scope_checks_without_access(
+        self, warning: Mock, capture_message: Mock
+    ) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:read",)}
+
+        with bind_endpoint_scope_declaration(
+            endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+        ):
+            assert not access.DEFAULT.has_scope("org:read")
+            assert not access.DEFAULT.has_team_scope(Mock(), "team:write")
+            assert not access.DEFAULT.has_project_scope(Mock(), "project:write")
+
+        assert [call.kwargs["extra"]["scope"] for call in warning.call_args_list] == [
+            "team:write",
+            "project:write",
+        ]
+        assert capture_message.call_count == 2
+
+    @patch("sentry.auth.scope_declaration.capture_message")
+    @patch("sentry.auth.scope_declaration.logger.warning")
+    @override_options({"api.permission-scope-audit.enabled": True})
+    def test_reports_every_scope_in_direct_project_scope_check(
+        self, warning: Mock, capture_message: Mock
+    ) -> None:
+        class Permission:
+            scope_map = {"GET": ("org:read",)}
+
+        with bind_endpoint_scope_declaration(
+            endpoint="test.Endpoint", method="GET", permission_classes=(Permission,)
+        ):
+            assert not access.DEFAULT.has_any_project_scope(
+                Mock(), ["project:read", "project:write"]
+            )
+
+        assert [call.kwargs["extra"]["scope"] for call in warning.call_args_list] == [
+            "project:read",
+            "project:write",
+        ]
+        assert capture_message.call_count == 2
+
+    def test_no_access(self) -> None:
         result = access.DEFAULT
-        assert not result.is_active
         assert result.sso_is_valid
         assert not result.scopes
         assert not result.has_team_access(Mock())
@@ -319,3 +1362,174 @@ class DefaultAccessTest(TestCase):
         assert not result.has_projects_access([Mock()])
         assert not result.has_project_scope(Mock(), "project:read")
         assert not result.has_project_membership(Mock())
+        assert not result.permissions
+
+
+@no_silo_test
+class ServiceAccountAccessTest(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.org = self.create_organization()
+        self.team = self.create_team(organization=self.org)
+        self.linked = self.create_project(organization=self.org, teams=[self.team])
+        self.unlinked = self.create_project(organization=self.org, teams=[self.team])
+        self.service_account = self.create_service_account(
+            organization=self.org, scope_list=["project:read"], project_ids=[self.linked.id]
+        )
+
+    def _access(self, organization: Organization | None = None) -> Access:
+        auth = AuthenticatedToken(
+            kind=SERVICE_ACCOUNT_TOKEN_KIND,
+            entity_id=self.service_account.id,
+            organization_id=self.org.id,
+            scopes=["project:read"],
+        )
+        return access.from_service_account_auth(auth, (organization or self.org).id)
+
+    def _set_all_projects(self) -> None:
+        with outbox_runner():
+            self.service_account.update(all_projects=True)
+            ServiceAccountProject.objects.filter(service_account=self.service_account).delete()
+
+    def test_principal_gets_its_credential_access(self) -> None:
+        # Authenticated with no user_id: is_authenticated would send it to membership access.
+        principal = ServiceAccountPrincipal(
+            service_account_id=self.service_account.id,
+            organization_id=self.org.id,
+            name=self.service_account.name,
+        )
+        token = AuthenticatedToken(
+            kind=SERVICE_ACCOUNT_TOKEN_KIND,
+            entity_id=self.service_account.id,
+            organization_id=self.org.id,
+            scopes=["project:read"],
+        )
+        request = Request(self.make_request())
+        set_request_principal(request, principal, token)
+        user: object = request.user
+        assert user is principal
+        rpc_user_org_context = organization_service.get_organization_by_id(id=self.org.id)
+
+        assert isinstance(access.from_request(request, self.org), access.ServiceAccountAccess)
+        assert isinstance(
+            access.from_request_org_and_scopes(
+                request=request, rpc_user_org_context=rpc_user_org_context
+            ),
+            access.ServiceAccountAccess,
+        )
+
+    def test_principal_without_organization_gets_no_access(self) -> None:
+        request = Request(self.make_request())
+        set_request_principal(
+            request,
+            ServiceAccountPrincipal(
+                service_account_id=self.service_account.id,
+                organization_id=self.org.id,
+                name=self.service_account.name,
+            ),
+            AuthenticatedToken(
+                kind=SERVICE_ACCOUNT_TOKEN_KIND,
+                entity_id=self.service_account.id,
+                organization_id=self.org.id,
+                scopes=["project:read"],
+            ),
+        )
+        assert access.from_request(request) is access.DEFAULT
+
+    def test_reaches_only_linked_projects(self) -> None:
+        result = self._access()
+
+        assert isinstance(result, access.ServiceAccountAccess)
+        assert not result.has_all_projects
+        assert not result.has_global_access
+        assert not result.has_open_membership
+        assert result.has_scope("project:read")
+        assert not result.has_scope("project:write")
+        assert result.has_project_access(self.linked)
+        assert not result.has_project_access(self.unlinked)
+        assert result.has_project_scope(self.linked, "project:read")
+        assert result.accessible_project_ids == {self.linked.id}
+        assert result.has_project_membership(self.linked)
+        assert not result.has_project_membership(self.unlinked)
+        assert not result.has_team_access(self.team)
+        assert result.accessible_team_ids == frozenset()
+        assert result.role is None
+
+    def test_skips_inactive_linked_project(self) -> None:
+        self.linked.update(status=ObjectStatus.PENDING_DELETION)
+
+        result = self._access()
+
+        assert not result.has_project_access(self.linked)
+        assert result.accessible_project_ids == frozenset()
+
+    def test_open_membership_does_not_widen_access(self) -> None:
+        self.org.flags.allow_joinleave = True
+        self.org.save()
+
+        result = self._access()
+
+        assert not result.has_global_access
+        assert not result.has_open_membership
+        assert not result.has_project_access(self.unlinked)
+        assert result.accessible_project_ids == {self.linked.id}
+        assert not result.has_team_access(self.team)
+
+    def test_all_projects_reaches_every_active_project(self) -> None:
+        self.org.flags.allow_joinleave = False
+        self.org.save()
+        self._set_all_projects()
+        later = self.create_project(organization=self.org)
+        inactive = self.create_project(organization=self.org, status=ObjectStatus.PENDING_DELETION)
+
+        result = self._access()
+
+        assert isinstance(result, access.ServiceAccountAccess)
+        assert result.has_all_projects
+        # Org-wide access would also cover team and member actions, so it stays off.
+        assert not result.has_global_access
+        assert not result.has_open_membership
+        assert result.has_project_access(self.unlinked)
+        assert result.has_project_access(later)
+        assert not result.has_project_access(inactive)
+        assert result.accessible_project_ids == {self.linked.id, self.unlinked.id, later.id}
+        assert result.project_ids_with_team_membership == result.accessible_project_ids
+
+    def test_all_projects_reaches_no_teams(self) -> None:
+        self._set_all_projects()
+
+        result = self._access()
+
+        assert not result.has_team_access(self.team)
+        assert not result.has_team_scope(self.team, "project:read")
+        assert result.accessible_team_ids == frozenset()
+
+    def test_inactive_account_has_no_access(self) -> None:
+        with outbox_runner():
+            self.service_account.update(is_active=False)
+
+        assert self._access() is access.DEFAULT
+
+    def test_no_access_to_other_org(self) -> None:
+        self._set_all_projects()
+        other_org = self.create_organization()
+        other_project = self.create_project(organization=other_org)
+
+        assert self._access(organization=other_org) is access.DEFAULT
+        assert not self._access().has_project_access(other_project)
+
+
+@no_silo_test
+class SystemAccessTest(TestCase):
+    def test_system_access(self) -> None:
+        org = self.create_organization()
+        team = self.create_team(organization=org)
+        project = self.create_project(teams=[team])
+        result = access.SystemAccess()
+        assert not result.sso_is_valid
+        assert not result.requires_sso
+        assert result.has_project_access(project)
+        assert result.has_any_project_scope(project, "project:read")
+        assert not result.has_team_membership(team)
+        assert result.has_scope("project:read")
+        assert result.has_team_access(team)

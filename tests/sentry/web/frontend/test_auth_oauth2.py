@@ -1,14 +1,26 @@
-from sentry.utils.compat import mock
-from exam import fixture
-from urllib.parse import urlencode, urlparse, parse_qs
+from __future__ import annotations
+
 from collections import namedtuple
+from collections.abc import Mapping
+from functools import cached_property
+from typing import TYPE_CHECKING, Any
+from unittest import mock
+from urllib.parse import parse_qs, urlencode, urlparse
 
-from django.core.urlresolvers import reverse
+from django.urls import reverse
 
-from sentry.auth.providers.oauth2 import OAuth2Provider, OAuth2Login, OAuth2Callback
-from sentry.models import AuthProvider
-from sentry.testutils import AuthProviderTestCase
+from sentry.auth.authenticators.recovery_code import RecoveryCodeInterface
+from sentry.auth.authenticators.totp import TotpInterface
+from sentry.auth.providers.oauth2 import OAuth2Callback, OAuth2Login, OAuth2Provider
+from sentry.auth.view import AuthView
+from sentry.models.authidentity import AuthIdentity
+from sentry.models.authprovider import AuthProvider
+from sentry.testutils.cases import AuthProviderTestCase
+from sentry.testutils.silo import control_silo_test
 from sentry.utils import json
+
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse
 
 
 class DummyOAuth2Login(OAuth2Login):
@@ -24,41 +36,68 @@ class DummyOAuth2Callback(OAuth2Callback):
 
 
 class DummyOAuth2Provider(OAuth2Provider):
-    def get_auth_pipeline(self):
+    name = "dummy"
+    key = "oauth2_dummy"
+
+    def get_client_id(self) -> str:
+        raise NotImplementedError
+
+    def get_client_secret(self) -> str:
+        raise NotImplementedError
+
+    def get_refresh_token_url(self) -> str:
+        raise NotImplementedError
+
+    def build_config(self, state: object) -> dict[str, object]:
+        raise NotImplementedError
+
+    def get_auth_pipeline(self) -> list[AuthView]:
         return [DummyOAuth2Login(), DummyOAuth2Callback()]
 
-    def build_identity(self, state):
+    def build_identity(self, state: Mapping[str, Any]) -> Mapping[str, Any]:
         return state["data"]
 
 
 MockResponse = namedtuple("MockResponse", ["headers", "content"])
 
 
+@control_silo_test
 class AuthOAuth2Test(AuthProviderTestCase):
     provider = DummyOAuth2Provider
     provider_name = "oauth2_dummy"
 
-    def setUp(self):
-        self.user = self.create_user("rick@onehundredyears.com")
-        self.org = self.create_organization(owner=self.user, name="oauth2-org")
-        self.auth_provider = AuthProvider.objects.create(
-            provider=self.provider_name, organization=self.org
-        )
+    def setUp(self) -> None:
         super().setUp()
+        auth_provider = AuthProvider.objects.create(
+            provider=self.provider_name, organization_id=self.organization.id
+        )
+        AuthIdentity.objects.create(
+            auth_provider=auth_provider,
+            user=self.user,
+            ident="oauth_external_id_1234",
+        )
 
-    @fixture
-    def login_path(self):
-        return reverse("sentry-auth-organization", args=["oauth2-org"])
+    @cached_property
+    def login_path(self) -> str:
+        return reverse("sentry-auth-organization", args=[self.organization.slug])
 
-    @fixture
-    def sso_path(self):
+    @cached_property
+    def sso_path(self) -> str:
         return reverse("sentry-auth-sso")
 
-    def initiate_oauth_flow(self):
-        resp = self.client.post(self.login_path, {"init": True})
+    def initiate_oauth_flow(self, http_host: str | None = None) -> str:
+        kwargs: dict[str, Any] = {}
+        if http_host is not None:
+            kwargs["HTTP_HOST"] = http_host
+        else:
+            http_host = "testserver"
+
+        resp = self.client.post(self.login_path, {"init": True}, **kwargs)
 
         assert resp.status_code == 302
-        redirect = urlparse(resp.get("Location", ""))
+        redirect_dest = resp.get("Location", "")
+        assert redirect_dest.startswith("http://example.com/authorize_url")
+        redirect = urlparse(redirect_dest)
         query = parse_qs(redirect.query)
 
         assert redirect.path == "/authorize_url"
@@ -66,10 +105,22 @@ class AuthOAuth2Test(AuthProviderTestCase):
         assert query["client_id"][0] == "my_client_id"
         assert "state" in query
 
-        return query["state"][0]
+        state = query["state"][0]
+        if not isinstance(state, str):
+            raise TypeError("OAuth authorize redirect carries no state")
+        return state
 
     @mock.patch("sentry.auth.providers.oauth2.safe_urlopen")
-    def initiate_callback(self, state, auth_data, urlopen, expect_success=True, **kwargs):
+    def initiate_callback(
+        self,
+        state: str,
+        auth_data: dict[str, str],
+        urlopen: mock.MagicMock,
+        expect_success: bool = True,
+        customer_domain: str = "",
+        has_2fa: bool = False,
+        **kwargs: Any,
+    ) -> _MonkeyPatchedWSGIResponse:
         headers = {"Content-Type": "application/json"}
         urlopen.return_value = MockResponse(headers, json.dumps(auth_data))
 
@@ -77,22 +128,96 @@ class AuthOAuth2Test(AuthProviderTestCase):
         resp = self.client.get(f"{self.sso_path}?{query}", **kwargs)
 
         if expect_success:
-            assert resp.status_code == 200
-            assert urlopen.called
-            assert urlopen.call_args[1]["data"]["code"] == "1234"
-            assert urlopen.call_args[1]["data"]["client_secret"] == "my_client_secret"
+            if has_2fa:
+                assert resp["Location"] == "/auth/login/"
+                with mock.patch(
+                    "sentry.auth.authenticators.TotpInterface.validate_otp", return_value=True
+                ):
+                    assert resp.status_code == 302
+                    resp = self.client.post(
+                        reverse("sentry-api-0-auth-2fa"),
+                        {"method": "totp", "otp": "123456"},
+                        content_type="application/json",
+                    )
+                    assert resp.status_code == 200
+                    next_uri = resp.json()["nextUri"]
+                    assert next_uri == "http://testserver/auth/sso/"
+                    resp = self.client.get(next_uri)
 
+            assert resp.status_code == 302
+            expected_location = (
+                f"{customer_domain}/issues/" if customer_domain else "/organizations/baz/issues/"
+            )
+            assert resp["Location"] == expected_location
+            resp = self.client.get(resp["Location"], follow=True)
+            assert resp.status_code == 200
+            assert resp.redirect_chain == []
+            assert resp.context["user"].id == self.user.id
+
+            assert urlopen.called
+            data = urlopen.call_args[1]["data"]
+
+            assert data == {
+                "grant_type": "authorization_code",
+                "code": "1234",
+                "redirect_uri": "http://testserver/auth/sso/",
+                "client_id": "my_client_id",
+                "client_secret": "my_client_secret",
+            }
         return resp
 
-    def test_oauth2_flow(self):
+    def test_oauth2_flow(self) -> None:
         auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
 
         state = self.initiate_oauth_flow()
-        auth_resp = self.initiate_callback(state, auth_data)
+        self.initiate_callback(state, auth_data)
 
-        assert auth_resp.context["existing_user"] == self.user
+    def test_oauth2_flow_customer_domain(self) -> None:
+        HTTP_HOST = "albertos-apples.testserver"
+        auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
 
-    def test_state_mismatch(self):
+        state = self.initiate_oauth_flow(http_host=HTTP_HOST)
+        self.initiate_callback(
+            state,
+            auth_data,
+            customer_domain="http://albertos-apples.testserver",
+        )
+
+    @mock.patch("sentry.utils.auth.login")
+    def test_oauth2_flow_incomplete_security_checks(self, mock_login: mock.MagicMock) -> None:
+        mock_login.return_value = False
+        auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
+
+        state = self.initiate_oauth_flow()
+        response = self.initiate_callback(state, auth_data, expect_success=False, follow=True)
+        assert response.status_code == 200
+        assert response.redirect_chain == [("/auth/login/", 302)]
+        assert response.context["user"] != self.user
+
+    @mock.patch("sentry.utils.auth.login")
+    def test_oauth2_flow_customer_domain_incomplete_security_checks(
+        self, mock_login: mock.MagicMock
+    ) -> None:
+        HTTP_HOST = "albertos-apples.testserver"
+        mock_login.return_value = False
+        auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
+
+        state = self.initiate_oauth_flow(http_host=HTTP_HOST)
+        response = self.initiate_callback(state, auth_data, expect_success=False, follow=True)
+        assert response.status_code == 200
+        assert response.redirect_chain == [("http://albertos-apples.testserver/auth/login/", 302)]
+        assert response.context["user"] != self.user
+
+    def test_oauth2_flow_with_2fa(self) -> None:
+        RecoveryCodeInterface().enroll(self.user)
+        TotpInterface().enroll(self.user)
+
+        auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
+
+        state = self.initiate_oauth_flow()
+        self.initiate_callback(state, auth_data, has_2fa=True)
+
+    def test_state_mismatch(self) -> None:
         auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
 
         self.initiate_oauth_flow()
@@ -101,8 +226,9 @@ class AuthOAuth2Test(AuthProviderTestCase):
         messages = list(auth_resp.context["messages"])
         assert len(messages) == 1
         assert str(messages[0]).startswith("Authentication error")
+        assert auth_resp.context["user"] != self.user
 
-    def test_response_errors(self):
+    def test_response_errors(self) -> None:
         auth_data = {"error_description": "Mock failure"}
 
         state = self.initiate_oauth_flow()
@@ -117,6 +243,41 @@ class AuthOAuth2Test(AuthProviderTestCase):
         state = self.initiate_oauth_flow()
         auth_resp = self.initiate_callback(state, auth_data, expect_success=False, follow=True)
 
+        messages = list(auth_resp.context["messages"])
+        assert len(messages) == 1
+        assert str(messages[0]).startswith("Authentication error")
+        assert auth_resp.context["user"] != self.user
+
+    def test_state_contains_provider_key(self) -> None:
+        """Test that OAuth state parameter contains the provider key for mismatch detection."""
+        state = self.initiate_oauth_flow()
+
+        # State format should be "{nonce}:{provider_key}"
+        assert ":" in state
+        nonce, provider_key = state.split(":", 1)
+        assert len(nonce) > 0
+        assert provider_key == self.provider_name
+
+    @mock.patch("sentry.auth.providers.oauth2.safe_urlopen")
+    def test_provider_mismatch_detected(self, urlopen: mock.MagicMock) -> None:
+        """Test that authenticating with wrong provider in state triggers mismatch detection."""
+        # Start a normal OAuth flow to get the session set up
+        state = self.initiate_oauth_flow()
+
+        # Modify the state to have a different provider key (simulating multi-tab scenario
+        # where user started auth with a different provider)
+        nonce = state.split(":")[0]
+        wrong_state = f"{nonce}:wrong_provider"
+
+        # The state validation should fail because the full state doesn't match
+        headers = {"Content-Type": "application/json"}
+        auth_data = {"id": "oauth_external_id_1234", "email": self.user.email}
+        urlopen.return_value = MockResponse(headers, json.dumps(auth_data))
+
+        query = urlencode({"code": "1234", "state": wrong_state})
+        auth_resp = self.client.get(f"{self.sso_path}?{query}", follow=True)
+
+        # Should fail with state mismatch error
         messages = list(auth_resp.context["messages"])
         assert len(messages) == 1
         assert str(messages[0]).startswith("Authentication error")

@@ -1,0 +1,265 @@
+# Copyright © 2011-present, Encode OSS Ltd.
+# Copyright © 2019-present, T. Franzel <tfranzel@gmail.com>, Cashlink Technologies GmbH.
+
+# All rights reserved.
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+
+# * Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived from
+#   this software without specific prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import collections
+import inspect
+import typing
+from collections import defaultdict
+from collections.abc import Sequence
+from enum import Enum
+from types import UnionType
+from typing import Any, Literal, Union, is_typeddict
+from typing import get_type_hints as _get_type_hints
+
+import drf_spectacular
+from drf_spectacular.drainage import get_override
+from drf_spectacular.plumbing import (
+    UnableToProceedError,
+    build_basic_type,
+    build_object_type,
+    is_basic_type,
+)
+from drf_spectacular.plumbing import build_array_type as drf_build_array_type
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import _SchemaType
+
+from sentry.apidocs.omission_guard import descended, omissions_enabled, record_typed_dict
+from sentry.apidocs.omissions import OMISSION_REASONS_OVERRIDE
+from sentry.apidocs.utils import reload_module_with_type_checking_enabled
+
+# This function is ported from the drf-spectacular library method here:
+# https://github.com/tfranzel/drf-spectacular/blob/03d315ced245db71cef1e45fd05a082b7dedc7aa/drf_spectacular/plumbing.py#L1100
+# with modifications to support our use case:
+#   grabbing description from a TypedDict __doc__
+#   support for TypedDict required fields
+#   support for excluded fields via @extend_schema_serializer
+
+# TODO:
+#   figure out solution for field descriptions
+#   support deprecated fields via extension
+#   map TypedDicts in schema registry
+
+
+TypeHint = Any
+
+
+def get_type_hints(
+    hint: TypeHint,
+    globalns: dict[str, TypeHint] | None = None,
+    localns: dict[str, TypeHint] | None = None,
+    include_extras: bool = False,
+) -> dict[str, TypeHint]:
+    try:
+        return _get_type_hints(hint, globalns, localns, include_extras)
+    except NameError:
+        # try to resolve a circular import from TYPE_CHECKING imports
+        reload_module_with_type_checking_enabled(hint.__module__)
+        return _get_type_hints(hint, globalns, localns, include_extras)
+    except TypeError:
+        raise UnableToProceedError(
+            f"""Unable to resolve type hints for {hint}.
+            Please use types imported from `typing` instead of the types enabled
+            by PEP585 (`from __future__ import annotations`).
+            e.g. instead of list[str], please use List[str]."""
+        )
+
+
+def _get_type_hint_origin(hint: TypeHint) -> tuple[TypeHint, tuple[TypeHint, ...]]:
+    return typing.get_origin(hint), typing.get_args(hint)
+
+
+def build_choice_description_list(choices: Sequence[tuple[object, object]]) -> str:
+    """
+    Override the default generated description for choicefields if the value and
+    label are identical to be (* `value`) instead of (* `value` - `label`).
+    """
+    return "\n".join(
+        f"* `{value}` - {label}" if value != label else f"* `{value}`" for value, label in choices
+    )
+
+
+# Monkey patch build_choice_description_list
+drf_spectacular.plumbing.build_choice_description_list = build_choice_description_list
+
+
+def build_array_type(
+    schema: _SchemaType | None, min_length: int | None = None, max_length: int | None = None
+) -> _SchemaType:
+    """
+    This function wraps the build_array_type from `drf-spectacular` because it is not type-safe.
+    """
+    if schema is None:
+        raise ValueError("Schema cannot be None")
+    return drf_build_array_type(schema=schema, min_length=min_length, max_length=max_length)
+
+
+# The TypedDicts whose fields are being resolved right now, outermost first.
+_typed_dicts_in_progress: list[Any] = []
+
+
+def _cycle_placeholder(hint: Any) -> dict[str, Any]:
+    """Stand-in for a TypedDict met again while its own fields are being resolved."""
+    return {
+        "type": "object",
+        "description": f"Same as the {hint.__name__} this is inside. "
+        "Its fields are left out here so it doesn't repeat forever.",
+    }
+
+
+def resolve_type_hint(hint: TypeHint) -> TypeHint:
+    """drf-spectacular library method modified as described above"""
+    if hint is type(None):
+        return {"nullable": True, "enum": [None]}
+
+    origin, args = _get_type_hint_origin(hint)
+    excluded_fields = get_override(hint, "exclude_fields", [])
+
+    if hint is object:
+        return build_basic_type(OpenApiTypes.ANY)
+    if origin is None and is_basic_type(hint, allow_none=False):
+        return build_basic_type(hint)
+    elif origin is None and inspect.isclass(hint) and issubclass(hint, tuple):
+        # a convoluted way to catch NamedTuple. suggestions welcome.
+        if get_type_hints(hint):
+            properties = {
+                k: _resolve_at(v, "properties", k) for k, v in get_type_hints(hint).items()
+            }
+        else:
+            properties = {k: build_basic_type(OpenApiTypes.ANY) for k in hint._fields}  # type: ignore[attr-defined]
+        return build_object_type(properties=properties, required=properties.keys())
+    elif origin is list or hint is list or origin is collections.abc.Sequence:
+        return build_array_type(
+            _resolve_at(args[0], "items") if args else build_basic_type(OpenApiTypes.ANY)
+        )
+    elif origin is tuple:
+        return build_array_type(
+            schema=build_basic_type(args[0]),
+            max_length=len(args),
+            min_length=len(args),
+        )
+    elif origin is dict or origin is defaultdict or origin is collections.abc.Mapping:
+        schema = build_basic_type(OpenApiTypes.OBJECT)
+        if args and args[1] is not typing.Any and schema is not None:
+            schema["additionalProperties"] = _resolve_at(args[1], "additionalProperties")
+        return schema
+    elif origin is set:
+        return build_array_type(_resolve_at(args[0], "items"))
+    elif origin is frozenset:
+        return build_array_type(_resolve_at(args[0], "items"))
+    elif origin is Literal:
+        # Literal only works for python >= 3.8 despite typing_extensions, because it
+        # behaves slightly different w.r.t. __origin__
+        choices = [choice.value if isinstance(choice, Enum) else choice for choice in args]
+        schema = {"enum": choices}
+        if all(type(choices[0]) is type(choice) for choice in choices):
+            basic_type = build_basic_type(type(choices[0]))
+            if basic_type is None:
+                raise ValueError(f"Cannot update schema with None type: {type(choices[0])}")
+            schema.update(basic_type)
+        return schema
+    elif inspect.isclass(hint) and issubclass(hint, Enum):
+        schema = {"enum": [item.value for item in hint]}
+        mixin_base_types = [t for t in hint.__mro__ if is_basic_type(t)]
+        if mixin_base_types:
+            basic_type = build_basic_type(mixin_base_types[0])
+            if basic_type is None:
+                raise ValueError(f"Cannot update schema with None type: {mixin_base_types[0]}")
+            schema.update(basic_type)
+        return schema
+    elif is_typeddict(hint):
+        if hint in _typed_dicts_in_progress:
+            return _cycle_placeholder(hint)
+
+        excluded_fields = _typed_dict_exclusions(hint, excluded_fields)
+        _typed_dicts_in_progress.append(hint)
+        try:
+            return build_object_type(
+                properties={
+                    k: _resolve_at(v, "properties", k)
+                    for k, v in get_type_hints(hint).items()
+                    if k not in excluded_fields
+                },
+                description=inspect.cleandoc(hint.__doc__ or ""),
+                required=[h for h in hint.__required_keys__ if h not in excluded_fields],
+            )
+        finally:
+            _typed_dicts_in_progress.pop()
+    elif origin is Union or origin is UnionType:
+        type_args = [arg for arg in args if arg is not type(None)]
+        if len(type_args) > 1:
+            # We use anyOf instead of oneOf (which DRF uses) b/c there's cases
+            # where you can have int | float | long, where a valid value can be
+            # multiple types but errors with oneOf.
+            # TODO(schew2381): Create issue in drf-spectacular to see if this
+            # fix makes sense
+            schema = {
+                "anyOf": [
+                    _resolve_at(arg, "anyOf", str(index)) for index, arg in enumerate(type_args)
+                ]
+            }
+        else:
+            schema = resolve_type_hint(type_args[0])
+        if type(None) in args and schema is not None:
+            # There's an issue where if 3 or more types are OR'd together and one of
+            # them is None, validating the schema will fail because "nullable: true"
+            # with "anyOf" raises an error because there is no "type" key on the
+            # schema. This works around it by including a proxy null object in
+            # the "anyOf".
+            # See:
+            #   - https://github.com/tfranzel/drf-spectacular/issues/925
+            #   - https://github.com/OAI/OpenAPI-Specification/issues/1368.
+            if len(args) > 2:
+                schema["anyOf"].append({"type": "object", "nullable": True})
+            else:
+                schema["nullable"] = True
+        return schema
+    elif origin is collections.abc.Iterable:
+        return build_array_type(_resolve_at(args[0], "items"))
+    else:
+        raise UnableToProceedError(hint)
+
+
+def _resolve_at(hint: Any, *keys: str) -> Any:
+    """Resolve a hint nested at `keys` below its parent, for the build's omission check."""
+    with descended(*keys):
+        return resolve_type_hint(hint)
+
+
+def _typed_dict_exclusions(hint: Any, excluded_fields: Any) -> list[str]:
+    """The fields a TypedDict leaves out, recording the ones it declares as omissions.
+
+    With omissions switched off, the declared ones are kept so the build can compare."""
+    declared = {
+        path for path in get_override(hint, OMISSION_REASONS_OVERRIDE, {}) or {} if "." not in path
+    }
+    if not omissions_enabled():
+        return [name for name in excluded_fields if name not in declared]
+    record_typed_dict(hint.__name__, declared)
+    return list(excluded_fields)

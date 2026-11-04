@@ -1,0 +1,197 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {ProjectFixture} from 'sentry-fixture/project';
+import {TeamFixture} from 'sentry-fixture/team';
+
+import {render, screen} from 'sentry-test/reactTestingLibrary';
+
+import {NoProjectMessage} from 'sentry/components/noProjectMessage';
+import {ConfigStore} from 'sentry/stores/configStore';
+import {ProjectsStore} from 'sentry/stores/projectsStore';
+import {TeamStore} from 'sentry/stores/teamStore';
+
+describe('NoProjectMessage', () => {
+  beforeEach(() => {
+    ProjectsStore.reset();
+    ConfigStore.set('user', {...ConfigStore.get('user'), isSuperuser: false});
+  });
+
+  const org = OrganizationFixture();
+  const noAccessOrg = OrganizationFixture({
+    access: [],
+    features: ['team-roles'],
+    allowMemberProjectCreation: false,
+  });
+
+  it('renders', () => {
+    const organization = OrganizationFixture({slug: 'org-slug'});
+    ProjectsStore.loadInitialData([]);
+
+    render(
+      <NoProjectMessage organization={organization}>
+        <div data-test-id="child">Test</div>
+      </NoProjectMessage>
+    );
+
+    expect(screen.getByText('Remain Calm')).toBeInTheDocument();
+    expect(screen.queryByTestId('child')).not.toBeInTheDocument();
+  });
+
+  it('shows "Create Project" button when there are no projects', () => {
+    const organization = OrganizationFixture({
+      slug: 'org-slug',
+      features: ['team-roles'],
+    });
+    ProjectsStore.loadInitialData([]);
+
+    render(<NoProjectMessage organization={organization} />);
+
+    expect(screen.getByRole('button', {name: 'Create project'})).toBeEnabled();
+  });
+
+  it('enable "Create Project" when user is team admin', () => {
+    ProjectsStore.loadInitialData([]);
+    TeamStore.loadInitialData([
+      TeamFixture({
+        id: '1',
+        slug: 'team1',
+        name: 'Team 1',
+        isMember: true,
+        teamRole: 'admin',
+        access: ['team:admin', 'team:write', 'team:read'],
+      }),
+    ]);
+
+    render(<NoProjectMessage organization={noAccessOrg} />, {organization: noAccessOrg});
+
+    expect(screen.getByRole('button', {name: 'Create project'})).toBeEnabled();
+  });
+
+  it('disable "Create Project" when user is not team admin', () => {
+    ProjectsStore.loadInitialData([]);
+    TeamStore.loadInitialData([
+      TeamFixture({
+        id: '1',
+        slug: 'team1',
+        name: 'Team 1',
+        isMember: true,
+        teamRole: 'admin',
+        access: ['team:write', 'team:read'],
+      }),
+    ]);
+
+    render(<NoProjectMessage organization={noAccessOrg} />, {organization: noAccessOrg});
+
+    expect(screen.getByRole('button', {name: 'Create project'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
+
+  it('shows "Create Project" button when user has team-level access', () => {
+    ProjectsStore.loadInitialData([]);
+    TeamStore.loadInitialData([
+      {...TeamFixture(), access: ['team:admin', 'team:write', 'team:read']},
+    ]);
+
+    // No org-level access
+    render(
+      <NoProjectMessage
+        organization={OrganizationFixture({
+          access: [],
+          features: ['team-roles'],
+          allowMemberProjectCreation: true,
+        })}
+      />
+    );
+
+    expect(screen.getByRole('button', {name: 'Create project'})).toBeEnabled();
+  });
+
+  it('has no "Join a Team" button when projects are missing', () => {
+    ProjectsStore.loadInitialData([]);
+
+    render(<NoProjectMessage organization={org} />);
+
+    expect(screen.queryByRole('button', {name: 'Join a Team'})).not.toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Create project'})).toBeEnabled();
+  });
+
+  it('has a "Join a Team" button when no projects but org has projects', () => {
+    ProjectsStore.loadInitialData([ProjectFixture({hasAccess: false})]);
+
+    render(<NoProjectMessage organization={org} />);
+
+    expect(screen.getByRole('button', {name: 'Join a Team'})).toBeInTheDocument();
+  });
+
+  it('has a disabled "Join a Team" button if no access to `team:read`', () => {
+    ProjectsStore.loadInitialData([ProjectFixture({hasAccess: false})]);
+
+    render(<NoProjectMessage organization={{...org, access: []}} />);
+
+    expect(screen.getByRole('button', {name: 'Join a Team'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
+
+  it('renders children when the user has access without project membership', () => {
+    ProjectsStore.loadInitialData([ProjectFixture({hasAccess: true, isMember: false})]);
+
+    render(
+      <NoProjectMessage organization={org}>
+        <div data-test-id="child">Test</div>
+      </NoProjectMessage>
+    );
+
+    expect(screen.getByTestId('child')).toBeInTheDocument();
+    expect(
+      screen.queryByText('You need at least one project to use this view')
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders children for non-superusers when superuserNeedsToBeProjectMember', () => {
+    ProjectsStore.loadInitialData([ProjectFixture({hasAccess: true, isMember: false})]);
+
+    render(
+      <NoProjectMessage organization={org} superuserNeedsToBeProjectMember>
+        <div data-test-id="child">Test</div>
+      </NoProjectMessage>
+    );
+
+    expect(screen.getByTestId('child')).toBeInTheDocument();
+    expect(
+      screen.queryByText('You need at least one project to use this view')
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows empty message to non-members when requireProjectMembership', () => {
+    ProjectsStore.loadInitialData([ProjectFixture({hasAccess: true, isMember: false})]);
+
+    render(
+      <NoProjectMessage organization={org} requireProjectMembership>
+        {null}
+      </NoProjectMessage>
+    );
+
+    expect(
+      screen.getByText('You need at least one project to use this view')
+    ).toBeInTheDocument();
+  });
+
+  it('shows empty message to superusers that are not members', () => {
+    ProjectsStore.loadInitialData([ProjectFixture({hasAccess: true, isMember: false})]);
+
+    ConfigStore.set('user', {...ConfigStore.get('user'), isSuperuser: true});
+
+    render(
+      <NoProjectMessage organization={org} superuserNeedsToBeProjectMember>
+        {null}
+      </NoProjectMessage>
+    );
+
+    expect(
+      screen.getByText('You need at least one project to use this view')
+    ).toBeInTheDocument();
+  });
+});

@@ -1,0 +1,665 @@
+from datetime import datetime, timedelta
+from unittest.mock import Mock
+
+from django.urls import reverse
+from requests.models import Response
+
+from sentry.sentry_apps.models.sentry_app import SentryApp
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.helpers.datetime import before_now, freeze_time
+from sentry.testutils.silo import control_silo_test, create_test_cells
+from sentry.testutils.skips import requires_snuba
+from sentry.utils.sentry_apps import SentryAppWebhookRequestsBuffer
+
+pytestmark = [requires_snuba]
+
+
+def webhook_url(sentry_app: SentryApp) -> str:
+    assert sentry_app.webhook_url is not None
+    return sentry_app.webhook_url
+
+
+@control_silo_test(cells=create_test_cells("us"))
+class SentryAppWebhookRequestsGetTest(APITestCase):
+    def setUp(self) -> None:
+        self.superuser = self.create_user(email="superuser@example.com", is_superuser=True)
+        self.user = self.create_user(email="user@example.com")
+        self.org = self.create_organization(
+            owner=self.user,
+            cell="us",
+            slug="test-org",
+        )
+        self.project = self.create_project(organization=self.org)
+        self.event_id = "d5111da2c28645c5889d072017e3445d"
+
+        self.published_app = self.create_sentry_app(
+            name="Published App", organization=self.org, published=True
+        )
+        self.unowned_published_app = self.create_sentry_app(
+            name="Unowned Published App", organization=self.create_organization(), published=True
+        )
+
+        self.unpublished_app = self.create_sentry_app(name="Unpublished App", organization=self.org)
+        self.unowned_unpublished_app = self.create_sentry_app(
+            name="Unowned Unpublished App", organization=self.create_organization()
+        )
+
+        self.internal_app = self.create_internal_integration(
+            name="Internal app", organization=self.org
+        )
+
+        self.create_sentry_app_installation(
+            organization=self.org, slug=self.published_app.slug, prevent_token_exchange=True
+        )
+
+        self.mock_response = Mock(spec=Response)
+        self.mock_response.content = '{"content": "mock response content"}'
+        self.mock_request = Mock()
+        self.mock_request.body = "mock request body"
+        self.mock_response.request = self.mock_request
+
+    def test_superuser_sees_unowned_published_requests(self) -> None:
+        self.login_as(user=self.superuser, superuser=True)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.unowned_published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.unowned_published_app),
+        )
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.unowned_published_app),
+        )
+
+        url = reverse(
+            "sentry-api-0-sentry-app-webhook-requests", args=[self.unowned_published_app.slug]
+        )
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 2
+        assert response.data[0]["organization"]["slug"] == self.org.slug
+        assert response.data[0]["sentryAppSlug"] == self.unowned_published_app.slug
+        assert response.data[0]["responseCode"] == 200
+
+    def test_superuser_sees_unpublished_stats(self) -> None:
+        self.login_as(user=self.superuser, superuser=True)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.unowned_unpublished_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.unowned_unpublished_app),
+        )
+
+        url = reverse(
+            "sentry-api-0-sentry-app-webhook-requests", args=[self.unowned_unpublished_app.slug]
+        )
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert response.data[0]["sentryAppSlug"] == self.unowned_unpublished_app.slug
+
+    def test_user_sees_owned_published_requests(self) -> None:
+        self.login_as(user=self.user)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert response.data[0]["organization"]["slug"] == self.org.slug
+        assert response.data[0]["sentryAppSlug"] == self.published_app.slug
+        assert response.data[0]["responseCode"] == 200
+
+    def test_member_does_not_see_owned_published_requests(self) -> None:
+        member = self.create_user(email="member@example.com")
+        self.create_member(user=member, organization=self.org, role="member")
+        self.login_as(user=member)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 403
+        assert response.data["detail"] == "You do not have permission to perform this action."
+
+    def test_member_token_does_not_see_owned_published_requests(self) -> None:
+        member = self.create_user(email="member@example.com")
+        self.create_member(user=member, organization=self.org, role="member")
+        token = self.create_user_auth_token(user=member, scope_list=["org:read"])
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json", HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+        assert response.status_code == 403
+        assert response.data["detail"] == "You do not have permission to perform this action."
+
+    def test_manager_sees_owned_published_requests(self) -> None:
+        manager = self.create_user(email="manager@example.com")
+        self.create_member(user=manager, organization=self.org, role="manager")
+        self.login_as(user=manager)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert response.data[0]["organization"]["slug"] == self.org.slug
+        assert response.data[0]["sentryAppSlug"] == self.published_app.slug
+        assert response.data[0]["responseCode"] == 200
+
+    def test_user_does_not_see_unowned_published_requests(self) -> None:
+        self.login_as(user=self.user)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.unowned_published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.unowned_published_app),
+        )
+
+        url = reverse(
+            "sentry-api-0-sentry-app-webhook-requests", args=[self.unowned_published_app.slug]
+        )
+        response = self.client.get(url, format="json")
+        assert response.status_code == 403
+        assert response.data["detail"] == "You do not have permission to perform this action."
+
+    def test_user_sees_owned_unpublished_requests(self) -> None:
+        self.login_as(user=self.user)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.unpublished_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.unpublished_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.unpublished_app.slug])
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 1
+
+    def test_internal_app_requests_does_not_have_organization_field(self) -> None:
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.internal_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.internal_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.internal_app.slug])
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert "organization" not in response.data[0]
+        assert response.data[0]["sentryAppSlug"] == self.internal_app.slug
+        assert response.data[0]["responseCode"] == 200
+
+    def test_manager_sees_owned_internal_request_details(self) -> None:
+        manager = self.create_user(email="manager@example.com")
+        self.create_member(user=manager, organization=self.org, role="manager")
+        self.login_as(user=manager)
+
+        buffer = SentryAppWebhookRequestsBuffer(self.internal_app)
+        buffer.add_request(
+            response_code=500,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.internal_app),
+            response=self.mock_response,
+            headers={
+                "Content-Type": "application/json",
+                "Sentry-Hook-Signature": "hook-signature",
+                "Sentry-App-Signature": "app-signature",
+            },
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.internal_app.slug])
+        response = self.client.get(url, format="json")
+
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert response.data[0]["request_body"] == self.mock_request.body
+        assert response.data[0]["request_headers"] == {
+            "Content-Type": "application/json",
+            "Sentry-Hook-Signature": "hook-signature",
+            "Sentry-App-Signature": "app-signature",
+        }
+        assert response.data[0]["response_body"] == self.mock_response.content
+
+    def test_member_token_does_not_see_owned_internal_requests(self) -> None:
+        member = self.create_user(email="member@example.com")
+        self.create_member(user=member, organization=self.org, role="member")
+        token = self.create_user_auth_token(user=member, scope_list=["org:read"])
+
+        buffer = SentryAppWebhookRequestsBuffer(self.internal_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.internal_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.internal_app.slug])
+        response = self.client.get(url, format="json", HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+        assert response.status_code == 403
+
+    def assert_access_to_all_app_types(self, status_code: int, authorization: str = "") -> None:
+        published_url = reverse(
+            "sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug]
+        )
+        unpublished_url = reverse(
+            "sentry-api-0-sentry-app-webhook-requests", args=[self.unpublished_app.slug]
+        )
+        internal_url = reverse(
+            "sentry-api-0-sentry-app-webhook-requests", args=[self.internal_app.slug]
+        )
+
+        assert (
+            self.client.get(
+                published_url, format="json", HTTP_AUTHORIZATION=authorization
+            ).status_code
+            == status_code
+        )
+        assert (
+            self.client.get(
+                unpublished_url, format="json", HTTP_AUTHORIZATION=authorization
+            ).status_code
+            == status_code
+        )
+        assert (
+            self.client.get(
+                internal_url, format="json", HTTP_AUTHORIZATION=authorization
+            ).status_code
+            == status_code
+        )
+
+    def test_member_cannot_read_request_logs_for_any_app_type(self) -> None:
+        member = self.create_user()
+        self.create_member(user=member, organization=self.org, role="member")
+        self.login_as(user=member)
+
+        self.assert_access_to_all_app_types(403)
+
+    def test_integrations_access_cannot_read_request_logs_for_any_app_type(self) -> None:
+        admin = self.create_user()
+        self.create_member(user=admin, organization=self.org, role="admin")
+        self.login_as(user=admin)
+
+        self.assert_access_to_all_app_types(403)
+
+    def test_manager_can_read_request_logs_for_any_app_type(self) -> None:
+        manager = self.create_user()
+        self.create_member(user=manager, organization=self.org, role="manager")
+        self.login_as(user=manager)
+
+        self.assert_access_to_all_app_types(200)
+
+    def test_read_only_token_cannot_read_request_logs_for_any_app_type(self) -> None:
+        token = self.create_user_auth_token(user=self.user, scope_list=["org:read"])
+
+        self.assert_access_to_all_app_types(403, authorization=f"Bearer {token.token}")
+
+    def test_integrations_token_cannot_read_request_logs_for_any_app_type(self) -> None:
+        token = self.create_user_auth_token(user=self.user, scope_list=["org:integrations"])
+
+        self.assert_access_to_all_app_types(403, authorization=f"Bearer {token.token}")
+
+    def test_write_token_can_read_request_logs_for_any_app_type(self) -> None:
+        token = self.create_user_auth_token(user=self.user, scope_list=["org:write"])
+
+        self.assert_access_to_all_app_types(200, authorization=f"Bearer {token.token}")
+
+    def test_admin_token_can_read_request_logs_for_any_app_type(self) -> None:
+        token = self.create_user_auth_token(user=self.user, scope_list=["org:admin"])
+
+        self.assert_access_to_all_app_types(200, authorization=f"Bearer {token.token}")
+
+    def test_write_token_does_not_elevate_member_access(self) -> None:
+        member = self.create_user()
+        self.create_member(user=member, organization=self.org, role="member")
+        token = self.create_user_auth_token(user=member, scope_list=["org:write"])
+
+        self.assert_access_to_all_app_types(403, authorization=f"Bearer {token.token}")
+
+    def test_post_owned_internal_requests_is_not_allowed(self) -> None:
+        member = self.create_user(email="member@example.com")
+        self.create_member(user=member, organization=self.org, role="member")
+        self.login_as(user=member)
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.internal_app.slug])
+        response = self.client.post(url, format="json")
+
+        assert response.status_code == 405
+
+    def test_event_type_filter(self) -> None:
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+        buffer.add_request(
+            response_code=400,
+            org_id=self.org.id,
+            event="installation.created",
+            url=webhook_url(self.published_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response1 = self.client.get(f"{url}?eventType=issue.created", format="json")
+        assert response1.status_code == 200
+        assert len(response1.data) == 0
+
+        response2 = self.client.get(f"{url}?eventType=issue.assigned", format="json")
+        assert response2.status_code == 200
+        assert len(response2.data) == 1
+        assert response2.data[0]["sentryAppSlug"] == self.published_app.slug
+        assert response2.data[0]["responseCode"] == 200
+
+        response3 = self.client.get(f"{url}?eventType=installation.created", format="json")
+        assert response3.status_code == 200
+        assert len(response3.data) == 1
+        assert response3.data[0]["sentryAppSlug"] == self.published_app.slug
+        assert response3.data[0]["responseCode"] == 400
+
+    def test_invalid_event_type(self) -> None:
+        self.login_as(user=self.user)
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(f"{url}?eventType=invalid_type", format="json")
+
+        assert response.status_code == 400
+
+    def test_errors_only_filter(self) -> None:
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        now = datetime.now()
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+        with freeze_time(now):
+            buffer.add_request(
+                response_code=500,
+                org_id=self.org.id,
+                event="issue.assigned",
+                url=webhook_url(self.published_app),
+                error_id="abc123",
+                project_id=1,
+                response=self.mock_response,
+                headers={
+                    "Content-Type": "application/json",
+                },
+            )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        errors_only_response = self.client.get(f"{url}?errorsOnly=true", format="json")
+        assert errors_only_response.status_code == 200
+        assert len(errors_only_response.data) == 1
+        assert errors_only_response.data[0] == {
+            "webhookUrl": self.published_app.webhook_url,
+            "sentryAppSlug": self.published_app.slug,
+            "eventType": "issue.assigned",
+            "responseCode": 500,
+            "requestId": None,
+            "subjectId": None,
+            "subjectType": None,
+            "durationMs": None,
+            "project_id": 1,
+            "date": str(now) + "+00:00",
+            "error_id": "abc123",
+            "request_body": self.mock_request.body,
+            "request_headers": {"Content-Type": "application/json"},
+            "response_body": self.mock_response.content,
+            "organization": {"name": self.org.name, "id": self.org.id, "slug": self.org.slug},
+        }
+
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 2
+
+    def test_request_id_subject_and_duration_on_success_and_error_rows(self) -> None:
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        now = datetime.now() - timedelta(hours=1)
+        with freeze_time(now):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="issue.assigned",
+                url=webhook_url(self.published_app),
+                request_id="req-success",
+                subject_id="123",
+                subject_type="group",
+                duration_ms=137,
+            )
+        with freeze_time(now + timedelta(seconds=1)):
+            buffer.add_request(
+                response_code=500,
+                org_id=self.org.id,
+                event="issue.assigned",
+                url=webhook_url(self.published_app),
+                request_id="req-error",
+                subject_id="456",
+                subject_type="group",
+                duration_ms=8000,
+            )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 2
+
+        # Buffer returns newest first.
+        error_row, success_row = response.data[0], response.data[1]
+        assert error_row["responseCode"] == 500
+        assert error_row["requestId"] == "req-error"
+        assert error_row["subjectId"] == "456"
+        assert error_row["subjectType"] == "group"
+        assert error_row["durationMs"] == 8000
+        assert success_row["responseCode"] == 200
+        assert success_row["requestId"] == "req-success"
+        assert success_row["subjectId"] == "123"
+        assert success_row["subjectType"] == "group"
+        assert success_row["durationMs"] == 137
+
+    def test_linked_error_not_returned_if_project_does_not_exist(self) -> None:
+        self.login_as(user=self.user)
+
+        self.store_event(
+            data={"event_id": self.event_id, "timestamp": before_now(minutes=1).isoformat()},
+            project_id=self.project.id,
+        )
+
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.unpublished_app),
+            error_id=self.event_id,
+            project_id=1000,
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 1
+        assert response.data[0]["organization"]["slug"] == self.org.slug
+        assert response.data[0]["sentryAppSlug"] == self.published_app.slug
+        assert "errorUrl" not in response.data[0]
+
+    def test_org_slug_filter(self) -> None:
+        """Test that filtering by the qparam organizationSlug properly filters results"""
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        made_up_org_response = self.client.get(f"{url}?organizationSlug=madeUpOrg", format="json")
+        assert made_up_org_response.status_code == 400
+        assert made_up_org_response.data["detail"] == "Invalid organization."
+
+        org_response = self.client.get(f"{url}?organizationSlug={self.org.slug}", format="json")
+        assert org_response.status_code == 200
+        assert len(org_response.data) == 2
+
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 2
+
+    def test_date_filter(self) -> None:
+        """Test that filtering by the qparams start and end properly filters results"""
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        now = datetime.now() - timedelta(hours=1)
+        buffer.add_request(
+            response_code=200,
+            org_id=self.org.id,
+            event="issue.assigned",
+            url=webhook_url(self.published_app),
+        )
+        with freeze_time(now + timedelta(seconds=1)):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="issue.assigned",
+                url=webhook_url(self.published_app),
+            )
+        with freeze_time(now + timedelta(seconds=2)):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="issue.assigned",
+                url=webhook_url(self.published_app),
+            )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 3
+
+        # test adding a start time
+        start_date = now.strftime("%Y-%m-%d %H:%M:%S")
+        start_date_response = self.client.get(f"{url}?start={start_date}", format="json")
+        assert start_date_response.status_code == 200
+        assert len(start_date_response.data) == 3
+
+        # test adding an end time
+        end_date = (now + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S")
+        end_date_response = self.client.get(f"{url}?end={end_date}", format="json")
+        assert end_date_response.status_code == 200
+        assert len(end_date_response.data) == 2
+
+        # test adding a start and end time
+        new_start_date = (now + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+        new_end_date = (now + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S")
+        start_end_date_response = self.client.get(
+            f"{url}?start={new_start_date}&end={new_end_date}", format="json"
+        )
+        assert start_end_date_response.status_code == 200
+        assert len(start_end_date_response.data) == 2
+
+        # test adding an improperly formatted end time
+        bad_date_format_response = self.client.get(f"{url}?end=2000-01- 00:00:00", format="json")
+        assert bad_date_format_response.status_code == 400
+
+        # test adding a start and end time
+        late_start_date = (now + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S")
+        early_end_date = (now + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+        start_after_end_response = self.client.get(
+            f"{url}?start={late_start_date}&end={early_end_date}", format="json"
+        )
+        assert start_after_end_response.status_code == 400
+
+    def test_get_includes_installation_requests(self) -> None:
+        self.login_as(user=self.user)
+        buffer = SentryAppWebhookRequestsBuffer(self.published_app)
+        now = datetime.now() - timedelta(hours=1)
+        with freeze_time(now):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="issue.created",
+                url=webhook_url(self.published_app),
+            )
+        with freeze_time(now + timedelta(seconds=1)):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="installation.created",
+                url=webhook_url(self.published_app),
+            )
+        with freeze_time(now + timedelta(seconds=2)):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="issue.assigned",
+                url=webhook_url(self.published_app),
+            )
+        with freeze_time(now + timedelta(seconds=3)):
+            buffer.add_request(
+                response_code=200,
+                org_id=self.org.id,
+                event="installation.deleted",
+                url=webhook_url(self.published_app),
+            )
+
+        url = reverse("sentry-api-0-sentry-app-webhook-requests", args=[self.published_app.slug])
+
+        response = self.client.get(url, format="json")
+        assert response.status_code == 200
+        assert len(response.data) == 4
+        assert response.data[0]["eventType"] == "installation.deleted"
+        assert response.data[1]["eventType"] == "issue.assigned"
+        assert response.data[2]["eventType"] == "installation.created"
+        assert response.data[3]["eventType"] == "issue.created"

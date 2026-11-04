@@ -1,11 +1,23 @@
-from django.db import IntegrityError, transaction
+import logging
+
+from django.db import IntegrityError, router, transaction
 from rest_framework import serializers
+from rest_framework.request import Request
 from rest_framework.response import Response
 
+from sentry import audit_log
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
 from sentry.api.bases.organization import OrganizationEndpoint, OrganizationPermission
 from sentry.api.exceptions import ResourceDoesNotExist
 from sentry.api.serializers import serialize
-from sentry.models import AuditLogEntryEvent, OrganizationAccessRequest, OrganizationMemberTeam
+from sentry.models.organization import Organization
+from sentry.models.organizationaccessrequest import OrganizationAccessRequest
+from sentry.models.organizationmemberteam import OrganizationMemberTeam
+from sentry.models.team import Team
+
+logger = logging.getLogger(__name__)
 
 
 class AccessRequestPermission(OrganizationPermission):
@@ -23,6 +35,7 @@ class AccessRequestPermission(OrganizationPermission):
         ],
         "POST": [],
         "PUT": [
+            "org:read",
             "org:write",
             "org:admin",
             "team:write",
@@ -38,11 +51,17 @@ class AccessRequestSerializer(serializers.Serializer):
     isApproved = serializers.BooleanField()
 
 
+@cell_silo_endpoint
 class OrganizationAccessRequestDetailsEndpoint(OrganizationEndpoint):
-    permission_classes = [AccessRequestPermission]
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+        "PUT": ApiPublishStatus.PRIVATE,
+    }
+    owner = ApiOwner.FOUNDATIONS
+    permission_classes = (AccessRequestPermission,)
 
     # TODO(dcramer): this should go onto AccessRequestPermission
-    def _can_access(self, request, access_request):
+    def _can_access(self, request: Request, access_request: OrganizationAccessRequest) -> bool:
         if request.access.has_scope("org:admin"):
             return True
         if request.access.has_scope("org:write"):
@@ -57,34 +76,59 @@ class OrganizationAccessRequestDetailsEndpoint(OrganizationEndpoint):
             return True
         return False
 
-    def get(self, request, organization):
+    def get(self, request: Request, organization: Organization) -> Response:
         """
-        Get list of requests to join org/team
-
+        Get a list of requests to join org/team.
+        If any requests are redundant (user already joined the team), they are not returned.
         """
         if request.access.has_scope("org:write"):
             access_requests = list(
                 OrganizationAccessRequest.objects.filter(
-                    team__organization=organization, member__user__is_active=True
-                ).select_related("team", "member__user")
+                    team__organization=organization,
+                    member__user_is_active=True,
+                    member__user_id__isnull=False,
+                ).select_related("team", "member")
             )
-        elif request.access.has_scope("team:write") and request.access.teams:
+
+        else:
+            authorized_team_ids = [
+                team.id
+                for team in Team.objects.filter(id__in=request.access.team_ids_with_membership)
+                if request.access.has_team_scope(team, "team:write")
+            ]
+            if not authorized_team_ids:
+                return Response([])
+
             access_requests = list(
                 OrganizationAccessRequest.objects.filter(
-                    member__user__is_active=True, team__in=request.access.teams
-                ).select_related("team", "member__user")
+                    member__user_is_active=True,
+                    member__user_id__isnull=False,
+                    team_id__in=authorized_team_ids,
+                ).select_related("team", "member")
             )
-        else:
-            # Return empty response if user does not have access
+
+        if not access_requests:
             return Response([])
 
-        return Response(serialize(access_requests, request.user))
+        member_ids = {access_request.member_id for access_request in access_requests}
+        team_ids = {access_request.team_id for access_request in access_requests}
+        existing_memberships = set(
+            OrganizationMemberTeam.objects.filter(
+                organizationmember_id__in=member_ids,
+                team_id__in=team_ids,
+            ).values_list("organizationmember_id", "team_id")
+        )
+        valid_access_requests = [
+            access_request
+            for access_request in access_requests
+            if (access_request.member_id, access_request.team_id) not in existing_memberships
+        ]
 
-    def put(self, request, organization, request_id):
+        return Response(serialize(valid_access_requests, request.user))
+
+    def put(self, request: Request, organization: Organization, request_id: int) -> Response:
         """
         Approve or deny a request
-
-        Approve or deny a request.
 
             {method} {path}
 
@@ -109,7 +153,7 @@ class OrganizationAccessRequestDetailsEndpoint(OrganizationEndpoint):
 
         if is_approved:
             try:
-                with transaction.atomic():
+                with transaction.atomic(router.db_for_write(OrganizationMemberTeam)):
                     omt = OrganizationMemberTeam.objects.create(
                         organizationmember=access_request.member, team=access_request.team
                     )
@@ -120,8 +164,8 @@ class OrganizationAccessRequestDetailsEndpoint(OrganizationEndpoint):
                     request=request,
                     organization=organization,
                     target_object=omt.id,
-                    target_user=access_request.member.user,
-                    event=AuditLogEntryEvent.MEMBER_JOIN_TEAM,
+                    target_user_id=access_request.member.user_id,
+                    event=audit_log.get_event_id("MEMBER_JOIN_TEAM"),
                     data=omt.get_audit_log_data(),
                 )
 

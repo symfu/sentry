@@ -1,0 +1,1042 @@
+from collections.abc import Iterator
+from unittest import mock
+
+import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+
+from sentry.integrations.mixins.issues import where_should_sync
+from sentry.integrations.services.integration import integration_service
+from sentry.integrations.types import EventLifecycleOutcome, ExternalProviders
+from sentry.integrations.utils.sync import (
+    AssigneeInboundSyncMethod,
+    sync_group_assignee_inbound,
+    sync_group_assignee_inbound_by_external_actor,
+)
+from sentry.models.group import Group
+from sentry.models.groupassignee import GroupAssignee
+from sentry.models.organization import Organization
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.silo import assume_test_silo_mode_of, cell_silo_test
+from sentry.users.models import User, UserEmail
+from sentry.users.services.user import RpcUser
+from sentry.users.services.user.serial import serialize_rpc_user
+
+
+@cell_silo_test
+class TestSyncAssigneeInbound(TestCase):
+    def setUp(self) -> None:
+        self.example_integration = self.create_integration(
+            organization=self.group.organization,
+            external_id="123456",
+            provider="example",
+            oi_params={
+                "config": {
+                    "sync_comments": True,
+                    "sync_status_outbound": True,
+                    "sync_status_inbound": True,
+                    "sync_assignee_outbound": True,
+                    "sync_assignee_inbound": True,
+                }
+            },
+        )
+        self.test_user = self.create_user("test@example.com")
+        self.create_member(organization=self.organization, user=self.test_user, teams=[self.team])
+
+        with assume_test_silo_mode_of(UserEmail):
+            UserEmail.objects.filter(user=self.test_user).update(is_verified=True)
+            assert UserEmail.objects.filter(
+                user=self.test_user, email="test@example.com", is_verified=True
+            ).exists()
+
+    def assign_default_group_to_user(self, user: User, group: Group | None = None) -> None:
+        group_to_update: Group = group or self.group
+        GroupAssignee.objects.assign(group_to_update, serialize_rpc_user(user))
+        group_to_update.refresh_from_db()
+        group_assignee = group_to_update.get_assignee()
+        assert group_assignee is not None and group_assignee.id == user.id
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_no_affected_groups(self, mock_record_event: mock.MagicMock) -> None:
+        self.assign_default_group_to_user(self.test_user)
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="foo@example.com",
+            external_issue_key="this-does-not-exist",
+            assign=True,
+        )
+
+        mock_record_event.record_event(EventLifecycleOutcome.SUCCESS)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_unassign(self, mock_record_event: mock.MagicMock) -> None:
+        self.assign_default_group_to_user(self.test_user)
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue.key,
+            assign=False,
+        )
+
+        assert self.group.get_assignee() is None
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_assignment(self, mock_record_event: mock.MagicMock) -> None:
+        assert self.group.get_assignee() is None
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert isinstance(updated_assignee, RpcUser)
+        assert updated_assignee.id == self.test_user.id
+        assert updated_assignee.email == "test@example.com"
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_assign_with_multiple_groups(self, mock_record_event: mock.MagicMock) -> None:
+        # Create a couple new test unassigned test groups
+        groups_to_assign: list[Group] = []
+        for _ in range(2):
+            org = self.create_organization(owner=self.create_user())
+            team = self.create_team(organization=org)
+            project = self.create_project(organization=org, teams=[team])
+            self.create_member(organization=org, user=self.test_user, teams=[team])
+            self.create_organization_integration(
+                organization_id=org.id,
+                integration=self.example_integration,
+                config={
+                    "sync_comments": True,
+                    "sync_status_outbound": True,
+                    "sync_status_inbound": True,
+                    "sync_assignee_outbound": True,
+                    "sync_assignee_inbound": True,
+                },
+            )
+
+            groups_to_assign.append(
+                self.create_group(project=project),
+            )
+
+        external_issue_key = "foo-123"
+        for group in groups_to_assign:
+            assert group.get_assignee() is None
+            self.create_integration_external_issue(
+                group=group,
+                key="foo-123",
+                integration=self.example_integration,
+            )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue_key,
+            assign=True,
+        )
+
+        for group in groups_to_assign:
+            assignee = group.get_assignee()
+            assert assignee is not None
+            assert isinstance(assignee, RpcUser)
+            assert assignee.id == self.test_user.id
+            assert assignee.email == "test@example.com"
+
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_halt")
+    def test_assign_with_no_user_found(self, mock_record_halt: mock.MagicMock) -> None:
+        assert self.group.get_assignee() is None
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="oopsnotfound@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert updated_assignee is None
+        mock_record_halt.assert_called_with(
+            "inbound-assignee-not-found",
+            extra={
+                "integration_id": self.example_integration.id,
+                "email": "oopsnotfound@example.com",
+                "issue_key": external_issue.key,
+                "method": AssigneeInboundSyncMethod.EMAIL.value,
+                "assign": True,
+            },
+        )
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_failure")
+    @mock.patch("sentry.models.groupassignee.GroupAssigneeManager.assign")
+    def test_assignment_fails(
+        self, mock_group_assign: mock.MagicMock, mock_record_failure: mock.MagicMock
+    ) -> None:
+        def raise_exception(*args: object, **kwargs: object) -> None:
+            raise Exception("oops, something went wrong")
+
+        assert self.group.get_assignee() is None
+
+        mock_group_assign.side_effect = raise_exception
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        with pytest.raises(Exception) as exc:
+            sync_group_assignee_inbound(
+                integration=self.example_integration,
+                email="test@example.com",
+                external_issue_key=external_issue.key,
+                assign=True,
+            )
+
+        assert exc.match("oops, something went wrong")
+
+        updated_assignee = self.group.get_assignee()
+        assert updated_assignee is None
+
+        mock_record_failure.assert_called_once_with(mock.ANY, create_issue=True)
+
+        exception_param = mock_record_failure.call_args_list[0].args[0]
+
+        assert isinstance(exception_param, Exception)
+        assert exception_param.args[0] == "oops, something went wrong"
+
+    @override_options({"integrations.assignee-sync.lock-external-issue": True})
+    def test_replayed_older_event_does_not_reassign(self) -> None:
+        other_user = self.create_user("other@example.com")
+        self.create_member(organization=self.organization, user=other_user, teams=[self.team])
+        with assume_test_silo_mode_of(UserEmail):
+            UserEmail.objects.filter(user=other_user).update(is_verified=True)
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="other@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:05.000+0000",
+        )
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+        )
+
+        assignee = self.group.get_assignee()
+        assert assignee is not None
+        assert assignee.id == other_user.id
+
+    @override_options({"integrations.assignee-sync.lock-external-issue": True})
+    def test_event_with_matching_timestamp_still_applies(self) -> None:
+        # Provider timestamps are coarse, so two distinct changes can share one. Assignment
+        # payloads are snapshots, so applying the later delivery is right either way.
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+        )
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue.key,
+            assign=False,
+            provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+        )
+
+        assert self.group.get_assignee() is None
+
+    @override_options({"integrations.assignee-sync.lock-external-issue": True})
+    def test_assignment_is_bracketed_by_a_lock_on_the_issue_row(self) -> None:
+        # Reading the watermark, assigning, and advancing the watermark have to be one
+        # critical section. Two deliveries that both read the watermark before either
+        # writes it will both pass the staleness check, and then the older one's
+        # assignment can land last while its own watermark write is correctly rejected --
+        # leaving the stored assignee and the watermark permanently disagreeing, with no
+        # later event able to repair it.
+        #
+        # A same-connection test cannot observe the mutual exclusion itself: a second
+        # SELECT ... FOR UPDATE inside the same transaction re-acquires a lock it already
+        # holds instead of blocking. What is checkable, and what fails without the fix, is
+        # that the locking read is issued and that it brackets the assignment.
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            sync_group_assignee_inbound(
+                integration=self.example_integration,
+                email="test@example.com",
+                external_issue_key=external_issue.key,
+                assign=True,
+                provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+            )
+
+        statements = [query["sql"] for query in queries.captured_queries]
+        locking_reads = [
+            index
+            for index, sql in enumerate(statements)
+            if "sentry_externalissue" in sql and "FOR UPDATE" in sql
+        ]
+        assignment_writes = [
+            index
+            for index, sql in enumerate(statements)
+            if "sentry_groupasignee" in sql and ("INSERT" in sql or "UPDATE" in sql)
+        ]
+        watermark_writes = [
+            index
+            for index, sql in enumerate(statements)
+            if sql.startswith('UPDATE "sentry_externalissue"')
+            and "provider_assignee_updated_at" in sql
+        ]
+
+        assert locking_reads, "the watermark must be read with the issue row locked"
+        assert assignment_writes
+        assert watermark_writes
+        assert locking_reads[0] < assignment_writes[0]
+        assert assignment_writes[-1] < watermark_writes[0]
+
+    @override_options({"integrations.assignee-sync.lock-external-issue": False})
+    def test_lock_killswitch_keeps_ordering_without_locking(self) -> None:
+        # With the lock off the watermark still orders sequential deliveries -- the
+        # concurrent case is what regresses, and it is what the option trades away.
+        other_user = self.create_user("other@example.com")
+        self.create_member(organization=self.organization, user=other_user, teams=[self.team])
+        with assume_test_silo_mode_of(UserEmail):
+            UserEmail.objects.filter(user=other_user).update(is_verified=True)
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            sync_group_assignee_inbound(
+                integration=self.example_integration,
+                email="other@example.com",
+                external_issue_key=external_issue.key,
+                assign=True,
+                provider_event_updated_at="2023-01-01T00:00:05.000+0000",
+            )
+            sync_group_assignee_inbound(
+                integration=self.example_integration,
+                email="test@example.com",
+                external_issue_key=external_issue.key,
+                assign=True,
+                provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+            )
+
+        assert not [
+            query["sql"]
+            for query in queries.captured_queries
+            if "sentry_externalissue" in query["sql"] and "FOR UPDATE" in query["sql"]
+        ]
+        assignee = self.group.get_assignee()
+        assert assignee is not None
+        assert assignee.id == other_user.id
+
+    def test_watermark_advances_when_no_user_is_resolved(self) -> None:
+        # The event was processed even though Sentry knows no such user, so an older
+        # delivery must not go on to assign someone the provider has already replaced.
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="foo-123",
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="unmapped@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:05.000+0000",
+        )
+        sync_group_assignee_inbound(
+            integration=self.example_integration,
+            email="test@example.com",
+            external_issue_key=external_issue.key,
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+        )
+
+        assert self.group.get_assignee() is None
+
+
+@cell_silo_test
+class TestSyncAssigneeInboundByExternalActor(TestCase):
+    @pytest.fixture(autouse=True)
+    def mock_where_should_sync(self) -> Iterator[mock.MagicMock]:
+        with mock.patch(
+            "sentry.integrations.utils.sync.where_should_sync"
+        ) as mock_where_should_sync:
+            mock_where_should_sync.return_value = [self.organization]
+            yield mock_where_should_sync
+
+    def setUp(self) -> None:
+        self.example_integration = self.create_integration(
+            organization=self.group.organization,
+            external_id="123456",
+            provider="github",
+            oi_params={
+                "config": {
+                    "sync_comments": True,
+                    "sync_status_outbound": True,
+                    "sync_status_inbound": True,
+                    "sync_assignee_outbound": True,
+                    "sync_assignee_inbound": True,
+                }
+            },
+        )
+        self.test_user = self.create_user("test@example.com")
+        self.create_member(organization=self.organization, user=self.test_user, teams=[self.team])
+
+        with assume_test_silo_mode_of(UserEmail):
+            UserEmail.objects.filter(user=self.test_user).update(is_verified=True)
+            assert UserEmail.objects.filter(
+                user=self.test_user, email="test@example.com", is_verified=True
+            ).exists()
+
+    def assign_default_group_to_user(self, user: User, group: Group | None = None) -> None:
+        group_to_update: Group = group or self.group
+        GroupAssignee.objects.assign(group_to_update, serialize_rpc_user(user))
+        group_to_update.refresh_from_db()
+        group_assignee = group_to_update.get_assignee()
+        assert group_assignee is not None and group_assignee.id == user.id
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_no_affected_groups(self, mock_record_event: mock.MagicMock) -> None:
+        """Test when no groups are affected by the external issue."""
+        self.assign_default_group_to_user(self.test_user)
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="johndoe",
+            external_issue_key="this-does-not-exist",
+            assign=True,
+        )
+
+        mock_record_event.record_event(EventLifecycleOutcome.SUCCESS)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_unassign(self, mock_record_event: mock.MagicMock) -> None:
+        """Test unassigning a group via external actor."""
+        self.assign_default_group_to_user(self.test_user)
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-123",
+            integration=self.example_integration,
+        )
+
+        # Create external user mapping
+        self.create_external_user(
+            user=self.test_user,
+            external_name="johndoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="johndoe",
+            external_issue_key=external_issue.key,
+            assign=False,
+        )
+
+        assert self.group.get_assignee() is None
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_assignment_with_external_actor(
+        self,
+        mock_record_event: mock.MagicMock,
+    ) -> None:
+        """Test assigning a group to a user via external actor."""
+        assert self.group.get_assignee() is None
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-123",
+            integration=self.example_integration,
+        )
+
+        # Create external user mapping
+        self.create_external_user(
+            user=self.test_user,
+            external_name="johndoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="johndoe",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert isinstance(updated_assignee, RpcUser)
+        assert updated_assignee.id == self.test_user.id
+        assert updated_assignee.email == "test@example.com"
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_assignment_with_external_actor_case_insensitive(
+        self,
+        mock_record_event: mock.MagicMock,
+    ) -> None:
+        """Test assigning a group to a user via external actor."""
+        assert self.group.get_assignee() is None
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-123",
+            integration=self.example_integration,
+        )
+
+        # Create external user mapping
+        self.create_external_user(
+            user=self.test_user,
+            external_name="@JohnDoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="@johndoe",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert isinstance(updated_assignee, RpcUser)
+        assert updated_assignee.id == self.test_user.id
+        assert updated_assignee.email == "test@example.com"
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.sync.where_should_sync")
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_assign_with_multiple_groups(
+        self, mock_record_event: mock.MagicMock, mock_where_should_sync: mock.MagicMock
+    ) -> None:
+        """Test assigning multiple groups via external actor."""
+        # Create a couple new test unassigned test groups
+        groups_to_assign: list[Group] = []
+        orgs_to_assign: list[Organization] = []
+        for _ in range(2):
+            org = self.create_organization(owner=self.create_user())
+            team = self.create_team(organization=org)
+            project = self.create_project(organization=org, teams=[team])
+            self.create_member(organization=org, user=self.test_user, teams=[team])
+            self.create_organization_integration(
+                organization_id=org.id,
+                integration=self.example_integration,
+                config={"sync_reverse_assignment": True},
+            )
+
+            groups_to_assign.append(
+                self.create_group(project=project),
+            )
+            orgs_to_assign.append(org)
+
+        mock_where_should_sync.return_value = orgs_to_assign
+
+        external_issue_key = "JIRA-456"
+        for group in groups_to_assign:
+            assert group.get_assignee() is None
+            self.create_integration_external_issue(
+                group=group,
+                key=external_issue_key,
+                integration=self.example_integration,
+            )
+
+        # Create external user mapping
+        self.create_external_user(
+            user=self.test_user,
+            external_name="johndoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="johndoe",
+            external_issue_key=external_issue_key,
+            assign=True,
+        )
+
+        for group in groups_to_assign:
+            assignee = group.get_assignee()
+            assert assignee is not None
+            assert isinstance(assignee, RpcUser)
+            assert assignee.id == self.test_user.id
+            assert assignee.email == "test@example.com"
+
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_halt")
+    def test_assign_with_no_external_actor_found(self, mock_record_halt: mock.MagicMock) -> None:
+        """Test assignment when no external actor mapping exists."""
+        assert self.group.get_assignee() is None
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-789",
+            integration=self.example_integration,
+        )
+
+        # Don't create any external user mapping - this should cause a halt
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="unknownuser",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert updated_assignee is None
+        mock_record_halt.assert_called_with(
+            "inbound-assignee-not-found",
+            extra={
+                "integration_id": self.example_integration.id,
+                "external_user_name": "unknownuser",
+                "external_user_id": None,
+                "issue_key": external_issue.key,
+                "method": AssigneeInboundSyncMethod.EXTERNAL_ACTOR.value,
+                "assign": True,
+                "affected_group_ids": [self.group.id],
+                "match_method": "external_name",
+                "external_actor_count": 0,
+                "matched_user_ids": [],
+                "user_ids": [],
+                "assigned_group_ids": [],
+                "groups_assigned_count": 0,
+                "affected_groups_count": 1,
+            },
+        )
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_halt")
+    def test_assign_with_user_not_in_project(self, mock_record_halt: mock.MagicMock) -> None:
+        """Test assignment when user exists but is not a member of the project."""
+        assert self.group.get_assignee() is None
+
+        # Create a user that is not a member of the project
+        other_user = self.create_user("other@example.com")
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-999",
+            integration=self.example_integration,
+        )
+
+        # Create external user mapping for the user who is not in the project
+        self.create_external_user(
+            user=other_user,
+            external_name="outsider",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="outsider",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert updated_assignee is None
+        mock_record_halt.assert_called_with(
+            "inbound-assignee-not-found",
+            extra={
+                "integration_id": self.example_integration.id,
+                "external_user_name": "outsider",
+                "external_user_id": None,
+                "issue_key": external_issue.key,
+                "method": AssigneeInboundSyncMethod.EXTERNAL_ACTOR.value,
+                "assign": True,
+                "affected_group_ids": [self.group.id],
+                "match_method": "external_name",
+                "external_actor_count": 1,
+                "matched_user_ids": [other_user.id],
+                "user_ids": [other_user.id],
+                "assigned_group_ids": [],
+                "groups_assigned_count": 0,
+                "affected_groups_count": 1,
+            },
+        )
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_failure")
+    @mock.patch("sentry.models.groupassignee.GroupAssigneeManager.assign")
+    def test_assignment_fails(
+        self,
+        mock_group_assign: mock.MagicMock,
+        mock_record_failure: mock.MagicMock,
+    ) -> None:
+        """Test handling when assignment operation fails."""
+
+        def raise_exception(*_args: object, **_kwargs: object) -> None:
+            raise Exception("oops, something went wrong during assignment")
+
+        assert self.group.get_assignee() is None
+
+        mock_group_assign.side_effect = raise_exception
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-ERROR",
+            integration=self.example_integration,
+        )
+
+        # Create external user mapping
+        self.create_external_user(
+            user=self.test_user,
+            external_name="johndoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        with pytest.raises(Exception) as exc:
+            sync_group_assignee_inbound_by_external_actor(
+                integration=self.example_integration,
+                external_user_name="johndoe",
+                external_issue_key=external_issue.key,
+                assign=True,
+            )
+
+        assert exc.match("oops, something went wrong during assignment")
+
+        updated_assignee = self.group.get_assignee()
+        assert updated_assignee is None
+
+        mock_record_failure.assert_called_once_with(mock.ANY, create_issue=True)
+
+        exception_param = mock_record_failure.call_args_list[0].args[0]
+
+        assert isinstance(exception_param, Exception)
+        assert exception_param.args[0] == "oops, something went wrong during assignment"
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_multiple_external_actors_same_name(self, mock_record_event: mock.MagicMock) -> None:
+        """Test assignment when multiple users have the same external name (should use the first one found)."""
+        assert self.group.get_assignee() is None
+
+        # Create another user
+        another_user = self.create_user("another@example.com")
+        self.create_member(organization=self.organization, user=another_user, teams=[self.team])
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-DUP",
+            integration=self.example_integration,
+        )
+
+        # Create external user mappings with the same external name
+        self.create_external_user(
+            user=self.test_user,
+            external_name="duplicate_name",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+        self.create_external_user(
+            user=another_user,
+            external_name="duplicate_name",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="duplicate_name",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        updated_assignee = self.group.get_assignee()
+        assert updated_assignee is not None
+        # The assignment should succeed with one of the users
+        assert updated_assignee.id in [self.test_user.id, another_user.id]
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+    @mock.patch("sentry.integrations.utils.sync.where_should_sync")
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_same_external_name_different_users_across_orgs(
+        self, mock_record_event: mock.MagicMock, mock_where_should_sync: mock.MagicMock
+    ) -> None:
+        """Test when the same external_user_name maps to different users in different orgs.
+
+        Scenario 1: Both users should be assigned to their respective groups.
+        Scenario 2: When only one user has a group with the external issue, only that user is affected.
+        """
+        # Create two different organizations
+        # org1 is self.organization (already exists)
+        org2 = self.create_organization(owner=self.create_user())
+
+        mock_where_should_sync.return_value = [self.organization, org2]
+
+        # Create two different users
+        user1 = self.test_user  # Already exists in org1
+        user2 = self.create_user("user2@example.com")
+
+        # Create teams and memberships
+        team2 = self.create_team(organization=org2)
+        self.create_member(organization=org2, user=user2, teams=[team2])
+
+        # Create projects and groups for each org
+        project2 = self.create_project(organization=org2, teams=[team2])
+        group1 = self.group  # Already exists in org1
+        group2 = self.create_group(project=project2)
+
+        # Setup organization integrations for both orgs
+        self.create_organization_integration(
+            organization_id=org2.id,
+            integration=self.example_integration,
+            config={"sync_reverse_assignment": True},
+        )
+
+        # Create external user mappings - same external name, different users in different orgs
+        self.create_external_user(
+            user=user1,
+            external_name="shared_github_username",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+        self.create_external_user(
+            user=user2,
+            external_name="shared_github_username",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        # Scenario 1: Both groups have the same external issue key
+        external_issue_key = "SHARED-123"
+
+        # Create external issues for both groups
+        self.create_integration_external_issue(
+            group=group1,
+            key=external_issue_key,
+            integration=self.example_integration,
+        )
+        self.create_integration_external_issue(
+            group=group2,
+            key=external_issue_key,
+            integration=self.example_integration,
+        )
+
+        # Verify both groups are unassigned initially
+        assert group1.get_assignee() is None
+        assert group2.get_assignee() is None
+
+        # Perform the sync
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="shared_github_username",
+            external_issue_key=external_issue_key,
+            assign=True,
+        )
+
+        # Both groups should be assigned to their respective users
+        assignee1 = group1.get_assignee()
+        assert isinstance(assignee1, RpcUser)
+        assert assignee1.id == user1.id
+        assert assignee1.email == "test@example.com"
+
+        assignee2 = group2.get_assignee()
+        assert isinstance(assignee2, RpcUser)
+        assert assignee2.id == user2.id
+        assert assignee2.email == "user2@example.com"
+
+        mock_record_event.assert_called_with(EventLifecycleOutcome.SUCCESS, None, False, None)
+
+        # Scenario 2: Only one group has a different external issue
+        group3 = self.create_group(project=self.project)
+        group4 = self.create_group(project=project2)
+
+        unique_issue_key = "UNIQUE-456"
+
+        # Only create external issue for group3 (user1's group)
+        self.create_integration_external_issue(
+            group=group3,
+            key=unique_issue_key,
+            integration=self.example_integration,
+        )
+        # group4 does NOT have this external issue
+
+        # Verify both are unassigned initially
+        assert group3.get_assignee() is None
+        assert group4.get_assignee() is None
+
+        # Perform the sync with the unique issue key
+        sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="shared_github_username",
+            external_issue_key=unique_issue_key,
+            assign=True,
+        )
+
+        # Only group3 should be assigned (to user1)
+        assignee3 = group3.get_assignee()
+        assert assignee3 is not None
+        assert assignee3.id == user1.id
+
+        # group4 should remain unassigned
+        assert group4.get_assignee() is None
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_halt")
+    def test_assign_inactive_user_is_not_reported_as_assigned(
+        self, mock_record_halt: mock.MagicMock
+    ) -> None:
+        """A deactivated user is refused by assign(), so the group is not assigned."""
+        assert self.group.get_assignee() is None
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-123",
+            integration=self.example_integration,
+        )
+        self.create_external_user(
+            user=self.test_user,
+            external_name="johndoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        with assume_test_silo_mode_of(User):
+            User.objects.filter(id=self.test_user.id).update(is_active=False)
+
+        groups_assigned = sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="johndoe",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        assert list(groups_assigned) == []
+        assert self.group.get_assignee() is None
+        mock_record_halt.assert_called_with(
+            "inbound-assignee-not-found",
+            extra={
+                "integration_id": self.example_integration.id,
+                "external_user_name": "johndoe",
+                "external_user_id": None,
+                "issue_key": external_issue.key,
+                "method": AssigneeInboundSyncMethod.EXTERNAL_ACTOR.value,
+                "assign": True,
+                "affected_group_ids": [self.group.id],
+                "match_method": "external_name",
+                "external_actor_count": 1,
+                "matched_user_ids": [self.test_user.id],
+                "user_ids": [self.test_user.id],
+                "assigned_group_ids": [],
+                "groups_assigned_count": 0,
+                "affected_groups_count": 1,
+            },
+        )
+
+    @mock.patch("sentry.integrations.utils.metrics.EventLifecycle.record_halt")
+    def test_assign_when_already_assigned_to_same_user_is_reported_as_assigned(
+        self, mock_record_halt: mock.MagicMock
+    ) -> None:
+        self.assign_default_group_to_user(self.test_user)
+
+        external_issue = self.create_integration_external_issue(
+            group=self.group,
+            key="JIRA-123",
+            integration=self.example_integration,
+        )
+        self.create_external_user(
+            user=self.test_user,
+            external_name="johndoe",
+            provider=ExternalProviders.GITHUB.value,
+            integration=self.example_integration,
+        )
+
+        groups_assigned = sync_group_assignee_inbound_by_external_actor(
+            integration=self.example_integration,
+            external_user_name="johndoe",
+            external_issue_key=external_issue.key,
+            assign=True,
+        )
+
+        assert [group.id for group in groups_assigned] == [self.group.id]
+        updated_assignee = self.group.get_assignee()
+        assert isinstance(updated_assignee, RpcUser)
+        assert updated_assignee.id == self.test_user.id
+        mock_record_halt.assert_not_called()
+
+
+@cell_silo_test
+class TestWhereShouldSync(TestCase):
+    def test_reuses_fetched_org_integrations(self) -> None:
+        integration = self.create_integration(
+            organization=self.organization,
+            external_id="jira:1",
+            provider="jira",
+            metadata={"base_url": "https://example.atlassian.net", "shared_secret": "secret"},
+            oi_params={"config": {"sync_status_reverse": True}},
+        )
+        other_org = self.create_organization()
+        self.create_organization_integration(
+            organization_id=other_org.id, integration=integration, config={}
+        )
+
+        with (
+            self.feature("organizations:integrations-issue-sync"),
+            mock.patch.object(
+                integration_service,
+                "get_organization_integration",
+                wraps=integration_service.get_organization_integration,
+            ) as mock_get,
+        ):
+            orgs = where_should_sync(integration, "inbound_status")
+
+        assert orgs == [self.organization]
+        assert mock_get.call_count == 0

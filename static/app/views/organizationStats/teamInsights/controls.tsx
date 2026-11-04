@@ -1,0 +1,224 @@
+import styled from '@emotion/styled';
+import type {LocationDescriptorObject} from 'history';
+import pick from 'lodash/pick';
+import moment from 'moment-timezone';
+
+import {Container, Grid} from '@sentry/scraps/layout';
+import {Select} from '@sentry/scraps/select';
+import {Text} from '@sentry/scraps/text';
+
+import {TeamSelector} from 'sentry/components/teamSelector';
+import {
+  TimeRangeSelector,
+  TimeRangeSelectTrigger,
+  type ChangeData,
+} from 'sentry/components/timeRangeSelector';
+import {getArbitraryRelativePeriod} from 'sentry/components/timeRangeSelector/utils';
+import {t} from 'sentry/locale';
+import type {DateString} from 'sentry/types/core';
+import type {TeamWithProjects} from 'sentry/types/project';
+import {uniq} from 'sentry/utils/array/uniq';
+import {isActiveSuperuser} from 'sentry/utils/isActiveSuperuser';
+import {localStorageWrapper} from 'sentry/utils/localStorage';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+
+import {dataDatetime} from './utils';
+
+const INSIGHTS_DEFAULT_STATS_PERIOD = '8w';
+
+const relativeOptions: Record<string, string> = {
+  '2w': t('Last 2 weeks'),
+  '4w': t('Last 4 weeks'),
+  [INSIGHTS_DEFAULT_STATS_PERIOD]: t('Last 8 weeks'),
+  '12w': t('Last 12 weeks'),
+};
+
+const PAGE_QUERY_PARAMS = [
+  'pageStatsPeriod',
+  'pageStart',
+  'pageEnd',
+  'pageUtc',
+  'dataCategory',
+  'transform',
+  'sort',
+  'query',
+  'cursor',
+  'team',
+  'environment',
+];
+
+type Props = {
+  currentEnvironment?: string;
+  currentTeam?: TeamWithProjects;
+  showEnvironment?: boolean;
+};
+
+export function TeamStatsControls({
+  currentTeam,
+  currentEnvironment,
+  showEnvironment,
+}: Props) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const {projects} = useProjects({
+    slugs: currentTeam?.projects?.map(project => project.slug) ?? [],
+  });
+  const organization = useOrganization();
+  const isSuperuser = isActiveSuperuser();
+
+  const query = location?.query ?? {};
+  const localStorageKey = `teamInsightsSelectedTeamId:${organization.slug}`;
+
+  function handleChangeTeam(teamId: string) {
+    localStorageWrapper.setItem(localStorageKey, teamId);
+    // TODO(workflow): Preserve environment if it exists for the new team
+    setStateOnUrl({team: teamId, environment: undefined});
+  }
+
+  function handleEnvironmentChange({value}: {label: string; value: string}) {
+    if (value === '') {
+      setStateOnUrl({environment: undefined});
+    } else {
+      setStateOnUrl({environment: value});
+    }
+  }
+
+  function handleUpdateDatetime(datetime: ChangeData): LocationDescriptorObject {
+    const {start, end, relative, utc} = datetime;
+
+    if (start && end) {
+      const parser = utc ? moment.utc : moment;
+
+      return setStateOnUrl({
+        pageStatsPeriod: undefined,
+        pageStart: parser(start).format(),
+        pageEnd: parser(end).format(),
+        pageUtc: utc ?? undefined,
+      });
+    }
+
+    return setStateOnUrl({
+      pageStatsPeriod: relative || undefined,
+      pageStart: undefined,
+      pageEnd: undefined,
+      pageUtc: undefined,
+    });
+  }
+
+  function setStateOnUrl(nextState: {
+    environment?: string;
+    pageEnd?: DateString;
+    pageStart?: DateString;
+    pageStatsPeriod?: string | null;
+    pageUtc?: boolean | null;
+    team?: string;
+  }): LocationDescriptorObject {
+    const nextQueryParams = pick(nextState, PAGE_QUERY_PARAMS);
+
+    const nextLocation = {
+      ...location,
+      query: {
+        ...query,
+        ...nextQueryParams,
+      },
+    };
+
+    navigate(nextLocation);
+
+    return nextLocation;
+  }
+
+  const {period, start, end, utc} = dataDatetime(query);
+  const environmentOptions = uniq(projects.flatMap(project => project.environments)).map(
+    env => ({label: env, value: env})
+  );
+
+  // org:admin is a unique scope that only org owners have
+  const isOrgOwner = organization.access.includes('org:admin');
+
+  return (
+    <Grid
+      align="center"
+      columns={{
+        zero: 'minmax(0, 1fr)',
+        xl: `246px ${showEnvironment ? '246px' : ''} 1fr`,
+      }}
+      gap="xl"
+      marginBottom="xl"
+    >
+      <TeamSelector
+        name="select-team"
+        controlLeadingItems={
+          <Container paddingLeft="lg" flexShrink={0}>
+            <Text bold wrap="nowrap">
+              {t('Team:')}
+            </Text>
+          </Container>
+        }
+        value={currentTeam?.slug ?? null}
+        onChange={(choice: any) => handleChangeTeam(choice.actor.id)}
+        teamFilter={
+          isSuperuser || isOrgOwner ? undefined : (filterTeam: any) => filterTeam.isMember
+        }
+      />
+      {showEnvironment && (
+        <Select
+          options={[
+            {
+              value: '',
+              label: t('All'),
+            },
+            ...environmentOptions,
+          ]}
+          value={currentEnvironment ?? ''}
+          onChange={handleEnvironmentChange}
+          controlLeadingItems={
+            <Container paddingLeft="lg" flexShrink={0}>
+              <Text bold wrap="nowrap">
+                {t('Environment:')}
+              </Text>
+            </Container>
+          }
+        />
+      )}
+      <Container width={{zero: '100%', xl: 'max-content'}}>
+        <StyledTimeRangeSelector
+          relative={period ?? ''}
+          start={start ?? null}
+          end={end ?? null}
+          utc={utc ?? null}
+          onChange={handleUpdateDatetime}
+          showAbsolute={false}
+          relativeOptions={props => ({
+            ...relativeOptions,
+            ...props.arbitraryOptions,
+          })}
+          trigger={triggerProps => (
+            <FullWidthTimeRangeSelectTrigger {...triggerProps} prefix={t('Date Range')}>
+              {period
+                ? relativeOptions[period] ||
+                  getArbitraryRelativePeriod(period)[period] ||
+                  triggerProps.children
+                : triggerProps.children}
+            </FullWidthTimeRangeSelectTrigger>
+          )}
+        />
+      </Container>
+    </Grid>
+  );
+}
+
+const StyledTimeRangeSelector = styled(TimeRangeSelector)`
+  width: 100%;
+
+  div {
+    min-height: unset;
+  }
+`;
+
+const FullWidthTimeRangeSelectTrigger = styled(TimeRangeSelectTrigger)`
+  width: 100%;
+`;

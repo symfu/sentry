@@ -1,0 +1,109 @@
+from sentry import analytics
+
+
+@analytics.eventclass()
+class AiAutofixPhaseEvent(analytics.Event):
+    organization_id: int
+    project_id: int
+    group_id: int
+    referrer: str | None
+    run_id: int | None = None
+    iteration_index: int | None = None
+
+
+@analytics.eventclass("ai.autofix.root_cause.started")
+class AiAutofixRootCauseStartedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.solution.started")
+class AiAutofixSolutionStartedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.code_changes.started")
+class AiAutofixCodeChangesStartedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.pr_iteration.started")
+class AiAutofixIterationStartedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.root_cause.completed")
+class AiAutofixRootCauseCompletedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.solution.completed")
+class AiAutofixSolutionCompletedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.code_changes.completed")
+class AiAutofixCodeChangesCompletedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.pr_iteration.completed")
+class AiAutofixIterationCompletedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.pr_created.started")
+class AiAutofixPrCreatedStartedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.pr_created.completed")
+class AiAutofixPrCreatedCompletedEvent(AiAutofixPhaseEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.agent_handoff")
+class AiAutofixAgentHandoffEvent(AiAutofixPhaseEvent):
+    coding_agent: str | None
+
+
+@analytics.eventclass()
+class AiAutofixPrEvent(analytics.Event):
+    organization_id: int
+    project_id: int
+    group_id: int
+    run_id: int
+    integration: str
+    github_app: str
+    sent_at: int
+    referrer: str | None = None
+
+
+@analytics.eventclass("ai.autofix.pr.closed")
+class AiAutofixPrClosedEvent(AiAutofixPrEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.pr.merged")
+class AiAutofixPrMergedEvent(AiAutofixPrEvent):
+    pass
+
+
+@analytics.eventclass("ai.autofix.pr.opened")
+class AiAutofixPrOpenedEvent(AiAutofixPrEvent):
+    pass
+
+
+analytics.register(AiAutofixRootCauseStartedEvent)
+analytics.register(AiAutofixSolutionStartedEvent)
+analytics.register(AiAutofixCodeChangesStartedEvent)
+analytics.register(AiAutofixIterationStartedEvent)
+analytics.register(AiAutofixRootCauseCompletedEvent)
+analytics.register(AiAutofixSolutionCompletedEvent)
+analytics.register(AiAutofixCodeChangesCompletedEvent)
+analytics.register(AiAutofixIterationCompletedEvent)
+analytics.register(AiAutofixPrCreatedStartedEvent)
+analytics.register(AiAutofixPrCreatedCompletedEvent)
+analytics.register(AiAutofixAgentHandoffEvent)
+analytics.register(AiAutofixPrClosedEvent)
+analytics.register(AiAutofixPrMergedEvent)
+analytics.register(AiAutofixPrOpenedEvent)

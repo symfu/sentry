@@ -1,0 +1,546 @@
+import {useEffect, useMemo} from 'react';
+
+import {Text} from '@sentry/scraps/text';
+
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import type {SpanSearchQueryBuilderProps} from 'sentry/components/performance/spanSearchQueryBuilder';
+import {
+  SearchQueryBuilder,
+  type SearchQueryBuilderProps,
+} from 'sentry/components/searchQueryBuilder';
+import type {CaseInsensitive} from 'sentry/components/searchQueryBuilder/hooks';
+import {useFilterKeyRegistry} from 'sentry/components/searchQueryBuilder/hooks/useFilterKeyRegistry';
+import type {FieldDefinitionGetter} from 'sentry/components/searchQueryBuilder/types';
+import {stripArrayMembershipOperator} from 'sentry/components/searchSyntax/utils';
+import {t, tct} from 'sentry/locale';
+import {SavedSearchType, type TagCollection} from 'sentry/types/group';
+import type {AggregationKey} from 'sentry/utils/fields';
+import {
+  ATTRIBUTE_SEARCH_SECONDARY_ALIASES,
+  FieldKind,
+  getFieldDefinition,
+} from 'sentry/utils/fields';
+import {getHasTag} from 'sentry/utils/tag';
+import {useExploreSuggestedAttribute} from 'sentry/views/explore/hooks/useExploreSuggestedAttribute';
+import {useGetTraceItemAttributeTagKeys} from 'sentry/views/explore/hooks/useGetTraceItemAttributeTagKeys';
+import {useGetTraceItemAttributeValues} from 'sentry/views/explore/hooks/useGetTraceItemAttributeValues';
+import {LOGS_FILTER_KEY_SECTIONS} from 'sentry/views/explore/logs/constants';
+import {TRACEMETRICS_FILTER_KEY_SECTIONS} from 'sentry/views/explore/metrics/constants';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+import {SPANS_FILTER_KEY_SECTIONS} from 'sentry/views/insights/constants';
+
+export type TraceItemSearchQueryBuilderProps = {
+  booleanAttributes: TagCollection;
+  booleanSecondaryAliases: TagCollection;
+  itemType: TraceItemDataset;
+  numberAttributes: TagCollection;
+  numberSecondaryAliases: TagCollection;
+  stringAttributes: TagCollection;
+  stringSecondaryAliases: TagCollection;
+  allowedAttributeKeys?: string[];
+  arrayAttributes?: TagCollection;
+  arraySecondaryAliases?: TagCollection;
+  attributeQuery?: string;
+  caseInsensitive?: CaseInsensitive;
+  defaultToAskSeerOnFreeTextSearch?: SearchQueryBuilderProps['defaultToAskSeerOnFreeTextSearch'];
+  disableFullWidthFilterKeyMenu?: SearchQueryBuilderProps['disableFullWidthFilterKeyMenu'];
+  disableRecentSearches?: boolean;
+  disabled?: boolean;
+  disallowFreeText?: boolean;
+  disallowHas?: boolean;
+  disallowLogicalOperators?: boolean;
+  disallowNegation?: boolean;
+  hiddenAttributeKeys?: string[];
+  invalidFilterKeys?: string[];
+  invalidMessages?: SearchQueryBuilderProps['invalidMessages'];
+  matchKeySuggestions?: Array<{key: string; valuePattern: RegExp}>;
+  menuPresentation?: SearchQueryBuilderProps['menuPresentation'];
+  namespace?: string;
+  onCaseInsensitiveClick?: SearchQueryBuilderProps['onCaseInsensitiveClick'];
+  replaceRawSearchKeys?: string[];
+  showSearchIcon?: SearchQueryBuilderProps['showSearchIcon'];
+} & Omit<SpanSearchQueryBuilderProps, 'numberTags' | 'stringTags'>;
+
+const getFunctionTags = (supportedAggregates?: AggregationKey[]) => {
+  if (!supportedAggregates?.length) {
+    return {};
+  }
+
+  return supportedAggregates.reduce<TagCollection>((acc, item) => {
+    acc[item] = {
+      key: item,
+      name: item,
+      kind: FieldKind.FUNCTION,
+    };
+    return acc;
+  }, {});
+};
+
+const typeMap: Partial<
+  Record<
+    TraceItemDataset,
+    'span' | 'log' | 'uptime' | 'tracemetric' | 'replay' | 'preprod'
+  >
+> = {
+  [TraceItemDataset.SPANS]: 'span',
+  [TraceItemDataset.LOGS]: 'log',
+  [TraceItemDataset.UPTIME_RESULTS]: 'uptime',
+  [TraceItemDataset.TRACEMETRICS]: 'tracemetric',
+  [TraceItemDataset.REPLAYS]: 'replay',
+  [TraceItemDataset.PREPROD]: 'preprod',
+};
+
+function getTraceItemFieldDefinitionFunction(
+  itemType: TraceItemDataset,
+  tags: TagCollection
+): FieldDefinitionGetter {
+  return (key, options) => {
+    // Array membership keys carry a `[*]` suffix (eg. `foo[*]`); strip it so the
+    // field definition resolves to the attribute's stored backend key.
+    const baseKey = stripArrayMembershipOperator(key);
+    return getFieldDefinition(
+      baseKey,
+      typeMap[itemType],
+      options?.kind ?? tags[baseKey]?.kind
+    );
+  };
+}
+
+const CONVENTION_ALIAS_DATASETS = new Set([
+  TraceItemDataset.SPANS,
+  TraceItemDataset.LOGS,
+  TraceItemDataset.TRACEMETRICS,
+]);
+
+function getDeprecatedAttributeSearchWarning(key: string, itemType: TraceItemDataset) {
+  if (!CONVENTION_ALIAS_DATASETS.has(itemType)) {
+    return;
+  }
+
+  const replacement = ATTRIBUTE_SEARCH_SECONDARY_ALIASES[key]?.alias;
+  if (!replacement) {
+    return;
+  }
+  return tct('[usedAttribute] is deprecated. Use [replacement] instead.', {
+    usedAttribute: (
+      <Text monospace variant="inherit">
+        {key}
+      </Text>
+    ),
+    replacement: (
+      <Text monospace variant="inherit">
+        {replacement}
+      </Text>
+    ),
+  });
+}
+
+export function useTraceItemSearchQueryBuilderProps({
+  itemType,
+  booleanAttributes,
+  booleanSecondaryAliases,
+  numberAttributes,
+  numberSecondaryAliases,
+  stringAttributes,
+  stringSecondaryAliases,
+  arrayAttributes = {},
+  arraySecondaryAliases = {},
+  initialQuery,
+  searchSource,
+  getFilterTokenWarning,
+  onBlur,
+  onChange,
+  onSearch,
+  portalTarget,
+  projects,
+  datetime,
+  supportedAggregates = [],
+  namespace,
+  replaceRawSearchKeys,
+  matchKeySuggestions,
+  caseInsensitive,
+  onCaseInsensitiveClick,
+  disallowHas,
+  disallowFreeText,
+  disallowLogicalOperators,
+  disallowNegation,
+  disableRecentSearches,
+  disabled,
+  defaultToAskSeerOnFreeTextSearch,
+  attributeQuery,
+  hiddenAttributeKeys,
+  allowedAttributeKeys,
+  placeholder,
+  invalidFilterKeys,
+  invalidMessages,
+}: TraceItemSearchQueryBuilderProps) {
+  const placeholderText = placeholder ?? itemTypeToDefaultPlaceholder(itemType);
+  const {selection} = usePageFilters();
+  const allowRegexOperators = itemType === TraceItemDataset.LOGS;
+  const effectiveProjects = projects ?? selection.projects;
+  const effectiveDatetime = datetime ?? selection.datetime;
+
+  const functionTags = useFunctionTags(itemType, supportedAggregates);
+  const filterKeySections = useFilterKeySections(itemType, stringAttributes);
+  const filterTags = useFilterTags({
+    numberAttributes,
+    stringAttributes,
+    functionTags,
+    booleanAttributes,
+    arrayAttributes,
+    disallowHas: disallowHas ?? false,
+  });
+
+  const getTraceItemAttributeValues = useGetTraceItemAttributeValues({
+    traceItemType: itemType,
+    type: 'string',
+    projectIds: projects,
+    datetime,
+    query: attributeQuery,
+  });
+
+  const getSuggestedAttribute = useExploreSuggestedAttribute({
+    numberAttributes,
+    stringAttributes,
+    booleanAttributes,
+    arrayAttributes,
+  });
+
+  const dynamicTagKeys = useGetTraceItemAttributeTagKeys({
+    itemType,
+    projects,
+    extraTags: functionTags,
+    query: attributeQuery,
+    hiddenKeys: hiddenAttributeKeys,
+    datetime,
+  });
+  // When an allowlist is in effect, the static filterKeys are already curated to
+  // it. Skip the dynamic EAP fetch so typed-key autocomplete only matches against
+  // the allowlist (and unrecognized keys are auto-rejected).
+  const getTagKeys = allowedAttributeKeys ? undefined : dynamicTagKeys;
+  const asyncFilterKeyRegistryQueryKey = useMemo(
+    () => [
+      'trace-item-search-query-builder-filter-key-registry',
+      itemType,
+      effectiveProjects,
+      selection.environments,
+      effectiveDatetime,
+      attributeQuery,
+      hiddenAttributeKeys,
+      allowedAttributeKeys,
+    ],
+    [
+      allowedAttributeKeys,
+      attributeQuery,
+      effectiveDatetime,
+      effectiveProjects,
+      hiddenAttributeKeys,
+      itemType,
+      selection.environments,
+    ]
+  );
+
+  const {filterKeyRegistryQueryOptions, registerFilterKeys} = useFilterKeyRegistry({
+    asyncFilterKeyRegistryQueryKey,
+  });
+
+  useEffect(() => {
+    registerFilterKeys(Object.values(filterTags), filterKeyRegistryQueryOptions.queryKey);
+  }, [filterKeyRegistryQueryOptions.queryKey, filterTags, registerFilterKeys]);
+
+  return useMemo(
+    () => ({
+      placeholder: placeholderText,
+      allowRegexOperators,
+      asyncFilterKeyRegistryQueryKey,
+      filterKeys: filterTags,
+      initialQuery,
+      fieldDefinitionGetter: getTraceItemFieldDefinitionFunction(itemType, filterTags),
+      onSearch,
+      onChange,
+      onBlur,
+      getFilterTokenWarning: (key: string) =>
+        getFilterTokenWarning?.(key) ??
+        getDeprecatedAttributeSearchWarning(key, itemType),
+      searchSource,
+      filterKeySections,
+      getSuggestedFilterKey: getSuggestedAttribute,
+      getTagValues: getTraceItemAttributeValues,
+      getTagKeys,
+      disallowUnsupportedFilters: !getTagKeys,
+      disallowFreeText,
+      disallowLogicalOperators,
+      disallowNegation,
+      defaultToAskSeerOnFreeTextSearch,
+      recentSearches: disableRecentSearches
+        ? undefined
+        : itemTypeToRecentSearches(itemType),
+      namespace,
+      showUnsubmittedIndicator: true,
+      portalTarget,
+      replaceRawSearchKeys,
+      matchKeySuggestions,
+      filterKeyAliases: {
+        ...(CONVENTION_ALIAS_DATASETS.has(itemType)
+          ? ATTRIBUTE_SEARCH_SECONDARY_ALIASES
+          : {}),
+        ...numberSecondaryAliases,
+        ...stringSecondaryAliases,
+        ...booleanSecondaryAliases,
+        ...arraySecondaryAliases,
+      },
+      caseInsensitive,
+      disabled,
+      onCaseInsensitiveClick,
+      invalidFilterKeys,
+      invalidMessages,
+    }),
+    [
+      allowRegexOperators,
+      asyncFilterKeyRegistryQueryKey,
+      booleanSecondaryAliases,
+      caseInsensitive,
+      disableRecentSearches,
+      disabled,
+      defaultToAskSeerOnFreeTextSearch,
+      disallowFreeText,
+      disallowLogicalOperators,
+      disallowNegation,
+      filterKeySections,
+      filterTags,
+      getFilterTokenWarning,
+      getSuggestedAttribute,
+      getTagKeys,
+      getTraceItemAttributeValues,
+      initialQuery,
+      invalidFilterKeys,
+      invalidMessages,
+      itemType,
+      matchKeySuggestions,
+      namespace,
+      numberSecondaryAliases,
+      onBlur,
+      onCaseInsensitiveClick,
+      onChange,
+      onSearch,
+      placeholderText,
+      portalTarget,
+      replaceRawSearchKeys,
+      searchSource,
+      stringSecondaryAliases,
+      arraySecondaryAliases,
+    ]
+  );
+}
+
+export function TraceItemSearchQueryBuilder({
+  autoFocus,
+  initialQuery,
+  booleanSecondaryAliases,
+  booleanAttributes,
+  numberSecondaryAliases,
+  numberAttributes,
+  stringSecondaryAliases,
+  arrayAttributes,
+  arraySecondaryAliases,
+  searchSource,
+  stringAttributes,
+  itemType,
+  datetime,
+  getFilterTokenWarning,
+  onBlur,
+  onChange,
+  onSearch,
+  portalTarget,
+  projects,
+  supportedAggregates = [],
+  disabled,
+  defaultToAskSeerOnFreeTextSearch,
+  namespace,
+  caseInsensitive,
+  onCaseInsensitiveClick,
+  matchKeySuggestions,
+  replaceRawSearchKeys,
+  disallowHas,
+  disallowFreeText,
+  disallowLogicalOperators,
+  disallowNegation,
+  disableRecentSearches,
+  attributeQuery,
+  hiddenAttributeKeys,
+  allowedAttributeKeys,
+  placeholder,
+  invalidFilterKeys,
+  invalidMessages,
+  showSearchIcon,
+  disableFullWidthFilterKeyMenu,
+  menuPresentation,
+}: TraceItemSearchQueryBuilderProps) {
+  const searchQueryBuilderProps = useTraceItemSearchQueryBuilderProps({
+    itemType,
+    booleanAttributes,
+    booleanSecondaryAliases,
+    numberAttributes,
+    stringAttributes,
+    numberSecondaryAliases,
+    stringSecondaryAliases,
+    arrayAttributes,
+    arraySecondaryAliases,
+    initialQuery,
+    placeholder,
+    searchSource,
+    getFilterTokenWarning,
+    onBlur,
+    onChange,
+    onSearch,
+    portalTarget,
+    projects,
+    supportedAggregates,
+    namespace,
+    caseInsensitive,
+    onCaseInsensitiveClick,
+    matchKeySuggestions,
+    replaceRawSearchKeys,
+    disallowHas,
+    disallowFreeText,
+    disallowLogicalOperators,
+    disallowNegation,
+    disableRecentSearches,
+    disabled,
+    defaultToAskSeerOnFreeTextSearch,
+    attributeQuery,
+    hiddenAttributeKeys,
+    allowedAttributeKeys,
+    datetime,
+    invalidFilterKeys,
+    invalidMessages,
+  });
+
+  return (
+    <SearchQueryBuilder
+      autoFocus={autoFocus}
+      showSearchIcon={showSearchIcon}
+      disableFullWidthFilterKeyMenu={disableFullWidthFilterKeyMenu}
+      menuPresentation={menuPresentation}
+      {...searchQueryBuilderProps}
+    />
+  );
+}
+
+function useFunctionTags(
+  itemType: TraceItemDataset,
+  supportedAggregates?: AggregationKey[]
+) {
+  return useMemo(() => {
+    if (itemType === TraceItemDataset.SPANS) {
+      return getFunctionTags(supportedAggregates);
+    }
+    return {};
+  }, [itemType, supportedAggregates]);
+}
+
+function useFilterTags({
+  numberAttributes,
+  stringAttributes,
+  booleanAttributes,
+  arrayAttributes,
+  functionTags,
+  disallowHas,
+}: {
+  arrayAttributes: TagCollection;
+  booleanAttributes: TagCollection;
+  disallowHas: boolean;
+  functionTags: TagCollection;
+  numberAttributes: TagCollection;
+  stringAttributes: TagCollection;
+}) {
+  return useMemo(() => {
+    const tags: TagCollection = {
+      ...functionTags,
+      ...numberAttributes,
+      ...stringAttributes,
+      ...booleanAttributes,
+      ...arrayAttributes,
+    };
+
+    if (!disallowHas) {
+      tags.has = getHasTag({
+        ...numberAttributes,
+        ...stringAttributes,
+        ...booleanAttributes,
+        ...arrayAttributes,
+      });
+    }
+    return tags;
+  }, [
+    booleanAttributes,
+    disallowHas,
+    functionTags,
+    numberAttributes,
+    stringAttributes,
+    arrayAttributes,
+  ]);
+}
+
+function useFilterKeySections(
+  itemType: TraceItemDataset,
+  stringAttributes: TagCollection
+) {
+  return useMemo(() => {
+    const predefined = new Set(
+      itemTypeToFilterKeySections(itemType).flatMap(section => section.children)
+    );
+    return [
+      ...itemTypeToFilterKeySections(itemType).map(section => {
+        return {
+          ...section,
+          children: section.children.filter(key => key in stringAttributes),
+        };
+      }),
+      {
+        value: 'custom_fields',
+        label: t('Attributes'),
+        children: Object.keys(stringAttributes).filter(key => !predefined.has(key)),
+      },
+    ].filter(section => section.children.length);
+  }, [stringAttributes, itemType]);
+}
+
+function itemTypeToRecentSearches(itemType: TraceItemDataset) {
+  if (itemType === TraceItemDataset.SPANS) {
+    return SavedSearchType.SPAN;
+  }
+  if (itemType === TraceItemDataset.TRACEMETRICS) {
+    return SavedSearchType.TRACEMETRIC;
+  }
+  if (itemType === TraceItemDataset.PREPROD) {
+    return SavedSearchType.PREPROD_APP_SIZE;
+  }
+  return SavedSearchType.LOG;
+}
+
+function itemTypeToFilterKeySections(itemType: TraceItemDataset) {
+  if (itemType === TraceItemDataset.SPANS) {
+    return SPANS_FILTER_KEY_SECTIONS;
+  }
+  if (itemType === TraceItemDataset.TRACEMETRICS) {
+    return TRACEMETRICS_FILTER_KEY_SECTIONS;
+  }
+  if (itemType === TraceItemDataset.PREPROD) {
+    return [];
+  }
+  return LOGS_FILTER_KEY_SECTIONS;
+}
+
+function itemTypeToDefaultPlaceholder(itemType: TraceItemDataset) {
+  if (itemType === TraceItemDataset.SPANS) {
+    return t('Search for spans, users, tags, and more');
+  }
+  if (itemType === TraceItemDataset.TRACEMETRICS) {
+    return t('Search for application metrics, users, tags, and more');
+  }
+  if (itemType === TraceItemDataset.PREPROD) {
+    return t('Search for builds, versions, and more');
+  }
+  return t('Search for logs, users, tags, and more');
+}

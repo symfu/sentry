@@ -1,0 +1,101 @@
+import {useMemo} from 'react';
+import {parseAsString, useQueryStates} from 'nuqs';
+
+import {useFeedbackApiOptions} from 'sentry/components/feedback/useFeedbackApiOptions';
+import type {Organization} from 'sentry/types/organization';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {coaleseIssueStatsPeriodQuery} from 'sentry/utils/feedback/coaleseIssueStatsPeriodQuery';
+import {useApiQuery, type UseApiQueryResult} from 'sentry/utils/queryClient';
+import type {RequestError} from 'sentry/utils/requestError/requestError';
+import {pageFilterParsers} from 'sentry/utils/url/pageFilterParsers';
+import {parseAsStringArray} from 'sentry/utils/url/parseAsStringArray';
+
+interface Props {
+  organization: Organization;
+}
+
+const mailboxCountsParsers = {
+  ...pageFilterParsers,
+  field: parseAsStringArray,
+  query: parseAsString.withDefault(''),
+};
+
+// The keys here are the different search terms that we're using:
+type ApiReturnType = Record<string, number>;
+
+// This is what the hook consumer gets:
+type HookReturnType = {
+  ignored: number;
+  resolved: number;
+  unresolved: number;
+};
+
+export function useMailboxCounts({
+  organization,
+}: Props): UseApiQueryResult<HookReturnType, RequestError> {
+  const [locationFields] = useQueryStates(mailboxCountsParsers);
+  const locationQuery = locationFields.query;
+  const {listHeadTime} = useFeedbackApiOptions();
+
+  // We should fetch the counts while taking the query into account
+  const MAILBOX: Record<keyof HookReturnType, keyof ApiReturnType> = useMemo(
+    () => ({
+      unresolved: 'issue.category:feedback is:unassigned is:unresolved ' + locationQuery,
+      resolved: 'issue.category:feedback is:unassigned is:resolved ' + locationQuery,
+      ignored: 'issue.category:feedback is:unassigned is:ignored ' + locationQuery,
+    }),
+    [locationQuery]
+  );
+
+  const mailboxQuery = useMemo(() => Object.values(MAILBOX), [MAILBOX]);
+
+  // The request is keyed off this object, so it has to stay referentially stable
+  // across renders that don't change the filters.
+  const queryView = useMemo(
+    () => ({
+      ...locationFields,
+      query: mailboxQuery,
+      queryReferrer: 'feedback_mailbox_count',
+    }),
+    [locationFields, mailboxQuery]
+  );
+
+  const queryViewWithStatsPeriod = useMemo(
+    () =>
+      coaleseIssueStatsPeriodQuery({
+        listHeadTime,
+        queryView,
+      }),
+    [listHeadTime, queryView]
+  );
+
+  const result = useApiQuery<ApiReturnType>(
+    [
+      getApiUrl('/organizations/$organizationIdOrSlug/issues-count/', {
+        path: {
+          organizationIdOrSlug: organization.slug,
+        },
+      }),
+      {query: queryViewWithStatsPeriod},
+    ],
+    {
+      staleTime: 1_000,
+      refetchInterval: 30_000,
+    }
+  );
+
+  return useMemo(
+    () =>
+      ({
+        ...result,
+        data: result.data
+          ? {
+              unresolved: result.data[MAILBOX.unresolved],
+              resolved: result.data[MAILBOX.resolved],
+              ignored: result.data[MAILBOX.ignored],
+            }
+          : undefined,
+      }) as UseApiQueryResult<HookReturnType, RequestError>,
+    [result, MAILBOX.ignored, MAILBOX.resolved, MAILBOX.unresolved]
+  );
+}

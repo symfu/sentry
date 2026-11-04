@@ -1,0 +1,585 @@
+import {Fragment, type ReactNode} from 'react';
+import {IconCursorArrow} from '@sentry/icons/cursorArrow';
+import {IconFire} from '@sentry/icons/fire';
+import {IconFix} from '@sentry/icons/fix';
+import {IconFocus} from '@sentry/icons/focus';
+import {IconHappy} from '@sentry/icons/happy';
+import {IconInfo} from '@sentry/icons/info';
+import {IconInput} from '@sentry/icons/input';
+import {IconKeyDown} from '@sentry/icons/keyDown';
+import {IconLightning} from '@sentry/icons/lightning';
+import {IconLocation} from '@sentry/icons/location';
+import {IconMegaphone} from '@sentry/icons/megaphone';
+import {IconMeh} from '@sentry/icons/meh';
+import {IconRefresh} from '@sentry/icons/refresh';
+import {IconSad} from '@sentry/icons/sad';
+import {IconSort} from '@sentry/icons/sort';
+import {IconTap} from '@sentry/icons/tap';
+import {IconTerminal} from '@sentry/icons/terminal';
+import {IconWarning} from '@sentry/icons/warning';
+import {IconWifi} from '@sentry/icons/wifi';
+
+import {InfoTip} from '@sentry/scraps/info';
+import {Flex} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+import type {GraphicsVariant} from '@sentry/scraps/theme';
+
+import {CrumbErrorTitle} from 'sentry/components/replays/breadcrumbs/errorTitle';
+import {SelectorList} from 'sentry/components/replays/breadcrumbs/selectorList';
+import {t, tct} from 'sentry/locale';
+import {explodeSlug} from 'sentry/utils';
+import {TabKey} from 'sentry/utils/replays/hooks/useActiveReplayTab';
+import type {
+  BreadcrumbFrame,
+  ClickFrame,
+  ClickFrameNode,
+  ConsoleFrame,
+  DeviceBatteryFrame,
+  DeviceConnectivityFrame,
+  DeviceOrientationFrame,
+  ErrorFrame,
+  FeedbackFrame,
+  MultiClickFrame,
+  MutationFrame,
+  NavFrame,
+  NavigationFrame,
+  RawBreadcrumbFrame,
+  ReplayFrame,
+  RequestFrame,
+  ResourceFrame,
+  ScrollFrame,
+  SlowClickFrame,
+  SwipeFrame,
+  TapFrame,
+  WebVitalFrame,
+} from 'sentry/utils/replays/types';
+import {
+  getFrameOpOrCategory,
+  isCLSFrame,
+  isDeadClick,
+  isDeadRageClick,
+  isRageClick,
+} from 'sentry/utils/replays/types';
+import {toTitleCase} from 'sentry/utils/string/toTitleCase';
+import {stripURLOrigin} from 'sentry/utils/url/stripURLOrigin';
+import {MODULE_DOC_LINK} from 'sentry/views/insights/browser/webVitals/settings';
+
+interface Details {
+  colorGraphicsToken: GraphicsVariant;
+  description: ReactNode;
+  icon: ReactNode;
+  tabKey: TabKey;
+  title: ReactNode;
+}
+
+const DEVICE_CONNECTIVITY_MESSAGE: Record<string, string> = {
+  wifi: t('Device connected to wifi'),
+  offline: t('Internet connection was lost'),
+  cellular: t('Device connected to cellular network'),
+  ethernet: t('Device connected to ethernet'),
+};
+
+// Replay attaches every event to the replay as an issue frame, including
+// `captureMessage` and CaptureConsole events at non-error levels, so the level
+// decides how alarming the frame looks.
+function getIssueLevelStyle(level: string): Pick<Details, 'colorGraphicsToken' | 'icon'> {
+  switch (level) {
+    case 'warning':
+      return {colorGraphicsToken: 'warning', icon: <IconWarning size="xs" />};
+    case 'info':
+    case 'log':
+    case 'debug':
+      return {colorGraphicsToken: 'neutral', icon: <IconInfo size="xs" />};
+    default:
+      return {colorGraphicsToken: 'danger', icon: <IconFire size="xs" />};
+  }
+}
+
+const MAPPER_FOR_FRAME: Record<string, (frame: any) => Details> = {
+  'replay.init': (frame: BreadcrumbFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: stripURLOrigin(frame.message ?? ''),
+    tabKey: TabKey.CONSOLE,
+    title: 'Replay Start',
+    icon: <IconInfo size="xs" />,
+  }),
+  navigation: (frame: NavFrame) => ({
+    colorGraphicsToken: 'success',
+    description: stripURLOrigin(frame.data?.to ?? frame.message),
+    tabKey: TabKey.NETWORK,
+    title: 'Navigation',
+    icon: <IconLocation size="xs" />,
+  }),
+  feedback: (frame: FeedbackFrame) => ({
+    colorGraphicsToken: 'promotion',
+    description: frame.message,
+    tabKey: TabKey.BREADCRUMBS,
+    title: defaultTitle(frame),
+    icon: <IconMegaphone size="xs" />,
+  }),
+  issue: (frame: ErrorFrame) => ({
+    ...getIssueLevelStyle(frame.data.level),
+    description: frame.message,
+    tabKey: TabKey.ERRORS,
+    title: <CrumbErrorTitle frame={frame} />,
+  }),
+  'ui.slowClickDetected': (frame: SlowClickFrame) => {
+    const selector = stringifyNodeAttributes(frame.data?.node);
+    const timeAfterClickMs = frame.data?.timeAfterClickMs;
+    if (isDeadClick(frame)) {
+      return {
+        colorGraphicsToken: isDeadRageClick(frame) ? 'danger' : 'warning',
+        description:
+          timeAfterClickMs === undefined
+            ? tct('Click on [selector] did not cause a visible effect', {selector})
+            : tct(
+                'Click on [selector] did not cause a visible effect within [timeout] ms',
+                {selector, timeout: Math.round(timeAfterClickMs)}
+              ),
+        icon: <IconCursorArrow size="xs" />,
+        title: isDeadRageClick(frame) ? 'Rage Click' : 'Dead Click',
+        tabKey: TabKey.BREADCRUMBS,
+      };
+    }
+    return {
+      colorGraphicsToken: 'warning',
+      description:
+        timeAfterClickMs === undefined
+          ? tct('Click on [selector] was slow to have a visible effect', {selector})
+          : tct('Click on [selector] took [duration] ms to have a visible effect', {
+              selector,
+              duration: Math.round(timeAfterClickMs),
+            }),
+      icon: <IconWarning size="xs" />,
+      title: 'Slow Click',
+      tabKey: TabKey.BREADCRUMBS,
+    };
+  },
+  'ui.multiClick': (frame: MultiClickFrame) => {
+    const selector = stringifyNodeAttributes(frame.data?.node);
+    const clickCount = frame.data?.clickCount;
+    if (isRageClick(frame)) {
+      return {
+        colorGraphicsToken: 'danger',
+        description: tct('Rage clicked [clickCount] times on [selector]', {
+          clickCount,
+          selector,
+        }),
+        tabKey: TabKey.BREADCRUMBS,
+        title: 'Rage Click',
+        icon: <IconFire size="xs" />,
+      };
+    }
+
+    return {
+      colorGraphicsToken: 'warning',
+      description:
+        clickCount === undefined
+          ? tct('Multiple clicks on [selector]', {selector})
+          : tct('[clickCount] clicks on [selector]', {clickCount, selector}),
+      tabKey: TabKey.BREADCRUMBS,
+      title: 'Multi Click',
+      icon: <IconWarning size="xs" />,
+    };
+  },
+  'replay.mutations': (frame: MutationFrame) => {
+    const count = frame.data?.count;
+    const link = (
+      <ExternalLink href="https://docs.sentry.io/platforms/javascript/session-replay/configuration/#mutation-limits">
+        {t('Learn more.')}
+      </ExternalLink>
+    );
+    let description: ReactNode;
+    if (frame.data?.limit) {
+      description =
+        count === undefined
+          ? tct(
+              'Significant mutations detected. Replay is now stopped to prevent poor performance for your customer. [link]',
+              {link}
+            )
+          : tct(
+              'Significant mutations detected: [count]. Replay is now stopped to prevent poor performance for your customer. [link]',
+              {count, link}
+            );
+    } else {
+      description =
+        count === undefined
+          ? tct(
+              'Significant mutations detected. This can slow down the Replay SDK, impacting your customers. [link]',
+              {link}
+            )
+          : tct(
+              'Significant mutations detected: [count]. This can slow down the Replay SDK, impacting your customers. [link]',
+              {count, link}
+            );
+    }
+    return {
+      colorGraphicsToken: 'warning',
+      description,
+      tabKey: TabKey.BREADCRUMBS,
+      title: 'DOM Mutations',
+      icon: <IconWarning size="xs" />,
+    };
+  },
+  'replay.hydrate-error': () => ({
+    colorGraphicsToken: 'danger',
+    description: t(
+      'There was a conflict between the server rendered html and the first client render.'
+    ),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'Hydration Error',
+    icon: <IconFire size="xs" />,
+  }),
+  'ui.click': (frame: ClickFrame) => ({
+    colorGraphicsToken: 'accent',
+    description: <SelectorList frame={frame} />,
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'User Click',
+    icon: <IconCursorArrow size="xs" />,
+  }),
+  'ui.swipe': (frame: SwipeFrame) => ({
+    colorGraphicsToken: 'accent',
+    description: frame.data,
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'User Swipe',
+    icon: <IconTap size="xs" />,
+  }),
+  'ui.scroll': (frame: ScrollFrame) => ({
+    colorGraphicsToken: 'accent',
+    description: frame.data,
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'User Scroll',
+    icon: <IconTap size="xs" />,
+  }),
+  'ui.tap': (frame: TapFrame) => ({
+    colorGraphicsToken: 'accent',
+    description: frame.message,
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'User Tap',
+    icon: <IconTap size="xs" />,
+  }),
+  'ui.input': () => ({
+    colorGraphicsToken: 'accent',
+    description: t('User Action'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'User Input',
+    icon: <IconInput size="xs" />,
+  }),
+  'ui.keyDown': () => ({
+    colorGraphicsToken: 'accent',
+    description: t('User Action'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'User KeyDown',
+    icon: <IconKeyDown size="xs" />,
+  }),
+  'ui.blur': () => ({
+    colorGraphicsToken: 'accent',
+    description: t('The user is preoccupied with another browser, tab, or window'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'Window Blur',
+    icon: <IconFocus isFocused={false} size="xs" />,
+  }),
+  'ui.focus': () => ({
+    colorGraphicsToken: 'accent',
+    description: t('The user is currently focused on your application,'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'Window Focus',
+    icon: <IconFocus size="xs" />,
+  }),
+  'app.foreground': () => ({
+    colorGraphicsToken: 'accent',
+    description: t('The user is currently focused on your application'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'App in Foreground',
+    icon: <IconFocus size="xs" />,
+  }),
+  'app.background': () => ({
+    colorGraphicsToken: 'accent',
+    description: t('The user is preoccupied with another app or activity'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'App in Background',
+    icon: <IconFocus isFocused={false} size="xs" />,
+  }),
+  console: (frame: ConsoleFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: frame.message ?? '',
+    tabKey: TabKey.CONSOLE,
+    title: 'Console',
+    icon: <IconFix size="xs" />,
+  }),
+  'navigation.navigate': (frame: NavigationFrame) => ({
+    colorGraphicsToken: 'success',
+    description: stripURLOrigin(frame.description),
+    tabKey: TabKey.NETWORK,
+    title: 'Page Load',
+    icon: <IconLocation size="xs" />,
+  }),
+  'navigation.reload': (frame: NavigationFrame) => ({
+    colorGraphicsToken: 'success',
+    description: stripURLOrigin(frame.description),
+    tabKey: TabKey.NETWORK,
+    title: 'Reload',
+    icon: <IconLocation size="xs" />,
+  }),
+  'navigation.back_forward': (frame: NavigationFrame) => ({
+    colorGraphicsToken: 'success',
+    description: stripURLOrigin(frame.description),
+    tabKey: TabKey.NETWORK,
+    title: 'Navigate Back/Forward',
+    icon: <IconLocation size="xs" />,
+  }),
+  'navigation.push': (frame: NavigationFrame) => ({
+    colorGraphicsToken: 'success',
+    description: stripURLOrigin(frame.description),
+    tabKey: TabKey.NETWORK,
+    title: 'Navigation',
+    icon: <IconLocation size="xs" />,
+  }),
+  'web-vital': (frame: WebVitalFrame) => {
+    const value = frame.data?.value;
+    const unit = isCLSFrame(frame) ? '' : 'ms';
+    switch (frame.data?.rating) {
+      case undefined:
+        return {
+          colorGraphicsToken: 'neutral',
+          description:
+            value === undefined
+              ? t('No value recorded')
+              : tct('[value][unit]', {value: value.toFixed(2), unit}),
+          tabKey: TabKey.NETWORK,
+          title: <WebVitalTitle frame={frame} />,
+          icon: <IconInfo size="xs" />,
+        };
+      case 'good':
+        return {
+          colorGraphicsToken: 'success',
+          description:
+            value === undefined
+              ? t('Good')
+              : tct('[value][unit] (Good)', {value: value.toFixed(2), unit}),
+          tabKey: TabKey.NETWORK,
+          title: <WebVitalTitle frame={frame} />,
+          icon: <IconHappy size="xs" />,
+        };
+      case 'needs-improvement':
+        return {
+          colorGraphicsToken: 'warning',
+          description:
+            value === undefined
+              ? t('Meh')
+              : tct('[value][unit] (Meh)', {value: value.toFixed(2), unit}),
+          tabKey: TabKey.NETWORK,
+          title: <WebVitalTitle frame={frame} />,
+          icon: <IconMeh size="xs" />,
+        };
+      default:
+        return {
+          colorGraphicsToken: 'danger',
+          description:
+            value === undefined
+              ? t('Poor')
+              : tct('[value][unit] (Poor)', {value: value.toFixed(2), unit}),
+          tabKey: TabKey.NETWORK,
+          title: <WebVitalTitle frame={frame} />,
+          icon: <IconSad size="xs" />,
+        };
+    }
+  },
+  memory: () => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.MEMORY,
+    title: 'Memory',
+    icon: <IconInfo size="xs" />,
+  }),
+  paint: () => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: 'Paint',
+    icon: <IconInfo size="xs" />,
+  }),
+  'resource.css': (frame: ResourceFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.fetch': (frame: RequestFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.iframe': (frame: ResourceFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.img': (frame: ResourceFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.link': (frame: ResourceFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.other': (frame: ResourceFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.script': (frame: ResourceFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.xhr': (frame: RequestFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'resource.http': (frame: RequestFrame) => ({
+    colorGraphicsToken: 'neutral',
+    description: undefined,
+    tabKey: TabKey.NETWORK,
+    title: frame.description,
+    icon: <IconSort size="xs" rotated />,
+  }),
+  'device.connectivity': (frame: DeviceConnectivityFrame) => ({
+    colorGraphicsToken: 'promotion',
+    description:
+      (frame.data && DEVICE_CONNECTIVITY_MESSAGE[frame.data.state]) ??
+      t('Device connectivity changed'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'Device Connectivity',
+    icon: <IconWifi size="xs" />,
+  }),
+  'device.battery': (frame: DeviceBatteryFrame) => ({
+    colorGraphicsToken: 'promotion',
+    description: frame.data
+      ? tct('Device was at [percent]% battery and [charging]', {
+          percent: Math.round(frame.data.level),
+          charging: frame.data.charging ? 'charging' : 'not charging',
+        })
+      : t('Device battery status is unknown'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'Device Battery',
+    icon: <IconLightning size="xs" />,
+  }),
+  'device.orientation': (frame: DeviceOrientationFrame) => ({
+    colorGraphicsToken: 'promotion',
+    description: frame.data
+      ? tct('Device orientation was changed to [orientation]', {
+          orientation: frame.data.position,
+        })
+      : t('Device orientation was changed'),
+    tabKey: TabKey.BREADCRUMBS,
+    title: 'Device Orientation',
+    icon: <IconRefresh size="xs" />,
+  }),
+};
+
+// Keep this lowercase. React Compiler treats capitalized functions that create
+// JSX as components, and this one is called from event handlers.
+const defaultMapper = (frame: any): Details => ({
+  colorGraphicsToken: 'neutral',
+  description: frame.message ?? frame.data ?? '',
+  tabKey: TabKey.BREADCRUMBS,
+  title: toTitleCase(defaultTitle(frame)),
+  icon: <IconTerminal size="xs" />,
+});
+
+export function getFrameDetails(frame: ReplayFrame): Details {
+  const key = getFrameOpOrCategory(frame);
+  const fn = MAPPER_FOR_FRAME[key] ?? defaultMapper;
+  try {
+    return fn(frame);
+  } catch (error) {
+    return defaultMapper(frame);
+  }
+}
+
+export function defaultTitle(frame: ReplayFrame | RawBreadcrumbFrame) {
+  // Override title for User Feedback frames
+  if (
+    'message' in frame &&
+    typeof frame.message === 'string' &&
+    frame.category === 'feedback'
+  ) {
+    return t('User Feedback');
+  }
+  if ('category' in frame && frame.category) {
+    const [type, action] = frame.category.split('.');
+    return `${type} ${action || ''}`.trim();
+  }
+  if ('message' in frame && frame.message) {
+    return frame.message; // TODO(replay): Included for backwards compat
+  }
+  return 'description' in frame ? (frame.description ?? '') : '';
+}
+
+function stringifyNodeAttributes(node: ClickFrameNode | undefined) {
+  const {tagName, attributes} = node ?? {};
+  const attributesEntries = Object.entries(attributes ?? {});
+  const componentName = attributes?.['data-sentry-component'];
+
+  const selector = `${componentName ?? tagName ?? ''}${
+    attributesEntries.length
+      ? attributesEntries
+          .map(([attr, val]) =>
+            componentName && attr === 'data-sentry-component' ? '' : `[${attr}="${val}"]`
+          )
+          .join('')
+      : ''
+  }`;
+
+  return selector || t('an unknown element');
+}
+
+function WebVitalTitle({frame}: {frame: WebVitalFrame}) {
+  const vitalDefinition = function () {
+    switch (frame.description) {
+      case 'cumulative-layout-shift':
+        return 'Cumulative Layout Shift (CLS) is the sum of individual layout shift scores for every unexpected element shift during the rendering process. ';
+      case 'interaction-to-next-paint':
+        return "Interaction to Next Paint (INP) is a metric that assesses a page's overall responsiveness to user interactions by observing the latency of all user interactions that occur throughout the lifespan of a user's visit to a page. ";
+      case 'largest-contentful-paint':
+        return 'Largest Contentful Paint (LCP) measures the render time for the largest content to appear in the viewport. ';
+      default:
+        return '';
+    }
+  };
+  return (
+    <Flex align="center" gap="xs">
+      {t('Web Vital: ') + toTitleCase(explodeSlug(frame.description))}
+      <InfoTip
+        size="xs"
+        title={
+          <Fragment>
+            {vitalDefinition()}
+            <ExternalLink href={`${MODULE_DOC_LINK}/web-vitals-concepts/`}>
+              {t('Learn more about web vitals here.')}
+            </ExternalLink>
+          </Fragment>
+        }
+      />
+    </Flex>
+  );
+}

@@ -1,0 +1,96 @@
+import type React from 'react';
+import {useEffect, useState} from 'react';
+import styled from '@emotion/styled';
+import {IconChevron} from '@sentry/icons/chevron';
+import {motion} from 'framer-motion';
+
+import {Stack} from '@sentry/scraps/layout';
+
+type AccordionRowProps = {
+  /**
+   * The body of the accordion that is shown & hidden
+   */
+  body: React.ReactNode;
+  /**
+   * The header of the accordion that is always shown
+   */
+  title: React.ReactNode;
+  /**
+   * Whether to render the body
+   */
+  disableBody?: boolean;
+  /**
+   * Whether the accordion is disabled (cannot be opened)
+   */
+  disabled?: boolean;
+  /**
+   * Action to execute upon opening accordion
+   */
+  onOpen?: () => Promise<void>;
+};
+
+export function AccordionRow({
+  disabled = false,
+  disableBody,
+  body,
+  title,
+  onOpen = async () => {},
+}: AccordionRowProps) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const duration = 0.2; // how long it takes the accordion to open/close
+  const animationState = isExpanded ? 'open' : 'collapsed';
+
+  useEffect(() => {
+    if (disabled) {
+      // oxlint-disable-next-line react/set-state-in-effect
+      setIsExpanded(false);
+    }
+  }, [disabled]);
+
+  const toggleDetails = () => {
+    setIsExpanded(!isExpanded);
+  };
+
+  return (
+    <Stack width="100%">
+      <Title
+        onClick={async () => {
+          if (!isExpanded) {
+            await onOpen();
+          }
+          toggleDetails();
+        }}
+        disabled={disabled}
+        data-test-id="accordion-title"
+      >
+        {title}
+        {!disabled && (
+          <IconChevron variant="muted" direction={isExpanded ? 'up' : 'down'} size="sm" />
+        )}
+      </Title>
+
+      <motion.div
+        initial="collapsed"
+        animate={disabled || disableBody ? undefined : animationState}
+        variants={{
+          open: {
+            height: 'auto',
+            overflow: 'visible',
+            transition: {duration, overflow: {delay: duration}},
+          },
+          collapsed: {height: 0, overflow: 'hidden', transition: {duration}},
+        }}
+      >
+        {body}
+      </motion.div>
+    </Stack>
+  );
+}
+
+const Title = styled('div')<{disabled: boolean}>`
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: ${props => (props.disabled ? 'auto' : 'pointer')};
+`;

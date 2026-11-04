@@ -1,36 +1,246 @@
-from sentry.models import Activity, OrganizationMember, OrganizationMemberTeam
-from sentry.incidents.models import IncidentActivityType
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import pytest
+from django.db.utils import IntegrityError
+from django.utils import timezone
 from django.utils.functional import cached_property
-from sentry.testutils.factories import Factories
-from sentry.testutils.helpers.datetime import before_now, iso_format
+from sentry_kafka_schemas.schema_types.uptime_results_v1 import (
+    CHECKSTATUS_FAILURE,
+    CHECKSTATUS_SUCCESS,
+)
 
+from sentry.constants import ObjectStatus
+from sentry.grouping.grouptype import ErrorGroupType
+from sentry.incidents.models.alert_rule import AlertRule
+from sentry.integrations.models.gcp_service_account import GcpServiceAccount
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.services.integration import RpcIntegration
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.issues.models.groupactionlogentry import GroupActionLogEntry
+from sentry.issues.models.groupderiveddata import GroupDerivedData
+from sentry.models.activity import Activity
+from sentry.models.commitcomparison import CommitComparison
+from sentry.models.custominboundfilter import CustomInboundFilter
+from sentry.models.environment import Environment
+from sentry.models.group import Group, GroupStatus
+from sentry.models.grouphash import GroupHash
+from sentry.models.grouprelease import GroupRelease
+from sentry.models.groupsearchview import GroupSearchView
+from sentry.models.organization import Organization
+from sentry.models.organizationcontributors import OrganizationContributors
+from sentry.models.organizationmember import OrganizationMember
+from sentry.models.organizationmemberteam import OrganizationMemberTeam
+from sentry.models.project import Project
+from sentry.models.rule import Rule
+from sentry.models.team import Team
+from sentry.monitors.models import (
+    Monitor,
+    MonitorCheckIn,
+    MonitorEnvironment,
+    MonitorIncident,
+    ScheduleType,
+)
+from sentry.organizations.services.organization import RpcOrganization
+from sentry.preprod.models import (
+    PreprodArtifact,
+    PreprodArtifactMobileAppInfo,
+    PreprodArtifactSizeComparison,
+    PreprodArtifactSizeMetrics,
+    PreprodBuildConfiguration,
+    PreprodComparisonApproval,
+    PreprodSnapshotComparison,
+    PreprodSnapshotMetrics,
+)
+from sentry.replays.models import ReplayDeletionJobModel
+from sentry.service_accounts.models import ServiceAccount
+from sentry.services.eventstore.models import Event
+from sentry.silo.base import SiloMode
+from sentry.tempest.models import TempestCredentials
+from sentry.testutils.factories import Factories
+from sentry.testutils.helpers.datetime import before_now
+from sentry.testutils.pytest.fixtures import InstaSnapshotter
+from sentry.testutils.silo import assume_test_silo_mode
 
 # XXX(dcramer): this is a compatibility layer to transition to pytest-based fixtures
 # all of the memoized fixtures are copypasta due to our inability to use pytest fixtures
 # on a per-class method basis
+from sentry.types.activity import ActivityType
+from sentry.types.actor import Actor
+from sentry.uptime.models import (
+    IntervalSecondsLiteral,
+    SupportedHTTPMethodsLiteral,
+    UptimeSubscription,
+    UptimeSubscriptionRegion,
+)
+from sentry.uptime.types import (
+    DATA_SOURCE_UPTIME_SUBSCRIPTION,
+    DEFAULT_DOWNTIME_THRESHOLD,
+    DEFAULT_RECOVERY_THRESHOLD,
+    GROUP_TYPE_UPTIME_DOMAIN_CHECK_FAILURE,
+    UptimeMonitorMode,
+)
+from sentry.users.models.identity import Identity, IdentityProvider
+from sentry.users.models.user import User
+from sentry.users.services.user import RpcUser
+from sentry.workflow_engine.models import DataSource, Detector, DetectorState, Workflow
+from sentry.workflow_engine.models.data_condition import Condition
+from sentry.workflow_engine.types import DetectorPriorityLevel
+
+if TYPE_CHECKING:
+    from django.contrib.sessions.backends.base import SessionBase
+
+    from sentry.ai_monitoring.models import AIConversationMetadata
+    from sentry.auth.access import RpcBackedAccess
+    from sentry.data_secrecy.models.data_access_grant import DataAccessGrant
+    from sentry.discover.models import DiscoverSavedQuery
+    from sentry.explore.models import ExploreSavedFormula, ExploreSavedQuery
+    from sentry.hybridcloud.models.webhookpayload import WebhookPayload
+    from sentry.integrations.models.data_forwarder import DataForwarder
+    from sentry.integrations.models.data_forwarder_project import DataForwarderProject
+    from sentry.integrations.models.doc_integration import DocIntegration
+    from sentry.integrations.models.doc_integration_avatar import DocIntegrationAvatar
+    from sentry.integrations.models.external_actor import ExternalActor
+    from sentry.integrations.models.external_issue import ExternalIssue
+    from sentry.integrations.models.integration_external_project import IntegrationExternalProject
+    from sentry.integrations.models.integration_feature import IntegrationFeature
+    from sentry.integrations.models.repository_project_path_config import (
+        RepositoryProjectPathConfig,
+    )
+    from sentry.investigations.models import (
+        InvestigationOrchestrationCommand,
+        InvestigationOrchestrationEvent,
+        InvestigationOrchestrationRun,
+    )
+    from sentry.models.apiapplication import ApiApplication
+    from sentry.models.apidevicecode import ApiDeviceCode
+    from sentry.models.apikey import ApiKey
+    from sentry.models.apitoken import ApiToken
+    from sentry.models.artifactbundle import ArtifactBundle
+    from sentry.models.authidentity import AuthIdentity
+    from sentry.models.authprovider import AuthProvider
+    from sentry.models.avatars.organization_avatar import OrganizationAvatar
+    from sentry.models.commit import Commit
+    from sentry.models.commitauthor import CommitAuthor
+    from sentry.models.commitfilechange import CommitFileChange
+    from sentry.models.dashboard import Dashboard, DashboardFavoriteUser
+    from sentry.models.dashboard_widget import DashboardWidget, DashboardWidgetQuery
+    from sentry.models.debugfile import ProjectDebugFile
+    from sentry.models.files.file import File
+    from sentry.models.grouphistory import GroupHistory
+    from sentry.models.grouplink import GroupLink
+    from sentry.models.groupowner import GroupOwner
+    from sentry.models.groupresolution import GroupResolution
+    from sentry.models.groupsubscription import GroupSubscription
+    from sentry.models.organizationmapping import OrganizationMapping
+    from sentry.models.organizationmemberinvite import OrganizationMemberInvite
+    from sentry.models.orgauthtoken import OrgAuthToken
+    from sentry.models.projectbookmark import ProjectBookmark
+    from sentry.models.projectcodeowners import ProjectCodeOwners
+    from sentry.models.projectkey import ProjectKey
+    from sentry.models.projectrepository import ProjectRepository
+    from sentry.models.pullrequest import PullRequest, PullRequestComment, PullRequestCommit
+    from sentry.models.release import Release
+    from sentry.models.releasecommit import ReleaseCommit
+    from sentry.models.releasefile import ReleaseFile
+    from sentry.models.repository import Repository
+    from sentry.models.repositorysettings import RepositorySettings
+    from sentry.models.userreport import UserReport
+    from sentry.models.weeklyreportprojectexclusion import WeeklyReportProjectExclusion
+    from sentry.notebooks.models import (
+        Notebook,
+        NotebookActionRequest,
+        NotebookBlock,
+        NotebookBlockExecution,
+        NotebookBlockExecutionProject,
+        NotebookComment,
+        NotebookFavoriteUser,
+        NotebookProject,
+        NotebookSeen,
+    )
+    from sentry.notifications.models.inboxitem import InboxItem
+    from sentry.notifications.models.inboxitemevent import InboxItemEvent
+    from sentry.notifications.models.notificationaction import NotificationAction
+    from sentry.notifications.models.notificationsettingoption import NotificationSettingOption
+    from sentry.notifications.models.notificationsettingprovider import NotificationSettingProvider
+    from sentry.preprod.models import InstallablePreprodArtifact
+    from sentry.seer.models.agent_write_grant import SeerAgentWriteGrant
+    from sentry.seer.models.autofix_issue_data import SeerAutofixIssueData
+    from sentry.seer.models.project_repository import SeerProjectRepository
+    from sentry.seer.models.run import (
+        SeerAgentRun,
+        SeerRun,
+        SeerRunCodingAgentHandoff,
+        SeerRunPullRequest,
+    )
+    from sentry.sentry_apps.models.platformexternalissue import PlatformExternalIssue
+    from sentry.sentry_apps.models.sentry_app import SentryApp
+    from sentry.sentry_apps.models.sentry_app_avatar import SentryAppAvatar
+    from sentry.sentry_apps.models.sentry_app_installation import SentryAppInstallation
+    from sentry.sentry_apps.models.sentry_app_installation_for_provider import (
+        SentryAppInstallationForProvider,
+    )
+    from sentry.sentry_apps.models.servicehook import ServiceHook, ServiceHookProject
+    from sentry.users.models.identity import OrganizationIdentity
+    from sentry.users.models.user_avatar import UserAvatar
+    from sentry.users.models.user_option import UserOption
+    from sentry.users.models.useremail import UserEmail
+    from sentry.users.models.userrole import UserRole
+    from sentry.workflow_engine.models import (
+        Action,
+        ActionAlertRuleTriggerAction,
+        AlertRuleDetector,
+        AlertRuleWorkflow,
+        DataCondition,
+        DataConditionAlertRuleTrigger,
+        DataConditionGroup,
+        DataConditionGroupAction,
+        DataSourceDetector,
+        DetectorGroup,
+        DetectorWorkflow,
+        IncidentGroupOpenPeriod,
+        WorkflowDataConditionGroup,
+    )
+    from sentry.workflow_engine.types import ActionInvocation
+    from social_auth.models import UserSocialAuth
+
+
 class Fixtures:
     @cached_property
-    def session(self):
+    def session(self) -> SessionBase:
         return Factories.create_session()
 
     @cached_property
-    def projectkey(self):
+    def projectkey(self) -> ProjectKey:
         return self.create_project_key(project=self.project)
 
     @cached_property
-    def user(self):
-        return self.create_user("admin@localhost", is_superuser=True)
+    def user(self) -> User:
+        try:
+            return self.create_user(
+                "admin@localhost",
+                is_superuser=True,
+                is_staff=True,
+                is_sentry_app=False,
+            )
+        except IntegrityError:
+            with assume_test_silo_mode(SiloMode.CONTROL):
+                return User.objects.get(email="admin@localhost")
 
     @cached_property
-    def organization(self):
+    def organization(self) -> Organization:
         # XXX(dcramer): ensure that your org slug doesnt match your team slug
         # and the same for your project slug
         return self.create_organization(name="baz", slug="baz", owner=self.user)
 
     @cached_property
-    def team(self):
+    @assume_test_silo_mode(SiloMode.CELL)
+    def team(self) -> Team:
         team = self.create_team(organization=self.organization, name="foo", slug="foo")
         # XXX: handle legacy team fixture
         queryset = OrganizationMember.objects.filter(organization=self.organization)
@@ -39,275 +249,646 @@ class Fixtures:
         return team
 
     @cached_property
-    def project(self):
-        return self.create_project(
-            name="Bar", slug="bar", teams=[self.team], fire_project_created=True
-        )
+    def project(self) -> Project:
+        return self.create_project(name="Bar", slug="bar", teams=[self.team])
 
     @cached_property
-    def release(self):
+    def release(self) -> Release:
         return self.create_release(project=self.project, version="foo-1.0")
 
     @cached_property
-    def environment(self):
+    def environment(self) -> Environment:
         return self.create_environment(name="development", project=self.project)
 
     @cached_property
-    def group(self):
-        # こんにちは konichiwa
+    def group(self) -> Group:
         return self.create_group(message="\u3053\u3093\u306b\u3061\u306f")
 
     @cached_property
-    def event(self):
+    def event(self) -> Event:
         return self.store_event(
             data={
                 "event_id": "a" * 32,
                 "message": "\u3053\u3093\u306b\u3061\u306f",
-                "timestamp": iso_format(before_now(seconds=1)),
+                "timestamp": before_now(seconds=1).isoformat(),
             },
             project_id=self.project.id,
         )
 
     @cached_property
-    def activity(self):
+    @assume_test_silo_mode(SiloMode.CELL)
+    def activity(self) -> Activity:
         return Activity.objects.create(
-            group=self.group, project=self.project, type=Activity.NOTE, user=self.user, data={}
+            group=self.group,
+            project=self.project,
+            type=ActivityType.NOTE.value,
+            user_id=self.user.id,
+            data={},
         )
 
-    def create_organization(self, *args, **kwargs):
+    @cached_property
+    @assume_test_silo_mode(SiloMode.CONTROL)
+    def integration(self) -> Integration:
+        integration = Integration.objects.create(
+            provider=IntegrationProviderSlug.GITHUB.value,
+            name="GitHub",
+            external_id="github:1",
+            metadata={
+                "access_token": "xxxxx-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx",
+                "expires_at": (timezone.now() + timedelta(days=14)).isoformat(),
+            },
+        )
+        integration.add_organization(self.organization, self.user)
+        return integration
+
+    @cached_property
+    @assume_test_silo_mode(SiloMode.CONTROL)
+    def organization_integration(self) -> OrganizationIntegration | None:
+        return self.integration.add_organization(self.organization, self.user)
+
+    def create_organization(self, *args: Any, **kwargs: Any) -> Organization:
         return Factories.create_organization(*args, **kwargs)
 
-    def create_member(self, *args, **kwargs):
+    def create_organization_avatar(self, *args: Any, **kwargs: Any) -> OrganizationAvatar:
+        return Factories.create_organization_avatar(*args, **kwargs)
+
+    def create_notebook(self, *args: Any, **kwargs: Any) -> Notebook:
+        return Factories.create_notebook(*args, **kwargs)
+
+    def create_notebook_project(self, *args: Any, **kwargs: Any) -> NotebookProject:
+        return Factories.create_notebook_project(*args, **kwargs)
+
+    def create_notebook_favorite(self, *args: Any, **kwargs: Any) -> NotebookFavoriteUser:
+        return Factories.create_notebook_favorite(*args, **kwargs)
+
+    def create_notebook_seen(self, *args: Any, **kwargs: Any) -> NotebookSeen:
+        return Factories.create_notebook_seen(*args, **kwargs)
+
+    def create_notebook_comment(self, *args: Any, **kwargs: Any) -> NotebookComment:
+        return Factories.create_notebook_comment(*args, **kwargs)
+
+    def create_notebook_action_request(self, *args: Any, **kwargs: Any) -> NotebookActionRequest:
+        return Factories.create_notebook_action_request(*args, **kwargs)
+
+    def create_notebook_block(self, *args: Any, **kwargs: Any) -> NotebookBlock:
+        return Factories.create_notebook_block(*args, **kwargs)
+
+    def create_notebook_block_execution(self, *args: Any, **kwargs: Any) -> NotebookBlockExecution:
+        return Factories.create_notebook_block_execution(*args, **kwargs)
+
+    def create_notebook_block_execution_project(
+        self, *args: Any, **kwargs: Any
+    ) -> NotebookBlockExecutionProject:
+        return Factories.create_notebook_block_execution_project(*args, **kwargs)
+
+    def create_investigation_orchestration_run(
+        self, *args: Any, **kwargs: Any
+    ) -> InvestigationOrchestrationRun:
+        return Factories.create_investigation_orchestration_run(*args, **kwargs)
+
+    def create_investigation_orchestration_event(
+        self, *args: Any, **kwargs: Any
+    ) -> InvestigationOrchestrationEvent:
+        return Factories.create_investigation_orchestration_event(*args, **kwargs)
+
+    def create_investigation_orchestration_command(
+        self, *args: Any, **kwargs: Any
+    ) -> InvestigationOrchestrationCommand:
+        return Factories.create_investigation_orchestration_command(*args, **kwargs)
+
+    def create_member(self, *args: Any, **kwargs: Any) -> OrganizationMember:
         return Factories.create_member(*args, **kwargs)
 
-    def create_team_membership(self, *args, **kwargs):
+    def create_member_invite(self, *args: Any, **kwargs: Any) -> OrganizationMemberInvite:
+        return Factories.create_member_invite(*args, **kwargs)
+
+    def create_api_key(self, *args: Any, **kwargs: Any) -> ApiKey:
+        return Factories.create_api_key(*args, **kwargs)
+
+    def create_api_application(self, **kwargs: Any) -> ApiApplication:
+        kwargs.setdefault("owner", self.user)
+        return Factories.create_api_application(**kwargs)
+
+    def create_api_device_code(self, *args: Any, **kwargs: Any) -> ApiDeviceCode:
+        return Factories.create_api_device_code(*args, **kwargs)
+
+    def create_auth_provider(self, *args: Any, **kwargs: Any) -> AuthProvider:
+        return Factories.create_auth_provider(*args, **kwargs)
+
+    def create_auth_identity(self, *args: Any, **kwargs: Any) -> AuthIdentity:
+        return Factories.create_auth_identity(*args, **kwargs)
+
+    def create_user_auth_token(self, *args: Any, **kwargs: Any) -> ApiToken:
+        return Factories.create_user_auth_token(*args, **kwargs)
+
+    def create_org_auth_token(self, *args: Any, **kwargs: Any) -> OrgAuthToken:
+        return Factories.create_org_auth_token(*args, **kwargs)
+
+    def create_team_membership(self, *args: Any, **kwargs: Any) -> OrganizationMemberTeam:
         return Factories.create_team_membership(*args, **kwargs)
 
-    def create_team(self, organization=None, **kwargs):
+    def create_team(self, organization: Organization | None = None, **kwargs: Any) -> Team:
         if organization is None:
             organization = self.organization
 
         return Factories.create_team(organization=organization, **kwargs)
 
-    def create_environment(self, project=None, **kwargs):
+    def create_environment(self, project: Project | None = None, **kwargs: Any) -> Environment:
         if project is None:
             project = self.project
         return Factories.create_environment(project=project, **kwargs)
 
-    def create_project(self, **kwargs):
-        kwargs.setdefault("teams", [self.team])
+    def create_project(self, **kwargs: Any) -> Project:
+        if "teams" not in kwargs:
+            kwargs["teams"] = [self.team]
         return Factories.create_project(**kwargs)
 
-    def create_project_bookmark(self, project=None, *args, **kwargs):
+    def create_project_bookmark(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> ProjectBookmark:
         if project is None:
             project = self.project
-        return Factories.create_project_bookmark(project=project, *args, **kwargs)
+        return Factories.create_project_bookmark(project, *args, **kwargs)
 
-    def create_project_key(self, project=None, *args, **kwargs):
+    def create_ai_conversation_metadata(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> AIConversationMetadata:
         if project is None:
             project = self.project
-        return Factories.create_project_key(project=project, *args, **kwargs)
+        return Factories.create_ai_conversation_metadata(project, *args, **kwargs)
+
+    def create_replay_deletion_job(
+        self, project: Project | None = None, **kwargs: Any
+    ) -> ReplayDeletionJobModel:
+        if project is None:
+            project = self.project
+        return Factories.create_replay_deletion_job(project, **kwargs)
+
+    def create_project_key(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> ProjectKey:
+        if project is None:
+            project = self.project
+        return Factories.create_project_key(project, *args, **kwargs)
+
+    def create_project_custom_inbound_filter(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> CustomInboundFilter:
+        if project is None:
+            project = self.project
+        return Factories.create_project_custom_inbound_filter(project, *args, **kwargs)
 
     def create_project_rule(
-        self, project=None, action_match=None, condition_match=None, *args, **kwargs
-    ):
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> Rule:
         if project is None:
             project = self.project
-        return Factories.create_project_rule(
-            project=project,
-            action_match=action_match,
-            condition_match=condition_match,
-            *args,
-            **kwargs,
-        )
+        return Factories.create_project_rule(project, *args, **kwargs)
 
     def create_slack_project_rule(
-        self, project=None, integration_id=None, channel_id=None, channel_name=None, *args, **kwargs
-    ):
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> Rule:
         if project is None:
             project = self.project
-        return Factories.create_slack_project_rule(
-            project,
-            integration_id=integration_id,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            *args,
-            **kwargs,
-        )
+        return Factories.create_slack_project_rule(project, *args, **kwargs)
 
-    def create_release(self, project=None, user=None, *args, **kwargs):
+    def create_release(self, project: Project | None = None, *args: Any, **kwargs: Any) -> Release:
         if project is None:
             project = self.project
-        return Factories.create_release(project=project, user=user, *args, **kwargs)
+        return Factories.create_release(project, *args, **kwargs)
 
-    def create_release_file(self, release=None, file=None, name=None, dist=None):
-        if release is None:
-            release = self.release
-        return Factories.create_release_file(release, file, name, dist)
+    def create_group_release(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> GroupRelease:
+        if project is None:
+            project = self.project
+        return Factories.create_group_release(project, *args, **kwargs)
 
-    def create_artifact_bundle(self, org=None, release=None, *args, **kwargs):
+    def create_release_file(
+        self,
+        release_id: int | None = None,
+        file: File | None = None,
+        name: str | None = None,
+        dist_id: int | None = None,
+    ) -> ReleaseFile:
+        if release_id is None:
+            release_id = self.release.id
+        return Factories.create_release_file(release_id, file, name, dist_id)
+
+    def create_artifact_bundle_zip(
+        self, org: str | None = None, release: str | None = None, *args: Any, **kwargs: Any
+    ) -> bytes:
+        return Factories.create_artifact_bundle_zip(org, release, *args, **kwargs)
+
+    def create_release_archive(
+        self, org: str | None = None, release: str | None = None, *args: Any, **kwargs: Any
+    ) -> ReleaseFile | None:
         if org is None:
             org = self.organization.slug
         if release is None:
             release = self.release.version
-        return Factories.create_artifact_bundle(org, release, *args, **kwargs)
+        return Factories.create_release_archive(org, release, *args, **kwargs)
 
-    def create_code_mapping(self, project=None, repo=None, **kwargs):
+    def create_artifact_bundle(
+        self, org: Organization | None = None, *args: Any, **kwargs: Any
+    ) -> ArtifactBundle:
+        if org is None:
+            org = self.organization
+        return Factories.create_artifact_bundle(org, *args, **kwargs)
+
+    def create_code_mapping(
+        self,
+        project: Project | None = None,
+        repo: Repository | None = None,
+        organization_integration: OrganizationIntegration | None = None,
+        **kwargs: Any,
+    ) -> RepositoryProjectPathConfig:
         if project is None:
             project = self.project
-        return Factories.create_code_mapping(project, repo, **kwargs)
+        if organization_integration is None:
+            organization_integration = self.organization_integration
+        return Factories.create_code_mapping(project, repo, organization_integration, **kwargs)
 
-    def create_repo(self, project=None, *args, **kwargs):
+    def create_repo(self, project: Project | None = None, *args: Any, **kwargs: Any) -> Repository:
         if project is None:
             project = self.project
-        return Factories.create_repo(project=project, *args, **kwargs)
+        return Factories.create_repo(project, *args, **kwargs)
 
-    def create_commit(self, *args, **kwargs):
+    def create_project_repository(
+        self, project: Project | None = None, **kwargs: Any
+    ) -> ProjectRepository:
+        if project is None:
+            project = self.project
+        return Factories.create_project_repository(project, **kwargs)
+
+    def create_seer_project_repository(
+        self, project: Project | None = None, **kwargs: Any
+    ) -> SeerProjectRepository:
+        if project is None:
+            project = self.project
+        return Factories.create_seer_project_repository(project, **kwargs)
+
+    def create_repository_settings(self, *args: Any, **kwargs: Any) -> RepositorySettings:
+        return Factories.create_repository_settings(*args, **kwargs)
+
+    def create_commit(self, *args: Any, **kwargs: Any) -> Commit:
         return Factories.create_commit(*args, **kwargs)
 
-    def create_commit_author(self, *args, **kwargs):
+    def create_commit_author(self, *args: Any, **kwargs: Any) -> CommitAuthor:
         return Factories.create_commit_author(*args, **kwargs)
 
-    def create_commit_file_change(self, *args, **kwargs):
+    def create_commit_file_change(self, *args: Any, **kwargs: Any) -> tuple[CommitFileChange, bool]:
         return Factories.create_commit_file_change(*args, **kwargs)
 
-    def create_user(self, *args, **kwargs):
+    def create_pull_request(self, *args: Any, **kwargs: Any) -> PullRequest:
+        return Factories.create_pull_request(*args, **kwargs)
+
+    def create_pull_request_comment(self, *args: Any, **kwargs: Any) -> PullRequestComment:
+        return Factories.create_pull_request_comment(*args, **kwargs)
+
+    def create_pull_request_commit(self, *args: Any, **kwargs: Any) -> PullRequestCommit:
+        return Factories.create_pull_request_commit(*args, **kwargs)
+
+    def create_release_commit(self, *args: Any, **kwargs: Any) -> ReleaseCommit:
+        return Factories.create_release_commit(*args, **kwargs)
+
+    def create_user(self, *args: Any, **kwargs: Any) -> User:
         return Factories.create_user(*args, **kwargs)
 
-    def create_useremail(self, *args, **kwargs):
+    def create_useremail(self, *args: Any, **kwargs: Any) -> UserEmail:
         return Factories.create_useremail(*args, **kwargs)
 
-    def store_event(self, *args, **kwargs):
+    def create_user_avatar(self, *args: Any, **kwargs: Any) -> UserAvatar:
+        return Factories.create_user_avatar(*args, **kwargs)
+
+    def create_user_role(self, *args: Any, **kwargs: Any) -> UserRole:
+        return Factories.create_user_role(*args, **kwargs)
+
+    def create_usersocialauth(
+        self,
+        user: User | None = None,
+        provider: str | None = None,
+        uid: str | None = None,
+        extra_data: dict[str, Any] | None = None,
+    ) -> UserSocialAuth:
+        if not user:
+            user = self.user
+        return Factories.create_usersocialauth(
+            user=user, provider=provider, uid=uid, extra_data=extra_data
+        )
+
+    def store_event(self, *args: Any, **kwargs: Any) -> Event:
         return Factories.store_event(*args, **kwargs)
 
-    def create_group(self, project=None, *args, **kwargs):
+    def create_tempest_credentials(
+        self, project: Project, *args: Any, **kwargs: Any
+    ) -> TempestCredentials:
+        return Factories.create_tempest_credentials(project, *args, **kwargs)
+
+    def create_github_identity(
+        self, user: User | None = None, idp: IdentityProvider | None = None, **kwargs: Any
+    ) -> Identity:
+        if not user:
+            user = self.user
+        return Factories.create_github_identity(user=user, idp=idp, **kwargs)
+
+    def create_github_provider(self, **kwargs: Any) -> IdentityProvider:
+        return Factories.create_github_provider(**kwargs)
+
+    def create_group(self, project: Project | None = None, *args: Any, **kwargs: Any) -> Group:
         if project is None:
             project = self.project
-        return Factories.create_group(project=project, *args, **kwargs)
+        return Factories.create_group(project, *args, **kwargs)
 
-    def create_file(self, **kwargs):
+    def create_group_activity(
+        self, group: Group | None = None, *args: Any, **kwargs: Any
+    ) -> Activity:
+        if group is None:
+            group = self.group
+        return Factories.create_group_activity(group, *args, **kwargs)
+
+    def create_group_link(self, group: Group | None = None, **kwargs: Any) -> GroupLink:
+        if group is None:
+            group = self.group
+        return Factories.create_group_link(group, **kwargs)
+
+    def create_group_resolution(self, group: Group | None = None, **kwargs: Any) -> GroupResolution:
+        if group is None:
+            group = self.group
+        return Factories.create_group_resolution(group, **kwargs)
+
+    def create_group_subscription(
+        self, group: Group | None = None, **kwargs: Any
+    ) -> GroupSubscription:
+        if group is None:
+            group = self.group
+        return Factories.create_group_subscription(group, **kwargs)
+
+    def create_group_owner(self, group: Group | None = None, **kwargs: Any) -> GroupOwner:
+        if group is None:
+            group = self.group
+        return Factories.create_group_owner(group, **kwargs)
+
+    def create_group_action_log_entry(
+        self, group: Group | None = None, *args: Any, **kwargs: Any
+    ) -> GroupActionLogEntry:
+        if group is None:
+            group = self.group
+        return Factories.create_group_action_log_entry(group, *args, **kwargs)
+
+    def create_group_derived_data(
+        self, group: Group | None = None, **kwargs: Any
+    ) -> GroupDerivedData:
+        if group is None:
+            group = self.group
+        return Factories.create_group_derived_data(group, **kwargs)
+
+    def create_n_groups_with_hashes(
+        self, number_of_groups: int, project: Project, group_type: int | None = None
+    ) -> list[Group]:
+        groups = []
+        for _ in range(number_of_groups):
+            if group_type:
+                group = self.create_group(
+                    project=project, status=GroupStatus.RESOLVED, type=group_type
+                )
+            else:
+                group = self.create_group(project=project, status=GroupStatus.RESOLVED)
+            hash = uuid4().hex
+            GroupHash.objects.create(project=group.project, hash=hash, group=group)
+            groups.append(group)
+
+        return groups
+
+    def create_file(self, **kwargs: Any) -> File:
         return Factories.create_file(**kwargs)
 
-    def create_file_from_path(self, *args, **kwargs):
-        return Factories.create_file_from_path(*args, **kwargs)
+    def create_data_forwarder(
+        self, organization: Organization | None = None, *args: Any, **kwargs: Any
+    ) -> DataForwarder:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_data_forwarder(organization, *args, **kwargs)
 
-    def create_event_attachment(self, event=None, *args, **kwargs):
-        if event is None:
-            event = self.event
-        return Factories.create_event_attachment(event=event, *args, **kwargs)
-
-    def create_dif_file(self, project=None, *args, **kwargs):
+    def create_data_forwarder_project(
+        self,
+        data_forwarder: DataForwarder | None = None,
+        project: Project | None = None,
+        **kwargs: Any,
+    ) -> DataForwarderProject:
         if project is None:
             project = self.project
-        return Factories.create_dif_file(project=project, *args, **kwargs)
+        assert data_forwarder is not None
+        return Factories.create_data_forwarder_project(data_forwarder, project, **kwargs)
 
-    def create_dif_from_path(self, project=None, *args, **kwargs):
+    def create_file_from_path(self, *args: Any, **kwargs: Any) -> File:
+        return Factories.create_file_from_path(*args, **kwargs)
+
+    def create_dif_file(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> ProjectDebugFile:
+        if project is None:
+            project = self.project
+        return Factories.create_dif_file(project, *args, **kwargs)
+
+    def create_dif_from_path(
+        self, project: Project | None = None, *args: Any, **kwargs: Any
+    ) -> ProjectDebugFile:
         if project is None:
             project = self.project
         return Factories.create_dif_from_path(project=project, *args, **kwargs)
 
-    def add_user_permission(self, *args, **kwargs):
+    def add_user_permission(self, *args: Any, **kwargs: Any) -> None:
         return Factories.add_user_permission(*args, **kwargs)
 
-    def create_sentry_app(self, *args, **kwargs):
+    def create_sentry_app(self, *args: Any, **kwargs: Any) -> SentryApp:
         return Factories.create_sentry_app(*args, **kwargs)
 
-    def create_internal_integration(self, *args, **kwargs):
+    def create_sentry_app_avatar(self, *args: Any, **kwargs: Any) -> SentryAppAvatar:
+        return Factories.create_sentry_app_avatar(*args, **kwargs)
+
+    def create_internal_integration(self, *args: Any, **kwargs: Any) -> SentryApp:
         return Factories.create_internal_integration(*args, **kwargs)
 
-    def create_internal_integration_token(self, *args, **kwargs):
+    def create_internal_integration_token(self, *args: Any, **kwargs: Any) -> ApiToken:
         return Factories.create_internal_integration_token(*args, **kwargs)
 
-    def create_sentry_app_installation(self, *args, **kwargs):
+    def create_sentry_app_installation(self, *args: Any, **kwargs: Any) -> SentryAppInstallation:
         return Factories.create_sentry_app_installation(*args, **kwargs)
 
-    def create_issue_link_schema(self, *args, **kwargs):
+    def create_sentry_app_installation_for_provider(
+        self, *args: Any, **kwargs: Any
+    ) -> SentryAppInstallationForProvider:
+        return Factories.create_sentry_app_installation_for_provider(*args, **kwargs)
+
+    def create_stacktrace_link_schema(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return Factories.create_stacktrace_link_schema(*args, **kwargs)
+
+    def create_issue_link_schema(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return Factories.create_issue_link_schema(*args, **kwargs)
 
-    def create_alert_rule_action_schema(self, *args, **kwargs):
+    def create_alert_rule_action_schema(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return Factories.create_alert_rule_action_schema(*args, **kwargs)
 
-    def create_sentry_app_feature(self, *args, **kwargs):
+    def create_sentry_app_feature(self, *args: Any, **kwargs: Any) -> IntegrationFeature:
         return Factories.create_sentry_app_feature(*args, **kwargs)
 
-    def create_service_hook(self, *args, **kwargs):
+    def create_doc_integration(self, *args: Any, **kwargs: Any) -> DocIntegration:
+        return Factories.create_doc_integration(*args, **kwargs)
+
+    def create_doc_integration_features(
+        self, *args: Any, **kwargs: Any
+    ) -> list[IntegrationFeature]:
+        return Factories.create_doc_integration_features(*args, **kwargs)
+
+    def create_doc_integration_avatar(self, *args: Any, **kwargs: Any) -> DocIntegrationAvatar:
+        return Factories.create_doc_integration_avatar(*args, **kwargs)
+
+    def create_service_hook(self, *args: Any, **kwargs: Any) -> ServiceHook:
         return Factories.create_service_hook(*args, **kwargs)
 
-    def create_userreport(self, *args, **kwargs):
+    def create_service_hook_project_for_installation(
+        self, *args: Any, **kwargs: Any
+    ) -> ServiceHookProject:
+        return Factories.create_service_hook_project_for_installation(*args, **kwargs)
+
+    def create_userreport(self, *args: Any, **kwargs: Any) -> UserReport:
         return Factories.create_userreport(*args, **kwargs)
 
-    def create_platform_external_issue(self, *args, **kwargs):
+    def create_platform_external_issue(self, *args: Any, **kwargs: Any) -> PlatformExternalIssue:
         return Factories.create_platform_external_issue(*args, **kwargs)
 
-    def create_integration_external_issue(self, *args, **kwargs):
+    def create_integration_external_issue(self, *args: Any, **kwargs: Any) -> ExternalIssue:
         return Factories.create_integration_external_issue(*args, **kwargs)
 
-    def create_incident(self, organization=None, projects=None, *args, **kwargs):
-        if not organization:
-            organization = self.organization
-        if projects is None:
-            projects = [self.project]
+    def create_integration_external_project(
+        self, *args: Any, **kwargs: Any
+    ) -> IntegrationExternalProject:
+        return Factories.create_integration_external_project(*args, **kwargs)
 
-        return Factories.create_incident(
-            organization=organization, projects=projects, *args, **kwargs
-        )
-
-    def create_incident_activity(self, incident, *args, **kwargs):
-        return Factories.create_incident_activity(incident=incident, *args, **kwargs)
-
-    def create_incident_comment(self, incident, *args, **kwargs):
-        return self.create_incident_activity(
-            incident, type=IncidentActivityType.COMMENT.value, *args, **kwargs
-        )
-
-    def create_alert_rule(self, organization=None, projects=None, *args, **kwargs):
+    def create_alert_rule(
+        self,
+        organization: Organization | None = None,
+        projects: Sequence[Project] | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> AlertRule:
         if not organization:
             organization = self.organization
         if projects is None:
             projects = [self.project]
         return Factories.create_alert_rule(organization, projects, *args, **kwargs)
 
-    def create_alert_rule_trigger(self, alert_rule=None, *args, **kwargs):
-        if not alert_rule:
-            alert_rule = self.create_alert_rule()
-        return Factories.create_alert_rule_trigger(alert_rule, *args, **kwargs)
-
-    def create_alert_rule_trigger_action(
+    def create_notification_action(
         self,
-        alert_rule_trigger=None,
-        target_identifier=None,
-        triggered_for_incident=None,
-        *args,
-        **kwargs,
-    ):
-        if not alert_rule_trigger:
-            alert_rule_trigger = self.create_alert_rule_trigger()
-
-        if not target_identifier:
-            target_identifier = str(self.user.id)
-
-        if triggered_for_incident is not None:
-            Factories.create_incident_trigger(triggered_for_incident, alert_rule_trigger)
-
-        return Factories.create_alert_rule_trigger_action(
-            alert_rule_trigger, target_identifier=target_identifier, **kwargs
+        organization: Organization | None = None,
+        projects: list[Project] | None = None,
+        **kwargs: Any,
+    ) -> NotificationAction:
+        return Factories.create_notification_action(
+            organization=organization, projects=projects, **kwargs
         )
 
-    def create_external_user(self, user=None, organization=None, **kwargs):
+    def create_notification_setting_option(
+        self, *args: Any, **kwargs: Any
+    ) -> NotificationSettingOption:
+        return Factories.create_notification_setting_option(*args, **kwargs)
+
+    def create_notification_settings_provider(
+        self, *args: Any, **kwargs: Any
+    ) -> NotificationSettingProvider:
+        return Factories.create_notification_settings_provider(*args, **kwargs)
+
+    def create_inbox_item(
+        self, organization: Organization | None = None, user: User | None = None, **kwargs: Any
+    ) -> InboxItem:
+        return Factories.create_inbox_item(
+            organization=organization or self.organization, user=user or self.user, **kwargs
+        )
+
+    def create_inbox_item_event(self, *args: Any, **kwargs: Any) -> InboxItemEvent:
+        return Factories.create_inbox_item_event(*args, **kwargs)
+
+    def create_weekly_report_project_exclusion(self, **kwargs: Any) -> WeeklyReportProjectExclusion:
+        return Factories.create_weekly_report_project_exclusion(**kwargs)
+
+    def create_user_option(self, *args: Any, **kwargs: Any) -> UserOption:
+        return Factories.create_user_option(*args, **kwargs)
+
+    def create_monitor(self, **kwargs: Any) -> Monitor:
+        if "owner_user_id" not in kwargs:
+            kwargs["owner_user_id"] = self.user.id
+
+        if "project" not in kwargs:
+            project_id = self.project.id
+        else:
+            project_id = kwargs.pop("project").id
+
+        if "organization" in kwargs:
+            organization = kwargs.pop("organization")
+        else:
+            organization = self.organization
+
+        return Monitor.objects.create(
+            organization_id=organization.id,
+            project_id=project_id,
+            config={
+                "schedule": "* * * * *",
+                "schedule_type": ScheduleType.CRONTAB,
+                "checkin_margin": None,
+                "max_runtime": None,
+            },
+            **kwargs,
+        )
+
+    def create_monitor_environment(self, **kwargs: Any) -> MonitorEnvironment:
+        return MonitorEnvironment.objects.create(**kwargs)
+
+    def create_monitor_incident(self, **kwargs: Any) -> MonitorIncident:
+        return MonitorIncident.objects.create(**kwargs)
+
+    def create_monitor_checkin(self, **kwargs: Any) -> MonitorCheckIn:
+        return MonitorCheckIn.objects.create(**kwargs)
+
+    def create_external_user(
+        self,
+        user: User | None = None,
+        organization: Organization | None = None,
+        integration: Integration | None = None,
+        **kwargs: Any,
+    ) -> ExternalActor:
         if not user:
             user = self.user
         if not organization:
-            organization = self.organization
+            organization = self.organization  # Force creation.
+        if not integration:
+            integration = self.integration
 
-        organizationmember = OrganizationMember.objects.get(user=user, organization=organization)
-        return Factories.create_external_user(organizationmember=organizationmember, **kwargs)
+        return Factories.create_external_user(
+            user=user, organization=organization, integration_id=integration.id, **kwargs
+        )
 
-    def create_external_team(self, team=None, **kwargs):
+    def create_external_team(
+        self, team: Team | None = None, integration: Integration | None = None, **kwargs: Any
+    ) -> ExternalActor:
         if not team:
             team = self.team
-        return Factories.create_external_team(team=team, **kwargs)
+        if not integration:
+            integration = self.integration
 
-    def create_codeowners(self, project=None, code_mapping=None, **kwargs):
+        return Factories.create_external_team(
+            team=team, organization=team.organization, integration_id=integration.id, **kwargs
+        )
+
+    def create_data_access_grant(self, **kwargs: Any) -> DataAccessGrant:
+        return Factories.create_data_access_grant(**kwargs)
+
+    def create_codeowners(
+        self,
+        project: Project | None = None,
+        code_mapping: RepositoryProjectPathConfig | None = None,
+        **kwargs: Any,
+    ) -> ProjectCodeOwners:
         if not project:
             project = self.project
         if not code_mapping:
@@ -316,6 +897,732 @@ class Fixtures:
 
         return Factories.create_codeowners(project=project, code_mapping=code_mapping, **kwargs)
 
+    def create_slack_integration(
+        self,
+        organization: Organization,
+        external_id: str = "TXXXXXXX1",
+        user: RpcUser | User | None = None,
+        identity_external_id: str = "UXXXXXXX1",
+        **kwargs: Any,
+    ) -> Integration:
+        if user is None:
+            with assume_test_silo_mode(SiloMode.CELL):
+                user = organization.get_default_owner()
+
+        integration = Factories.create_slack_integration(
+            organization=organization, external_id=external_id, **kwargs
+        )
+        idp = Factories.create_identity_provider(integration=integration)
+        Factories.create_identity(user, idp, identity_external_id)
+
+        return integration
+
+    def create_integration(
+        self,
+        organization: Organization,
+        external_id: str,
+        oi_params: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Integration:
+        """Create an integration and add an organization."""
+        return Factories.create_integration(organization, external_id, oi_params, **kwargs)
+
+    def create_gcp_service_account(self, *args: Any, **kwargs: Any) -> GcpServiceAccount:
+        return Factories.create_gcp_service_account(*args, **kwargs)
+
+    def create_service_account(self, *args: Any, **kwargs: Any) -> ServiceAccount:
+        return Factories.create_service_account(*args, **kwargs)
+
+    def create_organization_contributor(
+        self,
+        organization: Organization,
+        integration: Integration | RpcIntegration,
+        external_identifier: str,
+        **kwargs: Any,
+    ) -> OrganizationContributors:
+        """Create an OrganizationContributors row, deriving provider/hostname from the integration."""
+        return Factories.create_organization_contributor(
+            organization, integration, external_identifier, **kwargs
+        )
+
+    def create_provider_integration(self, **integration_params: Any) -> Integration:
+        """Create an integration tied to a provider but no particular organization."""
+        return Factories.create_provider_integration(**integration_params)
+
+    def create_provider_integration_for(
+        self,
+        organization: Organization | RpcOrganization,
+        user: User | RpcUser | None,
+        **integration_params: Any,
+    ) -> tuple[Integration, OrganizationIntegration]:
+        """Create an integration tied to a provider, then add an organization."""
+        return Factories.create_provider_integration_for(organization, user, **integration_params)
+
+    def create_identity_integration(
+        self,
+        user: User | RpcUser,
+        organization: Organization | RpcOrganization,
+        integration_params: Mapping[Any, Any],
+        identity_params: Mapping[Any, Any],
+    ) -> tuple[Integration, OrganizationIntegration, Identity, IdentityProvider]:
+        return Factories.create_identity_integration(
+            user, organization, integration_params, identity_params
+        )
+
+    def create_organization_integration(self, **integration_params: Any) -> OrganizationIntegration:
+        """Create an OrganizationIntegration entity."""
+        return Factories.create_organization_integration(**integration_params)
+
+    def create_identity(self, *args: Any, **kwargs: Any) -> Identity:
+        return Factories.create_identity(*args, **kwargs)
+
+    def create_organization_identity(self, *args: Any, **kwargs: Any) -> OrganizationIdentity:
+        return Factories.create_organization_identity(*args, **kwargs)
+
+    def create_identity_provider(
+        self,
+        integration: Integration | None = None,
+        config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> IdentityProvider:
+        return Factories.create_identity_provider(integration=integration, config=config, **kwargs)
+
+    def create_group_history(self, *args: Any, **kwargs: Any) -> GroupHistory:
+        if "user_id" not in kwargs and "team" not in kwargs and "team_id" not in kwargs:
+            kwargs["user_id"] = self.user.id
+        return Factories.create_group_history(*args, **kwargs)
+
+    def create_comment(self, *args: Any, **kwargs: Any) -> Activity:
+        return Factories.create_comment(*args, **kwargs)
+
+    def create_organization_mapping(self, *args: Any, **kwargs: Any) -> OrganizationMapping:
+        return Factories.create_org_mapping(*args, **kwargs)
+
+    def create_basic_auth_header(self, *args: Any, **kwargs: Any) -> bytes:
+        return Factories.create_basic_auth_header(*args, **kwargs)
+
+    def create_request_access(self, *args: Any, **kwargs: Any) -> RpcBackedAccess:
+        return Factories.create_request_access(*args, **kwargs)
+
+    def create_webhook_payload(self, *args: Any, **kwargs: Any) -> WebhookPayload:
+        return Factories.create_webhook_payload(*args, **kwargs)
+
+    def create_dashboard(self, *args: Any, **kwargs: Any) -> Dashboard:
+        return Factories.create_dashboard(*args, **kwargs)
+
+    def create_explore_saved_formula(
+        self, organization: Organization | None = None, *args: Any, **kwargs: Any
+    ) -> ExploreSavedFormula:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_explore_saved_formula(organization, *args, **kwargs)
+
+    def create_explore_saved_query(
+        self, organization: Organization | None = None, **kwargs: Any
+    ) -> ExploreSavedQuery:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_explore_saved_query(organization, **kwargs)
+
+    def create_discover_saved_query(
+        self, organization: Organization | None = None, **kwargs: Any
+    ) -> DiscoverSavedQuery:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_discover_saved_query(organization, **kwargs)
+
+    def create_group_search_view(
+        self, organization: Organization | None = None, **kwargs: Any
+    ) -> GroupSearchView:
+        if organization is None:
+            organization = self.organization
+        kwargs.setdefault("user_id", self.user.id)
+        return Factories.create_group_search_view(organization, **kwargs)
+
+    def create_dashboard_favorite_user(self, *args: Any, **kwargs: Any) -> DashboardFavoriteUser:
+        return Factories.create_dashboard_favorite_user(*args, **kwargs)
+
+    def create_dashboard_widget(self, *args: Any, **kwargs: Any) -> DashboardWidget:
+        return Factories.create_dashboard_widget(*args, **kwargs)
+
+    def create_dashboard_widget_query(self, *args: Any, **kwargs: Any) -> DashboardWidgetQuery:
+        return Factories.create_dashboard_widget_query(*args, **kwargs)
+
+    def create_workflow(self, *args: Any, **kwargs: Any) -> Workflow:
+        if "organization" not in kwargs:
+            kwargs["organization"] = self.organization
+        return Factories.create_workflow(*args, **kwargs)
+
+    def create_data_source(self, *args: Any, **kwargs: Any) -> DataSource:
+        return Factories.create_data_source(*args, **kwargs)
+
+    def create_data_condition(
+        self,
+        comparison: str | int | float | list[object] | Mapping[str, object] = "10",
+        type: Condition = Condition.EQUAL,
+        condition_result: str | int | float | list[object] | Mapping[str, object] | None = None,
+        condition_group: DataConditionGroup | None = None,
+        **kwargs: Any,
+    ) -> DataCondition:
+        if condition_result is None:
+            condition_result = str(DetectorPriorityLevel.HIGH.value)
+        if condition_group is None:
+            condition_group = self.create_data_condition_group()
+
+        return Factories.create_data_condition(
+            comparison=comparison,
+            type=type,
+            condition_result=condition_result,
+            condition_group=condition_group,
+            **kwargs,
+        )
+
+    def create_detector(
+        self,
+        project: Project | None = None,
+        type: str | None = ErrorGroupType.slug,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Detector:
+        if project is None:
+            project = self.create_project(organization=self.organization)
+
+        return Factories.create_detector(project=project, type=type, *args, **kwargs)
+
+    def create_all_projects_detector(self, organization: Organization, **kwargs: Any) -> Detector:
+        return Factories.create_all_projects_detector(organization_id=organization.id, **kwargs)
+
+    def create_detector_state(self, *args: Any, **kwargs: Any) -> DetectorState:
+        return Factories.create_detector_state(*args, **kwargs)
+
+    def create_data_source_detector(self, *args: Any, **kwargs: Any) -> DataSourceDetector:
+        return Factories.create_data_source_detector(*args, **kwargs)
+
+    def create_data_condition_group(
+        self, organization: Organization | None = None, **kwargs: Any
+    ) -> DataConditionGroup:
+        if organization is None:
+            organization = self.organization
+
+        return Factories.create_data_condition_group(organization=organization, **kwargs)
+
+    def create_data_condition_group_action(
+        self, *args: Any, **kwargs: Any
+    ) -> DataConditionGroupAction:
+        return Factories.create_data_condition_group_action(*args, **kwargs)
+
+    def create_data_condition_alert_rule_trigger(
+        self, *args: Any, **kwargs: Any
+    ) -> DataConditionAlertRuleTrigger:
+        return Factories.create_data_condition_alert_rule_trigger(*args, **kwargs)
+
+    def create_detector_workflow(self, *args: Any, **kwargs: Any) -> DetectorWorkflow:
+        return Factories.create_detector_workflow(*args, **kwargs)
+
+    def create_detector_group(self, *args: Any, **kwargs: Any) -> DetectorGroup:
+        return Factories.create_detector_group(*args, **kwargs)
+
+    def create_alert_rule_detector(self, *args: Any, **kwargs: Any) -> AlertRuleDetector:
+        # TODO: this is only needed during the ACI migration
+        return Factories.create_alert_rule_detector(*args, **kwargs)
+
+    def create_action_alert_rule_trigger_action(
+        self, *args: Any, **kwargs: Any
+    ) -> ActionAlertRuleTriggerAction:
+        # TODO: this is only needed during the ACI migration
+        return Factories.create_action_alert_rule_trigger_action(*args, **kwargs)
+
+    def create_alert_rule_workflow(self, *args: Any, **kwargs: Any) -> AlertRuleWorkflow:
+        # TODO: this is only needed during the ACI migration
+        return Factories.create_alert_rule_workflow(*args, **kwargs)
+
+    def create_incident_group_open_period(
+        self, *args: Any, **kwargs: Any
+    ) -> IncidentGroupOpenPeriod:
+        # TODO: this is only needed during the ACI migration
+        return Factories.create_incident_group_open_period(*args, **kwargs)
+
+    def create_workflow_data_condition_group(
+        self, *args: Any, **kwargs: Any
+    ) -> WorkflowDataConditionGroup:
+        return Factories.create_workflow_data_condition_group(*args, **kwargs)
+
+    # workflow_engine.models.action
+    def create_action(self, *args: Any, **kwargs: Any) -> Action:
+        return Factories.create_action(*args, **kwargs)
+
+    def create_action_invocation(self, *args: Any, **kwargs: Any) -> ActionInvocation:
+        return Factories.create_action_invocation(*args, **kwargs)
+
+    def create_uptime_subscription(
+        self,
+        type: str = "test",
+        subscription_id: str | None = None,
+        status: UptimeSubscription.Status = UptimeSubscription.Status.ACTIVE,
+        url: str | None = None,
+        host_provider_id: str = "TEST",
+        host_provider_name: str = "TEST",
+        url_domain: str = "sentry",
+        url_domain_suffix: str = "io",
+        interval_seconds: IntervalSecondsLiteral = 60,
+        timeout_ms: int = 100,
+        method: SupportedHTTPMethodsLiteral = "GET",
+        headers: Sequence[Sequence[str]] | None = None,
+        body: str | None = None,
+        date_updated: None | datetime = None,
+        trace_sampling: bool = False,
+        region_slugs: list[str] | None = None,
+        assertion: Any | None = None,
+    ) -> UptimeSubscription:
+        if date_updated is None:
+            date_updated = timezone.now()
+        if headers is None:
+            headers = []
+        if region_slugs is None:
+            region_slugs = []
+
+        subscription = Factories.create_uptime_subscription(
+            type=type,
+            subscription_id=subscription_id,
+            status=status,
+            url=url,
+            url_domain=url_domain,
+            url_domain_suffix=url_domain_suffix,
+            host_provider_id=host_provider_id,
+            host_provider_name=host_provider_name,
+            interval_seconds=interval_seconds,
+            timeout_ms=timeout_ms,
+            date_updated=date_updated,
+            method=method,
+            headers=headers,
+            body=body,
+            trace_sampling=trace_sampling,
+            assertion=assertion,
+        )
+        for region_slug in region_slugs:
+            self.create_uptime_subscription_region(subscription, region_slug)
+
+        return subscription
+
+    def create_uptime_subscription_region(
+        self,
+        subscription: UptimeSubscription,
+        region_slug: str,
+        mode: UptimeSubscriptionRegion.RegionMode = UptimeSubscriptionRegion.RegionMode.ACTIVE,
+    ) -> None:
+        Factories.create_uptime_subscription_region(subscription, region_slug, mode)
+
+    def create_uptime_detector(
+        self,
+        project: Project | None = None,
+        env: Environment | None = None,
+        uptime_subscription: UptimeSubscription | None = None,
+        status: int = ObjectStatus.ACTIVE,
+        enabled: bool = True,
+        mode: UptimeMonitorMode = UptimeMonitorMode.AUTO_DETECTED_ACTIVE,
+        name: str | None = None,
+        owner: User | Team | None = None,
+        id: int | None = None,
+        recovery_threshold: int = DEFAULT_RECOVERY_THRESHOLD,
+        downtime_threshold: int = DEFAULT_DOWNTIME_THRESHOLD,
+        detector_state: DetectorPriorityLevel = DetectorPriorityLevel.OK,
+    ) -> Detector:
+        if project is None:
+            project = self.project
+        if env is None:
+            env = self.environment
+
+        actor = Actor.from_object(owner) if owner else None
+        owner_team_id = None
+        owner_user_id = None
+        if actor:
+            if actor.is_team:
+                owner_team_id = actor.id
+            elif actor.is_user:
+                owner_user_id = actor.id
+
+        if uptime_subscription is None:
+            uptime_subscription = self.create_uptime_subscription()
+
+        data_source = Factories.create_data_source(
+            type=DATA_SOURCE_UPTIME_SUBSCRIPTION,
+            organization=project.organization,
+            source_id=str(uptime_subscription.id),
+        )
+        condition_group = Factories.create_data_condition_group(
+            organization=project.organization,
+        )
+        Factories.create_data_condition(
+            comparison=CHECKSTATUS_FAILURE,
+            type=Condition.EQUAL,
+            condition_result=DetectorPriorityLevel.HIGH,
+            condition_group=condition_group,
+        )
+        Factories.create_data_condition(
+            comparison=CHECKSTATUS_SUCCESS,
+            type=Condition.EQUAL,
+            condition_result=DetectorPriorityLevel.OK,
+            condition_group=condition_group,
+        )
+        env_name = env.name if env else None
+        detector = Factories.create_detector(
+            id=id,
+            type=GROUP_TYPE_UPTIME_DOMAIN_CHECK_FAILURE,
+            project=project,
+            name=name,
+            status=status,
+            enabled=enabled,
+            owner_user_id=owner_user_id,
+            owner_team_id=owner_team_id,
+            config={
+                "environment": env_name,
+                "mode": mode,
+                "recovery_threshold": recovery_threshold,
+                "downtime_threshold": downtime_threshold,
+            },
+            workflow_condition_group=condition_group,
+        )
+        Factories.create_data_source_detector(
+            data_source=data_source,
+            detector=detector,
+        )
+
+        # Create DetectorState with the provided state
+        # Infer is_triggered based on whether state is HIGH
+        Factories.create_detector_state(
+            detector=detector,
+            state=detector_state,
+            is_triggered=detector_state == DetectorPriorityLevel.HIGH,
+        )
+
+        return detector
+
+    # Preprod artifact helpers
+
+    def create_commit_comparison(
+        self, organization: Organization | None = None, **kwargs: Any
+    ) -> CommitComparison:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_commit_comparison(organization=organization, **kwargs)
+
+    def create_preprod_artifact(
+        self, project: Project | None = None, **kwargs: Any
+    ) -> PreprodArtifact:
+        if project is None:
+            project = self.project
+        return Factories.create_preprod_artifact(project=project, **kwargs)
+
+    def create_preprod_artifact_mobile_app_info(
+        self, preprod_artifact: PreprodArtifact, **kwargs: Any
+    ) -> PreprodArtifactMobileAppInfo:
+        return Factories.create_preprod_artifact_mobile_app_info(
+            preprod_artifact=preprod_artifact, **kwargs
+        )
+
+    def create_preprod_artifact_size_metrics(
+        self, preprod_artifact: PreprodArtifact, **kwargs: Any
+    ) -> PreprodArtifactSizeMetrics:
+        return Factories.create_preprod_artifact_size_metrics(artifact=preprod_artifact, **kwargs)
+
+    def create_preprod_artifact_size_comparison(
+        self,
+        head_size_analysis: PreprodArtifactSizeMetrics,
+        base_size_analysis: PreprodArtifactSizeMetrics,
+        organization: Organization | None = None,
+        **kwargs: Any,
+    ) -> PreprodArtifactSizeComparison:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_preprod_artifact_size_comparison(
+            organization=organization,
+            head_size_analysis=head_size_analysis,
+            base_size_analysis=base_size_analysis,
+            **kwargs,
+        )
+
+    def create_preprod_snapshot_metrics(
+        self, preprod_artifact: PreprodArtifact, **kwargs: Any
+    ) -> PreprodSnapshotMetrics:
+        return Factories.create_preprod_snapshot_metrics(
+            preprod_artifact=preprod_artifact, **kwargs
+        )
+
+    def create_preprod_snapshot_comparison(
+        self,
+        head_snapshot_metrics: PreprodSnapshotMetrics,
+        base_snapshot_metrics: PreprodSnapshotMetrics,
+        **kwargs: Any,
+    ) -> PreprodSnapshotComparison:
+        return Factories.create_preprod_snapshot_comparison(
+            head_snapshot_metrics=head_snapshot_metrics,
+            base_snapshot_metrics=base_snapshot_metrics,
+            **kwargs,
+        )
+
+    def create_preprod_comparison_approval(
+        self, preprod_artifact: PreprodArtifact, **kwargs: Any
+    ) -> PreprodComparisonApproval:
+        return Factories.create_preprod_comparison_approval(
+            preprod_artifact=preprod_artifact, **kwargs
+        )
+
+    def create_preprod_build_configuration(
+        self, project: Project | None = None, **kwargs: Any
+    ) -> PreprodBuildConfiguration:
+        if project is None:
+            project = self.project
+        return Factories.create_preprod_build_configuration(project=project, **kwargs)
+
+    def create_installable_preprod_artifact(
+        self, preprod_artifact: PreprodArtifact, **kwargs: Any
+    ) -> InstallablePreprodArtifact:
+        return Factories.create_installable_preprod_artifact(
+            preprod_artifact=preprod_artifact, **kwargs
+        )
+
+    def create_ios_preprod_artifact(
+        self,
+        project: Project | None = None,
+        app_id: str = "com.example.iosapp",
+        app_name: str = "iOS Test App",
+        build_version: str = "1.0.0",
+        build_number: int = 1,
+        state: int = PreprodArtifact.ArtifactState.PROCESSED,
+        commit_comparison: CommitComparison | None = None,
+        **kwargs: Any,
+    ) -> PreprodArtifact:
+        """Create a processed iOS preprod artifact (xcarchive)."""
+        if project is None:
+            project = self.project
+        return Factories.create_preprod_artifact(
+            project=project,
+            artifact_type=PreprodArtifact.ArtifactType.XCARCHIVE,
+            app_id=app_id,
+            app_name=app_name,
+            build_version=build_version,
+            build_number=build_number,
+            state=state,
+            commit_comparison=commit_comparison,
+            **kwargs,
+        )
+
+    def create_android_preprod_artifact(
+        self,
+        project: Project | None = None,
+        app_id: str = "com.example.androidapp",
+        app_name: str = "Android Test App",
+        build_version: str = "1.0.0",
+        build_number: int = 1,
+        state: int = PreprodArtifact.ArtifactState.PROCESSED,
+        artifact_type: int = PreprodArtifact.ArtifactType.APK,
+        commit_comparison: CommitComparison | None = None,
+        **kwargs: Any,
+    ) -> PreprodArtifact:
+        """Create a processed Android preprod artifact (APK or AAB)."""
+        if project is None:
+            project = self.project
+        return Factories.create_preprod_artifact(
+            project=project,
+            artifact_type=artifact_type,
+            app_id=app_id,
+            app_name=app_name,
+            build_version=build_version,
+            build_number=build_number,
+            state=state,
+            commit_comparison=commit_comparison,
+            **kwargs,
+        )
+
+    def create_ios_preprod_artifact_with_size_metrics(
+        self,
+        project: Project | None = None,
+        app_id: str = "com.example.iosapp",
+        app_name: str = "iOS Test App",
+        build_version: str = "1.0.0",
+        build_number: int = 1,
+        commit_comparison: CommitComparison | None = None,
+        max_install_size: int = 50 * 1024 * 1024,  # 50 MB
+        max_download_size: int = 25 * 1024 * 1024,  # 25 MB
+        size_analysis_state: int = PreprodArtifactSizeMetrics.SizeAnalysisState.COMPLETED,
+        **kwargs: Any,
+    ) -> tuple[PreprodArtifact, PreprodArtifactSizeMetrics]:
+        """
+        Create a fully processed iOS preprod artifact with completed size metrics.
+
+        Returns a tuple of (artifact, size_metrics) for easy access in tests.
+        """
+        artifact = self.create_ios_preprod_artifact(
+            project=project,
+            app_id=app_id,
+            app_name=app_name,
+            build_version=build_version,
+            build_number=build_number,
+            commit_comparison=commit_comparison,
+            **kwargs,
+        )
+        size_metrics = Factories.create_preprod_artifact_size_metrics(
+            artifact=artifact,
+            metrics_type=PreprodArtifactSizeMetrics.MetricsArtifactType.MAIN_ARTIFACT,
+            state=size_analysis_state,
+            max_install_size=max_install_size,
+            max_download_size=max_download_size,
+            min_install_size=max_install_size,
+            min_download_size=max_download_size,
+        )
+        return artifact, size_metrics
+
+    def create_android_preprod_artifact_with_size_metrics(
+        self,
+        project: Project | None = None,
+        app_id: str = "com.example.androidapp",
+        app_name: str = "Android Test App",
+        build_version: str = "1.0.0",
+        build_number: int = 1,
+        artifact_type: int = PreprodArtifact.ArtifactType.APK,
+        commit_comparison: CommitComparison | None = None,
+        max_install_size: int = 30 * 1024 * 1024,  # 30 MB
+        max_download_size: int = 15 * 1024 * 1024,  # 15 MB
+        size_analysis_state: int = PreprodArtifactSizeMetrics.SizeAnalysisState.COMPLETED,
+        **kwargs: Any,
+    ) -> tuple[PreprodArtifact, PreprodArtifactSizeMetrics]:
+        """
+        Create a fully processed Android preprod artifact with completed size metrics.
+
+        Returns a tuple of (artifact, size_metrics) for easy access in tests.
+        """
+        artifact = self.create_android_preprod_artifact(
+            project=project,
+            app_id=app_id,
+            app_name=app_name,
+            build_version=build_version,
+            build_number=build_number,
+            artifact_type=artifact_type,
+            commit_comparison=commit_comparison,
+            **kwargs,
+        )
+        size_metrics = Factories.create_preprod_artifact_size_metrics(
+            artifact=artifact,
+            metrics_type=PreprodArtifactSizeMetrics.MetricsArtifactType.MAIN_ARTIFACT,
+            state=size_analysis_state,
+            max_install_size=max_install_size,
+            max_download_size=max_download_size,
+            min_install_size=max_install_size,
+            min_download_size=max_download_size,
+        )
+        return artifact, size_metrics
+
+    def create_preprod_artifact_pair_for_comparison(
+        self,
+        project: Project | None = None,
+        artifact_type: int = PreprodArtifact.ArtifactType.APK,
+        app_id: str = "com.example.app",
+        head_build_version: str = "1.1.0",
+        base_build_version: str = "1.0.0",
+        head_install_size: int = 35 * 1024 * 1024,  # 35 MB
+        base_install_size: int = 30 * 1024 * 1024,  # 30 MB
+        head_download_size: int = 18 * 1024 * 1024,  # 18 MB
+        base_download_size: int = 15 * 1024 * 1024,  # 15 MB
+    ) -> tuple[
+        PreprodArtifact, PreprodArtifactSizeMetrics, PreprodArtifact, PreprodArtifactSizeMetrics
+    ]:
+        """
+        Create a head/base artifact pair with size metrics for comparison tests.
+
+        Creates two artifacts with a linked commit comparison (head's base_sha = base's head_sha)
+        to simulate a typical PR comparison scenario.
+
+        Returns a tuple of (head_artifact, head_size_metrics, base_artifact, base_size_metrics).
+        """
+        if project is None:
+            project = self.project
+
+        # Create base commit comparison first
+        base_commit_comparison = self.create_commit_comparison(
+            organization=project.organization,
+            head_sha="b" * 40,
+            base_sha="a" * 40,
+            head_ref="main",
+            base_ref="main~1",
+        )
+
+        # Create head commit comparison that references base's head_sha
+        head_commit_comparison = self.create_commit_comparison(
+            organization=project.organization,
+            head_sha="c" * 40,
+            base_sha="b" * 40,  # Points to base's head_sha
+            head_ref="feature/test",
+            base_ref="main",
+        )
+
+        # Create base artifact with size metrics
+        base_artifact = self.create_preprod_artifact(
+            project=project,
+            artifact_type=artifact_type,
+            app_id=app_id,
+            build_version=base_build_version,
+            commit_comparison=base_commit_comparison,
+        )
+        base_size_metrics = Factories.create_preprod_artifact_size_metrics(
+            artifact=base_artifact,
+            metrics_type=PreprodArtifactSizeMetrics.MetricsArtifactType.MAIN_ARTIFACT,
+            state=PreprodArtifactSizeMetrics.SizeAnalysisState.COMPLETED,
+            max_install_size=base_install_size,
+            max_download_size=base_download_size,
+            min_install_size=base_install_size,
+            min_download_size=base_download_size,
+        )
+
+        # Create head artifact with size metrics
+        head_artifact = self.create_preprod_artifact(
+            project=project,
+            artifact_type=artifact_type,
+            app_id=app_id,
+            build_version=head_build_version,
+            commit_comparison=head_commit_comparison,
+        )
+        head_size_metrics = Factories.create_preprod_artifact_size_metrics(
+            artifact=head_artifact,
+            metrics_type=PreprodArtifactSizeMetrics.MetricsArtifactType.MAIN_ARTIFACT,
+            state=PreprodArtifactSizeMetrics.SizeAnalysisState.COMPLETED,
+            max_install_size=head_install_size,
+            max_download_size=head_download_size,
+            min_install_size=head_install_size,
+            min_download_size=head_download_size,
+        )
+
+        return head_artifact, head_size_metrics, base_artifact, base_size_metrics
+
+    def create_seer_autofix_issue_data(self, group: Group, **kwargs: Any) -> SeerAutofixIssueData:
+        return Factories.create_seer_autofix_issue_data(group=group, **kwargs)
+
+    def create_seer_run(self, organization: Organization | None = None, **kwargs: Any) -> SeerRun:
+        if organization is None:
+            organization = self.organization
+        return Factories.create_seer_run(organization=organization, **kwargs)
+
+    def create_seer_agent_write_grant(
+        self, organization: Organization | None = None, user: User | None = None, **kwargs: Any
+    ) -> SeerAgentWriteGrant:
+        return Factories.create_seer_agent_write_grant(
+            organization=organization or self.organization,
+            user=user or self.user,
+            **kwargs,
+        )
+
+    def create_seer_agent_run(self, run: SeerRun, **kwargs: Any) -> SeerAgentRun:
+        return Factories.create_seer_agent_run(run=run, **kwargs)
+
+    def create_seer_run_coding_agent_handoff(
+        self, seer_run: SeerRun, **kwargs: Any
+    ) -> SeerRunCodingAgentHandoff:
+        return Factories.create_seer_run_coding_agent_handoff(seer_run=seer_run, **kwargs)
+
+    def create_seer_run_pull_request(
+        self, run: SeerRun, pull_request: PullRequest, **kwargs: Any
+    ) -> SeerRunPullRequest:
+        return Factories.create_seer_run_pull_request(run=run, pull_request=pull_request, **kwargs)
+
     @pytest.fixture(autouse=True)
-    def _init_insta_snapshot(self, insta_snapshot):
+    def _init_insta_snapshot(self, insta_snapshot: InstaSnapshotter) -> None:
         self.insta_snapshot = insta_snapshot

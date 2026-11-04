@@ -1,12 +1,16 @@
-import sys
-
+from collections.abc import Callable
 from functools import wraps
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
-from .exceptions import TransactionAborted
 from .helpers import can_reconnect
 
+P = ParamSpec("P")
+R = TypeVar("R")
 
-def auto_reconnect_cursor(func):
+
+def auto_reconnect_cursor(
+    func: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], R]:
     """
     Attempt to safely reconnect when an error is hit that resembles the
     bouncer disconnecting the client due to a timeout/etc during a cursor
@@ -14,7 +18,7 @@ def auto_reconnect_cursor(func):
     """
 
     @wraps(func)
-    def inner(self, *args, **kwargs):
+    def inner(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return func(self, *args, **kwargs)
         except Exception as e:
@@ -26,17 +30,19 @@ def auto_reconnect_cursor(func):
 
             return func(self, *args, **kwargs)
 
-    return inner
+    return cast("Callable[Concatenate[Any, P], R]", inner)
 
 
-def auto_reconnect_connection(func):
+def auto_reconnect_connection(
+    func: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], R]:
     """
     Attempt to safely reconnect when an error is hit that resembles the
     bouncer disconnecting the client due to a timeout/etc.
     """
 
     @wraps(func)
-    def inner(self, *args, **kwargs):
+    def inner(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return func(self, *args, **kwargs)
         except Exception as e:
@@ -47,52 +53,4 @@ def auto_reconnect_connection(func):
 
             return func(self, *args, **kwargs)
 
-    return inner
-
-
-def capture_transaction_exceptions(func):
-    """
-    Catches database errors and reraises them on subsequent errors that throw
-    some cruft about transaction aborted.
-    """
-
-    def raise_the_exception(conn, exc):
-        if (
-            "current transaction is aborted, commands ignored until end of transaction block"
-            in str(exc)
-        ):
-            exc_info = getattr(conn, "_last_exception", None)
-            if exc_info is None:
-                raise
-            new_exc = TransactionAborted(sys.exc_info(), exc_info)
-            raise new_exc.with_traceback(exc_info[2])
-
-        conn._last_exception = sys.exc_info()
-        raise
-
-    @wraps(func)
-    def inner(self, *args, **kwargs):
-        try:
-            return func(self, *args, **kwargs)
-        except Exception as e:
-            raise_the_exception(self.db, e)
-
-    return inner
-
-
-def less_shitty_error_messages(func):
-    """
-    Wraps functions where the first param is a SQL statement and enforces
-    any exceptions thrown will also contain the statement in the message.
-    """
-
-    @wraps(func)
-    def inner(self, sql, *args, **kwargs):
-        try:
-            return func(self, sql, *args, **kwargs)
-        except Exception as e:
-            exc_info = sys.exc_info()
-            msg = f"{e!r}\nSQL: {sql}"
-            raise exc_info[0](msg).with_traceback(exc_info[2])
-
-    return inner
+    return cast("Callable[Concatenate[Any, P], R]", inner)

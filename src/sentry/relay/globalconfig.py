@@ -1,0 +1,87 @@
+from typing import Any, TypedDict
+
+import sentry.options
+from sentry.ingest.inbound_filters import get_global_generic_filters
+from sentry.relay.config.ai_model_costs import AIModelMetadataConfig, ai_model_metadata_config
+from sentry.relay.config.measurements import MeasurementsConfig, get_measurements_config
+from sentry.relay.types import GenericFiltersConfig, RuleCondition
+from sentry.utils import metrics
+
+# List of options to include in the global config.
+RELAY_OPTIONS: list[str] = [
+    "profiling.profile_metrics.unsampled_profiles.platforms",
+    "profiling.profile_metrics.unsampled_profiles.sample_rate",
+    "profiling.profile_metrics.unsampled_profiles.enabled",
+    "relay.span-usage-metric",
+    "relay.metric-bucket-set-encodings",
+    "relay.metric-bucket-distribution-encodings",
+    "relay.sessions-eap.rollout-rate",
+    "relay.span-normalization.allowed_hosts",
+    "relay.drop-transaction-attachments",
+    "relay.objectstore-attachments.sample-rate",
+    "relay.endpoint-fetch-config.enabled",
+    "relay.attachment-inline.limit",
+    "relay.generic-metrics.disabled",
+    "relay.upload-max-chunk.size",
+]
+
+
+class SpanOpDefaultRule(TypedDict):
+    condition: RuleCondition
+    value: str
+
+
+class SpanOpDefaults(TypedDict):
+    rules: list[SpanOpDefaultRule]
+
+
+class GlobalConfig(TypedDict, total=False):
+    measurements: MeasurementsConfig
+    aiModelMetadata: AIModelMetadataConfig | None
+    filters: GenericFiltersConfig | None
+    spanOpDefaults: SpanOpDefaults
+    options: dict[str, Any]
+
+
+def span_op_defaults() -> SpanOpDefaults:
+    return {
+        "rules": [
+            {
+                # If span.data[messaging.system] is set, use span.op "message":
+                "condition": {
+                    "op": "not",
+                    "inner": {
+                        "op": "eq",
+                        "name": "span.data.messaging\\.system",
+                        "value": None,
+                    },
+                },
+                "value": "message",
+            }
+        ]
+    }
+
+
+@metrics.wraps("relay.globalconfig.get")
+def get_global_config() -> GlobalConfig:
+    """Return the global configuration for Relay."""
+
+    global_config: GlobalConfig = {
+        "measurements": get_measurements_config(),
+        "aiModelMetadata": ai_model_metadata_config(),
+        "spanOpDefaults": span_op_defaults(),
+    }
+
+    filters = get_global_generic_filters()
+    if filters and len(filters["filters"]) > 0:
+        global_config["filters"] = filters
+
+    options = dict()
+    for option in RELAY_OPTIONS:
+        if (value := sentry.options.get(option)) is not None:
+            options[option] = value
+
+    if options:
+        global_config["options"] = options
+
+    return global_config

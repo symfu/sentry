@@ -3,22 +3,26 @@ from django.db.models.signals import pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
-from sentry.db.models import FlexibleForeignKey, Model, sane_repr
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import FlexibleForeignKey, Model, cell_silo_model, sane_repr
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
+from sentry.models.organization import Organization
+from sentry.users.models.user import User
 from sentry.utils.hashlib import md5_text
-
 
 MAX_RECENT_SEARCHES = 30
 
 
+@cell_silo_model
 class RecentSearch(Model):
     """
     Searches run by users recently.
     """
 
-    __core__ = True
+    __relocation_scope__ = RelocationScope.Organization
 
     organization = FlexibleForeignKey("sentry.Organization")
-    user = FlexibleForeignKey("sentry.User", db_index=False)
+    user_id = HybridCloudForeignKey("sentry.User", db_index=False, on_delete="CASCADE")
     type = models.PositiveSmallIntegerField()
     query = models.TextField()
     query_hash = models.CharField(max_length=32)
@@ -28,24 +32,24 @@ class RecentSearch(Model):
     class Meta:
         app_label = "sentry"
         db_table = "sentry_recentsearch"
-        unique_together = (("user", "organization", "type", "query_hash"),)
+        unique_together = (("user_id", "organization", "type", "query_hash"),)
 
     __repr__ = sane_repr("organization_id", "user_id", "type", "query")
 
 
-def remove_excess_recent_searches(organization, user, search_type):
+def remove_excess_recent_searches(organization: Organization, user: User, search_type: int) -> None:
     """
     Remove any excess recent searches. We do this by sorting by `last_seen`
     descending and removing any rows after the `MAX_RECENT_SEARCHES` row. In
     practice this should only be removing a single row at most.
     """
     recent_searches_to_remove = RecentSearch.objects.filter(
-        organization=organization, user=user, type=search_type
+        organization=organization, user_id=user.id, type=search_type
     ).order_by("-last_seen")[MAX_RECENT_SEARCHES:]
     RecentSearch.objects.filter(id__in=recent_searches_to_remove).delete()
 
 
 @receiver(pre_save, sender=RecentSearch)
-def issue_saved(sender, instance, **kwargs):
+def issue_saved(sender: type[Model], instance: RecentSearch, **kwargs: object) -> None:
     if not instance.query_hash:
         instance.query_hash = md5_text(instance.query).hexdigest()

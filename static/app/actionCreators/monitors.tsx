@@ -1,0 +1,203 @@
+import * as Sentry from '@sentry/react';
+
+import {
+  addErrorMessage,
+  addLoadingMessage,
+  addSuccessMessage,
+  clearIndicators,
+} from 'sentry/actionCreators/indicator';
+import type {Client} from 'sentry/api';
+import {t} from 'sentry/locale';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import type {RequestError} from 'sentry/utils/requestError/requestError';
+import type {Monitor, ProcessingErrorType} from 'sentry/views/insights/crons/types';
+
+function getMonitorUrl(orgId: string, projectId: string, monitorId: string) {
+  return getApiUrl(
+    '/projects/$organizationIdOrSlug/$projectIdOrSlug/monitors/$monitorIdOrSlug/',
+    {
+      path: {
+        organizationIdOrSlug: orgId,
+        projectIdOrSlug: projectId,
+        monitorIdOrSlug: monitorId,
+      },
+    }
+  );
+}
+
+export async function deleteMonitor(api: Client, orgId: string, monitor: Monitor) {
+  addLoadingMessage(t('Deleting Monitor...'));
+
+  try {
+    await api.requestPromise(getMonitorUrl(orgId, monitor.project.slug, monitor.slug), {
+      method: 'DELETE',
+    });
+    clearIndicators();
+  } catch {
+    addErrorMessage(t('Unable to remove monitor.'));
+  }
+}
+
+export async function deleteMonitorEnvironment(
+  api: Client,
+  orgId: string,
+  monitor: Monitor,
+  environment: string
+): Promise<boolean> {
+  addLoadingMessage(t('Deleting Environment...'));
+
+  try {
+    await api.requestPromise(getMonitorUrl(orgId, monitor.project.slug, monitor.slug), {
+      method: 'DELETE',
+      query: {environment},
+    });
+    clearIndicators();
+    return true;
+  } catch {
+    addErrorMessage(t('Unable to remove environment from monitor.'));
+  }
+  return false;
+}
+
+export async function updateMonitor(
+  api: Client,
+  orgId: string,
+  monitor: Monitor,
+  data: Partial<Monitor>
+): Promise<Monitor | null> {
+  addLoadingMessage();
+
+  try {
+    const resp = await api.requestPromise(
+      getMonitorUrl(orgId, monitor.project.slug, monitor.slug),
+      {method: 'PUT', data}
+    );
+    clearIndicators();
+
+    if (data.status !== undefined) {
+      const isEnabled = data.status === 'active';
+      addSuccessMessage(
+        isEnabled ? t('Cron Monitor enabled') : t('Cron Monitor disabled')
+      );
+    }
+
+    return resp;
+  } catch (err: any) {
+    const respError: RequestError = err;
+    const updateKeys = Object.keys(data);
+
+    // If we are updating a single value in the monitor we can read the
+    // validation error for that key, otherwise fallback to the default error
+    const validationError =
+      updateKeys.length === 1
+        ? (respError.responseJSON?.[updateKeys[0]!] as any)?.[0]
+        : undefined;
+
+    Sentry.captureException(err);
+    addErrorMessage(validationError ?? t('Unable to update monitor.'));
+  }
+
+  return null;
+}
+
+export async function setEnvironmentIsMuted(
+  api: Client,
+  orgId: string,
+  monitor: Monitor,
+  environment: string,
+  isMuted: boolean
+) {
+  addLoadingMessage();
+
+  try {
+    const resp = await api.requestPromise(
+      getApiUrl(
+        '/projects/$organizationIdOrSlug/$projectIdOrSlug/monitors/$monitorIdOrSlug/environments/$environment/',
+        {
+          path: {
+            organizationIdOrSlug: orgId,
+            projectIdOrSlug: monitor.project.slug,
+            monitorIdOrSlug: monitor.slug,
+            environment,
+          },
+        }
+      ),
+      {method: 'PUT', data: {isMuted}}
+    );
+    clearIndicators();
+    return resp;
+  } catch (err) {
+    Sentry.captureException(err);
+    addErrorMessage(
+      isMuted ? t('Unable to mute environment.') : t('Unable to unmute environment.')
+    );
+  }
+
+  return null;
+}
+
+export async function deleteMonitorProcessingErrorByType(
+  api: Client,
+  orgId: string,
+  projectId: string,
+  monitorSlug: string,
+  errortype: ProcessingErrorType
+) {
+  addLoadingMessage();
+
+  try {
+    await api.requestPromise(
+      getApiUrl(
+        '/projects/$organizationIdOrSlug/$projectIdOrSlug/monitors/$monitorIdOrSlug/processing-errors/',
+        {
+          path: {
+            organizationIdOrSlug: orgId,
+            projectIdOrSlug: projectId,
+            monitorIdOrSlug: monitorSlug,
+          },
+        }
+      ),
+      {
+        method: 'DELETE',
+        query: {errortype},
+      }
+    );
+    clearIndicators();
+  } catch (err: any) {
+    Sentry.captureException(err);
+    if (err.status === 403) {
+      addErrorMessage(t('You do not have permission to dismiss these processing errors'));
+    } else {
+      addErrorMessage(t('Unable to dismiss the processing errors'));
+    }
+  }
+}
+
+export async function deleteProjectProcessingErrorByType(
+  api: Client,
+  orgId: string,
+  projectId: string,
+  errortype: ProcessingErrorType
+) {
+  addLoadingMessage();
+
+  try {
+    await api.requestPromise(
+      getApiUrl('/projects/$organizationIdOrSlug/$projectIdOrSlug/processing-errors/', {
+        path: {organizationIdOrSlug: orgId, projectIdOrSlug: projectId},
+      }),
+      {
+        method: 'DELETE',
+        query: {errortype},
+      }
+    );
+    clearIndicators();
+  } catch (err: any) {
+    Sentry.captureException(err);
+    if (err.status === 403) {
+      addErrorMessage(t('You do not have permission to dismiss these processing errors'));
+    } else {
+      addErrorMessage(t('Unable to dismiss the processing errors'));
+    }
+  }
+}

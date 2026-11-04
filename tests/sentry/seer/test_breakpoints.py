@@ -1,0 +1,66 @@
+from collections.abc import Generator
+from unittest import mock
+from unittest.mock import MagicMock
+
+import pytest
+from django.test import override_settings
+from urllib3.response import HTTPResponse
+
+from sentry.seer.breakpoints import detect_breakpoints
+from sentry.utils import json
+from sentry.viewer_context import Actor, ActorType, ViewerContext, viewer_context_scope
+
+
+@pytest.fixture(autouse=True)
+def _viewer_context() -> Generator[None]:
+    with (
+        override_settings(SEER_API_SHARED_SECRET="viewer-context-test-secret"),
+        viewer_context_scope(
+            ViewerContext(actor=Actor(type=ActorType.USER, actor_id=1), organization_id=1)
+        ),
+    ):
+        yield
+
+
+@pytest.mark.django_db
+@mock.patch("sentry.seer.breakpoints.seer_breakpoint_connection_pool.urlopen")
+def test_detect_breakpoints(mock_urlopen: mock.MagicMock) -> None:
+    data = {
+        "data": [
+            {
+                "project": "1",
+                "transaction": "foo",
+                "aggregate_range_1": 1.0,
+                "aggregate_range_2": 2.0,
+                "unweighted_t_value": 0.5,
+                "unweighted_p_value": 0.5,
+                "trend_percentage": 1.0,
+                "absolute_percentage_change": 1.0,
+                "trend_difference": 1.0,
+                "breakpoint": 100,
+            },
+        ],
+    }
+    mock_urlopen.return_value = HTTPResponse(json.dumps(data), status=200)
+
+    assert detect_breakpoints({"data": {}}) == data
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ["body", "status"],
+    [
+        pytest.param("this is not json", 200, id="200 with non json body"),
+        pytest.param("this is not json", 400, id="400 with non json body"),
+        pytest.param("{}", 400, id="400 with json body"),
+    ],
+)
+@mock.patch("sentry_sdk.capture_exception")
+@mock.patch("sentry.seer.breakpoints.seer_breakpoint_connection_pool.urlopen")
+def test_detect_breakpoints_errors(
+    mock_urlopen: MagicMock, mock_capture_exception: MagicMock, body: bytes, status: int
+) -> None:
+    mock_urlopen.return_value = HTTPResponse(body, status=status)
+
+    assert detect_breakpoints({"data": {}}) == {"data": []}
+    assert mock_capture_exception.called

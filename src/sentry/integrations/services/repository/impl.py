@@ -1,0 +1,509 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from functools import partial
+from typing import Any
+
+from django.db import IntegrityError, router, transaction
+from django.utils import timezone
+
+from sentry.api.serializers import serialize
+from sentry.constants import ObjectStatus
+from sentry.db.postgres.transactions import enforce_constraints
+from sentry.integrations.gitlab.tasks import update_all_project_webhooks
+from sentry.integrations.models.external_actor import ExternalActor
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.models.repository_project_path_config import RepositoryProjectPathConfig
+from sentry.integrations.services.repository import RepositoryService, RpcRepository
+from sentry.integrations.services.repository.model import (
+    RpcCreateRepository,
+    RpcRepointIntegrationResult,
+)
+from sentry.integrations.services.repository.serial import serialize_repository
+from sentry.integrations.source_code_management.auto_link_repos import auto_link_repos_by_name
+from sentry.models.code_review_event import CodeReviewEvent
+from sentry.models.commit import Commit
+from sentry.models.grouplink import GroupLink
+from sentry.models.options.project_option import ProjectOption
+from sentry.models.organization import Organization
+from sentry.models.projectcodeowners import ProjectCodeOwners
+from sentry.models.projectrepository import ProjectRepository
+from sentry.models.pullrequest import PullRequest
+from sentry.models.repository import Repository
+from sentry.seer.models.project_repository import SeerProjectRepository
+from sentry.users.services.user.model import RpcUser
+
+
+def _reload_project_option_caches(project_ids: tuple[int, ...], option_key: str) -> None:
+    for project_id in project_ids:
+        ProjectOption.objects.reload_cache(
+            project_id,
+            "repository_service.repoint_organization_integration_data",
+            option_key,
+        )
+
+
+class DatabaseBackedRepositoryService(RepositoryService):
+    def serialize_repository(
+        self,
+        *,
+        organization_id: int,
+        id: int,
+        as_user: RpcUser | None = None,
+    ) -> Any | None:
+        repository = Repository.objects.filter(organization_id=organization_id, id=id).first()
+        if repository is None:
+            return None
+        return serialize(repository, user=as_user)
+
+    def get_repositories(
+        self,
+        *,
+        organization_id: int,
+        integration_id: int | None = None,
+        external_id: str | None = None,
+        external_ids: list[str] | None = None,
+        providers: list[str] | None = None,
+        has_integration: bool | None = None,
+        has_provider: bool | None = None,
+        status: int | None = None,
+    ) -> list[RpcRepository]:
+        if external_id is not None and external_ids is not None:
+            raise ValueError("external_id and external_ids cannot both be provided")
+
+        query = Repository.objects.filter(organization_id=organization_id)
+        if integration_id is not None:
+            query = query.filter(integration_id=integration_id)
+        if external_id is not None:
+            query = query.filter(external_id=external_id)
+        if external_ids is not None:
+            query = query.filter(external_id__in=external_ids)
+        if providers is not None:
+            query = query.filter(provider__in=providers)
+        if has_integration is not None:
+            query = query.filter(integration_id__isnull=not has_integration)
+        if has_provider is not None:
+            query = query.filter(provider__isnull=not has_provider)
+        if status is not None:
+            query = query.filter(status=status)
+        return [serialize_repository(repo) for repo in query]
+
+    def get_repository(self, *, organization_id: int, id: int) -> RpcRepository | None:
+        repository = Repository.objects.filter(organization_id=organization_id, id=id).first()
+        if repository is None:
+            return None
+        return serialize_repository(repository)
+
+    def create_repository(
+        self, *, organization_id: int, create: RpcCreateRepository
+    ) -> RpcRepository | None:
+        try:
+            with enforce_constraints(transaction.atomic(router.db_for_write(Repository))):
+                repository = Repository.objects.create(
+                    organization_id=organization_id, **create.dict()
+                )
+                return serialize_repository(repository)
+        except IntegrityError:
+            return None
+
+    def update_repository(self, *, organization_id: int, update: RpcRepository) -> None:
+        with transaction.atomic(router.db_for_write(Repository)):
+            repository = (
+                Repository.objects.filter(organization_id=organization_id, id=update.id)
+                .select_for_update()
+                .first()
+            )
+            if repository is None:
+                return
+
+            update_dict = update.dict()
+            del update_dict["id"]
+
+            for field_name, field_value in update_dict.items():
+                setattr(repository, field_name, field_value)
+
+            repository.save()
+
+    def update_repository_config(
+        self,
+        *,
+        organization_id: int,
+        id: int,
+        config_updates: dict[str, Any],
+        config_deletions: list[str] | None = None,
+        expected_integration_id: int | None = None,
+        expected_config: dict[str, Any] | None = None,
+    ) -> bool:
+        with transaction.atomic(router.db_for_write(Repository)):
+            repository = (
+                Repository.objects.filter(organization_id=organization_id, id=id)
+                .select_for_update()
+                .first()
+            )
+            if repository is None or repository.status != ObjectStatus.ACTIVE:
+                return False
+            if (
+                expected_integration_id is not None
+                and repository.integration_id != expected_integration_id
+            ):
+                return False
+            for key, value in (expected_config or {}).items():
+                if repository.config.get(key) != value:
+                    return False
+
+            config = {**repository.config, **config_updates}
+            for key in config_deletions or ():
+                config.pop(key, None)
+            repository.config = config
+            repository.save(update_fields=["config"])
+        return True
+
+    def update_repositories(self, *, organization_id: int, updates: list[RpcRepository]) -> None:
+        if not updates:
+            return
+
+        update_mapping: dict[int, dict[str, Any]] = {}
+        for update in updates:
+            update_dict = update.dict()
+            del update_dict["id"]  # don't update the repo ID
+            update_mapping[update.id] = update_dict
+
+        if len(update_mapping.keys()) != len(updates):
+            raise Exception("Multiple updates for the same repository are not allowed.")
+
+        # we could be updating everything except the repo IDs, so we need to collect the fields
+        fields_to_update = set(list(update_mapping.values())[0].keys())
+
+        with transaction.atomic(router.db_for_write(Repository)):
+            repositories = (
+                Repository.objects.filter(
+                    organization_id=organization_id, id__in=update_mapping.keys()
+                )
+                .select_for_update()
+                .order_by("id")
+            )
+
+            # Apply updates to each repository object
+            for repository in repositories:
+                repo_update = update_mapping[repository.id]
+                for field_name, field_value in repo_update.items():
+                    setattr(repository, field_name, field_value)
+
+            Repository.objects.bulk_update(repositories, fields=list(fields_to_update))
+
+    def transfer_repository_to_integration(
+        self,
+        *,
+        organization_id: int,
+        update: RpcRepository,
+        organization_integration_id: int,
+    ) -> bool:
+        with transaction.atomic(router.db_for_write(Repository)):
+            # Lock the row so it can't be deleted between this check and the update.
+            repository = (
+                Repository.objects.filter(organization_id=organization_id, id=update.id)
+                .select_for_update()
+                .first()
+            )
+            if repository is None or repository.status not in (
+                ObjectStatus.ACTIVE,
+                ObjectStatus.DISABLED,
+            ):
+                return False
+
+            update_dict = update.dict()
+            del update_dict["id"]
+            for field_name, field_value in update_dict.items():
+                setattr(repository, field_name, field_value)
+
+            repository.save()
+
+            RepositoryProjectPathConfig.objects.filter(
+                organization_id=organization_id,
+                project_repository__repository_id=update.id,
+            ).update(
+                integration_id=update.integration_id,
+                organization_integration_id=organization_integration_id,
+            )
+        return True
+
+    def repoint_organization_integration_data(
+        self,
+        *,
+        organization_id: int,
+        old_integration_id: int,
+        new_integration_id: int,
+    ) -> RpcRepointIntegrationResult:
+        if old_integration_id == new_integration_id:
+            return RpcRepointIntegrationResult(
+                repositories=0,
+                code_mappings=0,
+                external_issues=0,
+                external_actors=0,
+                project_options=0,
+            )
+
+        option_key = "sentry:seer_automation_handoff_integration_id"
+        database = router.db_for_write(Repository)
+        with transaction.atomic(database):
+            repositories = Repository.objects.filter(
+                organization_id=organization_id,
+                integration_id=old_integration_id,
+            ).update(integration_id=new_integration_id)
+            code_mappings = RepositoryProjectPathConfig.objects.filter(
+                organization_id=organization_id,
+                integration_id=old_integration_id,
+            ).update(integration_id=new_integration_id)
+            old_issue_keys = ExternalIssue.objects.filter(
+                organization_id=organization_id,
+                integration_id=old_integration_id,
+            ).values_list("key", flat=True)
+            target_issue_ids = dict(
+                ExternalIssue.objects.filter(
+                    organization_id=organization_id,
+                    integration_id=new_integration_id,
+                    key__in=old_issue_keys,
+                ).values_list("key", "id")
+            )
+            conflicting_issue_ids = dict(
+                ExternalIssue.objects.filter(
+                    organization_id=organization_id,
+                    integration_id=old_integration_id,
+                    key__in=target_issue_ids.keys(),
+                ).values_list("id", "key")
+            )
+            issue_id_mapping = {
+                stale_id: target_issue_ids[key] for stale_id, key in conflicting_issue_ids.items()
+            }
+            if issue_id_mapping:
+                stale_links = list(
+                    GroupLink.objects.filter(
+                        linked_type=GroupLink.LinkedType.issue,
+                        linked_id__in=issue_id_mapping.keys(),
+                    ).values_list("id", "group_id", "linked_id")
+                )
+                survivor_links = set(
+                    GroupLink.objects.filter(
+                        linked_type=GroupLink.LinkedType.issue,
+                        linked_id__in=issue_id_mapping.values(),
+                    ).values_list("group_id", "linked_id")
+                )
+                duplicate_link_ids = []
+                links_to_update = []
+                for link_id, group_id, stale_issue_id in stale_links:
+                    survivor_id = issue_id_mapping[stale_issue_id]
+                    if (group_id, survivor_id) in survivor_links:
+                        duplicate_link_ids.append(link_id)
+                    else:
+                        links_to_update.append(GroupLink(id=link_id, linked_id=survivor_id))
+
+                GroupLink.objects.filter(id__in=duplicate_link_ids).delete()
+                GroupLink.objects.bulk_update(links_to_update, ["linked_id"])
+                ExternalIssue.objects.filter(id__in=issue_id_mapping.keys()).delete()
+
+            moved_external_issues = ExternalIssue.objects.filter(
+                organization_id=organization_id,
+                integration_id=old_integration_id,
+            ).update(integration_id=new_integration_id)
+            external_issues = len(issue_id_mapping) + moved_external_issues
+            external_actors = ExternalActor.objects.filter(
+                organization_id=organization_id,
+                integration_id=old_integration_id,
+            ).update(integration_id=new_integration_id)
+
+            affected_project_options = ProjectOption.objects.filter(
+                project__organization_id=organization_id,
+                key=option_key,
+                value__in=[old_integration_id, new_integration_id],
+            )
+            project_ids = tuple(affected_project_options.values_list("project_id", flat=True))
+            updated_project_options = affected_project_options.filter(
+                value=old_integration_id
+            ).update(value=new_integration_id)
+            if project_ids:
+                transaction.on_commit(
+                    partial(_reload_project_option_caches, project_ids, option_key),
+                    using=database,
+                )
+
+        return RpcRepointIntegrationResult(
+            repositories=repositories,
+            code_mappings=code_mappings,
+            external_issues=external_issues,
+            external_actors=external_actors,
+            project_options=updated_project_options,
+        )
+
+    def disable_repositories_for_integration(
+        self, *, organization_id: int, integration_id: int, provider: str
+    ) -> None:
+        with transaction.atomic(router.db_for_write(Repository)):
+            Repository.objects.filter(
+                organization_id=organization_id,
+                integration_id=integration_id,
+                provider=provider,
+            ).update(status=ObjectStatus.DISABLED)
+
+    def find_recently_active_repo_external_ids(
+        self,
+        *,
+        organization_id: int,
+        integration_id: int,
+        provider: str,
+        external_ids: list[str],
+        cutoff_days: int,
+    ) -> list[str]:
+        if not external_ids:
+            return []
+
+        cutoff = timezone.now() - timedelta(days=cutoff_days)
+        repo_id_to_external = dict(
+            Repository.objects.filter(
+                organization_id=organization_id,
+                integration_id=integration_id,
+                provider=provider,
+                external_id__in=external_ids,
+                status=ObjectStatus.ACTIVE,
+            ).values_list("id", "external_id")
+        )
+        if not repo_id_to_external:
+            return []
+
+        repo_ids = list(repo_id_to_external.keys())
+        active_repo_ids: set[int] = set()
+
+        active_repo_ids.update(
+            Commit.objects.filter(
+                repository_id__in=repo_ids,
+                date_added__gte=cutoff,
+            )
+            .values_list("repository_id", flat=True)
+            .distinct()
+        )
+        active_repo_ids.update(
+            PullRequest.objects.filter(
+                repository_id__in=repo_ids,
+                date_added__gte=cutoff,
+            )
+            .values_list("repository_id", flat=True)
+            .distinct()
+        )
+        active_repo_ids.update(
+            CodeReviewEvent.objects.filter(
+                organization_id=organization_id,
+                repository_id__in=repo_ids,
+                trigger_at__gte=cutoff,
+            )
+            .values_list("repository_id", flat=True)
+            .distinct()
+        )
+        return [
+            eid
+            for rid, eid in repo_id_to_external.items()
+            if rid in active_repo_ids and eid is not None
+        ]
+
+    def disable_repositories_by_external_ids(
+        self,
+        *,
+        organization_id: int,
+        integration_id: int,
+        provider: str,
+        external_ids: list[str],
+    ) -> None:
+        with transaction.atomic(router.db_for_write(Repository)):
+            repo_ids = list(
+                Repository.objects.filter(
+                    organization_id=organization_id,
+                    integration_id=integration_id,
+                    provider=provider,
+                    external_id__in=external_ids,
+                    status=ObjectStatus.ACTIVE,
+                ).values_list("id", flat=True)
+            )
+
+            if repo_ids:
+                Repository.objects.filter(id__in=repo_ids).update(status=ObjectStatus.DISABLED)
+
+    def disassociate_organization_integration(
+        self,
+        *,
+        organization_id: int,
+        organization_integration_id: int,
+        integration_id: int,
+    ) -> None:
+        with transaction.atomic(router.db_for_write(Repository)):
+            repo_ids = list(
+                Repository.objects.filter(
+                    organization_id=organization_id, integration_id=integration_id
+                ).values_list("id", flat=True)
+            )
+            if repo_ids:
+                # Disassociate repos from the organization integration being deleted
+                Repository.objects.filter(id__in=repo_ids).update(integration_id=None)
+
+                # Delete Seer preferences for this repository
+                SeerProjectRepository.objects.filter(
+                    project_repository__repository_id__in=repo_ids,
+                    project_repository__project__organization_id=organization_id,
+                ).delete()
+
+            # Delete Code Owners with a Code Mapping using the OrganizationIntegration
+            ProjectCodeOwners.objects.filter(
+                repository_project_path_config__in=RepositoryProjectPathConfig.objects.filter(
+                    organization_integration_id=organization_integration_id
+                ).values_list("id", flat=True)
+            ).delete()
+
+            # Delete the Code Mappings
+            RepositoryProjectPathConfig.objects.filter(
+                organization_integration_id=organization_integration_id
+            ).delete()
+            # Delete project-repo links for the disconnected repos
+            if repo_ids:
+                ProjectRepository.objects.filter(
+                    repository_id__in=repo_ids,
+                    project__organization_id=organization_id,
+                ).delete()
+
+            # Clear automation_handoff project options that reference this integration.
+            affected_project_ids = ProjectOption.objects.filter(
+                project__organization_id=organization_id,
+                key="sentry:seer_automation_handoff_integration_id",
+                value=integration_id,
+            ).values("project_id")
+            ProjectOption.objects.filter(
+                project_id__in=affected_project_ids,
+                key__in={
+                    "sentry:seer_automation_handoff_integration_id",
+                    "sentry:seer_automation_handoff_point",
+                    "sentry:seer_automation_handoff_target",
+                    "sentry:seer_automation_handoff_auto_create_pr",
+                },
+            ).delete()
+
+    def schedule_update_gitlab_project_webhooks(
+        self,
+        *,
+        organization_id: int,
+        integration_id: int,
+        force: bool = False,
+    ) -> None:
+        update_all_project_webhooks.delay(
+            integration_id=integration_id,
+            organization_id=organization_id,
+            force=force,
+        )
+
+    def auto_link_repos_by_name(
+        self,
+        *,
+        organization_id: int,
+        repo_ids: list[int] | None = None,
+        project_ids: list[int] | None = None,
+    ) -> int:
+        try:
+            organization = Organization.objects.get(id=organization_id)
+        except Organization.DoesNotExist:
+            return 0
+        return auto_link_repos_by_name(organization, repo_ids, project_ids=project_ids)

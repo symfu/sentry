@@ -1,5 +1,3 @@
-/* eslint-env node */
-
 /**
  * List of workflows to dispatch to `getsentry`
  *
@@ -10,34 +8,100 @@
  */
 const DISPATCHES = [
   {
-    workflow: 'js-build-and-lint.yml',
-    pathFilterName: 'frontend',
+    workflow: 'backend.yml',
+    pathFilterName: 'backend_all',
   },
   {
-    workflow: 'backend-test.yml',
-    pathFilterName: 'backend_dependencies',
+    workflow: 'acceptance.yml',
+    pathFilterName: 'gsapp',
   },
 ];
 
-module.exports = {
-  dispatch: async ({github, context, fileChanges}) => {
-    const shouldSkip = {
-      frontend: fileChanges.frontend !== 'true',
-      backend_dependencies: fileChanges.backend_dependencies !== 'true',
-    };
+const RETRY_DELAYS_MS = [5000, 15000, 30000, 60000];
+const MAX_WORKFLOW_DISPATCH_INPUTS_LENGTH = 65_535;
 
-    DISPATCHES.forEach(({workflow, pathFilterName}) => {
-      github.actions.createWorkflowDispatch({
+async function dispatchWithRetry({github, core, workflow, inputs}) {
+  const maxAttempts = RETRY_DELAYS_MS.length + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await github.rest.actions.createWorkflowDispatch({
         owner: 'getsentry',
         repo: 'getsentry',
         workflow_id: workflow,
         ref: 'master',
-        inputs: {
-          pull_request_number: `${context.payload.pull_request.number}`, // needs to be string
-          skip: `${shouldSkip[pathFilterName]}`, // even though this is a boolean, it must be cast to a string
-          'sentry-sha': context.payload.pull_request.head.sha,
-        },
+        inputs,
       });
-    });
-  },
-};
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) {
+        throw err;
+      }
+      const delay = RETRY_DELAYS_MS[attempt - 1];
+      core.warning(
+        `Dispatch for '${workflow}' failed (attempt ${attempt}/${maxAttempts}): ${err.message}. Retrying in ${delay / 1000}s...`
+      );
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
+export async function dispatch({
+  github,
+  context,
+  core,
+  fileChanges,
+  mergeCommitSha,
+  sentryChangedFiles,
+  sentryPreviousFilenames,
+  targetWorkflow,
+}) {
+  core.startGroup('Dispatching request to getsentry.');
+
+  const dispatches =
+    targetWorkflow !== undefined
+      ? [
+          {
+            workflow: targetWorkflow,
+            pathFilterName:
+              DISPATCHES.find(d => d.workflow === targetWorkflow)?.pathFilterName ??
+              'backend_all',
+          },
+        ]
+      : DISPATCHES;
+
+  await Promise.all(
+    dispatches.map(({workflow, pathFilterName}) => {
+      const inputs = {
+        pull_request_number: `${context.payload.pull_request.number}`, // needs to be string
+        skip: `${fileChanges[pathFilterName] !== 'true'}`, // even though this is a boolean, it must be cast to a string
+
+        // sentrySHA is the sha getsentry should run against.
+        'sentry-sha': mergeCommitSha,
+        // prSHA is the sha actions should post commit statuses too.
+        'sentry-pr-sha': context.payload.pull_request.head.sha,
+
+        // Changed files for selective testing. Empty string means full suite.
+        'sentry-changed-files': sentryChangedFiles || '',
+        'sentry-previous-filenames': sentryPreviousFilenames || '',
+      };
+
+      if (JSON.stringify(inputs).length > MAX_WORKFLOW_DISPATCH_INPUTS_LENGTH) {
+        core.warning(
+          `Inputs for '${workflow}' exceed GitHub's ` +
+            `${MAX_WORKFLOW_DISPATCH_INPUTS_LENGTH}-character limit. ` +
+            'Clearing changed-file lists so getsentry runs the full suite.'
+        );
+        inputs['sentry-changed-files'] = '';
+        inputs['sentry-previous-filenames'] = '';
+      }
+
+      core.info(
+        `Sending dispatch for '${workflow}':\n${JSON.stringify(inputs, null, 2)}`
+      );
+
+      return dispatchWithRetry({github, core, workflow, inputs});
+    })
+  );
+
+  core.endGroup();
+}

@@ -1,0 +1,448 @@
+import pickBy from 'lodash/pickBy';
+
+import {Link} from '@sentry/scraps/link';
+
+import type {TagCollection} from 'sentry/types/group';
+import type {Organization} from 'sentry/types/organization';
+import type {CustomMeasurementCollection} from 'sentry/utils/customMeasurements/customMeasurements';
+import type {EventsTableData, TableData} from 'sentry/utils/discover/discoverQuery';
+import {emptyStringValue} from 'sentry/utils/discover/emptyFieldValues';
+import type {EventData} from 'sentry/utils/discover/eventView';
+import type {RenderFunctionBaggage} from 'sentry/utils/discover/fieldRenderers';
+import {getFieldRenderer} from 'sentry/utils/discover/fieldRenderers';
+import {
+  AGGREGATIONS,
+  stripEquationPrefix,
+  type Aggregation,
+  type QueryFieldValue,
+} from 'sentry/utils/discover/fields';
+import {Container, NumberContainer} from 'sentry/utils/discover/styles';
+import {generateLinkToEventInTraceView} from 'sentry/utils/discover/urls';
+import {getShortEventId} from 'sentry/utils/events';
+import {
+  AggregationKey,
+  ALLOWED_EXPLORE_VISUALIZE_AGGREGATES,
+  NO_ARGUMENT_SPAN_AGGREGATES,
+} from 'sentry/utils/fields';
+import type {EventsTimeSeriesResponse} from 'sentry/utils/timeSeries/useFetchEventsTimeSeries';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {WIDGET_BUILDER_ATTRIBUTE_STALE_TIME} from 'sentry/views/dashboards/constants';
+import {
+  type DatasetConfig,
+  type SearchBarData,
+  type SearchBarDataProviderProps,
+} from 'sentry/views/dashboards/datasetConfig/base';
+import {
+  getTableSortOptions,
+  getTimeseriesSortOptions,
+  renderTraceAsLinkable,
+} from 'sentry/views/dashboards/datasetConfig/events';
+import {combineBaseFieldsWithTags} from 'sentry/views/dashboards/datasetConfig/utils/combineBaseFieldsWithEapTags';
+import {handleOrderByReset} from 'sentry/views/dashboards/datasetConfig/utils/handleOrderByReset';
+import {spansResponseTransforms} from 'sentry/views/dashboards/datasetConfig/utils/spansResponseTransforms';
+import {
+  DisplayType,
+  type DashboardFilters,
+  type Widget,
+  type WidgetQuery,
+} from 'sentry/views/dashboards/types';
+import {getWidgetTableRowExploreUrlFunction} from 'sentry/views/dashboards/utils/getWidgetExploreUrl';
+import {SpansSearchBar} from 'sentry/views/dashboards/widgetBuilder/buildSteps/filterResultsStep/spansSearchBar';
+import {
+  useSpansSeriesQuery,
+  useSpansTableQuery,
+} from 'sentry/views/dashboards/widgetCard/hooks/useSpansWidgetQuery';
+import type {FieldValueOption} from 'sentry/views/discover/table/queryField';
+import {FieldValueKind} from 'sentry/views/discover/table/types';
+import {useTraceItemSearchQueryBuilderProps} from 'sentry/views/explore/components/traceItemSearchQueryBuilder';
+import {useSpanItemAttributes} from 'sentry/views/explore/hooks/useTraceItemAttributes';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+import {
+  hasConditionalAggregateFilter,
+  withBaseConditionalAggregateField,
+} from 'sentry/views/explore/utils/conditionalAggregate';
+import {SpanFields} from 'sentry/views/insights/types';
+import {TraceViewSources} from 'sentry/views/performance/traceDetails/traceHeader/traceViewSources';
+import {transactionSummaryRouteWithQuery} from 'sentry/views/performance/transactionSummary/utils';
+
+const DEFAULT_WIDGET_QUERY: WidgetQuery = {
+  name: '',
+  fields: ['count(span.duration)'],
+  columns: [],
+  fieldAliases: [],
+  aggregates: ['count(span.duration)'],
+  conditions: '',
+  orderby: '-count(span.duration)',
+};
+
+const DEFAULT_FIELD: QueryFieldValue = {
+  function: ['count', 'span.duration', undefined, undefined],
+  kind: FieldValueKind.FUNCTION,
+};
+
+const EAP_AGGREGATIONS = ALLOWED_EXPLORE_VISUALIZE_AGGREGATES.reduce(
+  (acc, aggregate) => {
+    if (aggregate === AggregationKey.COUNT) {
+      acc[AggregationKey.COUNT] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [
+          {
+            kind: 'column',
+            columnTypes: ['number'],
+            defaultValue: 'span.duration',
+            required: true,
+          },
+        ],
+      };
+    } else if (aggregate === AggregationKey.COUNT_UNIQUE) {
+      acc[AggregationKey.COUNT_UNIQUE] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [
+          {
+            kind: 'column',
+            columnTypes: ['number', 'string'],
+            defaultValue: 'span.op',
+            required: true,
+          },
+        ],
+      };
+    } else if (
+      aggregate === AggregationKey.PERFORMANCE_SCORE ||
+      aggregate === AggregationKey.OPPORTUNITY_SCORE
+    ) {
+      acc[aggregate] = AGGREGATIONS[aggregate];
+    } else if (NO_ARGUMENT_SPAN_AGGREGATES.includes(aggregate)) {
+      acc[aggregate] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [],
+      };
+    } else {
+      acc[aggregate] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [
+          {
+            kind: 'column',
+            columnTypes: ['number', 'string'], // Need to keep the string type for unknown values before tags are resolved
+            defaultValue: 'span.duration',
+            required: true,
+          },
+        ],
+      };
+    }
+    return acc;
+  },
+  {} as Record<AggregationKey, Aggregation>
+);
+
+const INTERNAL_ERROR_COUNT_FIELD =
+  'count_if(`span.status:internal_error`) + count_if(`span.status:error`)';
+
+function useSpansSearchBarDataProvider(props: SearchBarDataProviderProps): SearchBarData {
+  const {filterKeySearch, pageFilters, widgetQuery} = props;
+  const organization = useOrganization();
+  const attributeOptions = {
+    enabled: organization.features.includes('visibility-explore-view'),
+    search: filterKeySearch,
+    staleTime: WIDGET_BUILDER_ATTRIBUTE_STALE_TIME,
+  };
+
+  const {
+    attributes: stringAttributes,
+    isLoading: stringAttributesLoading,
+    secondaryAliases: stringSecondaryAliases,
+  } = useSpanItemAttributes(attributeOptions, 'string');
+  const {
+    attributes: numberAttributes,
+    isLoading: numberAttributesLoading,
+    secondaryAliases: numberSecondaryAliases,
+  } = useSpanItemAttributes(attributeOptions, 'number');
+  const {
+    attributes: booleanAttributes,
+    isLoading: booleanAttributesLoading,
+    secondaryAliases: booleanSecondaryAliases,
+  } = useSpanItemAttributes(attributeOptions, 'boolean');
+  const isFetchingFilterKeys =
+    stringAttributesLoading || numberAttributesLoading || booleanAttributesLoading;
+
+  const {filterKeys, filterKeySections, getTagValues} =
+    useTraceItemSearchQueryBuilderProps({
+      itemType: TraceItemDataset.SPANS,
+      booleanAttributes,
+      numberAttributes,
+      stringAttributes,
+      booleanSecondaryAliases,
+      numberSecondaryAliases,
+      stringSecondaryAliases,
+      searchSource: 'dashboards',
+      initialQuery: widgetQuery?.conditions ?? '',
+      projects: pageFilters.projects,
+      supportedAggregates: ALLOWED_EXPLORE_VISUALIZE_AGGREGATES,
+    });
+  return {
+    getFilterKeys: () => filterKeys,
+    getFilterKeySections: () => filterKeySections,
+    getTagValues,
+    isFetchingFilterKeys,
+  };
+}
+
+export const SpansConfig: DatasetConfig<
+  EventsTimeSeriesResponse,
+  TableData | EventsTableData
+> = {
+  defaultCategoryField: 'transaction',
+  defaultField: DEFAULT_FIELD,
+  defaultWidgetQuery: DEFAULT_WIDGET_QUERY,
+  enableEquations: true,
+  SearchBar: SpansSearchBar,
+  useSearchBarDataProvider: useSpansSearchBarDataProvider,
+  filterYAxisAggregateParams: () => filterAggregateParams,
+  filterYAxisOptions,
+  filterSeriesSortOptions,
+  getTableFieldOptions: getPrimaryFieldOptions,
+  getTableSortOptions,
+  getTimeseriesSortOptions: (organization, widgetQuery, tags) =>
+    getTimeseriesSortOptions(organization, widgetQuery, tags, getPrimaryFieldOptions),
+  getGroupByFieldOptions,
+  handleOrderByReset,
+  supportedDisplayTypes: [
+    DisplayType.AREA,
+    DisplayType.BAR,
+    DisplayType.BIG_NUMBER,
+    DisplayType.CATEGORICAL_BAR,
+    DisplayType.LINE,
+    DisplayType.TABLE,
+    DisplayType.TOP_N,
+    DisplayType.DETAILS,
+    DisplayType.SERVER_TREE,
+  ],
+  useSeriesQuery: useSpansSeriesQuery,
+  useTableQuery: useSpansTableQuery,
+  ...spansResponseTransforms,
+  filterAggregateParams,
+  getCustomFieldRenderer: (field, meta, widget, _organization, dashboardFilters) => {
+    if (field === 'id') {
+      return renderEventInTraceView;
+    }
+    if (field === 'trace') {
+      return renderTraceAsLinkable(widget);
+    }
+    if (
+      field === SpanFields.TRANSACTION &&
+      !widget?.queries?.[0]?.linkedDashboards?.some(
+        linkedDashboard => linkedDashboard.field === SpanFields.TRANSACTION
+      )
+    ) {
+      return renderTransactionAsLinkable;
+    }
+    const strippedField = stripEquationPrefix(field);
+    if (
+      field === INTERNAL_ERROR_COUNT_FIELD ||
+      strippedField === INTERNAL_ERROR_COUNT_FIELD
+    ) {
+      return renderInternalErrorCount(widget, dashboardFilters);
+    }
+    return getFieldRenderer(field, meta, false, widget, dashboardFilters);
+  },
+};
+
+function getPrimaryFieldOptions(
+  organization: Organization,
+  tags?: TagCollection,
+  _customMeasurements?: CustomMeasurementCollection
+): Record<string, FieldValueOption> {
+  return combineBaseFieldsWithTags(organization, tags, EAP_AGGREGATIONS);
+}
+
+function filterAggregateParams(option: FieldValueOption, fieldValue?: QueryFieldValue) {
+  // Allow for unknown values to be used for aggregate functions
+  // This supports showing the tag value even if it's not in the current
+  // set of tags.
+  if ('unknown' in option.value.meta && option.value.meta.unknown) {
+    return true;
+  }
+
+  // Explore-style `_if` fields explode as `count_unique_if` / `count_if`, but
+  // column filtering must use the base aggregate name.
+  const normalizedField = fieldValue
+    ? withBaseConditionalAggregateField(fieldValue)
+    : fieldValue;
+
+  if (
+    normalizedField?.kind === 'function' &&
+    normalizedField?.function[0] === AggregationKey.COUNT
+  ) {
+    return option.value.meta.name === 'span.duration';
+  }
+
+  const expectedDataType =
+    normalizedField?.kind === 'function' &&
+    normalizedField?.function[0] === AggregationKey.COUNT_UNIQUE
+      ? 'string'
+      : 'number';
+
+  if ('dataType' in option.value.meta) {
+    return option.value.meta.dataType === expectedDataType;
+  }
+  return true;
+}
+
+function filterYAxisOptions() {
+  return function (option: FieldValueOption) {
+    return option.value.kind === FieldValueKind.FUNCTION;
+  };
+}
+
+function getGroupByFieldOptions(organization: Organization, tags?: TagCollection) {
+  const primaryFieldOptions = getPrimaryFieldOptions(organization, tags);
+  const yAxisFilter = filterYAxisOptions();
+
+  const filterGroupByOptions = (option: FieldValueOption) => !yAxisFilter(option);
+
+  return pickBy(primaryFieldOptions, filterGroupByOptions);
+}
+
+// Filters the primary options in the sort by selector
+function filterSeriesSortOptions(columns: Set<string>) {
+  return (option: FieldValueOption) => {
+    if (
+      option.value.kind === FieldValueKind.FUNCTION ||
+      option.value.kind === FieldValueKind.EQUATION ||
+      hasConditionalAggregateFilter(option.value.meta.name)
+    ) {
+      return true;
+    }
+
+    return columns.has(option.value.meta.name);
+  };
+}
+
+function renderEventInTraceView(
+  data: EventData,
+  {location, organization}: RenderFunctionBaggage
+) {
+  const spanId = data.id;
+  if (!spanId || typeof spanId !== 'string') {
+    return <Container>{emptyStringValue}</Container>;
+  }
+
+  if (!data.trace) {
+    return <Container>{getShortEventId(spanId)}</Container>;
+  }
+
+  const target = generateLinkToEventInTraceView({
+    traceSlug: data.trace,
+    timestamp: data.timestamp,
+    targetId: data['transaction.span_id'],
+    organization,
+    location,
+    spanId,
+    source: TraceViewSources.DASHBOARDS,
+  });
+
+  return (
+    <Link to={target}>
+      <Container>{getShortEventId(spanId)}</Container>
+    </Link>
+  );
+}
+
+function renderTransactionAsLinkable(data: EventData, baggage: RenderFunctionBaggage) {
+  const transaction = data.transaction;
+  if (!transaction || typeof transaction !== 'string') {
+    return <Container>{emptyStringValue}</Container>;
+  }
+
+  const {organization, location, projects} = baggage;
+
+  let projectID: string | string[] | undefined;
+  const filterProjects = location?.query.project;
+
+  if (typeof filterProjects === 'string' && filterProjects !== '-1') {
+    projectID = filterProjects;
+  } else {
+    const projectMatch = projects?.find(
+      project =>
+        project.slug && [data['project.name'], data.project].includes(project.slug)
+    );
+    projectID = projectMatch ? [projectMatch.id] : undefined;
+  }
+
+  const filters = new MutableSearch('');
+
+  if (data[SpanFields.SPAN_OP]) {
+    filters.addFilterValue(SpanFields.SPAN_OP, data[SpanFields.SPAN_OP]);
+  }
+  if (data[SpanFields.REQUEST_METHOD]) {
+    filters.addFilterValue('request.method', data[SpanFields.REQUEST_METHOD]);
+  }
+
+  const target = transactionSummaryRouteWithQuery({
+    organization,
+    transaction: String(transaction),
+    projectID,
+    query: location?.query,
+    additionalQuery: {query: filters.formatString()},
+  });
+
+  return (
+    <Link to={target}>
+      <Container>{transaction}</Container>
+    </Link>
+  );
+}
+
+// Renders the count of internal errors for a given widget and dashboard filters.
+// Displays 0 if a row receives null count.
+// Returns a link to the explore page with the internal error filter applied.
+function renderInternalErrorCount(widget?: Widget, dashboardFilters?: DashboardFilters) {
+  return function (data: EventData, baggage: RenderFunctionBaggage) {
+    const {organization, eventView} = baggage;
+    const selection = eventView?.getPageFilters();
+    const value =
+      data[INTERNAL_ERROR_COUNT_FIELD] ?? data[`equation|${INTERNAL_ERROR_COUNT_FIELD}`];
+    const count = typeof value === 'number' ? value : 0;
+
+    if (count === 0) {
+      return <NumberContainer>0</NumberContainer>;
+    }
+
+    if (!widget || !selection) {
+      return <NumberContainer>{count}</NumberContainer>;
+    }
+
+    const baseConditions = widget.queries[0]?.conditions ?? '';
+    const errorQuery = new MutableSearch(baseConditions);
+    errorQuery.addStringFilter('span.status:[internal_error,error]');
+    const widgetWithErrorFilter: Widget = {
+      ...widget,
+      queries: widget.queries.map(q => ({
+        ...q,
+        conditions: errorQuery.formatString(),
+      })),
+    };
+
+    const getRowExploreUrl = getWidgetTableRowExploreUrlFunction(
+      selection,
+      widgetWithErrorFilter,
+      organization,
+      dashboardFilters
+    );
+    const target = getRowExploreUrl(data);
+
+    if (!target) {
+      return <NumberContainer>{count}</NumberContainer>;
+    }
+
+    return (
+      <NumberContainer>
+        <Link to={target}>{count}</Link>
+      </NumberContainer>
+    );
+  };
+}

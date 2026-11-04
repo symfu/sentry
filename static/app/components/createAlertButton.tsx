@@ -1,0 +1,126 @@
+import {IconSiren} from '@sentry/icons/siren';
+import type {LocationDescriptor} from 'history';
+
+import type {LinkButtonProps} from '@sentry/scraps/button';
+import {LinkButton} from '@sentry/scraps/button';
+import {Link} from '@sentry/scraps/link';
+
+import {hasEveryAccess} from 'sentry/components/acl/access';
+import {t, tct} from 'sentry/locale';
+import type {Organization} from 'sentry/types/organization';
+import type {Project} from 'sentry/types/project';
+import {isDemoModeActive} from 'sentry/utils/demoMode';
+import type {EventView} from 'sentry/utils/discover/eventView';
+import {decodeScalar} from 'sentry/utils/queryString';
+import {useProjects} from 'sentry/utils/useProjects';
+import type {AlertType} from 'sentry/views/alerts/wizard/options';
+import {
+  AlertWizardRuleTemplates,
+  DEFAULT_WIZARD_TEMPLATE,
+} from 'sentry/views/alerts/wizard/options';
+import {getMetricMonitorUrl} from 'sentry/views/insights/common/utils/getMetricMonitorUrl';
+
+type CreateAlertFromViewButtonProps = Omit<LinkButtonProps, 'aria-label' | 'to'> & {
+  /**
+   * Discover query used to create the alert
+   */
+  eventView: EventView;
+  organization: Organization;
+  projects: Project[];
+  alertType?: AlertType;
+  className?: string;
+
+  /**
+   * Called when the user is redirected to the alert builder
+   */
+  onClick?: () => void;
+  referrer?: string;
+};
+
+/**
+ * Provide a button that can create an alert from an event view.
+ * Emits incompatible query issues on click
+ */
+export function CreateAlertFromViewButton({
+  projects,
+  eventView,
+  organization,
+  referrer,
+  onClick,
+  alertType,
+  ...buttonProps
+}: CreateAlertFromViewButtonProps) {
+  const project = projects.find(p => p.id === `${eventView.project[0]}`);
+  const queryParams = eventView.generateQueryStringObject();
+  if (queryParams.query?.includes(`project:${project?.slug}`)) {
+    queryParams.query = (queryParams.query as string).replace(
+      `project:${project?.slug}`,
+      ''
+    );
+  }
+
+  const alertTemplate = alertType
+    ? // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+      AlertWizardRuleTemplates[alertType]
+    : DEFAULT_WIZARD_TEMPLATE;
+
+  const to = getMetricMonitorUrl({
+    project,
+    environment: queryParams.environment,
+    aggregate: queryParams.yAxis ?? alertTemplate.aggregate,
+    dataset: alertTemplate.dataset,
+    organization,
+    query: decodeScalar(queryParams.query),
+    referrer,
+    eventTypes: alertTemplate.eventTypes,
+  });
+
+  const handleClick = () => {
+    onClick?.();
+  };
+
+  return (
+    <CreateAlertButton
+      organization={organization}
+      onClick={handleClick}
+      to={to}
+      aria-label={t('Create Monitor')}
+      {...buttonProps}
+    />
+  );
+}
+
+type CreateAlertButtonProps = {
+  organization: Organization;
+  to: string | LocationDescriptor;
+} & Omit<LinkButtonProps, 'to'>;
+
+function CreateAlertButton({organization, to, ...buttonProps}: CreateAlertButtonProps) {
+  const {projects} = useProjects();
+
+  const permissionTooltipText = tct(
+    'Ask your organization owner or manager to [settingsLink:enable alerts access] for you.',
+    {settingsLink: <Link to={`/settings/${organization.slug}/`} />}
+  );
+
+  const canCreateAlert =
+    isDemoModeActive() ||
+    hasEveryAccess(['alerts:write'], {organization}) ||
+    projects.some(p => hasEveryAccess(['alerts:write'], {project: p}));
+
+  return (
+    <LinkButton
+      disabled={!canCreateAlert}
+      icon={<IconSiren />}
+      to={to}
+      tooltipProps={{
+        title: canCreateAlert ? undefined : permissionTooltipText,
+        position: 'top',
+        maxWidth: 270,
+      }}
+      {...buttonProps}
+    >
+      {buttonProps.children ?? t('Create Monitor')}
+    </LinkButton>
+  );
+}

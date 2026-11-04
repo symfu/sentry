@@ -1,0 +1,343 @@
+# Fixtures used to interact with a test Relay server
+
+from __future__ import annotations
+
+import datetime
+import logging
+import shutil
+import sys
+import time
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager
+from os import environ, path
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from unittest import mock
+from urllib.parse import urlparse
+
+import docker
+import docker.errors
+import ephemeral_port_reserve
+import pytest
+import requests
+
+from sentry.runner.commands.devservices import get_docker_client
+from sentry.testutils.pytest import xdist
+
+if TYPE_CHECKING:
+    from pytest import TempPathFactory
+    from pytest_django.live_server_helper import LiveServer
+
+_log = logging.getLogger(__name__)
+
+
+class RelayDockerOptions(TypedDict):
+    image: str
+    ports: dict[str, int]
+    network: str
+    detach: Literal[True]
+    name: str
+    volumes: dict[str, dict[str, str]]
+    command: list[str]
+    extra_hosts: dict[str, str]
+
+
+class RelayServerSetup(TypedDict):
+    url: str
+    options: RelayDockerOptions
+
+
+class RelayServer(TypedDict):
+    url: str
+
+
+# This helps the Relay CI to specify the generated Docker build before it is published
+RELAY_TEST_IMAGE = environ.get("RELAY_TEST_IMAGE", "ghcr.io/getsentry/relay:nightly")
+
+
+def _relay_server_container_name() -> str:
+    if xdist._worker_id:
+        return f"sentry_test_relay_server_{xdist._worker_id}"
+    return "sentry_test_relay_server"
+
+
+def _wait_until_ready(url: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    last_result = "not probed"
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            status = requests.get(url, timeout=min(1, remaining)).status_code
+        except requests.RequestException as e:
+            last_result = f"{type(e).__name__}: {e}"
+        else:
+            if status == 200:
+                return
+            last_result = f"HTTP {status}"
+        time.sleep(max(0, min(0.05, deadline - time.monotonic())))
+    raise TimeoutError(last_result)
+
+
+class _Container(Protocol):
+    def stop(self, timeout: int | None = None) -> object: ...
+    def kill(self) -> object: ...
+    def remove(self) -> object: ...
+
+
+def _get_template_dir() -> str:
+    return path.abspath(path.join(path.dirname(__file__), "template"))
+
+
+def _remove_container_if_exists(docker_client: docker.DockerClient, container_name: str) -> None:
+    try:
+        container = cast("_Container", docker_client.containers.get(container_name))
+    except Exception:
+        pass  # container not found
+    else:
+        actions: list[Callable[[], object]] = [
+            lambda: container.stop(timeout=1),
+            lambda: container.kill(),
+            lambda: container.remove(),
+        ]
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                pass
+
+
+@pytest.fixture(scope="module")
+def relay_server_setup(
+    live_server: LiveServer, tmpdir_factory: TempPathFactory
+) -> Generator[RelayServerSetup]:
+    prefix = "test_relay_config_{}_".format(
+        datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    )
+    config_dir = tmpdir_factory.mktemp(prefix)
+    config_dir.chmod(0o755)
+    config_path = str(config_dir)
+
+    parsed_live_server_url = urlparse(live_server.url)
+    if parsed_live_server_url.port is not None:
+        port = parsed_live_server_url.port
+    else:
+        port = 80
+
+    template_path = _get_template_dir()
+    sources = ["config.yml", "credentials.json"]
+
+    relay_port = ephemeral_port_reserve.reserve(ip="127.0.0.1", port=0)
+
+    redis_db = xdist.get_redis_db()
+
+    from sentry.relay import projectconfig_cache
+    from sentry.relay.projectconfig_cache.redis import RedisProjectConfigCache
+
+    projectconfig_backend = projectconfig_cache.backend.test_only__downcast_to(
+        RedisProjectConfigCache
+    )
+    assert redis_db == projectconfig_backend.cluster.connection_pool.connection_kwargs["db"]
+
+    template_vars = {
+        "SENTRY_HOST": f"http://host.docker.internal:{port}/",
+        "RELAY_PORT": relay_port,
+        "KAFKA_HOST": "kafka",
+        "REDIS_HOST": "redis",
+        "REDIS_DB": redis_db,
+        "KAFKA_TOPIC_EVENTS": xdist.get_kafka_topic("ingest-events"),
+        "KAFKA_TOPIC_OUTCOMES": xdist.get_kafka_topic("outcomes"),
+    }
+
+    for source in sources:
+        source_path = path.join(template_path, source)
+        dest_path = path.join(config_path, source)
+        with open(source_path) as input:
+            content = input.read()
+
+        for var_name, var_val in template_vars.items():
+            content = content.replace("${%s}" % var_name, str(var_val))
+
+        with open(dest_path, "w") as output:
+            output.write(content)
+
+    # we have a config path for relay that is set up with the current live serve as upstream
+    # check if we have the test relay docker container
+    with get_docker_client() as docker_client:
+        container_name = _relay_server_container_name()
+        _remove_container_if_exists(docker_client, container_name)
+
+    options: RelayDockerOptions = {
+        "image": RELAY_TEST_IMAGE,
+        "ports": {"%s/tcp" % relay_port: relay_port},
+        "network": "devservices",
+        "detach": True,
+        "name": container_name,
+        "volumes": {config_path: {"bind": "/etc/relay"}},
+        "command": ["run", "--config", "/etc/relay"],
+        "extra_hosts": {"host.docker.internal": "host-gateway"},
+    }
+
+    # Some structure similar to what the live_server fixture returns
+    server_info: RelayServerSetup = {
+        "url": f"http://127.0.0.1:{relay_port}",
+        "options": options,
+    }
+
+    # Relay keeps idle upstream connections open past the global 5s socket timeout.
+    httpd = live_server.thread.httpd
+    handle_error = httpd.handle_error
+
+    def _handle_error(request: object, client_address: object) -> None:
+        if not isinstance(sys.exception(), TimeoutError):
+            handle_error(request, client_address)
+
+    with mock.patch.object(httpd, "handle_error", _handle_error):
+        yield server_info
+
+    # cleanup
+    shutil.rmtree(config_path)
+    if not environ.get("RELAY_TEST_KEEP_CONTAINER", False):
+        with get_docker_client() as docker_client:
+            _remove_container_if_exists(docker_client, container_name)
+
+
+@pytest.fixture(scope="function")
+def relay_server(relay_server_setup: RelayServerSetup) -> Generator[RelayServer]:
+    # Imported lazily: this module is loaded as a pytest plugin before Django is set up,
+    # and override_options pulls in app code that requires configured settings.
+    from sentry.testutils.helpers.options import override_options
+
+    options = relay_server_setup["options"]
+
+    # `relay.endpoint-fetch-config.enabled` (default True since #114947) makes Relay's
+    # minidump/unreal endpoints resolve the project config synchronously before queueing.
+    # The test project's config is never warm in Relay, so that fetch times out and Relay
+    # rejects the upload with a 503 (ProjectUnavailable) -- the cause of the minidump test
+    # flakiness. These tests cover the ingestion pipeline, not the endpoint-fetch path,
+    # so turn it off.
+    # It is served to the test Relay via the upstream global config, hence the override
+    # must wrap Relay startup.
+    with (
+        relay_test_settings(),
+        override_options({"relay.endpoint-fetch-config.enabled": False}),
+    ):
+        # Keep the docker client open through the readiness wait so the error paths
+        # below can still fetch `container.logs()` for diagnostics.
+        with get_docker_client() as docker_client:
+            container_name = _relay_server_container_name()
+            _remove_container_if_exists(docker_client, container_name)
+            # Docker may not release the host port binding immediately after
+            # container removal; retry to ride out the race window.
+            for attempt in range(5):
+                try:
+                    container = docker_client.containers.run(**options)
+                    break
+                except docker.errors.APIError as e:
+                    if "address already in use" in str(e) and attempt < 4:
+                        time.sleep(1 * 1.5**attempt)
+                        _remove_container_if_exists(docker_client, container_name)
+                        continue
+                    raise
+
+            _log.info("Waiting for Relay container to start")
+
+            url = relay_server_setup["url"]
+
+            # Gate on Relay's readiness probe rather than a bare GET, which only proves the
+            # HTTP server is up. Readiness reports whether Relay can actually accept envelopes
+            # (authenticated with the upstream, spool capacity, memory); posting before then
+            # races startup and Relay rejects the request with a 503. This mirrors production,
+            # where load balancers route ingest traffic only to Relays passing this same probe.
+            #
+            # Poll at a fixed short interval: Relay is usually ready within a couple of
+            # seconds, and exponential backoff overshoots that by up to the last sleep.
+            # The deadline matches the previous backoff schedule's total.
+            readiness_url = f"{url}/api/relay/healthcheck/ready/"
+            try:
+                _wait_until_ready(readiness_url, timeout=25.5)
+            except TimeoutError as e:
+                try:
+                    logs = container.logs().decode()
+                finally:
+                    if not environ.get("RELAY_TEST_KEEP_CONTAINER", False):
+                        _remove_container_if_exists(docker_client, container_name)
+                raise ValueError(
+                    f"relay did not become ready in time (now: {datetime.datetime.now().isoformat()}, last result: {e}) {readiness_url}:\n{logs}"
+                ) from e
+
+        server: RelayServer = {"url": relay_server_setup["url"]}
+        yield server
+
+
+def relay_test_settings() -> AbstractContextManager[object]:
+    """
+    Settings that let a Relay instance running inside a docker container call the app.
+    """
+    from django.test import override_settings
+
+    return override_settings(
+        ALLOWED_HOSTS=[
+            "localhost",
+            "testserver",
+            "host.docker.internal",
+            "0.0.0.0",
+            "127.0.0.1",
+        ],
+        KAFKA_CLUSTERS={
+            "default": {
+                "common": {"bootstrap.servers": "127.0.0.1:9092"},
+                "producers": {
+                    "compression.type": "lz4",
+                    "message.max.bytes": 50000000,  # 50MB, default is 1MB
+                },
+            }
+        },
+        SENTRY_RELAY_WHITELIST_PK=["SMSesqan65THCV6M4qs4kBzPai60LzuDn-xNsvYpuP8"],
+        SENTRY_USE_RELAY=True,
+    )
+
+
+@pytest.fixture
+def get_relay_store_url(relay_server: RelayServer) -> Callable[[int | str], str]:
+    def inner(project_id: int | str) -> str:
+        return "{}/api/{}/store/".format(relay_server["url"], project_id)
+
+    return inner
+
+
+@pytest.fixture
+def get_relay_security_url(
+    relay_server: RelayServer,
+) -> Callable[[int | str, str], str]:
+    def inner(project_id: int | str, key: str) -> str:
+        return "{}/api/{}/security/?sentry_key={}".format(relay_server["url"], project_id, key)
+
+    return inner
+
+
+@pytest.fixture
+def get_relay_minidump_url(
+    relay_server: RelayServer,
+) -> Callable[[int | str, str], str]:
+    def inner(project_id: int | str, key: str) -> str:
+        return "{}/api/{}/minidump/?sentry_key={}".format(relay_server["url"], project_id, key)
+
+    return inner
+
+
+@pytest.fixture
+def get_relay_unreal_url(
+    relay_server: RelayServer,
+) -> Callable[[int | str, str], str]:
+    def inner(project_id: int | str, key: str) -> str:
+        return "{}/api/{}/unreal/{}/".format(relay_server["url"], project_id, key)
+
+    return inner
+
+
+@pytest.fixture
+def get_relay_attachments_url(
+    relay_server: RelayServer,
+) -> Callable[[int | str, str], str]:
+    def inner(project_id: int | str, event_id: str) -> str:
+        return "{}/api/{}/events/{}/attachments/".format(relay_server["url"], project_id, event_id)
+
+    return inner

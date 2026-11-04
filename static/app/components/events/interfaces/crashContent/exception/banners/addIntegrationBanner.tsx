@@ -1,0 +1,102 @@
+import styled from '@emotion/styled';
+import {IconClose} from '@sentry/icons/close';
+
+import addIntegrationProvider from 'sentry-images/spot/add-integration-provider.svg';
+
+import {Button, LinkButton} from '@sentry/scraps/button';
+import {Image} from '@sentry/scraps/image';
+import {Container, Flex, Stack} from '@sentry/scraps/layout';
+import {Text} from '@sentry/scraps/text';
+
+import {t} from 'sentry/locale';
+
+interface AddIntegrationBannerProps {
+  onDismiss: () => void;
+  orgSlug: string;
+}
+
+/**
+ * Displayed when there are no installed source integrations (github/gitlab/etc)
+ */
+export function AddIntegrationBanner({orgSlug, onDismiss}: AddIntegrationBannerProps) {
+  const title = t('Connect with Git Providers');
+
+  return (
+    <Banner>
+      <Stack gap="lg">
+        <Stack gap="md">
+          <Text as="div" bold size="xl">
+            {title}
+          </Text>
+          <Container maxWidth="340px">
+            <Text as="div">
+              {t(
+                'Install Git providers (GitHub, GitLab…) to enable features like code mapping and stack trace linking.'
+              )}
+            </Text>
+          </Container>
+        </Stack>
+        <LinkButton
+          to={{
+            pathname: `/settings/${orgSlug}/integrations/`,
+            // This should filter to only source code management integrations
+            query: {category: 'source code management'},
+          }}
+          size="sm"
+        >
+          {t('Get Started')}
+        </LinkButton>
+      </Stack>
+      <Container
+        bottom="0"
+        display={{zero: 'none', xl: 'block'}}
+        pointerEvents="none"
+        position="absolute"
+        right="4rem"
+      >
+        <Image alt={title} src={addIntegrationProvider} width="auto" />
+      </Container>
+      <Flex
+        align="start"
+        inset="0"
+        justify="end"
+        padding="xl"
+        pointerEvents="none"
+        position="absolute"
+      >
+        <Container pointerEvents="auto">
+          <Button
+            variant="link"
+            aria-label={t('Dismiss')}
+            icon={<IconClose variant="muted" />}
+            size="xs"
+            onClick={onDismiss}
+          />
+        </Container>
+      </Flex>
+    </Banner>
+  );
+}
+
+function Banner({children}: {children: React.ReactNode}) {
+  return (
+    <Container
+      border="primary"
+      margin="md 0"
+      padding="xl"
+      position="relative"
+      radius="md"
+    >
+      {containerProps => <StyledBanner {...containerProps}>{children}</StyledBanner>}
+    </Container>
+  );
+}
+
+const StyledBanner = styled('div')`
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, ${p => p.theme.tokens.background.secondary} 0%, transparent) 0%,
+    ${p => p.theme.tokens.background.secondary} 70%,
+    ${p => p.theme.tokens.background.secondary} 100%
+  );
+`;

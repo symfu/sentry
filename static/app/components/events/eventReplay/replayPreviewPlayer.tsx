@@ -1,0 +1,241 @@
+import type {ComponentProps} from 'react';
+import {useEffect, useRef, useState} from 'react';
+import {useMatches} from 'react-router';
+import styled from '@emotion/styled';
+import {IconNext} from '@sentry/icons/next';
+import {IconPrevious} from '@sentry/icons/previous';
+import type {Query} from 'history';
+
+import {Alert} from '@sentry/scraps/alert';
+import {Button, LinkButton, type LinkButtonProps} from '@sentry/scraps/button';
+import {Flex, Grid, Stack} from '@sentry/scraps/layout';
+import {TooltipContext} from '@sentry/scraps/tooltip';
+
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import {useReplayContext} from 'sentry/components/replays/replayContext';
+import {ReplayCurrentScreen} from 'sentry/components/replays/replayCurrentScreen';
+import {ReplayCurrentUrl} from 'sentry/components/replays/replayCurrentUrl';
+import {ReplayFullscreenButton} from 'sentry/components/replays/replayFullscreenButton';
+import {SentryPlayerRoot as ReplayPlayer} from 'sentry/components/replays/replayPlayer';
+import {ReplayPlayPauseButton} from 'sentry/components/replays/replayPlayPauseButton';
+import {ReplaySidebarToggleButton} from 'sentry/components/replays/replaySidebarToggleButton';
+import {ReplaySessionColumn} from 'sentry/components/replays/table/replayTableColumns';
+import {TimeAndScrubberGrid} from 'sentry/components/replays/timeAndScrubberGrid';
+import {t} from 'sentry/locale';
+import {getRouteStringFromRoutes} from 'sentry/utils/getRouteStringFromRoutes';
+import {TabKey} from 'sentry/utils/replays/hooks/useActiveReplayTab';
+import {useMarkReplayViewed} from 'sentry/utils/replays/hooks/useMarkReplayViewed';
+import {TimelineScaleContextProvider} from 'sentry/utils/replays/hooks/useTimelineScale';
+import {useReplayReader} from 'sentry/utils/replays/playback/providers/replayReaderProvider';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useParams} from 'sentry/utils/useParams';
+import {useFullscreen} from 'sentry/utils/window/useFullscreen';
+import {useIsFullscreen} from 'sentry/utils/window/useIsFullscreen';
+import {Breadcrumbs} from 'sentry/views/explore/replays/detail/breadcrumbs';
+import {FluidHeight} from 'sentry/views/explore/replays/detail/layout/fluidHeight';
+import {makeReplaysPathname} from 'sentry/views/explore/replays/pathnames';
+import type {ReplayRecord} from 'sentry/views/explore/replays/types';
+
+export function ReplayPreviewPlayer({
+  query,
+  errorBeforeReplayStart,
+  replayId,
+  fullReplayButtonProps,
+  replayRecord,
+  handleBackClick,
+  handleForwardClick,
+  overlayContent,
+  showNextAndPrevious,
+  playPauseVariant,
+}: {
+  errorBeforeReplayStart: boolean;
+  replayId: string;
+  replayRecord: ReplayRecord;
+  fullReplayButtonProps?: Partial<Omit<LinkButtonProps, 'external'>>;
+  handleBackClick?: () => void;
+  handleForwardClick?: () => void;
+  overlayContent?: React.ReactNode;
+  playPauseVariant?: ComponentProps<typeof ReplayPlayPauseButton>['variant'];
+  query?: Query;
+  showNextAndPrevious?: boolean;
+}) {
+  const matches = useMatches();
+  const organization = useOrganization();
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const replay = useReplayReader();
+  const {currentTime, isFetching, isFinished, isPlaying, isVideoReplay} =
+    useReplayContext();
+
+  const fullscreenRef = useRef<HTMLDivElement | null>(null);
+  const {toggle: toggleFullscreen} = useFullscreen({
+    elementRef: fullscreenRef,
+  });
+  const isFullscreen = useIsFullscreen();
+  const startOffsetMs = replay?.getStartOffsetMs() ?? 0;
+
+  const referrer = getRouteStringFromRoutes({matches});
+  const fromFeedback = referrer === '/issues/feedback/';
+
+  const {groupId} = useParams<{groupId: string}>();
+
+  const {mutate: markAsViewed} = useMarkReplayViewed();
+  useEffect(() => {
+    if (
+      !replayRecord.is_archived &&
+      !replayRecord.has_viewed &&
+      !isFetching &&
+      isPlaying
+    ) {
+      markAsViewed({projectSlug: replayRecord.project_id, replayId: replayRecord.id});
+    }
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+  }, [isFetching, isPlaying, markAsViewed, organization, replayRecord]);
+
+  return (
+    <Stack flexGrow={1} gap="md" height="100%">
+      {errorBeforeReplayStart && (
+        <StyledAlert variant="warning">
+          {t(
+            'For this event, the replay recording started after the error happened, so the replay below shows the user experience after the error.'
+          )}
+        </StyledAlert>
+      )}
+      <Grid
+        columns="minmax(0, 1fr) auto"
+        align="center"
+        gap="md"
+        marginBottom="md"
+        position="relative"
+      >
+        <ReplaySessionColumn.Component
+          to={{
+            pathname: makeReplaysPathname({path: `/${replayId}/`, organization}),
+            query,
+          }}
+          replay={replayRecord}
+          rowIndex={0}
+          columnIndex={0}
+          showDropdownFilters={false}
+        />
+        <LinkButton
+          size="sm"
+          to={{
+            pathname: makeReplaysPathname({
+              path: `/${replayId}/`,
+              organization,
+            }),
+            query: {
+              referrer,
+              t_main: fromFeedback ? TabKey.BREADCRUMBS : TabKey.ERRORS,
+              t: (currentTime + startOffsetMs) / 1000,
+              groupId,
+              ...query,
+            },
+          }}
+          {...fullReplayButtonProps}
+        >
+          {t('See Full Replay')}
+        </LinkButton>
+      </Grid>
+      <PreviewPlayerContainer ref={fullscreenRef} isSidebarOpen={isSidebarOpen}>
+        {/* oxlint-disable-next-line react/refs */}
+        <TooltipContext value={{container: fullscreenRef.current}}>
+          <PlayerBreadcrumbContainer>
+            <PlayerContextContainer>
+              {isFullscreen ? (
+                <Grid align="center" gap="md" columns="1fr max-content" flow="column">
+                  {isVideoReplay ? <ReplayCurrentScreen /> : <ReplayCurrentUrl />}
+                  <ReplaySidebarToggleButton
+                    isOpen={isSidebarOpen}
+                    setIsOpen={setIsSidebarOpen}
+                  />
+                </Grid>
+              ) : null}
+              <StaticPanel>
+                <ReplayPlayer overlayContent={overlayContent} isPreview />
+              </StaticPanel>
+            </PlayerContextContainer>
+            {isFullscreen && isSidebarOpen ? <Breadcrumbs /> : null}
+          </PlayerBreadcrumbContainer>
+          <ErrorBoundary mini>
+            <Flex justify="between" align="center" gap="0 md">
+              {showNextAndPrevious && (
+                <Button
+                  size="sm"
+                  tooltipProps={{title: t('Previous Clip')}}
+                  icon={<IconPrevious />}
+                  onClick={() => handleBackClick?.()}
+                  aria-label={t('Previous Clip')}
+                  disabled={!handleBackClick}
+                  analyticsEventName="Replay Preview Player: Clicked Previous Clip"
+                  analyticsEventKey="replay_preview_player.clicked_previous_clip"
+                />
+              )}
+              <ReplayPlayPauseButton
+                analyticsEventName="Replay Preview Player: Clicked Play/Plause Clip"
+                analyticsEventKey="replay_preview_player.clicked_play_pause_clip"
+                variant={
+                  playPauseVariant ?? (isFinished || isPlaying ? 'primary' : 'secondary')
+                }
+              />
+              {showNextAndPrevious && (
+                <Button
+                  size="sm"
+                  tooltipProps={{title: t('Next Clip')}}
+                  icon={<IconNext />}
+                  onClick={() => handleForwardClick?.()}
+                  aria-label={t('Next Clip')}
+                  disabled={!handleForwardClick}
+                  analyticsEventName="Replay Preview Player: Clicked Next Clip"
+                  analyticsEventKey="replay_preview_player.clicked_next_clip"
+                />
+              )}
+              <Stack justify="center" flex="1 1">
+                <TimelineScaleContextProvider>
+                  <TimeAndScrubberGrid />
+                </TimelineScaleContextProvider>
+              </Stack>
+              <ReplayFullscreenButton toggleFullscreen={toggleFullscreen} />
+            </Flex>
+          </ErrorBoundary>
+        </TooltipContext>
+      </PreviewPlayerContainer>
+    </Stack>
+  );
+}
+
+const PlayerBreadcrumbContainer = styled(FluidHeight)`
+  position: relative;
+`;
+
+const PreviewPlayerContainer = styled(FluidHeight)<{isSidebarOpen: boolean}>`
+  gap: ${p => p.theme.space.xl};
+  background: ${p => p.theme.tokens.background.primary};
+  height: unset;
+  overflow: unset;
+
+  :fullscreen {
+    padding: ${p => p.theme.space.md};
+
+    ${PlayerBreadcrumbContainer} {
+      display: grid;
+      grid-template-columns: ${p => (p.isSidebarOpen ? '1fr 25%' : '1fr')};
+      height: 100%;
+      gap: ${p => p.theme.space.md};
+    }
+  }
+`;
+
+const PlayerContextContainer = styled(FluidHeight)`
+  display: flex;
+  flex-direction: column;
+  gap: ${p => p.theme.space.md};
+`;
+
+const StaticPanel = styled(FluidHeight)`
+  border: 1px solid ${p => p.theme.tokens.border.primary};
+  border-radius: ${p => p.theme.radius.md};
+`;
+const StyledAlert = styled(Alert)`
+  margin: ${p => p.theme.space.md} 0;
+`;

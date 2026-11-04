@@ -1,69 +1,79 @@
-import datetime
-import time
 import logging
-import msgpack
-import pytest
 import random
+import time
+import uuid
+from collections.abc import Callable
+from typing import ContextManager
 
-from confluent_kafka import KafkaError
+import msgpack
+import orjson
+import pytest
+from confluent_kafka import Producer
 from django.conf import settings
-from django.test import override_settings
 
-from sentry import eventstore
+from sentry import nodestore
+from sentry.conf.types.kafka_definition import Topic
+from sentry.consumers import get_stream_processor
 from sentry.event_manager import EventManager
-from sentry.ingest.ingest_consumer import ConsumerType, get_ingest_consumer
-from sentry.utils import json
+from sentry.models.project import Project
+from sentry.services import eventstore
+from sentry.services.eventstore.models import Event
+from sentry.services.eventstore.processing import event_processing_store
+from sentry.testutils.pytest.fixtures import django_db_all
+from sentry.testutils.pytest.kafka import _KafkaAdminWrapper
+from sentry.testutils.skips import requires_kafka, requires_snuba
+from sentry.testutils.thread_leaks.pytest import thread_leak_allowlist
+from sentry.utils.batching_kafka_consumer import create_topics
+from sentry.utils.kafka_config import get_topic_definition
+
+pytestmark = [
+    requires_snuba,
+    requires_kafka,
+    thread_leak_allowlist(reason="ingest consumers", issue=97037),
+]
 
 logger = logging.getLogger(__name__)
 
 # Poll this amount of times (for 0.1 sec each) at most to wait for messages
 MAX_POLL_ITERATIONS = 100
 
+# Block size for shared memory of the multiprocessing kafka consumer strategy.
+# Any reasonable value will do for tests.
+DEFAULT_BLOCK_SIZE = int(32 * 1e6)
+
 
 @pytest.fixture
-def get_test_message(default_project):
+def get_test_message(
+    default_project: Project,
+) -> Callable[[str, Project], tuple[bytes, str]]:
     """
     creates a test message to be inserted in a kafka queue
     """
 
-    def inner(type, project=default_project):
-        now = datetime.datetime.now()
+    def inner(type: str, project: Project = default_project) -> tuple[bytes, str]:
         # the event id should be 32 digits
-        event_id = "{}".format(now.strftime("000000000000%Y%m%d%H%M%S%f"))
+        event_id = uuid.uuid4().hex
         message_text = f"some message {event_id}"
         project_id = project.id  # must match the project id set up by the test fixtures
-        if type == "transaction":
+        if type == "event":
             event = {
-                "type": "transaction",
-                "timestamp": now.isoformat(),
-                "start_timestamp": now.isoformat(),
+                "message": message_text,
+                "extra": {"the_id": event_id},
+                "project": project_id,
                 "event_id": event_id,
-                "spans": [],
-                "contexts": {
-                    "trace": {
-                        "parent_span_id": "8988cec7cc0779c1",
-                        "type": "trace",
-                        "op": "foobar",
-                        "trace_id": "a7d67cf796774551a95be6543cacd459",
-                        "span_id": "babaae0d4b7512d9",
-                        "status": "ok",
-                    }
-                },
             }
-        elif type == "event":
-            event = {"message": message_text, "extra": {"the_id": event_id}, "event_id": event_id}
         else:
-            raise ValueError(type)
+            raise AssertionError(type)
 
         em = EventManager(event, project=project)
         em.normalize()
         normalized_event = dict(em.get_data())
         message = {
             "type": "event",
-            "start_time": time.time(),
+            "start_time": int(time.time()),
             "event_id": event_id,
             "project_id": int(project_id),
-            "payload": json.dumps(normalized_event),
+            "payload": orjson.dumps(normalized_event),
         }
 
         val = msgpack.packb(message)
@@ -72,81 +82,181 @@ def get_test_message(default_project):
     return inner
 
 
-@pytest.mark.django_db(transaction=True)
-def test_ingest_consumer_reads_from_topic_and_calls_celery_task(
-    task_runner,
-    kafka_producer,
-    kafka_admin,
-    requires_kafka,
-    default_project,
-    get_test_message,
-):
-    group_id = f"test-consumer-{random.randint(0, 2 ** 16)}"
-    topic_event_name = ConsumerType.get_topic_name(ConsumerType.Events)
+@pytest.fixture
+def random_group_id() -> str:
+    return f"test-consumer-{random.randint(0, 2**16)}"
+
+
+@django_db_all(transaction=True)
+def test_ingest_consumer_reads_from_topic_and_calls_task(
+    task_runner: Callable[[], ContextManager[None]],
+    kafka_producer: Callable[[object], Producer],
+    kafka_admin: Callable[[object], _KafkaAdminWrapper],
+    default_project: Project,
+    get_test_message: Callable[[str, Project], tuple[bytes, str]],
+    random_group_id: str,
+) -> None:
+    topic = Topic.INGEST_EVENTS
+    topic_event_name = get_topic_definition(topic)["real_topic_name"]
 
     admin = kafka_admin(settings)
     admin.delete_topic(topic_event_name)
     producer = kafka_producer(settings)
 
-    message, event_id = get_test_message(type="event")
+    create_topics("default", [topic_event_name])
+
+    message, event_id = get_test_message("event", default_project)
     producer.produce(topic_event_name, message)
 
-    transaction_message, transaction_event_id = get_test_message(type="transaction")
-    producer.produce(topic_event_name, transaction_message)
-
-    with override_settings(KAFKA_CONSUMER_AUTO_CREATE_TOPICS=True):
-        consumer = get_ingest_consumer(
-            max_batch_size=2,
-            max_batch_time=5000,
-            group_id=group_id,
-            consumer_types={ConsumerType.Events},
-            auto_offset_reset="earliest",
-        )
+    consumer = get_stream_processor(
+        "ingest-events",
+        consumer_args=["--max-batch-size=2", "--max-batch-time-ms=5000", "--processes=10"],
+        topic=None,
+        group_id=random_group_id,
+        auto_offset_reset="earliest",
+        strict_offset_reset=False,
+        enforce_schema=True,
+    )
 
     with task_runner():
         i = 0
         while i < MAX_POLL_ITERATIONS:
-            transaction_message = eventstore.get_event_by_id(
-                default_project.id, transaction_event_id
-            )
-            message = eventstore.get_event_by_id(default_project.id, event_id)
+            stored_event = eventstore.backend.get_event_by_id(default_project.id, event_id)
 
-            if transaction_message and message:
+            if stored_event:
                 break
 
             consumer._run_once()
             i += 1
 
     # check that we got the messages
-    assert message.data["event_id"] == event_id
-    assert message.data["extra"]["the_id"] == event_id
-
-    assert transaction_message.data["event_id"] == transaction_event_id
-    assert transaction_message.data["spans"] == []
-    assert transaction_message.data["contexts"]["trace"]
+    assert stored_event is not None
+    assert stored_event.data["event_id"] == event_id
+    assert stored_event.data["extra"]["the_id"] == event_id
 
 
-def test_ingest_consumer_fails_when_not_autocreating_topics(
-    kafka_admin,
-    requires_kafka,
-):
-    group_id = f"test-consumer-{random.randint(0, 2 ** 16)}"
-    topic_event_name = ConsumerType.get_topic_name(ConsumerType.Events)
+@django_db_all(transaction=True)
+def test_ingest_consumer_gets_event_unstuck(
+    task_runner: Callable[[], ContextManager[None]],
+    kafka_producer: Callable[[object], Producer],
+    kafka_admin: Callable[[object], _KafkaAdminWrapper],
+    default_project: Project,
+    get_test_message: Callable[[str, Project], tuple[bytes, str]],
+    random_group_id: str,
+) -> None:
+    topic = Topic.INGEST_EVENTS
+    topic_event_name = get_topic_definition(topic)["real_topic_name"]
 
     admin = kafka_admin(settings)
     admin.delete_topic(topic_event_name)
+    producer = kafka_producer(settings)
 
-    with override_settings(KAFKA_CONSUMER_AUTO_CREATE_TOPICS=False):
-        consumer = get_ingest_consumer(
-            max_batch_size=2,
-            max_batch_time=5000,
-            group_id=group_id,
-            consumer_types={ConsumerType.Events},
-            auto_offset_reset="earliest",
-        )
+    create_topics("default", [topic_event_name])
 
-    with pytest.raises(Exception) as err:
-        consumer._run_once()
+    message1, event_id1 = get_test_message("event", default_project)
+    producer.produce(topic_event_name, message1)
 
-    kafka_error = err.value.args[0]
-    assert kafka_error.code() == KafkaError.UNKNOWN_TOPIC_OR_PART
+    message2, event_id2 = get_test_message("event", default_project)
+    producer.produce(topic_event_name, message2)
+
+    # an event is "stuck" when it is in the processing store, so lets fake that:
+    event_processing_store.store({"project": default_project.id, "event_id": event_id2})
+
+    consumer = get_stream_processor(
+        "ingest-events",
+        consumer_args=[
+            "--max-batch-size=2",
+            "--max-batch-time-ms=5000",
+            "--processes=10",
+            "--reprocess-only-stuck-events",
+        ],
+        topic=None,
+        group_id=random_group_id,
+        auto_offset_reset="earliest",
+        strict_offset_reset=False,
+        enforce_schema=True,
+    )
+
+    with task_runner():
+        i = 0
+        while i < MAX_POLL_ITERATIONS:
+            message = eventstore.backend.get_event_by_id(default_project.id, event_id2)
+
+            if message:
+                break
+
+            consumer._run_once()
+            i += 1
+
+    # check that we got the messages
+    assert message is not None
+    assert message.data["event_id"] == event_id2
+    assert message.data["extra"]["the_id"] == event_id2
+
+    # the first event was never "stuck", so we expect it to be skipped
+    assert not eventstore.backend.get_event_by_id(default_project.id, event_id1)
+
+
+@django_db_all(transaction=True)
+def test_ingest_consumer_reprocesses_events_not_in_nodestore(
+    task_runner: Callable[[], ContextManager[None]],
+    kafka_producer: Callable[[object], Producer],
+    kafka_admin: Callable[[object], _KafkaAdminWrapper],
+    default_project: Project,
+    get_test_message: Callable[[str, Project], tuple[bytes, str]],
+    random_group_id: str,
+) -> None:
+    topic = Topic.INGEST_EVENTS
+    topic_event_name = get_topic_definition(topic)["real_topic_name"]
+
+    admin = kafka_admin(settings)
+    admin.delete_topic(topic_event_name)
+    producer = kafka_producer(settings)
+
+    create_topics("default", [topic_event_name])
+
+    message1, event_id1 = get_test_message("event", default_project)
+    producer.produce(topic_event_name, message1)
+
+    message2, event_id2 = get_test_message("event", default_project)
+    producer.produce(topic_event_name, message2)
+
+    # the first event already made it to `nodestore`, so lets fake that:
+    nodestore.backend.set(
+        Event.generate_node_id(default_project.id, event_id1),
+        {"event_id": event_id1, "project": default_project.id, "timestamp": time.time()},
+    )
+
+    consumer = get_stream_processor(
+        "ingest-events",
+        consumer_args=[
+            "--max-batch-size=2",
+            "--max-batch-time-ms=5000",
+            "--processes=10",
+            "--reprocess-only-events-not-in-nodestore",
+        ],
+        topic=None,
+        group_id=random_group_id,
+        auto_offset_reset="earliest",
+        strict_offset_reset=False,
+        enforce_schema=True,
+    )
+
+    with task_runner():
+        i = 0
+        while i < MAX_POLL_ITERATIONS:
+            message = eventstore.backend.get_event_by_id(default_project.id, event_id2)
+
+            if message:
+                break
+
+            consumer._run_once()
+            i += 1
+
+    # the second event was missing from `nodestore`, so we expect it to be processed
+    assert message is not None
+    assert message.data["event_id"] == event_id2
+    assert message.data["extra"]["the_id"] == event_id2
+
+    # the first event was already in `nodestore`, so we expect it to be skipped
+    assert not eventstore.backend.get_event_by_id(default_project.id, event_id1)

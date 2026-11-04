@@ -7,21 +7,21 @@ class OriginField(serializers.CharField):
     # Special case origins that don't fit the normal regex pattern, but are valid
     WHITELIST_ORIGINS = "*"
 
-    def to_internal_value(self, data):
+    def to_internal_value(self, data: str) -> str:
         rv = super().to_internal_value(data)
         if not rv:
-            return
-        if not self.is_valid_origin(rv):
-            raise serializers.ValidationError("%s is not an acceptable domain" % rv)
+            return None  # type: ignore[return-value]  # removed in #129428
+        self.validate_origin(rv)
         return rv
 
-    def is_valid_origin(self, value):
+    def validate_origin(self, value: str) -> None:
         if value in self.WHITELIST_ORIGINS:
-            return True
+            return
 
         bits = parse_uri_match(value)
-        # ports are not supported on matching expressions (yet)
-        if ":" in bits.domain:
-            return False
+        if ":*" in bits.domain:
+            raise serializers.ValidationError(
+                "%s is not an acceptable domain. Wildcard ports are not allowed." % value
+            )
 
-        return True
+        return

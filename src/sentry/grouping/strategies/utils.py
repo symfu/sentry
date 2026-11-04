@@ -1,7 +1,14 @@
-def remove_non_stacktrace_variants(variants):
-    """This is a utility function that when given multiple variants will
-    mark all variants as non contributing that do not contain any stacktraces
-    if any of the other variants contain a stacktrace that contributes.
+from typing import Any
+
+from sentry.grouping.strategies.base import ComponentsByVariant
+
+
+def remove_non_stacktrace_variants(variants: ComponentsByVariant[Any]) -> ComponentsByVariant[Any]:
+    """
+    Given multiple variants, if at least one variant has a contributing stacktrace, mark all
+    variants without a stacktrace as non-contributing.
+
+    This is a no-op if there is only one variant.
     """
     if len(variants) <= 1:
         return variants
@@ -9,15 +16,15 @@ def remove_non_stacktrace_variants(variants):
     non_contributing_components = []
     stacktrace_variants = set()
 
-    # In case any of the variants has a contributing stacktrace, we want
-    # to make all other variants non contributing.
-    for key, component in variants.items():
+    # If at least one variant has a contributing stacktrace, we want to mark all variants without a
+    # stacktrace as non-contributing.
+    for variant_name, component in variants.items():
         stacktrace_iter = component.iter_subcomponents(
             id="stacktrace", recursive=True, only_contributing=True
         )
         if next(stacktrace_iter, None) is not None:
             any_stacktrace_contributes = True
-            stacktrace_variants.add(key)
+            stacktrace_variants.add(variant_name)
         else:
             non_contributing_components.append(component)
 
@@ -39,7 +46,7 @@ def remove_non_stacktrace_variants(variants):
     return variants
 
 
-def has_url_origin(path, allow_file_origin=False):
+def has_url_origin(path: str, files_count_as_urls: bool) -> bool:
     # URLs can be generated such that they are:
     #   blob:http://example.com/7f7aaadf-a006-4217-9ed5-5fbf8585c6c0
     # https://developer.mozilla.org/en-US/docs/Web/API/URL/createObjectURL
@@ -48,5 +55,5 @@ def has_url_origin(path, allow_file_origin=False):
     if path.startswith(("http:", "https:", "applewebdata:", "blob:")):
         return True
     if path.startswith("file:"):
-        return not allow_file_origin
+        return files_count_as_urls
     return False

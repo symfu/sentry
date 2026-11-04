@@ -1,18 +1,63 @@
-import time
+from __future__ import annotations
 
+import logging
+import time
+from abc import ABC
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from typing import NotRequired, TypedDict, cast
 from urllib.parse import urlencode
+
+from requests import PreparedRequest
 
 from sentry import options
 from sentry.integrations.client import ApiClient
+from sentry.integrations.models import Integration
+from sentry.integrations.msteams.metrics import translate_msteams_api_error
+from sentry.integrations.services.integration import integration_service
+from sentry.integrations.services.integration.model import RpcIntegration
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.shared_integrations.client.proxy import IntegrationProxyClient, infer_org_integration
+from sentry.shared_integrations.exceptions import ApiError, IntegrationError
+from sentry.shared_integrations.response.base import BaseApiResponse
+from sentry.silo.base import SiloMode, control_silo_function
+from sentry.utils import metrics
 
+logger = logging.getLogger(__name__)
 
-# five minutes which is industry standard clock skew tolerence
+# five minutes which is industry standard clock skew tolerance
 CLOCK_SKEW = 60 * 5
 
 
-# MsTeamsAbstractClient abstract client does not handle setting the base url or auth token
-class MsTeamsAbstractClient(ApiClient):
-    integration_name = "msteams"
+class _TeamChannel(TypedDict, total=False):
+    id: str
+    name: str
+
+
+class _TeamMember(TypedDict):
+    id: str
+    name: str
+    tenantId: str
+
+
+class _PagedMembersResponse(TypedDict):
+    members: list[_TeamMember]
+    continuationToken: NotRequired[str]
+
+
+class _TokenResponse(TypedDict):
+    access_token: str
+    expires_in: int
+
+
+class _OpenIDConfig(TypedDict):
+    jwks_uri: str
+    id_token_signing_alg_values_supported: list[str]
+
+
+# MsTeamsClientABC abstract client does not handle setting the base url or auth token
+class MsTeamsClientABC(ApiClient, ABC):
+    integration_name = IntegrationProviderSlug.MSTEAMS.value
     TEAM_URL = "/v3/teams/%s"
     CHANNEL_URL = "/v3/teams/%s/conversations"
     ACTIVITY_URL = "/v3/conversations/%s/activities"
@@ -20,36 +65,35 @@ class MsTeamsAbstractClient(ApiClient):
     CONVERSATION_URL = "/v3/conversations"
     MEMBER_URL = "/v3/conversations/%s/pagedmembers"
 
-    def request(self, method, path, data=None, params=None):
-        headers = {"Authorization": f"Bearer {self.access_token}"}
-        return self._request(method, path, headers=headers, data=data, params=params)
+    def get_channel_list(self, team_id: str) -> list[_TeamChannel]:
+        resp = self.get_mapping(self.CHANNEL_URL % team_id)
+        return cast("list[_TeamChannel]", resp.get("conversations"))
 
-    def get_team_info(self, team_id):
-        return self.get(self.TEAM_URL % team_id)
-
-    def get_channel_list(self, team_id):
-        resp = self.get(self.CHANNEL_URL % team_id)
-        return resp.get("conversations")
-
-    def get_member_list(self, team_id, continuation_token=None):
+    def get_member_list(
+        self, team_id: str, continuation_token: str | None = None
+    ) -> _PagedMembersResponse:
         url = self.MEMBER_URL % team_id
-        params = {"pageSize": 500}
+        params: dict[str, int | str] = {"pageSize": 500}
         if continuation_token:
             params["continuationToken"] = continuation_token
-        return self.get(url, params=params)
+        return cast("_PagedMembersResponse", self.get_mapping(url, params=params))
 
-    def get_user_conversation_id(self, user_id, tenant_id):
+    def get_user_conversation_id(self, user_id: str, tenant_id: str) -> str:
         data = {"members": [{"id": user_id}], "channelData": {"tenant": {"id": tenant_id}}}
-        resp = self.post(self.CONVERSATION_URL, data=data)
-        return resp.get("id")
+        resp = self.post_mapping(self.CONVERSATION_URL, data=data)
+        return cast(str, resp.get("id"))
 
-    def send_message(self, conversation_id, data):
-        return self.post(self.ACTIVITY_URL % conversation_id, data=data)
+    def send_message(self, conversation_id: str, data: Mapping[str, object]) -> object:
+        response: object = self.post(self.ACTIVITY_URL % conversation_id, data=data)
+        return response
 
-    def update_message(self, conversation_id, activity_id, data):
-        return self.put(self.MESSAGE_URL % (conversation_id, activity_id), data=data)
+    def update_message(
+        self, conversation_id: str, activity_id: str, data: Mapping[str, object]
+    ) -> object:
+        response: object = self.put(self.MESSAGE_URL % (conversation_id, activity_id), data=data)
+        return response
 
-    def send_card(self, conversation_id, card):
+    def send_card(self, conversation_id: str, card: Mapping[str, object]) -> object:
         payload = {
             "type": "message",
             "attachments": [
@@ -58,7 +102,9 @@ class MsTeamsAbstractClient(ApiClient):
         }
         return self.send_message(conversation_id, payload)
 
-    def update_card(self, conversation_id, activity_id, card):
+    def update_card(
+        self, conversation_id: str, activity_id: str, card: Mapping[str, object]
+    ) -> object:
         payload = {
             "type": "message",
             "attachments": [
@@ -70,54 +116,99 @@ class MsTeamsAbstractClient(ApiClient):
 
 # MsTeamsPreInstallClient is used with the access token and service url as arguments to the constructor
 # It will not handle token refreshing
-class MsTeamsPreInstallClient(MsTeamsAbstractClient):
-    def __init__(self, access_token, service_url):
+class MsTeamsPreInstallClient(MsTeamsClientABC):
+    integration_name = IntegrationProviderSlug.MSTEAMS.value
+
+    def __init__(self, access_token: str, service_url: str) -> None:
         super().__init__()
         self.access_token = access_token
         self.base_url = service_url.rstrip("/")
 
+    def request(
+        self,
+        method: str,
+        path: str,
+        data: Mapping[str, object] | None = None,
+        params: Mapping[str, str | int] | None = None,
+    ) -> BaseApiResponse:
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        return self._request(method, path, headers=headers, data=data, params=params)
+
 
 # MsTeamsClient is used with an existing integration object and handles token refreshing
-class MsTeamsClient(MsTeamsAbstractClient):
-    def __init__(self, integration):
-        super().__init__()
+class MsTeamsClient(MsTeamsClientABC, IntegrationProxyClient):
+    integration_name = IntegrationProviderSlug.MSTEAMS.value
+
+    def request(self, *args: object, **kwargs: object) -> BaseApiResponse:
+        try:
+            return super().request(*args, **kwargs)
+        except ApiError as error:
+            if kwargs.get("raw_response"):
+                raise
+            translate_msteams_api_error(error)
+
+    def __init__(self, integration: Integration | RpcIntegration) -> None:
         self.integration = integration
+        self.metadata = self.integration.metadata
+        self.base_url = self.metadata["service_url"].rstrip("/")
+        org_integration_id = infer_org_integration(integration_id=integration.id)
+        super().__init__(org_integration_id=org_integration_id)
 
     @property
-    def metadata(self):
-        return self.integration.metadata
+    def access_token(self) -> str:
+        access_token: str = self.metadata["access_token"]
+        expires_at: int = self.metadata["expires_at"]
 
-    @property
-    def base_url(self):
-        return self.metadata["service_url"].rstrip("/")
+        # We don't refresh the access token in cell silos.
+        if SiloMode.get_current_mode() != SiloMode.CELL:
+            # if the token is expired, refresh it and save  it
+            if expires_at <= int(time.time()):
+                from copy import deepcopy
 
-    @property
-    def access_token(self):
-        access_token = self.metadata.get("access_token")
-        expires_at = self.metadata.get("expires_at")
+                new_metadata = deepcopy(self.integration.metadata)
 
-        # if the token is expired, refresh it and save  it
-        if expires_at <= int(time.time()):
-            token_data = get_token_data()
-            access_token = token_data["access_token"]
-            self.metadata.update(token_data)
-            self.integration.save()
+                token_data = get_token_data()
+                access_token = token_data["access_token"]
+                new_metadata.update(token_data)
+
+                if (
+                    updated_integration := integration_service.update_integration(
+                        integration_id=self.integration.id,
+                        metadata=new_metadata,
+                    )
+                ) is None:
+                    # This should never happen, but if it does, fail loudly
+                    raise IntegrationError("Integration not found, failed to refresh access token")
+
+                self.integration = updated_integration
+                self.metadata = self.integration.metadata
+                self.base_url = self.metadata["service_url"].rstrip("/")
         return access_token
+
+    @control_silo_function
+    def authorize_request(self, prepared_request: PreparedRequest) -> PreparedRequest:
+        prepared_request.headers["Authorization"] = f"Bearer {self.access_token}"
+        return prepared_request
 
 
 # OAuthMsTeamsClient is used only for the exchanging the token
 class OAuthMsTeamsClient(ApiClient):
     base_url = "https://login.microsoftonline.com/botframework.com"
-    integration_name = "msteams"
+    integration_name = IntegrationProviderSlug.MSTEAMS.value
 
     TOKEN_URL = "/oauth2/v2.0/token"
 
-    def __init__(self, client_id, client_secret):
+    def __init__(self, client_id: str, client_secret: str) -> None:
         super().__init__()
         self.client_id = client_id
         self.client_secret = client_secret
+        # tenant_id is required for single-tenant bots to authenticate. The bot framework
+        # base_url is specific to multi-tenant bots which microsoft no longer provisions.
+        tenant_id = options.get("msteams.tenant-id")
+        if tenant_id:
+            self.base_url = f"https://login.microsoftonline.com/{tenant_id}"
 
-    def exchange_token(self):
+    def exchange_token(self) -> _TokenResponse:
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data = {
             "client_id": self.client_id,
@@ -125,12 +216,21 @@ class OAuthMsTeamsClient(ApiClient):
             "grant_type": "client_credentials",
             "scope": "https://api.botframework.com/.default",
         }
-        return self.post(self.TOKEN_URL, data=urlencode(data), headers=headers, json=False)
+        return cast(
+            "_TokenResponse",
+            self.post_mapping(self.TOKEN_URL, data=urlencode(data), headers=headers, json=False),
+        )
 
 
-def get_token_data():
+class TokenData(TypedDict):
+    access_token: str
+    expires_at: int
+
+
+def get_token_data() -> TokenData:
     client_id = options.get("msteams.client-id")
     client_secret = options.get("msteams.client-secret")
+    _record_client_secret_expiry()
     client = OAuthMsTeamsClient(client_id, client_secret)
     resp = client.exchange_token()
     # calculate the expiration date but offset because of the delay in receiving the response
@@ -138,11 +238,34 @@ def get_token_data():
     return {"access_token": resp["access_token"], "expires_at": expires_at}
 
 
+def _record_client_secret_expiry() -> None:
+    """Record the time remaining before the MS Teams client secret expires."""
+    expires_at = options.get("msteams.client-secret-expires-at")
+    if not expires_at:
+        return
+
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+
+        seconds_until_expiry = (expiry - datetime.now(timezone.utc)).total_seconds()
+        metrics.gauge(
+            "integrations.msteams.client_secret.seconds_until_expiry",
+            seconds_until_expiry,
+            sample_rate=0.01,
+        )
+    except ValueError:
+        logger.exception("MS Teams client secret expiry is not a valid ISO format")
+    except Exception:
+        logger.exception("Failed to record MS Teams client secret expiry")
+
+
 class MsTeamsJwtClient(ApiClient):
-    integration_name = "msteams"
+    integration_name = IntegrationProviderSlug.MSTEAMS.value
     # 24 hour cache is recommended: https://docs.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication?view=azure-bot-service-4.0#connector-to-bot-step-3
     cache_time = 60 * 60 * 24
     OPEN_ID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openidconfiguration"
 
-    def get_open_id_config(self):
-        return self.get_cached(self.OPEN_ID_CONFIG_URL)
+    def get_open_id_config(self) -> _OpenIDConfig:
+        return cast("_OpenIDConfig", self.get_cached_mapping(self.OPEN_ID_CONFIG_URL))

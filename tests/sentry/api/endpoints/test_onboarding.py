@@ -1,28 +1,44 @@
-from django.core.urlresolvers import reverse
-
-from sentry.models import OrganizationOnboardingTask, OnboardingTask, OnboardingTaskStatus
-from sentry.testutils import APITestCase
+from sentry.models.organizationonboardingtask import (
+    OnboardingTask,
+    OnboardingTaskStatus,
+    OrganizationOnboardingTask,
+)
+from sentry.testutils.cases import APITestCase
 
 
 class SkipOnboardingTaskTest(APITestCase):
-    def test_update_onboarding_task(self):
-        self.login_as(user=self.user)
+    endpoint = "sentry-api-0-organization-onboardingtasks"
+    method = "post"
 
-        organization = self.create_organization(name="foo", owner=self.user)
-        url = reverse(
-            "sentry-api-0-organization-onboardingtasks",
-            kwargs={"organization_slug": organization.slug},
-        )
+    def setUp(self) -> None:
+        super().setUp()
+        self.login_as(self.user)
 
-        resp = self.client.post(
-            url, data={"task": "setup_issue_tracker", "status": "skipped"}, format="json"
-        )
-        assert resp.status_code == 204
+    def test_skip_skippable_tasks(self) -> None:
+        """
+        Test if the tasks marked as skippable in the new quick start are skipped
+        """
+        skippable_tasks = OrganizationOnboardingTask.SKIPPABLE_TASKS
 
-        oot = OrganizationOnboardingTask.objects.get(
-            organization=organization,
-            task=OnboardingTask.ISSUE_TRACKER,
-            status=OnboardingTaskStatus.SKIPPED,
-        )
+        def get_skipped_tasks() -> set[int]:
+            return set(
+                OrganizationOnboardingTask.objects.filter(
+                    organization=self.organization, status=OnboardingTaskStatus.SKIPPED
+                ).values_list("task", flat=True)
+            )
 
-        assert oot
+        for task_id in skippable_tasks:
+            # Ensure the task is not initially marked as skipped
+            tasks_before = get_skipped_tasks()
+            assert task_id not in tasks_before
+
+            # Mark the task as skipped via API call
+            self.get_success_response(
+                self.organization.slug,
+                task=OrganizationOnboardingTask.TASK_KEY_MAP.get(OnboardingTask(task_id)),
+                status="skipped",
+            )
+
+            # Verify the task is now marked as skipped
+            tasks_after = get_skipped_tasks()
+            assert task_id in tasks_after

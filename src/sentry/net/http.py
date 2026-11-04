@@ -1,20 +1,25 @@
-import socket
-from socket import error as SocketError, timeout as SocketTimeout
+from __future__ import annotations
 
+import socket
+from collections.abc import Callable
+from functools import partial
+from typing import Any, Optional, cast
+
+from requests import Response
 from requests import Session as _Session
-from requests.adapters import HTTPAdapter, DEFAULT_POOLBLOCK
-from urllib3.connectionpool import (
-    HTTPConnectionPool,
-    HTTPSConnectionPool,
-    connection_from_url as _connection_from_url,
-)
+from requests.adapters import DEFAULT_POOLBLOCK, DEFAULT_RETRIES, HTTPAdapter, Retry
 from urllib3.connection import HTTPConnection, HTTPSConnection
-from urllib3.exceptions import NewConnectionError, ConnectTimeoutError
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.connectionpool import connection_from_url as _connection_from_url
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 from urllib3.poolmanager import PoolManager
-from urllib3.util.connection import _set_socket_options
+from urllib3.util.connection import _TYPE_SOCKET_OPTIONS, _set_socket_options
+from urllib3.util.timeout import _DEFAULT_TIMEOUT
 
 from sentry import VERSION as SENTRY_VERSION
 from sentry.net.socket import safe_create_connection
+
+IsIpAddressPermitted = Optional[Callable[[str], bool]]
 
 
 class SafeConnectionMixin:
@@ -23,10 +28,26 @@ class SafeConnectionMixin:
     to override `_new_conn` with the ability to create our own socket.
     """
 
+    is_ipaddress_permitted: IsIpAddressPermitted = None
+    source_address: tuple[str, int] | None
+    socket_options: _TYPE_SOCKET_OPTIONS | None
+    timeout: float | None
+    port: int
+
+    def __init__(
+        self,
+        *args: Any,
+        is_ipaddress_permitted: IsIpAddressPermitted = None,
+        **kwargs: Any,
+    ) -> None:
+        self.is_ipaddress_permitted = is_ipaddress_permitted
+        super().__init__(*args, **kwargs)
+
+    # urllib3.connection.HTTPConnection.host
     # These `host` properties need rebound otherwise `self._dns_host` doesn't
     # get set correctly.
     @property
-    def host(self):
+    def host(self) -> str:
         """
         Getter method to remove any trailing dots that indicate the hostname is an FQDN.
         In general, SSL certificates don't include the trailing dot indicating a
@@ -43,7 +64,7 @@ class SafeConnectionMixin:
         return self._dns_host.rstrip(".")
 
     @host.setter
-    def host(self, value):
+    def host(self, value: str) -> None:
         """
         Setter for the `host` property.
         We assume that only urllib3 uses the _dns_host attribute; httplib itself
@@ -51,12 +72,12 @@ class SafeConnectionMixin:
         """
         self._dns_host = value
 
-    # Mostly yanked from https://github.com/urllib3/urllib3/blob/1.22/urllib3/connection.py#L127
-    def _new_conn(self):
+    # urllib3.connection.HTTPConnection._new_conn
+    def _new_conn(self) -> socket.socket:
         """Establish a socket connection and set nodelay settings on it.
         :return: New socket connection.
         """
-        extra_kw = {}
+        extra_kw: dict[str, Any] = {}
         if self.source_address:
             extra_kw["source_address"] = self.source_address
 
@@ -64,18 +85,25 @@ class SafeConnectionMixin:
             extra_kw["socket_options"] = self.socket_options
 
         try:
-            # HACK(mattrobenolt): All of this is to replace this one line
-            # to establish our own connection.
-            conn = safe_create_connection((self._dns_host, self.port), self.timeout, **extra_kw)
+            # Begin custom code.
+            conn = safe_create_connection(
+                (self._dns_host, self.port),
+                self.timeout,
+                is_ipaddress_permitted=self.is_ipaddress_permitted,
+                **extra_kw,
+            )
+            # End custom code.
 
-        except SocketTimeout:
+        except TimeoutError:
             raise ConnectTimeoutError(
                 self,
                 f"Connection to {self.host} timed out. (connect timeout={self.timeout})",
             )
 
-        except SocketError as e:
-            raise NewConnectionError(self, "Failed to establish a new connection: %s" % e)
+        except OSError as e:
+            raise NewConnectionError(
+                cast(HTTPConnection, self), f"Failed to establish a new connection: {e}"
+            )
 
         return conn
 
@@ -91,9 +119,33 @@ class SafeHTTPSConnection(SafeConnectionMixin, HTTPSConnection):
 class SafeHTTPConnectionPool(HTTPConnectionPool):
     ConnectionCls = SafeHTTPConnection
 
+    def __init__(
+        self,
+        *args: Any,
+        is_ipaddress_permitted: IsIpAddressPermitted = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.ConnectionCls = cast(
+            type[SafeHTTPConnection],
+            partial(self.ConnectionCls, is_ipaddress_permitted=is_ipaddress_permitted),
+        )
+
 
 class SafeHTTPSConnectionPool(HTTPSConnectionPool):
     ConnectionCls = SafeHTTPSConnection
+
+    def __init__(
+        self,
+        *args: Any,
+        is_ipaddress_permitted: IsIpAddressPermitted = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.ConnectionCls = cast(
+            type[SafeHTTPSConnection],
+            partial(self.ConnectionCls, is_ipaddress_permitted=is_ipaddress_permitted),
+        )
 
 
 class SafePoolManager(PoolManager):
@@ -103,11 +155,18 @@ class SafePoolManager(PoolManager):
     ConnectionPool classes to create.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args: Any,
+        is_ipaddress_permitted: IsIpAddressPermitted = None,
+        **kwargs: Any,
+    ) -> None:
         PoolManager.__init__(self, *args, **kwargs)
         self.pool_classes_by_scheme = {
-            "http": SafeHTTPConnectionPool,
-            "https": SafeHTTPSConnectionPool,
+            "http": partial(SafeHTTPConnectionPool, is_ipaddress_permitted=is_ipaddress_permitted),  # type: ignore[dict-item]  # https://github.com/urllib3/urllib3/issues/3554
+            "https": partial(  # type: ignore[dict-item]  # https://github.com/urllib3/urllib3/issues/3554
+                SafeHTTPSConnectionPool, is_ipaddress_permitted=is_ipaddress_permitted
+            ),
         }
 
 
@@ -117,24 +176,56 @@ class BlacklistAdapter(HTTPAdapter):
     rather than the default PoolManager.
     """
 
-    def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):
+    is_ipaddress_permitted: IsIpAddressPermitted = None
+
+    def __init__(
+        self,
+        is_ipaddress_permitted: IsIpAddressPermitted = None,
+        max_retries: Retry | None | int = DEFAULT_RETRIES,
+    ) -> None:
+        # If is_ipaddress_permitted is defined, then we pass it as an additional parameter to freshly created
+        # `urllib3.connectionpool.ConnectionPool` instances managed by `SafePoolManager`.
+        self.is_ipaddress_permitted = is_ipaddress_permitted
+        super().__init__(max_retries=max_retries)
+
+    def init_poolmanager(
+        self, connections: int, maxsize: int, block: bool = DEFAULT_POOLBLOCK, **pool_kwargs: Any
+    ) -> None:
         self._pool_connections = connections
         self._pool_maxsize = maxsize
         self._pool_block = block
+        # Begin custom code.
         self.poolmanager = SafePoolManager(
-            num_pools=connections, maxsize=maxsize, block=block, strict=True, **pool_kwargs
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            is_ipaddress_permitted=self.is_ipaddress_permitted,
+            **pool_kwargs,
         )
+        # End custom code.
 
 
 class TimeoutAdapter(HTTPAdapter):
-    def __init__(self, *args, **kwargs):
-        timeout = kwargs.pop("timeout", None)
-        HTTPAdapter.__init__(self, *args, **kwargs)
+    def __init__(
+        self,
+        pool_connections: int = 10,
+        pool_maxsize: int = 10,
+        max_retries: Retry | int = 0,
+        pool_block: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        HTTPAdapter.__init__(
+            self,
+            pool_connections=pool_connections,
+            pool_maxsize=pool_maxsize,
+            max_retries=max_retries,
+            pool_block=pool_block,
+        )
         if timeout is None:
             timeout = 10.0
-        self.default_timeout = timeout
+        self.default_timeout: float = timeout
 
-    def send(self, *args, **kwargs):
+    def send(self, *args: Any, **kwargs: Any) -> Response:
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = self.default_timeout
         return HTTPAdapter.send(self, *args, **kwargs)
@@ -144,7 +235,7 @@ USER_AGENT = f"sentry/{SENTRY_VERSION} (https://sentry.io)"
 
 
 class Session(_Session):
-    def request(self, *args, **kwargs):
+    def request(self, *args: Any, **kwargs: Any) -> Response:
         kwargs.setdefault("timeout", 30)
         response = _Session.request(self, *args, **kwargs)
         # requests' attempts to use chardet internally when no encoding is found
@@ -155,10 +246,16 @@ class Session(_Session):
 
 
 class SafeSession(Session):
-    def __init__(self):
+    def __init__(
+        self,
+        is_ipaddress_permitted: IsIpAddressPermitted = None,
+        max_retries: Retry | int | None = None,
+    ) -> None:
         Session.__init__(self)
         self.headers.update({"User-Agent": USER_AGENT})
-        adapter = BlacklistAdapter()
+        adapter = BlacklistAdapter(
+            is_ipaddress_permitted=is_ipaddress_permitted, max_retries=max_retries
+        )
         self.mount("https://", adapter)
         self.mount("http://", adapter)
 
@@ -166,7 +263,7 @@ class SafeSession(Session):
 class UnixHTTPConnection(HTTPConnection):
     default_socket_options = []
 
-    def __init__(self, host, **kwargs):
+    def __init__(self, host: str, **kwargs: Any) -> None:
         # We're using the `host` as the socket path, but
         # urllib3 uses this host as the Host header by default.
         # If we send along the socket path as a Host header, this is
@@ -176,13 +273,13 @@ class UnixHTTPConnection(HTTPConnection):
         self.socket_path = host
         super().__init__(host="localhost", **kwargs)
 
-    def _new_conn(self):
+    def _new_conn(self) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
         # If provided, set socket level options before connecting.
         _set_socket_options(sock, self.socket_options)
 
-        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+        if cast("object", self.timeout) is not _DEFAULT_TIMEOUT:
             sock.settimeout(self.timeout)
         sock.connect(self.socket_path)
         return sock
@@ -191,11 +288,11 @@ class UnixHTTPConnection(HTTPConnection):
 class UnixHTTPConnectionPool(HTTPConnectionPool):
     ConnectionCls = UnixHTTPConnection
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{type(self).__name__}(host={self.host!r})"
 
 
-def connection_from_url(endpoint, **kw):
+def connection_from_url(endpoint: str, **kw: Any) -> HTTPConnectionPool:
     if endpoint[:1] == "/":
         return UnixHTTPConnectionPool(endpoint, **kw)
     return _connection_from_url(endpoint, **kw)

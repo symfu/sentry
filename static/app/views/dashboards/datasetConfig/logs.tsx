@@ -1,0 +1,338 @@
+import pickBy from 'lodash/pickBy';
+
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import type {TagCollection} from 'sentry/types/group';
+import type {Organization} from 'sentry/types/organization';
+import type {CustomMeasurementCollection} from 'sentry/utils/customMeasurements/customMeasurements';
+import type {EventsTableData, TableData} from 'sentry/utils/discover/discoverQuery';
+import {getFieldRenderer} from 'sentry/utils/discover/fieldRenderers';
+import type {Aggregation, QueryFieldValue} from 'sentry/utils/discover/fields';
+import {AggregationKey, attributeTypeFromKind} from 'sentry/utils/fields';
+import type {EventsTimeSeriesResponse} from 'sentry/utils/timeSeries/useFetchEventsTimeSeries';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {WIDGET_BUILDER_ATTRIBUTE_STALE_TIME} from 'sentry/views/dashboards/constants';
+import {
+  type DatasetConfig,
+  type SearchBarData,
+  type SearchBarDataProviderProps,
+  type WidgetBuilderSearchBarProps,
+} from 'sentry/views/dashboards/datasetConfig/base';
+import {
+  getTableSortOptions,
+  getTimeseriesSortOptions,
+} from 'sentry/views/dashboards/datasetConfig/events';
+import {eventsResponseTransforms} from 'sentry/views/dashboards/datasetConfig/utils/eventsResponseTransforms';
+import {handleOrderByReset} from 'sentry/views/dashboards/datasetConfig/utils/handleOrderByReset';
+import {DisplayType, type WidgetQuery} from 'sentry/views/dashboards/types';
+import {
+  useLogsSeriesQuery,
+  useLogsTableQuery,
+} from 'sentry/views/dashboards/widgetCard/hooks/useLogsWidgetQuery';
+import type {FieldValueOption} from 'sentry/views/discover/table/queryField';
+import {FieldValueKind} from 'sentry/views/discover/table/types';
+import {generateFieldOptions} from 'sentry/views/discover/utils';
+import {
+  TraceItemSearchQueryBuilder,
+  useTraceItemSearchQueryBuilderProps,
+} from 'sentry/views/explore/components/traceItemSearchQueryBuilder';
+import {useLogItemAttributes} from 'sentry/views/explore/hooks/useTraceItemAttributes';
+import {isLogsEnabled} from 'sentry/views/explore/logs/isLogsEnabled';
+import {LOG_AGGREGATES} from 'sentry/views/explore/logs/logsToolbar';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+
+const DEFAULT_WIDGET_QUERY: WidgetQuery = {
+  name: '',
+  fields: ['count(message)'],
+  columns: [],
+  fieldAliases: [],
+  aggregates: ['count(message)'],
+  conditions: '',
+  orderby: '-count(message)',
+};
+
+const DEFAULT_FIELD: QueryFieldValue = {
+  function: ['count', 'message', undefined, undefined],
+  kind: FieldValueKind.FUNCTION,
+};
+
+const EAP_AGGREGATIONS = LOG_AGGREGATES.map(
+  (x: {value: AggregationKey}) => x.value
+).reduce(
+  (acc, aggregate) => {
+    if (aggregate === AggregationKey.COUNT) {
+      acc[AggregationKey.COUNT] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [
+          {
+            kind: 'column',
+            columnTypes: ['string'],
+            defaultValue: 'message',
+            required: true,
+          },
+        ],
+      };
+    } else if (aggregate === AggregationKey.COUNT_UNIQUE) {
+      acc[AggregationKey.COUNT_UNIQUE] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [
+          {
+            kind: 'column',
+            columnTypes: ['number', 'string'],
+            defaultValue: 'message.template',
+            required: true,
+          },
+        ],
+      };
+    } else {
+      acc[aggregate] = {
+        isSortable: true,
+        outputType: null,
+        parameters: [
+          {
+            kind: 'column',
+            columnTypes: ['number', 'string'], // Need to keep the string type for unknown values before tags are resolved
+            defaultValue: 'severity_number',
+            required: true,
+          },
+        ],
+      };
+    }
+    return acc;
+  },
+  {} as Record<AggregationKey, Aggregation>
+);
+
+function LogsSearchBar({
+  widgetQuery,
+  onSearch,
+  portalTarget,
+  onClose,
+}: Pick<
+  WidgetBuilderSearchBarProps,
+  'widgetQuery' | 'onSearch' | 'portalTarget' | 'onClose'
+>) {
+  const organization = useOrganization();
+  const supportsArrays = organization.features.includes('trace-item-array-query-support');
+  const {
+    selection: {projects},
+  } = usePageFilters();
+  const {attributes: stringAttributes, secondaryAliases: stringSecondaryAliases} =
+    useLogItemAttributes({enabled: isLogsEnabled(organization)}, 'string');
+  const {attributes: numberAttributes, secondaryAliases: numberSecondaryAliases} =
+    useLogItemAttributes({enabled: isLogsEnabled(organization)}, 'number');
+  const {attributes: booleanAttributes, secondaryAliases: booleanSecondaryAliases} =
+    useLogItemAttributes({enabled: isLogsEnabled(organization)}, 'boolean');
+  const {attributes: arrayAttributes, secondaryAliases: arraySecondaryAliases} =
+    useLogItemAttributes(
+      {enabled: isLogsEnabled(organization) && supportsArrays},
+      'array'
+    );
+  return (
+    <TraceItemSearchQueryBuilder
+      initialQuery={widgetQuery.conditions}
+      onSearch={onSearch}
+      itemType={TraceItemDataset.LOGS}
+      arrayAttributes={supportsArrays ? arrayAttributes : {}}
+      booleanAttributes={booleanAttributes}
+      numberAttributes={numberAttributes}
+      stringAttributes={stringAttributes}
+      arraySecondaryAliases={supportsArrays ? arraySecondaryAliases : {}}
+      booleanSecondaryAliases={booleanSecondaryAliases}
+      numberSecondaryAliases={numberSecondaryAliases}
+      stringSecondaryAliases={stringSecondaryAliases}
+      searchSource="dashboards"
+      projects={projects}
+      portalTarget={portalTarget}
+      onChange={(query, state) => {
+        onClose?.(query, {validSearch: state.queryIsValid});
+      }}
+    />
+  );
+}
+
+function useLogsSearchBarDataProvider(props: SearchBarDataProviderProps): SearchBarData {
+  const {filterKeySearch, pageFilters, widgetQuery} = props;
+  const organization = useOrganization();
+  const supportsArrays = organization.features.includes('trace-item-array-query-support');
+  const logsEnabled = isLogsEnabled(organization);
+  const attributeOptions = {
+    enabled: logsEnabled,
+    search: filterKeySearch,
+    staleTime: WIDGET_BUILDER_ATTRIBUTE_STALE_TIME,
+  };
+
+  const {
+    attributes: stringAttributes,
+    isLoading: stringAttributesLoading,
+    secondaryAliases: stringSecondaryAliases,
+  } = useLogItemAttributes(attributeOptions, 'string');
+  const {
+    attributes: numberAttributes,
+    isLoading: numberAttributesLoading,
+    secondaryAliases: numberSecondaryAliases,
+  } = useLogItemAttributes(attributeOptions, 'number');
+  const {
+    attributes: booleanAttributes,
+    isLoading: booleanAttributesLoading,
+    secondaryAliases: booleanSecondaryAliases,
+  } = useLogItemAttributes(attributeOptions, 'boolean');
+  const {
+    attributes: arrayAttributes,
+    isLoading: arrayAttributesLoading,
+    secondaryAliases: arraySecondaryAliases,
+  } = useLogItemAttributes(
+    {...attributeOptions, enabled: logsEnabled && supportsArrays},
+    'array'
+  );
+  const isFetchingFilterKeys =
+    stringAttributesLoading ||
+    numberAttributesLoading ||
+    booleanAttributesLoading ||
+    arrayAttributesLoading;
+
+  const {filterKeys, filterKeySections, getTagValues} =
+    useTraceItemSearchQueryBuilderProps({
+      itemType: TraceItemDataset.LOGS,
+      arrayAttributes: supportsArrays ? arrayAttributes : {},
+      booleanAttributes,
+      numberAttributes,
+      stringAttributes,
+      arraySecondaryAliases: supportsArrays ? arraySecondaryAliases : {},
+      booleanSecondaryAliases,
+      numberSecondaryAliases,
+      stringSecondaryAliases,
+      searchSource: 'dashboards',
+      initialQuery: widgetQuery?.conditions ?? '',
+      projects: pageFilters.projects,
+    });
+  return {
+    getFilterKeySections: () => filterKeySections,
+    getFilterKeys: () => filterKeys,
+    getTagValues,
+    isFetchingFilterKeys,
+  };
+}
+
+export const LogsConfig: DatasetConfig<
+  EventsTimeSeriesResponse,
+  TableData | EventsTableData
+> = {
+  defaultCategoryField: 'severity',
+  defaultField: DEFAULT_FIELD,
+  defaultWidgetQuery: DEFAULT_WIDGET_QUERY,
+  enableEquations: false,
+  SearchBar: LogsSearchBar,
+  useSearchBarDataProvider: useLogsSearchBarDataProvider,
+  filterYAxisAggregateParams: () => filterAggregateParams,
+  filterYAxisOptions,
+  filterSeriesSortOptions,
+  getTableFieldOptions: getPrimaryFieldOptions,
+  getTableSortOptions,
+  getTimeseriesSortOptions: (organization, widgetQuery, tags) =>
+    getTimeseriesSortOptions(organization, widgetQuery, tags, getPrimaryFieldOptions),
+  getGroupByFieldOptions,
+  handleOrderByReset,
+  supportedDisplayTypes: [
+    DisplayType.AREA,
+    DisplayType.BAR,
+    DisplayType.BIG_NUMBER,
+    DisplayType.CATEGORICAL_BAR,
+    DisplayType.LINE,
+    DisplayType.TABLE,
+    DisplayType.TOP_N,
+  ],
+  useSeriesQuery: useLogsSeriesQuery,
+  useTableQuery: useLogsTableQuery,
+  ...eventsResponseTransforms,
+  filterAggregateParams,
+  getCustomFieldRenderer: (field, meta, widget, _organization, dashboardFilters) => {
+    return getFieldRenderer(field, meta, false, widget, dashboardFilters);
+  },
+};
+
+function getPrimaryFieldOptions(
+  organization: Organization,
+  tags?: TagCollection,
+  _customMeasurements?: CustomMeasurementCollection
+): Record<string, FieldValueOption> {
+  const baseFieldOptions = generateFieldOptions({
+    organization,
+    tagKeys: [],
+    fieldKeys: [],
+    aggregations: EAP_AGGREGATIONS,
+  });
+
+  const logTags = Object.values(tags ?? {}).reduce<Record<string, FieldValueOption>>(
+    (acc, tag) => {
+      acc[`${tag.kind}:${tag.key}`] = {
+        label: tag.name,
+        value: {
+          kind: FieldValueKind.TAG,
+
+          // We have numeric and string tags which have the same
+          // display name, but one is used for aggregates and the other
+          // is used for grouping.
+          meta: {name: tag.key, dataType: attributeTypeFromKind(tag.kind)},
+        },
+      };
+      return acc;
+    },
+    {}
+  );
+
+  return {...baseFieldOptions, ...logTags};
+}
+
+function filterAggregateParams(option: FieldValueOption, fieldValue?: QueryFieldValue) {
+  // Allow for unknown values to be used for aggregate functions
+  // This supports showing the tag value even if it's not in the current
+  // set of tags.
+  if ('unknown' in option.value.meta && option.value.meta.unknown) {
+    return true;
+  }
+
+  if (
+    fieldValue?.kind === 'function' &&
+    fieldValue?.function[0] === AggregationKey.COUNT
+  ) {
+    return option.value.meta.name === 'message';
+  }
+
+  const expectedDataTypes =
+    fieldValue?.kind === 'function' &&
+    fieldValue?.function[0] === AggregationKey.COUNT_UNIQUE
+      ? new Set(['number', 'string', 'boolean'])
+      : new Set(['number']);
+
+  if ('dataType' in option.value.meta) {
+    return expectedDataTypes.has(option.value.meta.dataType);
+  }
+  return true;
+}
+
+function filterYAxisOptions() {
+  return function (option: FieldValueOption) {
+    return option.value.kind === FieldValueKind.FUNCTION;
+  };
+}
+
+function getGroupByFieldOptions(organization: Organization, tags?: TagCollection) {
+  const primaryFieldOptions = getPrimaryFieldOptions(organization, tags);
+  const yAxisFilter = filterYAxisOptions();
+  const filterGroupByOptions = (option: FieldValueOption) => !yAxisFilter(option);
+
+  return pickBy(primaryFieldOptions, filterGroupByOptions);
+}
+
+// Filters the primary options in the sort by selector
+function filterSeriesSortOptions(columns: Set<string>) {
+  return (option: FieldValueOption) => {
+    if (option.value.kind === FieldValueKind.FUNCTION) {
+      return true;
+    }
+
+    return columns.has(option.value.meta.name);
+  };
+}

@@ -1,0 +1,234 @@
+import {useMutation, useQueryClient} from '@tanstack/react-query';
+import {z} from 'zod';
+
+import {Button} from '@sentry/scraps/button';
+import {
+  defaultFormOptions,
+  FormSearch,
+  setFieldErrors,
+  useScrapsForm,
+} from '@sentry/scraps/form';
+import {Flex} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+
+import {
+  addLoadingMessage,
+  addSuccessMessage,
+  clearIndicators,
+} from 'sentry/actionCreators/indicator';
+import {
+  PROVIDER_TO_SETUP_WEBHOOK_URL,
+  WebhookProviderEnum,
+} from 'sentry/components/events/featureFlags/utils';
+import {InputCopyButton} from 'sentry/components/textCopyInput';
+import {t, tct} from 'sentry/locale';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {handleXhrErrorResponse} from 'sentry/utils/handleXhrErrorResponse';
+import {fetchMutation} from 'sentry/utils/queryClient';
+import {RequestError} from 'sentry/utils/requestError/requestError';
+import {requestErrorToFieldErrors} from 'sentry/utils/requestError/requestErrorToFieldErrors';
+import {selectText} from 'sentry/utils/selectText';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {
+  makeFetchSecretQueryKey,
+  type Secret,
+} from 'sentry/views/settings/featureFlags/changeTracking';
+
+const schema = z.object({
+  provider: z
+    .enum(WebhookProviderEnum)
+    .nullable()
+    .refine(v => v !== null, 'Provider is required'),
+  secret: z.string().min(1, t('Secret is required')).max(100),
+  webhookUrl: z.string(),
+});
+
+const defaultValues: z.input<typeof schema> = {
+  provider: null,
+  secret: '',
+  webhookUrl: '',
+};
+
+type CreateSecretData = z.output<typeof schema>;
+
+interface Props {
+  canSaveSecret: boolean;
+  onCreatedSecret: (secret: string) => void;
+  setError: (error: string | null) => void;
+  setSelectedProvider: (provider: WebhookProviderEnum) => void;
+  existingSecret?: Secret;
+}
+
+export function NewProviderForm({
+  onCreatedSecret,
+  setSelectedProvider,
+  setError,
+  canSaveSecret,
+  existingSecret,
+}: Props) {
+  const organization = useOrganization();
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+
+  const handleGoBack = () => {
+    navigate(
+      normalizeUrl(`/settings/${organization.slug}/feature-flags/change-tracking/`)
+    );
+  };
+
+  const mutation = useMutation({
+    mutationFn: ({provider, secret}: CreateSecretData) => {
+      addLoadingMessage();
+      return fetchMutation({
+        url: getApiUrl('/organizations/$organizationIdOrSlug/flags/signing-secrets/', {
+          path: {organizationIdOrSlug: organization.slug},
+        }),
+        method: 'POST',
+        data: {
+          provider: provider.toLowerCase(),
+          secret,
+        },
+      });
+    },
+    onSuccess: (_response, {secret, provider}) => {
+      addSuccessMessage(t('Added provider and secret.'));
+      onCreatedSecret(secret);
+      setSelectedProvider(provider);
+      queryClient.invalidateQueries({
+        queryKey: makeFetchSecretQueryKey({orgSlug: organization.slug}),
+      });
+    },
+    onError: error => {
+      clearIndicators();
+      if (error instanceof RequestError) {
+        const responseJSON = error.responseJSON;
+        const hasFieldSpecificErrors = responseJSON?.secret || responseJSON?.provider;
+
+        if (!hasFieldSpecificErrors) {
+          const message =
+            typeof responseJSON === 'string'
+              ? responseJSON
+              : t('Failed to add provider or secret.');
+          handleXhrErrorResponse(message, error);
+          setError(message);
+        }
+      }
+    },
+  });
+
+  const form = useScrapsForm({
+    ...defaultFormOptions,
+    defaultValues,
+    validators: {onDynamic: schema},
+    onSubmit: ({value, formApi}) => {
+      return mutation.mutateAsync(schema.parse(value)).catch(error => {
+        if (error instanceof RequestError) {
+          setFieldErrors(formApi, requestErrorToFieldErrors(error, formApi.state.values));
+        }
+      });
+    },
+  });
+
+  return (
+    <FormSearch route="/settings/:orgId/feature-flags/change-tracking/new-provider/">
+      <form.AppForm form={form}>
+        <form.AppField name="provider">
+          {field => (
+            <field.Layout.Row
+              padding="xl"
+              label={t('Provider')}
+              hintText={t(
+                'If you have already linked this provider, pasting a new secret will override the existing secret.'
+              )}
+              required
+            >
+              <field.Select
+                value={field.state.value}
+                onChange={value => {
+                  field.handleChange(value);
+                  form.setFieldValue(
+                    'webhookUrl',
+                    value
+                      ? `${window.location.origin}/api/0/organizations/${organization.slug}/flags/hooks/provider/${value.toLowerCase()}/`
+                      : ''
+                  );
+                  setSelectedProvider(value);
+                }}
+                placeholder={t('Select a provider')}
+                options={Object.values(WebhookProviderEnum).map(p => ({
+                  value: p,
+                  label: p,
+                }))}
+              />
+            </field.Layout.Row>
+          )}
+        </form.AppField>
+        <form.Subscribe selector={state => state.values.provider}>
+          {provider => (
+            <form.AppField name="webhookUrl">
+              {field => (
+                <field.Layout.Row
+                  padding="xl"
+                  label={t('Webhook URL')}
+                  hintText={getWebhookUrlHint(provider ?? '')}
+                >
+                  <field.Input
+                    readOnly
+                    dir="ltr"
+                    value={field.state.value}
+                    disabled={!provider}
+                    onClick={event => selectText(event.currentTarget)}
+                    trailingItems={<InputCopyButton text={field.state.value} />}
+                  />
+                </field.Layout.Row>
+              )}
+            </form.AppField>
+          )}
+        </form.Subscribe>
+        <form.AppField name="secret">
+          {field => (
+            <field.Layout.Row
+              padding="xl"
+              label={t('Secret')}
+              hintText={t(
+                'Paste the signing secret given by your provider when creating the webhook.'
+              )}
+              required
+            >
+              <field.Input
+                value={field.state.value}
+                onChange={field.handleChange}
+                maxLength={100}
+              />
+            </field.Layout.Row>
+          )}
+        </form.AppField>
+        <Flex justify="end" gap="md" padding="xl">
+          <Button onClick={handleGoBack}>{t('Cancel')}</Button>
+          <form.SubmitButton disabled={!canSaveSecret}>
+            {existingSecret ? t('Update Provider') : t('Add Provider')}
+          </form.SubmitButton>
+        </Flex>
+      </form.AppForm>
+    </FormSearch>
+  );
+}
+
+function getWebhookUrlHint(provider: string) {
+  return Object.keys(PROVIDER_TO_SETUP_WEBHOOK_URL).includes(provider)
+    ? tct(
+        "Create a webhook integration with your [link:feature flag service]. When you do so, you'll need to enter this URL.",
+        {
+          link: (
+            <ExternalLink
+              href={PROVIDER_TO_SETUP_WEBHOOK_URL[provider as WebhookProviderEnum]}
+            />
+          ),
+        }
+      )
+    : t(
+        "Create a webhook integration with your feature flag service. When you do so, you'll need to enter this URL."
+      );
+}

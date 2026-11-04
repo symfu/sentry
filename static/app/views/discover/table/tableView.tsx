@@ -1,0 +1,687 @@
+import {Fragment} from 'react';
+import {useMatches} from 'react-router';
+import {useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+import {IconStack} from '@sentry/icons/stack';
+import * as Sentry from '@sentry/react';
+import type {Location, LocationDescriptor} from 'history';
+
+import {Flex, Grid} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import {useModal} from '@sentry/scraps/modal';
+import {COL_WIDTH_MINIMUM} from '@sentry/scraps/table';
+import {Heading, Text} from '@sentry/scraps/text';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {DataGrid} from 'sentry/components/tables/dataGrid';
+import {Truncate} from 'sentry/components/truncate';
+import {t} from 'sentry/locale';
+import type {Organization} from 'sentry/types/organization';
+import type {Project} from 'sentry/types/project';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import type {CustomMeasurementCollection} from 'sentry/utils/customMeasurements/customMeasurements';
+import {getTimeStampFromTableDateField} from 'sentry/utils/dates';
+import type {TableData, TableDataRow} from 'sentry/utils/discover/discoverQuery';
+import type {EventView} from 'sentry/utils/discover/eventView';
+import {getFieldRenderer} from 'sentry/utils/discover/fieldRenderers';
+import type {Column} from 'sentry/utils/discover/fields';
+import {getEquationAliasIndex, isEquationAlias} from 'sentry/utils/discover/fields';
+import {DURATION_UNITS, SIZE_UNITS} from 'sentry/utils/discover/fieldUnits';
+import {
+  DisplayModes,
+  SavedQueryDatasets,
+  TOP_N,
+  type DiscoverDatasets,
+} from 'sentry/utils/discover/types';
+import {generateLinkToEventInTraceView} from 'sentry/utils/discover/urls';
+import {ViewReplayLink} from 'sentry/utils/discover/viewReplayLink';
+import {getShortEventId} from 'sentry/utils/events';
+import {generateProfileFlamechartRoute} from 'sentry/utils/profiling/routes';
+import {decodeList} from 'sentry/utils/queryString';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useProjects} from 'sentry/utils/useProjects';
+import {appendQueryDatasetParam, hasDatasetSelector} from 'sentry/views/dashboards/utils';
+import {
+  getExpandedResults,
+  getTargetForTransactionSummaryLink,
+} from 'sentry/views/discover/utils';
+import {makeReleasesPathname} from 'sentry/views/explore/releases/utils/pathnames';
+import {TraceViewSources} from 'sentry/views/performance/traceDetails/traceHeader/traceViewSources';
+import {getTraceDetailsUrl} from 'sentry/views/performance/traceDetails/traceUrl';
+import {generateReplayLink} from 'sentry/views/performance/transactionSummary/utils';
+
+import {QuickContextHoverWrapper} from './quickContext/quickContextWrapper';
+import {ContextType} from './quickContext/utils';
+import {Actions, updateQuery} from './cellAction';
+import {ColumnEditModal, modalCss} from './columnEditModal';
+import {TableActions} from './tableActions';
+import {TopResultsIndicator} from './topResultsIndicator';
+import type {TableColumn} from './types';
+import {useEventViewTable, type RenderCellOptions} from './useEventViewTable';
+
+type TableViewProps = {
+  error: string | null;
+  eventView: EventView;
+  isFirstPage: boolean;
+
+  isLoading: boolean;
+  location: Location;
+
+  measurementKeys: null | string[];
+  onChangeShowTags: () => void;
+  organization: Organization;
+  showTags: boolean;
+  tableData: TableData | null | undefined;
+
+  title: string;
+  customMeasurements?: CustomMeasurementCollection;
+  dataset?: DiscoverDatasets;
+  isHomepage?: boolean;
+  queryDataset?: SavedQueryDatasets;
+  spanOperationBreakdownKeys?: string[];
+};
+
+/**
+ * The `TableView` is marked with leading _ in its method names. It consumes
+ * the EventView object given in its props to generate new EventView objects
+ * for actions like resizing column.
+ *
+ * The entire state of the table view (or event view) is co-located within
+ * the EventView object. This object is fed from the props.
+ *
+ * Attempting to modify the state, and therefore, modifying the given EventView
+ * object given from its props, will generate new instances of EventView objects.
+ *
+ * In most cases, the new EventView object differs from the previous EventView
+ * object. The new EventView object is pushed to the location object.
+ */
+export function TableView(props: TableViewProps) {
+  const {openModal} = useModal();
+
+  const theme = useTheme();
+  const navigate = useNavigate();
+  const {projects} = useProjects();
+  const matches = useMatches();
+  const replayLinkGenerator = generateReplayLink(matches);
+
+  function _renderPrependColumns(
+    isHeader: boolean,
+    dataRow?: any,
+    rowIndex?: number
+  ): React.ReactNode[] {
+    const {organization, eventView, tableData, location, queryDataset} = props;
+    const hasAggregates = eventView.hasAggregateField();
+    const hasIdField = eventView.hasIdField();
+
+    const isTransactionsDataset =
+      hasDatasetSelector(organization) &&
+      queryDataset === SavedQueryDatasets.TRANSACTIONS;
+
+    if (isHeader) {
+      if (hasAggregates) {
+        return [<IconStack key="header-icon" size="sm" variant="muted" />];
+      }
+      if (!hasIdField) {
+        return [
+          <Text key="header-event-id" variant="muted">
+            {t('Event ID')}
+          </Text>,
+        ];
+      }
+      return [];
+    }
+
+    if (hasAggregates) {
+      const nextView = getExpandedResults(eventView, {}, dataRow);
+
+      const target = {
+        pathname: location.pathname,
+        query: {
+          ...nextView.generateQueryStringObject(),
+          ...appendQueryDatasetParam(organization, queryDataset),
+        },
+      };
+
+      return [
+        <Tooltip key={`eventlink${rowIndex}`} title={t('Open Group')}>
+          <Link
+            to={target}
+            data-test-id="open-group"
+            onClick={() => {
+              if (nextView.isEqualTo(eventView)) {
+                Sentry.captureException(new Error('Failed to drilldown'));
+              }
+            }}
+          >
+            <StyledIcon size="sm" />
+          </Link>
+        </Tooltip>,
+      ];
+    }
+    if (!hasIdField) {
+      let value = dataRow.id;
+
+      if (tableData?.meta) {
+        const fieldRenderer = getFieldRenderer('id', tableData.meta);
+        value = fieldRenderer(dataRow, {navigate, organization, location, theme});
+      }
+
+      const eventIdLink = (
+        <StyledLink
+          data-test-id="view-event"
+          to={getEventTarget({
+            dataRow,
+            eventView,
+            isTransactionsDataset,
+            location,
+            organization,
+          })}
+        >
+          {value}
+        </StyledLink>
+      );
+
+      return [
+        <QuickContextHoverWrapper
+          key={`quickContextEventHover${rowIndex}`}
+          dataRow={dataRow}
+          contextType={ContextType.EVENT}
+          organization={organization}
+          projects={projects}
+          eventView={eventView}
+        >
+          {eventIdLink}
+        </QuickContextHoverWrapper>,
+      ];
+    }
+    return [];
+  }
+
+  function _renderGridHeaderCell(
+    column: TableColumn<keyof TableDataRow>
+  ): React.ReactNode {
+    const {eventView} = props;
+    let titleText = isEquationAlias(column.name)
+      ? eventView.getEquations()[getEquationAliasIndex(column.name)]!
+      : column.name;
+
+    if (column.name.toLowerCase() === 'replayid') {
+      titleText = 'Replay';
+    }
+
+    return (
+      <StyledTooltip title={titleText}>
+        <Truncate value={titleText} maxLength={60} expandable={false} />
+      </StyledTooltip>
+    );
+  }
+
+  function _renderCell({
+    columnIndex,
+    dataRow,
+    field: columnKey,
+    rendered,
+    rowIndex,
+    wrap,
+  }: RenderCellOptions): React.ReactNode {
+    const {isFirstPage, eventView, location, organization, tableData, queryDataset} =
+      props;
+
+    const display = eventView.getDisplayMode();
+    const isTopEvents =
+      display === DisplayModes.TOP5 || display === DisplayModes.DAILYTOP5;
+
+    const topEvents = eventView.topEvents ? parseInt(eventView.topEvents, 10) : TOP_N;
+    const count = Math.min(tableData?.data?.length ?? topEvents, topEvents);
+
+    let cell = rendered;
+
+    const isTransactionsDataset =
+      hasDatasetSelector(organization) &&
+      queryDataset === SavedQueryDatasets.TRANSACTIONS;
+
+    if (columnKey === 'id') {
+      const idLink = (
+        <StyledLink
+          data-test-id="view-event"
+          to={getEventTarget({
+            dataRow,
+            eventView,
+            isTransactionsDataset,
+            location,
+            organization,
+          })}
+        >
+          {cell}
+        </StyledLink>
+      );
+
+      cell = (
+        <QuickContextHoverWrapper
+          organization={organization}
+          dataRow={dataRow}
+          contextType={ContextType.EVENT}
+          projects={projects}
+          eventView={eventView}
+        >
+          {idLink}
+        </QuickContextHoverWrapper>
+      );
+    } else if (columnKey === 'transaction' && dataRow.transaction) {
+      cell = (
+        <TransactionLink
+          data-test-id="tableView-transaction-link"
+          to={getTargetForTransactionSummaryLink(
+            dataRow,
+            organization,
+            projects,
+            eventView,
+            location
+          )}
+        >
+          {cell}
+        </TransactionLink>
+      );
+    } else if (columnKey === 'trace') {
+      const timestamp = getTimeStampFromTableDateField(
+        dataRow['max(timestamp)'] ?? dataRow.timestamp
+      );
+      const dateSelection = eventView.normalizeDateSelection(location);
+      const traceSlug = dataRow.trace;
+      if (typeof traceSlug === 'string' && traceSlug) {
+        const target = getTraceDetailsUrl({
+          organization,
+          traceSlug,
+          dateSelection,
+          timestamp,
+          location,
+          source: TraceViewSources.DISCOVER,
+        });
+
+        cell = (
+          <Tooltip title={t('View Trace')}>
+            <StyledLink data-test-id="view-trace" to={target}>
+              {cell}
+            </StyledLink>
+          </Tooltip>
+        );
+      }
+    } else if (columnKey === 'replayId') {
+      if (dataRow.replayId) {
+        if (!dataRow['project.name']) {
+          return getShortEventId(String(dataRow.replayId));
+        }
+
+        const target = replayLinkGenerator(organization, dataRow, undefined);
+        cell = (
+          <ViewReplayLink replayId={dataRow.replayId} to={target}>
+            {cell}
+          </ViewReplayLink>
+        );
+      }
+    } else if (columnKey === 'profile.id') {
+      const projectSlug = dataRow.project || dataRow['project.name'];
+      const profileId = dataRow['profile.id'];
+
+      if (projectSlug && profileId) {
+        const target = generateProfileFlamechartRoute({
+          organization,
+          projectSlug: String(projectSlug),
+          profileId: String(profileId),
+        });
+
+        cell = (
+          <StyledTooltip title={t('View Profile')}>
+            <StyledLink
+              data-test-id="view-profile"
+              to={target}
+              onClick={() =>
+                trackAnalytics('profiling_views.go_to_flamegraph', {
+                  organization,
+                  source: 'discover.transactions_table',
+                })
+              }
+            >
+              {cell}
+            </StyledLink>
+          </StyledTooltip>
+        );
+      }
+    }
+
+    const topResultsIndicator =
+      isFirstPage && isTopEvents && rowIndex < topEvents && columnIndex === 0 ? (
+        // Add one if we need to include Other in the series
+        <TopResultsIndicator count={count} index={rowIndex} />
+      ) : null;
+
+    return wrap(cell, topResultsIndicator);
+  }
+
+  function handleEditColumns() {
+    const {
+      organization,
+      eventView,
+      measurementKeys,
+      spanOperationBreakdownKeys,
+      customMeasurements,
+      dataset,
+    } = props;
+
+    const selectedProjects = eventView
+      .getFullSelectedProjects(projects)
+      .filter((project): project is Project => project !== undefined);
+
+    openModal(
+      modalProps => (
+        <ColumnEditModal
+          {...modalProps}
+          organization={organization}
+          measurementKeys={measurementKeys}
+          spanOperationBreakdownKeys={spanOperationBreakdownKeys}
+          columns={eventView.getColumns().map(col => col.column)}
+          onApply={handleUpdateColumns}
+          customMeasurements={customMeasurements}
+          dataset={dataset}
+          selectedProjects={selectedProjects}
+        />
+      ),
+      {modalCss: modalCss(theme), closeEvents: 'escape-key'}
+    );
+  }
+
+  function handleCellAction(
+    column: TableColumn<keyof TableDataRow>,
+    dataRow: TableDataRow
+  ) {
+    return (action: Actions, value: string | number) => {
+      const {eventView, organization, location, tableData, isHomepage, queryDataset} =
+        props;
+
+      const query = new MutableSearch(eventView.query);
+
+      let nextView = eventView.clone();
+      trackAnalytics('discover_v2.results.cellaction', {
+        organization,
+        action,
+      });
+
+      switch (action) {
+        case Actions.RELEASE: {
+          const maybeProject = projects.find(project => {
+            return project.slug === dataRow.project;
+          });
+
+          navigate(
+            normalizeUrl({
+              pathname: makeReleasesPathname({
+                organization,
+                path: `/${encodeURIComponent(value)}/`,
+              }),
+              query: {
+                ...nextView.getPageFiltersQuery(),
+
+                project: maybeProject ? maybeProject.id : undefined,
+              },
+            })
+          );
+
+          return;
+        }
+        case Actions.DRILLDOWN: {
+          // count_unique(column) drilldown
+          trackAnalytics('discover_v2.results.drilldown', {
+            organization,
+          });
+
+          // Drilldown into each distinct value and get a count() for each value.
+          nextView = getExpandedResults(nextView, {}, dataRow).withNewColumn({
+            kind: 'function',
+            function: ['count', '', undefined, undefined],
+          });
+
+          navigate(
+            normalizeUrl(
+              nextView.getResultsViewUrlTarget(
+                organization,
+                isHomepage,
+                hasDatasetSelector(organization) ? queryDataset : undefined
+              )
+            )
+          );
+
+          return;
+        }
+        default: {
+          // Some custom perf metrics have units.
+          // These custom perf metrics need to be adjusted to the correct value.
+          let cellValue = value;
+          const unit = tableData?.meta?.units?.[column.name];
+          if (typeof cellValue === 'number' && unit) {
+            if (Object.keys(SIZE_UNITS).includes(unit)) {
+              // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+              cellValue *= SIZE_UNITS[unit];
+            } else if (Object.keys(DURATION_UNITS).includes(unit)) {
+              // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+              cellValue *= DURATION_UNITS[unit];
+            }
+          }
+          updateQuery(query, action, column, cellValue);
+        }
+      }
+      nextView.query = query.formatString();
+
+      const target = nextView.getResultsViewUrlTarget(
+        organization,
+        isHomepage,
+        hasDatasetSelector(organization) ? queryDataset : undefined
+      );
+      // Get yAxis from location
+      target.query.yAxis = decodeList(location.query.yAxis);
+      navigate(normalizeUrl(target));
+    };
+  }
+
+  function handleUpdateColumns(columns: Column[]): void {
+    const {organization, eventView, location, isHomepage, queryDataset} = props;
+
+    // metrics
+    trackAnalytics('discover_v2.update_columns', {
+      organization,
+    });
+
+    const nextView = eventView.withColumns(columns);
+    const resultsViewUrlTarget = nextView.getResultsViewUrlTarget(
+      organization,
+      isHomepage,
+      hasDatasetSelector(organization) ? queryDataset : undefined
+    );
+    // Need to pull yAxis from location since eventView only stores 1 yAxis field at time
+    const previousYAxis = decodeList(location.query.yAxis);
+    resultsViewUrlTarget.query.yAxis = previousYAxis.filter(yAxis =>
+      nextView.getYAxisOptions().find(({value}) => value === yAxis)
+    );
+    navigate(normalizeUrl(resultsViewUrlTarget));
+  }
+
+  const {
+    error,
+    eventView,
+    isLoading,
+    location,
+    onChangeShowTags,
+    organization,
+    queryDataset,
+    showTags,
+    tableData,
+    title,
+  } = props;
+
+  const prependColumnWidths = eventView.hasAggregateField()
+    ? ['40px']
+    : eventView.hasIdField()
+      ? []
+      : [`minmax(${COL_WIDTH_MINIMUM}px, max-content)`];
+
+  const {columnOrder, getGrid} = useEventViewTable({
+    eventView,
+    getCellActionHandler: handleCellAction,
+    location,
+    makeQuery: queryStringObject => ({
+      ...queryStringObject,
+      yAxis: decodeList(location.query.yAxis),
+      ...appendQueryDatasetParam(organization, queryDataset),
+    }),
+    renderCell: _renderCell,
+    resize: 'query',
+  });
+
+  return (
+    <Fragment>
+      <Flex justify="between" align="center" marginBottom="md">
+        <Heading as="h4" size="md" variant="muted">
+          {t('Results')}
+        </Heading>
+        <Grid flow="column" gap="md" justifyItems="end">
+          <TableActions
+            title={title}
+            isLoading={isLoading}
+            error={error}
+            organization={organization}
+            eventView={eventView}
+            onEdit={handleEditColumns}
+            tableData={tableData}
+            location={location}
+            onChangeShowTags={onChangeShowTags}
+            showTags={showTags}
+            queryDataset={queryDataset}
+          />
+        </Grid>
+      </Flex>
+      <DataGrid
+        isLoading={isLoading}
+        error={error}
+        data={tableData ? tableData.data : []}
+        columnOrder={columnOrder}
+        grid={{
+          ...getGrid(tableData?.meta),
+          renderHeadCell: _renderGridHeaderCell as any,
+          renderPrependColumns: _renderPrependColumns as any,
+          prependColumnWidths,
+        }}
+      />
+    </Fragment>
+  );
+}
+
+type EventTargetOptions = {
+  dataRow: TableDataRow;
+  eventView: EventView;
+  isTransactionsDataset: boolean;
+  location: Location;
+  organization: Organization;
+};
+
+type TraceEventDataRow = TableDataRow & {
+  timestamp: string | number;
+  trace: string;
+};
+
+type IssueEventDataRow = TableDataRow & {
+  'issue.id': string | number;
+};
+
+function getEventTarget({
+  dataRow,
+  eventView,
+  isTransactionsDataset,
+  location,
+  organization,
+}: EventTargetOptions): LocationDescriptor {
+  if (dataRow['event.type'] !== 'transaction' && !isTransactionsDataset) {
+    if (isIssueEventDataRow(dataRow)) {
+      return getIssueEventTarget(dataRow, organization);
+    }
+
+    return getProjectEventRedirectTarget(dataRow, organization, location);
+  }
+
+  if (!isTraceEventDataRow(dataRow)) {
+    return getProjectEventRedirectTarget(dataRow, organization, location);
+  }
+
+  return generateLinkToEventInTraceView({
+    traceSlug: dataRow.trace,
+    eventId: dataRow.id,
+    timestamp: dataRow.timestamp,
+    organization,
+    location,
+    eventView,
+    source: TraceViewSources.DISCOVER,
+  });
+}
+
+function isIssueEventDataRow(dataRow: TableDataRow): dataRow is IssueEventDataRow {
+  const issueId = dataRow['issue.id'];
+  // Discover coalesces missing issue IDs to 0, so treat 0 as no issue.
+  return issueId !== undefined && issueId !== null && issueId !== 0 && issueId !== '0';
+}
+
+function isTraceEventDataRow(dataRow: TableDataRow): dataRow is TraceEventDataRow {
+  return (
+    typeof dataRow.trace === 'string' &&
+    dataRow.trace !== '' &&
+    dataRow.timestamp !== undefined
+  );
+}
+
+function getIssueEventTarget(
+  dataRow: IssueEventDataRow,
+  organization: Organization
+): LocationDescriptor {
+  return normalizeUrl({
+    pathname: `/organizations/${organization.slug}/issues/${dataRow['issue.id']}/events/${dataRow.id}/`,
+    query: {
+      referrer: 'discover-events-table',
+    },
+  });
+}
+
+function getProjectEventRedirectTarget(
+  dataRow: TableDataRow,
+  organization: Organization,
+  location: Location
+): LocationDescriptor {
+  const project = dataRow.project || dataRow['project.name'];
+
+  return {
+    // Redirects to the issue group event page via ProjectEventRedirect
+    pathname: normalizeUrl(`/${organization.slug}/${project}/events/${dataRow.id}/`),
+    query: {...location.query, referrer: 'discover-events-table'},
+  };
+}
+
+const StyledTooltip = styled(Tooltip)`
+  display: initial;
+  max-width: max-content;
+`;
+
+const StyledLink = styled(Link)`
+  & div {
+    display: inline;
+  }
+`;
+
+export const TransactionLink = styled(Link)`
+  display: block;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+`;
+
+const StyledIcon = styled(IconStack)`
+  vertical-align: middle;
+`;

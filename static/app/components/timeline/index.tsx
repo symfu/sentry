@@ -1,0 +1,200 @@
+import type {CSSProperties} from 'react';
+import {useTheme, type Theme} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import {Flex, Container} from '@sentry/scraps/layout';
+
+export interface TimelineItemProps {
+  title: React.ReactNode;
+  'aria-current'?: React.AriaAttributes['aria-current'];
+  /**
+   * Renders the row as another element — an `li`, when the timeline is a list.
+   * The row itself has to be the list item: `:first-child` and `:last-child`
+   * above decide the row's margin and whether the connecting line is masked,
+   * and a wrapping `li` would make every row match both.
+   */
+  as?: React.ElementType;
+  children?: React.ReactNode;
+  className?: string;
+  colorConfig?: {
+    icon: string;
+    iconBorder: string;
+    title: string;
+  };
+  /**
+   * Used by tanstack virtualizer to track the index of the item.
+   */
+  'data-index'?: number;
+  icon?: React.ReactNode;
+  isActive?: boolean;
+  onClick?: React.MouseEventHandler<HTMLDivElement>;
+  onMouseEnter?: React.MouseEventHandler<HTMLDivElement>;
+  onMouseLeave?: React.MouseEventHandler<HTMLDivElement>;
+  ref?: React.Ref<HTMLDivElement>;
+  showLastLine?: boolean;
+  style?: CSSProperties;
+  timestamp?: React.ReactNode;
+  titleTrailingItems?: React.ReactNode;
+}
+
+function Item({
+  title,
+  children,
+  icon,
+  colorConfig,
+  timestamp,
+  isActive = false,
+  titleTrailingItems,
+  ref,
+  ...props
+}: TimelineItemProps) {
+  const theme = useTheme();
+  const config = colorConfig ?? makeDefaultColorConfig(theme);
+
+  return (
+    <Row ref={ref} {...props}>
+      {icon ? (
+        <IconWrapper
+          style={{
+            borderColor: isActive ? config.iconBorder : 'transparent',
+            color: config.icon,
+          }}
+          className="timeline-icon-wrapper"
+        >
+          {icon}
+        </IconWrapper>
+      ) : (
+        <IconWrapper className="timeline-icon-wrapper" />
+      )}
+      <TitleRow align="center" gap="xs" wrap="wrap">
+        <Title style={{color: config.title}}>{title}</Title>
+        {titleTrailingItems}
+      </TitleRow>
+      {timestamp ?? <div />}
+      <Container justifySelf="center" width="0" height="100%" column="span 1" />
+      <Content>{children}</Content>
+    </Row>
+  );
+}
+
+function makeDefaultColorConfig(theme: Theme) {
+  return {
+    title: theme.tokens.content.primary,
+    icon: theme.tokens.content.secondary,
+    iconBorder: theme.tokens.content.secondary,
+  };
+}
+
+const Row = styled('div')<{showLastLine?: boolean}>`
+  position: relative;
+  color: ${p => p.theme.tokens.content.secondary};
+  display: grid;
+  align-items: start;
+  grid-template-rows: auto auto;
+  grid-template-columns: 22px minmax(50px, 1fr) auto;
+  grid-column-gap: ${p => p.theme.space.md};
+  margin: ${p => p.theme.space.md} 0;
+  &:first-child {
+    margin-top: 0;
+  }
+  &:last-child {
+    margin-bottom: 0;
+    /* Show/hide connecting line from the last element of the timeline */
+    background: ${p =>
+      p.showLastLine ? 'transparent' : p.theme.tokens.background.primary};
+  }
+`;
+
+const IconWrapper = styled('div')`
+  grid-column: span 1;
+  border-radius: 100%;
+  border: 1px solid;
+  background: ${p => p.theme.tokens.background.primary};
+  svg {
+    display: block;
+    margin: ${p => p.theme.space.xs};
+  }
+`;
+
+const TitleRow = styled(Flex)``;
+
+const Title = styled('div')`
+  font-weight: bold;
+  text-align: left;
+  grid-column: span 1;
+  font-size: ${p => p.theme.font.size.md};
+`;
+
+const Content = styled('div')`
+  text-align: left;
+  grid-column: span 2;
+  color: ${p => p.theme.tokens.content.secondary};
+  margin: ${p => p.theme.space['2xs']} 0 0;
+  font-size: ${p => p.theme.font.size.sm};
+  word-wrap: break-word;
+`;
+
+const Text = styled('div')`
+  text-align: left;
+  font-size: ${p => p.theme.font.size.sm};
+  &:only-child {
+    margin-top: 0;
+  }
+`;
+
+const Data = styled('div')`
+  border-radius: ${p => p.theme.space.xs};
+  padding: ${p => p.theme.space['2xs']} ${p => p.theme.space.sm};
+  border: 1px solid ${p => p.theme.tokens.border.secondary};
+  margin: ${p => p.theme.space.sm} 0 0 -${p => p.theme.space.sm};
+  font-family: ${p => p.theme.font.family.mono};
+  font-size: ${p => p.theme.font.size.sm};
+  background: ${p => p.theme.tokens.background.secondary};
+  position: relative;
+  &:only-child {
+    margin-top: 0;
+  }
+`;
+
+/**
+ * A marker for an entry with no icon of its own: a plain point on the line.
+ *
+ * Passed as `icon`, so it sits in the same box an icon would and lands on the
+ * container's axis without the caller positioning anything. An icon marker is
+ * a 12px glyph inside 4px of margin; the dot is smaller, and its margin makes
+ * up the difference so the two share a centre. It takes its colour from
+ * `colorConfig.icon` like an icon does.
+ */
+const Dot = styled('span')`
+  display: block;
+  width: 8px;
+  height: 8px;
+  margin: 6px;
+  border-radius: 100%;
+  background: currentColor;
+`;
+
+const TimelineContainer = styled('div')`
+  position: relative;
+  /* vertical line connecting items */
+  &::before {
+    content: '';
+    position: absolute;
+    left: 10.5px;
+    width: 1px;
+    top: 0;
+    bottom: 0;
+    /* oxlint-disable-next-line @sentry/scraps/use-semantic-token */
+    background: ${p => p.theme.tokens.border.transparent.neutral.muted};
+  }
+`;
+
+export const Timeline = {
+  Data,
+  Dot,
+  Text,
+  Title,
+  TitleRow,
+  Item,
+  Container: TimelineContainer,
+};

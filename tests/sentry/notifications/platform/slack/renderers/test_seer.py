@@ -1,0 +1,735 @@
+from unittest.mock import Mock, patch
+
+from django.test import override_settings
+from slack_sdk.models.blocks import (
+    ActionsBlock,
+    ButtonElement,
+    ContextBlock,
+    DividerBlock,
+    LinkButtonElement,
+    MarkdownBlock,
+    MarkdownTextObject,
+    PlainTextObject,
+    RichTextBlock,
+    RichTextListElement,
+    SectionBlock,
+)
+
+from fixtures.seer.webhooks import MOCK_GROUP_ID, MOCK_RUN_ID
+from sentry.notifications.platform.service import NotificationService
+from sentry.notifications.platform.slack.provider import SlackNotificationProvider, SlackRenderable
+from sentry.notifications.platform.slack.renderers.seer import AUTOFIX_CONFIG, SeerSlackRenderer
+from sentry.notifications.platform.slack.renderers.seer_agent_write_approval import (
+    SeerAgentWriteApprovalSlackRenderer,
+)
+from sentry.notifications.platform.templates.seer import (
+    SeerAgentError,
+    SeerAgentResponse,
+    SeerAgentWriteApproval,
+    SeerAutofixCodeChange,
+    SeerAutofixPullRequest,
+    SeerAutofixUpdate,
+    SeerInvestigationConclusionTemplate,
+    SeerInvestigationError,
+    SeerInvestigationErrorTemplate,
+    SeerInvestigationProgress,
+    SeerInvestigationStarted,
+    SeerInvestigationStartedTemplate,
+    SeerInvestigationStatus,
+    SeerInvestigationStatusTemplate,
+)
+from sentry.notifications.platform.tracking import NotificationLink, NotificationLinkDecorator
+from sentry.notifications.platform.types import (
+    NotificationData,
+    NotificationProviderKey,
+    NotificationRenderedTemplate,
+)
+from sentry.seer.autofix.utils import AutofixStoppingPoint
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.options import override_options
+
+
+def link_decorator(data: NotificationData) -> NotificationLinkDecorator:
+    return NotificationLinkDecorator(data=data, provider=NotificationProviderKey.SLACK)
+
+
+def render_seer(
+    data: NotificationData, rendered_template: NotificationRenderedTemplate
+) -> SlackRenderable:
+    renderer = SlackNotificationProvider.get_renderer(data=data)
+    return renderer.render(
+        data=data,
+        rendered_template=rendered_template,
+        link_decorator=link_decorator(data),
+    )
+
+
+class SeerSlackRendererTest(TestCase):
+    def _create_update(
+        self,
+        current_point: AutofixStoppingPoint,
+        summary: str | None = None,
+        steps: list[str] | None = None,
+        reasoning: list[str] | None = None,
+        changes: list[SeerAutofixCodeChange] | None = None,
+        pull_requests: list[SeerAutofixPullRequest] | None = None,
+        handoff_target: str | None = None,
+        reasoning_header: str | None = None,
+        steps_header: str | None = None,
+    ) -> SeerAutofixUpdate:
+        return SeerAutofixUpdate(
+            run_id=MOCK_RUN_ID,
+            organization_id=self.organization.id,
+            project_id=self.project.id,
+            group_id=MOCK_GROUP_ID,
+            current_point=current_point,
+            group_link=f"https://sentry.io/issues/{MOCK_GROUP_ID}?seerDrawer=true",
+            summary=summary,
+            steps=steps or [],
+            reasoning=reasoning or [],
+            changes=changes or [],
+            pull_requests=pull_requests or [],
+            handoff_target=handoff_target,
+            reasoning_header=reasoning_header,
+            steps_header=steps_header,
+        )
+
+    def test_render_footer_blocks_with_has_complete_stage(self) -> None:
+        data = self._create_update(AutofixStoppingPoint.ROOT_CAUSE)
+        blocks = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=link_decorator(data), has_complete_stage=True
+        )
+        assert len(blocks) == 1
+        config = AUTOFIX_CONFIG[AutofixStoppingPoint.ROOT_CAUSE]
+        completed_text = config["completed_text"]
+        assert completed_text is not None
+        section_block = blocks[0]
+        assert isinstance(section_block, SectionBlock)
+        assert section_block.text is not None
+        assert completed_text in section_block.text.text
+        assert section_block.accessory is not None
+        assert isinstance(section_block.accessory, LinkButtonElement)
+        assert section_block.accessory.url == data.group_link
+
+    @override_options(
+        {
+            "notifications.tracking.sources": ["seer-autofix-update"],
+            "system.url-prefix": "https://sentry.io",
+        }
+    )
+    def test_render_footer_blocks_decorates_group_link(self) -> None:
+        data = self._create_update(AutofixStoppingPoint.ROOT_CAUSE)
+        decorator = link_decorator(data)
+
+        blocks = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=decorator, has_complete_stage=True
+        )
+
+        section_block = blocks[0]
+        assert isinstance(section_block, SectionBlock)
+        assert isinstance(section_block.accessory, LinkButtonElement)
+        assert section_block.accessory.url is not None
+        assert f"notification_uuid={data.notification_uuid}" in section_block.accessory.url
+        assert decorator.links == {NotificationLink.ISSUE_WITH_SEER}
+
+    def test_render_footer_blocks_with_stage_not_completed(self) -> None:
+        data = self._create_update(AutofixStoppingPoint.ROOT_CAUSE)
+        blocks = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=link_decorator(data), has_complete_stage=False
+        )
+        assert len(blocks) == 1
+        config = AUTOFIX_CONFIG[AutofixStoppingPoint.ROOT_CAUSE]
+        working_text = config["working_text"]
+        assert working_text is not None
+        section_block = blocks[0]
+        assert isinstance(section_block, SectionBlock)
+        assert section_block.text is not None
+        assert working_text in section_block.text.text
+
+    def test_render_footer_blocks_with_handoff_target_uses_handoff_text(self) -> None:
+        data = self._create_update(
+            current_point=AutofixStoppingPoint.ROOT_CAUSE,
+            handoff_target="cursor_background_agent",
+        )
+        config = AUTOFIX_CONFIG[AutofixStoppingPoint.ROOT_CAUSE]
+
+        working = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=link_decorator(data), has_complete_stage=False
+        )
+        assert len(working) == 1
+        working_section = working[0]
+        assert isinstance(working_section, SectionBlock)
+        assert working_section.text is not None
+        assert "Cursor" in working_section.text.text
+        # Generic stopping-point text is suppressed when a handoff target is set.
+        assert config["working_text"] not in working_section.text.text
+
+        completed = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=link_decorator(data), has_complete_stage=True
+        )
+        completed_section = completed[0]
+        assert isinstance(completed_section, SectionBlock)
+        assert completed_section.text is not None
+        assert "Cursor" in completed_section.text.text
+        assert config["completed_text"] not in completed_section.text.text
+
+    def test_render_footer_blocks_with_extra_text(self) -> None:
+        data = self._create_update(AutofixStoppingPoint.ROOT_CAUSE)
+        extra_text = "(ty <@U12345>)"
+        blocks = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=link_decorator(data), extra_text=extra_text
+        )
+        assert len(blocks) == 1
+        section_block = blocks[0]
+        assert isinstance(section_block, SectionBlock)
+        assert section_block.text is not None
+        assert extra_text in section_block.text.text
+
+    @override_settings(DEBUG=True)
+    def test_render_footer_debug_block(self) -> None:
+        data = self._create_update(AutofixStoppingPoint.ROOT_CAUSE)
+        blocks = SeerSlackRenderer.render_footer_blocks(
+            data=data, link_decorator=link_decorator(data)
+        )
+        assert len(blocks) == 2
+        assert isinstance(blocks[1], ContextBlock)
+        context_element = blocks[1].elements[0]
+        assert isinstance(context_element, PlainTextObject)
+        assert f"Run ID: {MOCK_RUN_ID}" in context_element.text
+
+    def test_render_autofix_button(self) -> None:
+        element = SeerSlackRenderer.render_autofix_button(group=self.group)
+        assert isinstance(element, ButtonElement)
+        assert element.text is not None
+        assert element.text.text == "Fix with Seer"
+        assert element.value == AutofixStoppingPoint.ROOT_CAUSE.value
+
+    @patch(
+        "sentry.notifications.platform.templates.seer.organization_service.get_option",
+        return_value=True,
+    )
+    def test_render_autofix_update_no_progress_with_next_trigger(
+        self, _mock_get_option: Mock
+    ) -> None:
+        data = self._create_update(
+            current_point=AutofixStoppingPoint.ROOT_CAUSE,
+            summary="Test summary",
+        )
+        renderable = SeerSlackRenderer._render_autofix_update(data, link_decorator(data))
+        # Should have link button and next stage trigger button
+        actions_block = None
+        for block in renderable["blocks"]:
+            if isinstance(block, ActionsBlock):
+                actions_block = block
+                break
+        assert actions_block is not None
+        assert len(actions_block.elements) == 2
+        # First button is link to sentry
+        assert isinstance(actions_block.elements[0], LinkButtonElement)
+        # Second button is trigger for next stage
+        assert isinstance(actions_block.elements[1], ButtonElement)
+        assert actions_block.elements[1].value == AutofixStoppingPoint.SOLUTION.value
+
+    @patch(
+        "sentry.notifications.platform.templates.seer.organization_service.get_option",
+        return_value=True,
+    )
+    def test_render_autofix_update_open_pr_no_footer(self, _mock_get_option: Mock) -> None:
+        data = self._create_update(
+            current_point=AutofixStoppingPoint.OPEN_PR,
+            pull_requests=[{"pr_number": 123, "pr_url": "https://github.com/org/repo/pull/123"}],
+        )
+        renderable = SeerSlackRenderer._render_autofix_update(data, link_decorator(data))
+        # Open PR with progress should NOT have footer (it's the final stage)
+        has_context_block = any(isinstance(b, ContextBlock) for b in renderable["blocks"])
+        assert not has_context_block
+
+    @patch(
+        "sentry.notifications.platform.templates.seer.organization_service.get_option",
+        return_value=True,
+    )
+    def test_render_autofix_update_with_pull_requests(self, _mock_get_option: Mock) -> None:
+        data = self._create_update(
+            current_point=AutofixStoppingPoint.OPEN_PR,
+            pull_requests=[
+                {"pr_number": 123, "pr_url": "https://github.com/org/repo/pull/123"},
+                {"pr_number": 456, "pr_url": "https://github.com/org/repo/pull/456"},
+            ],
+        )
+        renderable = SeerSlackRenderer._render_autofix_update(data, link_decorator(data))
+        actions_block = None
+        for block in renderable["blocks"]:
+            if isinstance(block, ActionsBlock):
+                actions_block = block
+                break
+        assert actions_block is not None
+        # Should have link button + 2 PR buttons
+        pr_buttons = [
+            e
+            for e in actions_block.elements
+            if isinstance(e, LinkButtonElement) and e.text is not None and "PR" in e.text.text
+        ]
+        assert len(pr_buttons) == 2
+
+    def test_render_autofix_update_root_cause_with_handoff_target(self) -> None:
+        data = self._create_update(
+            current_point=AutofixStoppingPoint.ROOT_CAUSE,
+            summary="Test summary",
+            handoff_target="cursor_background_agent",
+        )
+        renderable = SeerSlackRenderer._render_autofix_update(data, link_decorator(data))
+
+        actions_block = next((b for b in renderable["blocks"] if isinstance(b, ActionsBlock)), None)
+        assert actions_block is not None
+        # Link button + handoff button (next-stage trigger is suppressed).
+        assert len(actions_block.elements) == 2
+        assert isinstance(actions_block.elements[0], LinkButtonElement)
+        handoff_button = actions_block.elements[1]
+        assert isinstance(handoff_button, ButtonElement)
+        assert handoff_button.text is not None
+        assert handoff_button.text.text == "Hand off to Cursor"
+        assert handoff_button.action_id is not None
+        assert handoff_button.action_id.startswith("seer_autofix_handoff::")
+
+    def test_render_autofix_update_root_cause_with_reasoning(self) -> None:
+        data = self._create_update(
+            current_point=AutofixStoppingPoint.ROOT_CAUSE,
+            summary="Test summary",
+            reasoning=["First reason", "Second reason", "Third reason"],
+        )
+        renderable = SeerSlackRenderer._render_autofix_update(data, link_decorator(data))
+        rich_text_blocks = [b for b in renderable["blocks"] if isinstance(b, RichTextBlock)]
+        assert len(rich_text_blocks) == 1
+        list_element = rich_text_blocks[0].elements[0]
+        assert isinstance(list_element, RichTextListElement)
+        assert list_element.style == "ordered"
+        assert len(list_element.elements) == 3
+
+    @patch(
+        "sentry.notifications.platform.templates.seer.organization_service.get_option",
+        return_value=False,
+    )
+    def test_render_autofix_update_solution_no_next_trigger_when_coding_disabled(
+        self, _mock_get_option: Mock
+    ) -> None:
+        data = self._create_update(current_point=AutofixStoppingPoint.SOLUTION)
+        renderable = SeerSlackRenderer._render_autofix_update(data, link_decorator(data))
+        actions_block = None
+        for block in renderable["blocks"]:
+            if isinstance(block, ActionsBlock):
+                actions_block = block
+                break
+        assert actions_block is not None
+        # Should only have link button, no next trigger button
+        assert len(actions_block.elements) == 1
+        assert isinstance(actions_block.elements[0], LinkButtonElement)
+
+
+class SeerSlackRendererAgentErrorTest(TestCase):
+    def test_render_agent_error(self) -> None:
+        data = SeerAgentError(
+            organization_id=1, error_message="Seer could not explore your organization."
+        )
+        renderable = SeerSlackRenderer._render_agent_error(data)
+
+        assert renderable["text"] == "Seer stumbled: Seer had some trouble..."
+        blocks = renderable["blocks"]
+        assert len(blocks) == 2
+        assert isinstance(blocks[0], SectionBlock)
+        assert blocks[0].text is not None
+        assert blocks[0].text.text == "Seer had some trouble..."
+        assert isinstance(blocks[1], SectionBlock)
+        assert blocks[1].text is not None
+        assert ">Seer could not explore your organization." in blocks[1].text.text
+
+    def test_render_agent_error_custom_title(self) -> None:
+        data = SeerAgentError(
+            organization_id=1,
+            error_message="Timeout.",
+            error_title="Agent failed",
+        )
+        renderable = SeerSlackRenderer._render_agent_error(data)
+
+        assert renderable["text"] == "Seer stumbled: Agent failed"
+        title_block = renderable["blocks"][0]
+        assert isinstance(title_block, SectionBlock)
+        assert title_block.text is not None
+        assert title_block.text.text == "Agent failed"
+        body_block = renderable["blocks"][1]
+        assert isinstance(body_block, SectionBlock)
+        assert body_block.text is not None
+        assert ">Timeout." in body_block.text.text
+
+    def test_render_dispatches_to_agent_error(self) -> None:
+        data = SeerAgentError(organization_id=1, error_message="Something went wrong.")
+        renderable = render_seer(
+            data=data,
+            rendered_template=NotificationRenderedTemplate(subject="", body=[]),
+        )
+        assert renderable["text"] == "Seer stumbled: Seer had some trouble..."
+
+
+class SeerSlackRendererAgentTest(TestCase):
+    def _create_agent_response(self, summary: str = "") -> SeerAgentResponse:
+        return SeerAgentResponse(
+            run_id=MOCK_RUN_ID,
+            organization_id=self.organization.id,
+            summary=summary,
+        )
+
+    def test_render_agent_response_with_summary(self) -> None:
+        seer_run = self.create_seer_run(
+            organization=self.organization, seer_run_state_id=MOCK_RUN_ID
+        )
+        data = self._create_agent_response(
+            summary="Found a spike in 500 errors from the auth service."
+        )
+        with self.feature("organizations:seer-run-id-in-slack"):
+            renderable = SeerSlackRenderer._render_agent_response(data, link_decorator(data))
+
+        assert renderable["text"] == "Seer Agent has finished"
+        blocks = renderable["blocks"]
+        assert len(blocks) == 2
+
+        assert isinstance(blocks[0], MarkdownBlock)
+        assert "Found a spike in 500 errors from the auth service." in blocks[0].text
+
+        assert isinstance(blocks[1], ContextBlock)
+        assert isinstance(blocks[1].elements[0], MarkdownTextObject)
+        run_id_text = blocks[1].elements[0].text
+        conversation_id = str(seer_run.uuid)
+        expected_url = self.organization.absolute_url(
+            f"/organizations/{self.organization.slug}/explore/agents/conversations/{conversation_id}/"
+        )
+        assert run_id_text == f"Agent Trace: <{expected_url}|{conversation_id}>"
+
+    def test_render_agent_response_without_seer_run_mirror(self) -> None:
+        data = self._create_agent_response(
+            summary="Found a spike in 500 errors from the auth service."
+        )
+        with self.feature("organizations:seer-run-id-in-slack"):
+            renderable = SeerSlackRenderer._render_agent_response(data, link_decorator(data))
+
+        assert renderable["text"] == "Seer Agent has finished"
+        blocks = renderable["blocks"]
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], MarkdownBlock)
+
+    def test_render_agent_response_without_run_id_flag(self) -> None:
+        data = self._create_agent_response(
+            summary="Found a spike in 500 errors from the auth service."
+        )
+        renderable = SeerSlackRenderer._render_agent_response(data, link_decorator(data))
+
+        assert renderable["text"] == "Seer Agent has finished"
+        blocks = renderable["blocks"]
+        assert len(blocks) == 1
+
+        assert isinstance(blocks[0], MarkdownBlock)
+        assert "Found a spike in 500 errors from the auth service." in blocks[0].text
+
+    def test_render_agent_response_with_missing_scope_footer(self) -> None:
+        data = SeerAgentResponse(
+            run_id=MOCK_RUN_ID,
+            organization_id=self.organization.id,
+            summary="Some analysis",
+            missing_scope_settings_url="https://sentry.io/settings/test/integrations/slack/",
+        )
+        renderable = SeerSlackRenderer._render_agent_response(data, link_decorator(data))
+
+        blocks = renderable["blocks"]
+        assert len(blocks) == 2
+        last_block = blocks[-1]
+        assert last_block.type == "context"
+        assert isinstance(last_block, ContextBlock)
+        first_element = last_block.elements[0]
+        assert isinstance(first_element, MarkdownTextObject)
+        footer_text = first_element.text
+        assert "Reinstall" in footer_text
+        assert "I can't read the whole thread" in footer_text
+
+    def test_render_agent_response_no_footer_when_url_not_set(self) -> None:
+        data = self._create_agent_response(summary="Some analysis")
+        assert data.missing_scope_settings_url is None
+        renderable = SeerSlackRenderer._render_agent_response(data, link_decorator(data))
+
+        for block in renderable["blocks"]:
+            assert block.type != "context"
+
+    def test_render_dispatches_to_agent_response(self) -> None:
+        data = self._create_agent_response(summary="Test")
+        renderable = render_seer(
+            data=data,
+            rendered_template=NotificationRenderedTemplate(subject="", body=[]),
+        )
+        assert renderable["text"] == "Seer Agent has finished"
+
+
+class SeerAgentWriteApprovalSlackRendererTest(TestCase):
+    rendered_template = NotificationRenderedTemplate(subject="", body=[])
+
+    def test_render_request_and_provider_dispatch(self) -> None:
+        data = SeerAgentWriteApproval(
+            run_id=MOCK_RUN_ID,
+            organization_id=self.organization.id,
+            input_id="approval-1",
+            scopes=["org:write"],
+        )
+
+        renderer = SlackNotificationProvider.get_renderer(data=data)
+        assert renderer is SeerAgentWriteApprovalSlackRenderer
+        renderable = render_seer(data, self.rendered_template)
+
+        assert renderable["text"] == "Seer needs approval to make a change"
+        assert len(renderable["blocks"]) == 3
+        actions = renderable["blocks"][2]
+        assert isinstance(actions, ActionsBlock)
+        reject_button, approve_button = actions.elements
+        assert isinstance(reject_button, ButtonElement)
+        assert isinstance(approve_button, ButtonElement)
+        assert reject_button.text is not None
+        assert approve_button.text is not None
+        assert [reject_button.text.text, approve_button.text.text] == ["Reject", "Approve"]
+        assert reject_button.value == "link_clicked"
+        assert approve_button.value == "link_clicked"
+
+
+class SeerSlackRendererInvestigationTest(TestCase):
+    def test_render_investigation_started(self) -> None:
+        renderable, _ = NotificationService.render_template(
+            data=SeerInvestigationStarted(
+                organization_id=1,
+                slack_user_id="U0123456789",
+                investigation_url="https://example.sentry.io/seer/investigations/1/",
+            ),
+            template=SeerInvestigationStartedTemplate(),
+            provider=SlackNotificationProvider,
+        )
+
+        text = "<@U0123456789> started a Seer investigation for this alert."
+        assert renderable["text"] == text
+        (block,) = renderable["blocks"]
+        assert isinstance(block, MarkdownBlock)
+        assert block.text == text
+
+    @override_options(
+        {
+            "notifications.tracking.sources": ["seer-investigation-started"],
+            "system.url-prefix": "https://sentry.io",
+        }
+    )
+    def test_render_investigation_link_button(self) -> None:
+        url = "https://acme.sentry.io/seer/investigations/1/"
+        data = SeerInvestigationStarted(
+            organization_id=1, slack_user_id="U0123456789", investigation_url=url
+        )
+        link_decorator = NotificationLinkDecorator(
+            data=data, provider=NotificationProviderKey.SLACK
+        )
+
+        button = SeerSlackRenderer.render_investigation_link_button(
+            data=data, link_decorator=link_decorator
+        )
+
+        assert button.text is not None
+        assert button.text.text == "Open investigation"
+        assert button.url is not None
+        assert button.url.startswith(f"{url}?referrer=seer-investigation-started-slack")
+        assert button.value == "link_clicked"
+        assert link_decorator.links == {NotificationLink.INVESTIGATION}
+
+    def test_render_investigation_error(self) -> None:
+        renderable, _ = NotificationService.render_template(
+            data=SeerInvestigationError(organization_id=1, error_message="Something broke"),
+            template=SeerInvestigationErrorTemplate(),
+            provider=SlackNotificationProvider,
+        )
+
+        text = "Seer couldn't start an investigation: Something broke"
+        assert renderable["text"] == text
+        (block,) = renderable["blocks"]
+        assert isinstance(block, MarkdownBlock)
+        assert block.text == text
+
+    def test_render_investigation_status_without_hypotheses(self) -> None:
+        renderable, _ = NotificationService.render_template(
+            data=SeerInvestigationStatus(
+                organization_id=1,
+                title="Checkout <errors>",
+                subtitle="`/checkout/`",
+                investigation_url="https://example.com/investigation",
+            ),
+            template=SeerInvestigationStatusTemplate(),
+            provider=SlackNotificationProvider,
+        )
+
+        assert renderable["text"] == "Investigating Checkout &lt;errors&gt;"
+        header, divider, actions = renderable["blocks"]
+        assert isinstance(header, SectionBlock)
+        assert header.text is not None
+        assert header.text.type == "mrkdwn"
+        assert header.text.text == "*Investigating Checkout &lt;errors&gt;*\n`/checkout/`"
+        assert isinstance(divider, DividerBlock)
+        assert isinstance(actions, ActionsBlock)
+
+    @override_options(
+        {
+            "notifications.tracking.sources": ["seer-investigation-status"],
+            "system.url-prefix": "https://sentry.io",
+        }
+    )
+    def test_render_investigation_status_decorates_link(self) -> None:
+        url = "https://acme.sentry.io/seer/investigations/1/"
+
+        renderable, links = NotificationService.render_template(
+            data=SeerInvestigationStatus(
+                organization_id=1, title="Checkout errors", subtitle=None, investigation_url=url
+            ),
+            template=SeerInvestigationStatusTemplate(),
+            provider=SlackNotificationProvider,
+        )
+
+        actions = renderable["blocks"][-1]
+        assert isinstance(actions, ActionsBlock)
+        (button,) = actions.elements
+        assert isinstance(button, ButtonElement)
+        assert button.url is not None
+        assert button.url.startswith(f"{url}?referrer=seer-investigation-status-slack")
+        assert links == {NotificationLink.INVESTIGATION}
+
+    def test_render_investigation_status_with_hypotheses(self) -> None:
+        template = SeerInvestigationStatusTemplate()
+        data = template.example_data
+
+        renderable, _ = NotificationService.render_template(
+            data=data, template=template, provider=SlackNotificationProvider
+        )
+
+        assert renderable["text"] == "Investigating FCP on organization login pages"
+        header, *quotes, task_card, divider, actions = renderable["blocks"]
+        assert isinstance(header, SectionBlock)
+        assert header.text is not None
+        assert header.text.text == (
+            "*Investigating FCP on organization login pages*\n"
+            "`/auth/login/[org]/` · Aug 27, 09:00–11:00 UTC"
+        )
+        assert len(quotes) == len(data.hypotheses)
+        assert quotes[0].to_dict()["elements"] == [
+            {
+                "type": "rich_text_quote",
+                "elements": [
+                    {
+                        "type": "text",
+                        "text": "1. Database or cache degradation delayed the response",
+                        "style": {"bold": True},
+                    },
+                    {"type": "text", "text": "\n● Verifying", "style": {"bold": True}},
+                    {
+                        "type": "text",
+                        "text": "\nComparing server response time, organization lookup "
+                        "spans, and cache behavior…",
+                    },
+                ],
+            }
+        ]
+        assert task_card.to_dict() == {
+            "type": "task_card",
+            "task_id": "investigation-progress",
+            "title": "Verifying hypotheses",
+            "status": "in_progress",
+            "details": {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {
+                                "type": "text",
+                                "text": "Checking the remaining explanations against related "
+                                "telemetry.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+        assert isinstance(divider, DividerBlock)
+        assert isinstance(actions, ActionsBlock)
+        (button,) = actions.elements
+        assert isinstance(button, ButtonElement)
+        assert button.text is not None
+        assert button.text.text == "View full investigation"
+        assert button.url == data.investigation_url
+        assert button.style == "primary"
+        assert button.value == "link_clicked"
+
+    def test_render_investigation_status_complete_has_no_button(self) -> None:
+        template = SeerInvestigationStatusTemplate()
+        data = template.example_data.copy(
+            update={
+                "progress": SeerInvestigationProgress(
+                    title="Investigation complete",
+                    status="complete",
+                    detail="Seer finished checking every hypothesis.",
+                )
+            }
+        )
+
+        renderable, _ = NotificationService.render_template(
+            data=data, template=template, provider=SlackNotificationProvider
+        )
+
+        assert [block.type for block in renderable["blocks"]][-2:] == ["rich_text", "task_card"]
+
+    @override_options(
+        {
+            "notifications.tracking.sources": ["seer-investigation-conclusion"],
+            "system.url-prefix": "https://sentry.io",
+        }
+    )
+    def test_render_investigation_conclusion(self) -> None:
+        template = SeerInvestigationConclusionTemplate()
+        data = template.example_data
+
+        renderable, links = NotificationService.render_template(
+            data=data, template=template, provider=SlackNotificationProvider
+        )
+
+        assert renderable["text"] == "Seer finished the investigation"
+        summary, next_step, divider, actions = renderable["blocks"]
+        assert isinstance(summary, SectionBlock)
+        assert summary.text is not None
+        assert summary.text.text == f"*{data.summary}*\n{data.summary_description}"
+        assert data.next_step is not None
+        assert isinstance(next_step, SectionBlock)
+        assert next_step.text is not None
+        assert next_step.text.text == (
+            f"*Suggested next step:* {data.next_step['title']}\n{data.next_step['rationale']}"
+        )
+        assert isinstance(divider, DividerBlock)
+        assert isinstance(actions, ActionsBlock)
+        (button,) = actions.elements
+        assert isinstance(button, ButtonElement)
+        assert button.text is not None
+        assert button.text.text == "View full investigation"
+        assert button.url is not None
+        assert button.url.startswith(
+            f"{data.investigation_url}?referrer=seer-investigation-conclusion-slack"
+        )
+        assert button.style == "primary"
+        assert button.value == "link_clicked"
+        assert links == {NotificationLink.INVESTIGATION}
+
+    def test_render_investigation_conclusion_with_only_a_summary(self) -> None:
+        template = SeerInvestigationConclusionTemplate()
+        data = template.example_data.copy(update={"summary_description": None, "next_step": None})
+
+        renderable, _ = NotificationService.render_template(
+            data=data, template=template, provider=SlackNotificationProvider
+        )
+
+        section, divider, _actions = renderable["blocks"]
+        assert isinstance(divider, DividerBlock)
+        assert isinstance(section, SectionBlock)
+        assert section.text is not None
+        assert section.text.text == f"*{data.summary}*"

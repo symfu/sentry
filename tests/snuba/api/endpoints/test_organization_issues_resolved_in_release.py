@@ -1,17 +1,20 @@
+from typing import Any
 from uuid import uuid1
 
-
-from sentry.models import Commit, GroupLink, GroupResolution, ReleaseCommit, Repository
-
-from sentry.testutils import APITestCase, SnubaTestCase
-from sentry.utils.compat import map
+from sentry.models.commit import Commit
+from sentry.models.group import Group
+from sentry.models.grouplink import GroupLink
+from sentry.models.groupresolution import GroupResolution
+from sentry.models.releasecommit import ReleaseCommit
+from sentry.models.repository import Repository
+from sentry.testutils.cases import APITestCase, SnubaTestCase
 
 
 class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase):
     endpoint = "sentry-api-0-organization-release-resolved"
     method = "get"
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.user = self.create_user()
         self.org = self.create_organization()
@@ -27,7 +30,7 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
         self.group_2 = self.create_group(project=self.project_2)
         self.login_as(self.user)
 
-    def build_grouplink(self, group=None):
+    def build_grouplink(self, group: Group | None = None) -> None:
         group = self.group if group is None else group
         repo = Repository.objects.create(organization_id=self.org.id, name=group.project.name)
         commit = Commit.objects.create(
@@ -50,26 +53,31 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
             linked_id=commit.id,
         )
 
-    def build_group_resolution(self, group=None):
+    def build_group_resolution(self, group: Group | None = None) -> GroupResolution:
         return GroupResolution.objects.create(
             group=self.group if group is None else group,
             release=self.release,
             type=GroupResolution.Type.in_release,
         )
 
-    def run_test(self, expected_groups, project_ids=None, environment_names=None):
-        params = {}
+    def run_test(
+        self,
+        expected_groups: list[Group],
+        project_ids: list[int] | None = None,
+        environment_names: list[str] | None = None,
+    ) -> None:
+        params: dict[str, Any] = {}
         if project_ids:
             params["project"] = project_ids
         if environment_names:
             params["environment"] = environment_names
 
-        response = self.get_valid_response(self.org.slug, self.release.version, **params)
+        response = self.get_success_response(self.org.slug, self.release.version, **params)
         assert len(response.data) == len(expected_groups)
         expected = set(map(str, [g.id for g in expected_groups]))
         assert {item["id"] for item in response.data} == expected
 
-    def test_shows_issues_from_groupresolution(self):
+    def test_shows_issues_from_groupresolution(self) -> None:
         """
         tests that the endpoint will correctly retrieve issues resolved
         in a release from the GroupResolution model
@@ -77,7 +85,7 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
         self.build_group_resolution()
         self.run_test([self.group])
 
-    def test_shows_issues_from_grouplink(self):
+    def test_shows_issues_from_grouplink(self) -> None:
         """
         tests that the endpoint will correctly retrieve issues resolved
         in a release from the GroupLink model
@@ -85,7 +93,7 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
         self.build_grouplink()
         self.run_test([self.group])
 
-    def test_does_not_return_duplicate_groups(self):
+    def test_does_not_return_duplicate_groups(self) -> None:
         """
         tests that the endpoint will correctly retrieve issues resolved
         in a release from the GroupLink and GroupResolution model
@@ -95,7 +103,7 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
         self.build_group_resolution()
         self.run_test([self.group])
 
-    def test_return_groups_from_both_types(self):
+    def test_return_groups_from_both_types(self) -> None:
         """
         tests that the endpoint will correctly retrieve issues resolved
         in a release from both the GroupLink and GroupResolution model
@@ -105,7 +113,7 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
         self.build_group_resolution(new_group)
         self.run_test([self.group, new_group])
 
-    def test_multiple_projects(self):
+    def test_multiple_projects(self) -> None:
         """
         Test that the endpoint will return issues resolved in a release across
         projects in the org, and that filtering by project works as expected
@@ -119,7 +127,7 @@ class OrganizationIssuesResolvedInReleaseEndpointTest(APITestCase, SnubaTestCase
             [self.group, self.group_2], project_ids=[self.group.project_id, self.group_2.project_id]
         )
 
-    def test_multiple_envs_projects(self):
+    def test_multiple_envs_projects(self) -> None:
         """
         Test that the endpoint will work correctly if multiple envs are passed
         """

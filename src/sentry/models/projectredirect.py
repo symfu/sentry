@@ -1,13 +1,24 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from django.db import models
 from django.utils import timezone
 
-from sentry.db.models import Model, FlexibleForeignKey
+from sentry.backup.scopes import RelocationScope
+from sentry.constants import PROJECT_SLUG_MAX_LENGTH
+from sentry.db.models import FlexibleForeignKey, Model, cell_silo_model
+from sentry.db.models.fields.slug import SentrySlugField
+
+if TYPE_CHECKING:
+    from sentry.models.project import Project
 
 
+@cell_silo_model
 class ProjectRedirect(Model):
-    __core__ = True
+    __relocation_scope__ = RelocationScope.Organization
 
-    redirect_slug = models.SlugField(db_index=True)
+    redirect_slug = SentrySlugField(max_length=PROJECT_SLUG_MAX_LENGTH, db_index=True)
     project = FlexibleForeignKey("sentry.Project")
     organization = FlexibleForeignKey("sentry.Organization")
     date_added = models.DateTimeField(default=timezone.now)
@@ -18,7 +29,7 @@ class ProjectRedirect(Model):
         unique_together = (("organization", "redirect_slug"),)
 
     @classmethod
-    def record(cls, project, historic_slug):
+    def record(cls, project: Project, historic_slug: str) -> None:
         """
         Records a historic slug used for redirect purposes. Overwrites
         historic redirect slugs from previous projects

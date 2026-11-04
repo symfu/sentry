@@ -1,26 +1,184 @@
-from django.core.urlresolvers import reverse
+from django.test import override_settings
+from django.urls import reverse
+from rest_framework.response import Response
 
-from sentry.testutils import APITestCase
+from sentry.models.apikey import ApiKey
+from sentry.models.promptsactivity import PromptsActivity
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.viewer_context import Actor, ActorType, ViewerContext, encode_viewer_context
 
 
-class PromptsActivityTest(APITestCase):
-    def setUp(self):
+class PromptsActivityTestBase(APITestCase):
+    endpoint = "sentry-api-0-organization-prompts-activity"
+
+    def setUp(self) -> None:
         super().setUp()
         self.login_as(user=self.user)
         self.org = self.create_organization(owner=self.user, name="baz")
-        # self.project = self.create_project(
-        #     organization=self.org,
-        #     # teams=[self.team],
-        #     # name='Bengal-Elephant-Giraffe-Tree-House',
-        # )
-
         self.team = self.create_team(organization=self.org, name="Mariachi Band")
         self.project = self.create_project(
             organization=self.org, teams=[self.team], name="Bengal-Elephant-Giraffe-Tree-House"
         )
-        self.path = reverse("sentry-api-0-prompts-activity")
+        self.path = reverse(self.endpoint, args=[self.org.slug])
 
-    def test_invalid_feature(self):
+
+class GetPromptsActivityTest(PromptsActivityTestBase):
+    method = "get"
+
+    def test_idor_get_project_from_different_org(self) -> None:
+        """Regression test: GET cannot access projects from other organizations (IDOR)."""
+        other_org = self.create_organization()
+        other_project = self.create_project(organization=other_org)
+
+        resp = self.client.get(
+            self.path,
+            {
+                "project_id": str(other_project.id),
+                "feature": "releases",
+            },
+        )
+
+        # Should return 404 to prevent ID enumeration
+        assert resp.status_code == 404
+        assert resp.data["detail"] == "Project not found"
+
+    def test_get_empty_project_id(self) -> None:
+        """Test that empty string project_id returns 400 instead of 500."""
+        resp = self.client.get(
+            self.path,
+            {
+                "project_id": "",
+                "feature": "releases",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.data["detail"] == 'Missing required field "project_id"'
+
+    @override_settings(SEER_API_SHARED_SECRET="service-account-secret")
+    @with_feature("organizations:service-accounts")
+    def test_service_account_sees_no_prompt_state(self) -> None:
+        PromptsActivity.objects.create(
+            user_id=self.user.id,
+            feature="releases",
+            organization_id=self.org.id,
+            project_id=self.project.id,
+            data={"dismissed_ts": 1},
+        )
+        service_account = self.create_service_account(
+            organization=self.org, scope_list=["org:read"]
+        )
+        viewer_context = encode_viewer_context(
+            ViewerContext(
+                actor=Actor(type=ActorType.SERVICE_ACCOUNT, actor_id=service_account.id),
+                organization_id=self.org.id,
+            ),
+            key="service-account-secret",
+        )
+
+        resp = self.client.get(
+            self.path,
+            {"project_id": self.project.id, "feature": "releases"},
+            HTTP_X_VIEWER_CONTEXT=viewer_context,
+        )
+        assert resp.status_code == 200, resp.content
+        assert resp.data == {"data": None, "features": {}}
+
+
+class PutPromptsActivityTest(PromptsActivityTestBase):
+    method = "put"
+
+    def _dismiss(self, **headers: str | bytes) -> Response:
+        return self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+            **headers,
+        )
+
+    def test_api_key_cannot_dismiss(self) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            key = ApiKey.objects.create(organization_id=self.org.id, scope_list=["org:read"])
+            self.client.logout()
+
+        resp = self._dismiss(HTTP_AUTHORIZATION=self.create_basic_auth_header(key.key))
+
+        assert resp.status_code == 401, resp.content
+        assert not PromptsActivity.objects.filter(feature="releases").exists()
+
+    @override_settings(SEER_API_SHARED_SECRET="service-account-secret")
+    @with_feature("organizations:service-accounts")
+    def test_service_account_cannot_dismiss(self) -> None:
+        service_account = self.create_service_account(
+            organization=self.org, scope_list=["org:read"]
+        )
+        viewer_context = encode_viewer_context(
+            ViewerContext(
+                actor=Actor(type=ActorType.SERVICE_ACCOUNT, actor_id=service_account.id),
+                organization_id=self.org.id,
+            ),
+            key="service-account-secret",
+        )
+
+        resp = self._dismiss(HTTP_X_VIEWER_CONTEXT=viewer_context)
+
+        assert resp.status_code == 403, resp.content
+        assert resp.data["detail"]["code"] == "user-required"
+        assert not PromptsActivity.objects.filter(feature="releases").exists()
+
+    def test_regular_org_member_can_dismiss(self) -> None:
+        member_user = self.create_user()
+        self.create_member(user=member_user, organization=self.org, role="member")
+        self.login_as(user=member_user)
+
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "feature": "alert_stream",
+                "status": "dismissed",
+            },
+        )
+        assert resp.status_code == 201
+
+    def test_organization_permissions(self) -> None:
+        new_org = self.create_organization()
+        self.path = reverse("sentry-api-0-organization-prompts-activity", args=[new_org.slug])
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": new_org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+
+        assert resp.status_code == 403
+
+    def test_organization_id_mismatch(self) -> None:
+        new_org = self.create_organization()
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": new_org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.data["detail"] == "Organization missing or mismatched"
+
+    def test_invalid_feature(self) -> None:
         # Invalid feature prompt name
         resp = self.client.put(
             self.path,
@@ -34,17 +192,52 @@ class PromptsActivityTest(APITestCase):
 
         assert resp.status_code == 400
 
-    def test_invalid_project(self):
+    def test_batched_invalid_feature(self) -> None:
+        # Invalid feature prompt name
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": ["releases", "gibberish"],
+                "status": "dismissed",
+            },
+        )
+
+        assert resp.status_code == 400
+
+    def test_invalid_project(self) -> None:
         # Invalid project id
-        data = {
-            "organization_id": self.org.id,
-            "project_id": self.project.id,
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
             "feature": "releases",
         }
         resp = self.client.get(self.path, data)
         assert resp.status_code == 200
+        project_id = self.project.id
         self.project.delete()
         # project doesn't exist
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": project_id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.data["detail"] == "Project does not belong to this organization"
+
+    def test_dismiss(self) -> None:
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
+            "feature": "releases",
+        }
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert resp.data.get("data", None) is None
+
         resp = self.client.put(
             self.path,
             {
@@ -54,42 +247,43 @@ class PromptsActivityTest(APITestCase):
                 "status": "dismissed",
             },
         )
-        assert resp.status_code == 400
-
-    def test_dismiss(self):
-        data = {
-            "organization_id": self.org.id,
-            "project_id": self.project.id,
-            "feature": "releases",
-        }
-        resp = self.client.get(self.path, data)
-        assert resp.status_code == 200
-        assert resp.data == {}
-
-        self.client.put(
-            self.path,
-            {
-                "organization_id": self.org.id,
-                "project_id": self.project.id,
-                "feature": "releases",
-                "status": "dismissed",
-            },
-        )
+        assert resp.status_code == 201
 
         resp = self.client.get(self.path, data)
         assert resp.status_code == 200
         assert "data" in resp.data
         assert "dismissed_ts" in resp.data["data"]
 
-    def test_snooze(self):
-        data = {
-            "organization_id": self.org.id,
-            "project_id": self.project.id,
+    def test_dismiss_str_id(self) -> None:
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": str(self.org.id),
+                "project_id": str(self.project.id),
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+        assert resp.status_code == 201, resp.content
+
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
             "feature": "releases",
         }
         resp = self.client.get(self.path, data)
         assert resp.status_code == 200
-        assert resp.data == {}
+        assert resp.data
+        assert "data" in resp.data
+        assert "dismissed_ts" in resp.data["data"]
+
+    def test_snooze(self) -> None:
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
+            "feature": "releases",
+        }
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert resp.data.get("data", None) is None
 
         self.client.put(
             self.path,
@@ -106,3 +300,180 @@ class PromptsActivityTest(APITestCase):
         assert resp.status_code == 200
         assert "data" in resp.data
         assert "snoozed_ts" in resp.data["data"]
+
+    def test_visible(self) -> None:
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
+            "feature": "releases",
+        }
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert resp.data.get("data", None) is None
+
+        self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "visible",
+            },
+        )
+
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert "data" in resp.data
+        assert resp.data["data"].get("dismissed_ts") is None
+        assert resp.data["data"].get("snoozed_ts") is None
+
+    def test_visible_after_dismiss(self) -> None:
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
+            "feature": "releases",
+        }
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert resp.data.get("data", None) is None
+
+        self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "dismiss",
+            },
+        )
+
+        self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "visible",
+            },
+        )
+
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert "data" in resp.data
+        assert resp.data["data"].get("dismissed_ts") is None
+        assert resp.data["data"].get("snoozed_ts") is None
+
+    def test_batched(self) -> None:
+        data: dict[str, str | list[str]] = {
+            "project_id": str(self.project.id),
+            "feature": ["releases", "alert_stream"],
+        }
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert resp.data["features"].get("releases", None) is None
+        assert resp.data["features"].get("alert_stream", None) is None
+
+        self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert "dismissed_ts" in resp.data["features"]["releases"]
+        assert resp.data["features"].get("alert_stream", None) is None
+
+        self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "alert_stream",
+                "status": "snoozed",
+            },
+        )
+
+        resp = self.client.get(self.path, data)
+        assert resp.status_code == 200
+        assert "dismissed_ts" in resp.data["features"]["releases"]
+        assert "snoozed_ts" in resp.data["features"]["alert_stream"]
+
+    def test_project_from_different_organization(self) -> None:
+        other_org = self.create_organization()
+        other_project = self.create_project(organization=other_org)
+
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": other_project.id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.data["detail"] == "Project does not belong to this organization"
+
+    def test_put_empty_project_id(self) -> None:
+        """Test that empty string project_id in PUT returns 400 instead of 500."""
+        resp = self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": "",
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.data["detail"] == "Invalid project_id"
+
+
+@with_feature("organizations:granular-permission-scopes")
+class PromptsActivityScopeTest(PromptsActivityTestBase):
+    def _use_token(self, scope_list: list[str]) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.client.logout()
+            token = self.create_user_auth_token(user=self.user, scope_list=scope_list)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+    def dismiss(self) -> Response:
+        response: Response = self.client.put(
+            self.path,
+            {
+                "organization_id": self.org.id,
+                "project_id": self.project.id,
+                "feature": "releases",
+                "status": "dismissed",
+            },
+        )
+        return response
+
+    def test_read_scope_can_get(self) -> None:
+        self._use_token(["user_preference:read"])
+        resp = self.client.get(
+            self.path, {"project_id": str(self.project.id), "feature": "releases"}
+        )
+        assert resp.status_code == 200, resp.content
+
+    def test_read_scope_cannot_dismiss(self) -> None:
+        self._use_token(["user_preference:read"])
+        assert self.dismiss().status_code == 403
+
+    def test_write_scope_can_dismiss(self) -> None:
+        self._use_token(["user_preference:write"])
+        resp = self.dismiss()
+        assert resp.status_code == 201, resp.content
+
+    def test_write_scope_cannot_get(self) -> None:
+        # Write does not imply read.
+        self._use_token(["user_preference:write"])
+        resp = self.client.get(
+            self.path, {"project_id": str(self.project.id), "feature": "releases"}
+        )
+        assert resp.status_code == 403

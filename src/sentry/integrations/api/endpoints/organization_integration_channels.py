@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import logging
+from typing import Any, TypedDict
+
+from drf_spectacular.utils import extend_schema
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import control_silo_endpoint
+from sentry.apidocs.constants import RESPONSE_BAD_REQUEST, RESPONSE_FORBIDDEN, RESPONSE_NOT_FOUND
+from sentry.apidocs.parameters import GlobalParams
+from sentry.apidocs.response_types import DetailResponse
+from sentry.apidocs.utils import inline_sentry_response_serializer
+from sentry.integrations.api.bases.organization_integrations import (
+    OrganizationIntegrationBaseEndpoint,
+)
+from sentry.integrations.discord.client import DiscordClient
+from sentry.integrations.models import Integration
+from sentry.integrations.msteams.client import MsTeamsClient
+from sentry.integrations.services.integration.model import RpcIntegration
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.organizations.services.organization import RpcUserOrganizationContext
+from sentry.shared_integrations.exceptions import ApiError
+
+logger = logging.getLogger(__name__)
+
+
+class IntegrationChannel(TypedDict):
+    id: str
+    name: str
+    display: str
+    type: str
+
+
+class IntegrationChannelsResponseOptional(TypedDict, total=False):
+    warning: str
+
+
+class IntegrationChannelsResponse(IntegrationChannelsResponseOptional):
+    results: list[IntegrationChannel]
+
+
+def _slack_list_channels(*, integration_id: int) -> list[IntegrationChannel]:
+    """
+    List Slack channels for a given integration.
+
+    Fetches up to the Slack API limit (1000 channels).
+    Handles authentication via integration context and validates responses.
+    """
+
+    from sentry.integrations.slack.sdk_client import SlackSdkClient
+
+    client = SlackSdkClient(integration_id=integration_id)
+
+    try:
+        response = client.conversations_list(
+            exclude_archived=True,
+            types="public_channel,private_channel",
+            limit=1000,  # Max allowed by Slack API
+        )
+        resp_data: dict[str, Any] = response.data if isinstance(response.data, dict) else {}
+    except Exception as e:
+        logger.warning("Slack API request failed for integration_id=%s: %s", integration_id, e)
+        return []
+
+    # Validate structure
+    raw_channels = resp_data.get("channels")
+    if not isinstance(raw_channels, list):
+        logger.warning(
+            "Unexpected Slack API response structure for integration_id=%s: %r",
+            integration_id,
+            resp_data,
+        )
+        return []
+
+    results: list[IntegrationChannel] = []
+    for ch in raw_channels:
+        if not isinstance(ch, dict):
+            continue
+
+        ch_id = ch.get("id")
+        ch_name = ch.get("name")
+        if not ch_id or not ch_name:
+            continue
+
+        is_private = bool(ch.get("is_private"))
+        name_str = str(ch_name)
+
+        results.append(
+            IntegrationChannel(
+                id=str(ch_id),
+                name=name_str,
+                display=f"#{name_str}",
+                type="private" if is_private else "public",
+            )
+        )
+
+    return results
+
+
+def _discord_list_channels(*, guild_id: str) -> list[IntegrationChannel]:
+    """
+    List Discord channels for a given guild that can receive messages.
+
+    The Discord API returns all guild channels in a single call.
+    This function filters for messageable channels only.
+    """
+
+    DISCORD_CHANNEL_TYPES = {
+        0: "text",
+        5: "announcement",
+        15: "forum",
+    }
+
+    client = DiscordClient()
+
+    try:
+        raw_resp = client.get(
+            f"/guilds/{guild_id}/channels",
+            headers=client.prepare_auth_header(),
+        )
+    except Exception as e:
+        logger.warning(
+            "Discord API request failed for guild_id=%s: %s",
+            guild_id,
+            e,
+        )
+        return []
+
+    if not isinstance(raw_resp, list):
+        logger.warning(
+            "Unexpected Discord API response for guild_id=%s: %r",
+            guild_id,
+            raw_resp,
+        )
+        return []
+
+    selectable_types = set(DISCORD_CHANNEL_TYPES.keys())
+    results: list[IntegrationChannel] = []
+
+    for item in raw_resp:
+        if not isinstance(item, dict):
+            continue
+
+        ch_type = item.get("type")
+        if not isinstance(ch_type, int) or ch_type not in selectable_types:
+            continue
+
+        ch_id = item.get("id")
+        ch_name = item.get("name")
+        if not ch_id or not ch_name:
+            continue
+
+        results.append(
+            IntegrationChannel(
+                id=str(ch_id),
+                name=str(ch_name),
+                display=f"#{ch_name}",
+                type=DISCORD_CHANNEL_TYPES.get(ch_type, "unknown"),
+            )
+        )
+
+    return results
+
+
+def _msteams_list_channels(
+    *, integration: Integration | RpcIntegration, team_id: str
+) -> list[IntegrationChannel]:
+    """
+    List Microsoft Teams channels for a given team.
+
+    The Teams API returns all channels at once, each as `id`, `name` and `type`.
+    """
+
+    client = MsTeamsClient(integration)
+
+    try:
+        raw_resp = client.get(client.CHANNEL_URL % team_id)
+    except Exception as e:
+        logger.warning(
+            "Microsoft Teams API request failed for integration_id=%s, team_id=%s: %s",
+            integration.id,
+            team_id,
+            e,
+        )
+        return []
+
+    if not isinstance(raw_resp, dict):
+        logger.warning(
+            "Unexpected Microsoft Teams API response for integration_id=%s, team_id=%s: %r",
+            integration.id,
+            team_id,
+            raw_resp,
+        )
+        return []
+
+    raw_channels = raw_resp.get("conversations")
+    if not isinstance(raw_channels, list):
+        logger.warning(
+            "Missing or invalid 'conversations' in Teams API response for integration_id=%s, team_id=%s: %r",
+            integration.id,
+            team_id,
+            raw_resp,
+        )
+        return []
+
+    results: list[IntegrationChannel] = []
+    for item in raw_channels:
+        if not isinstance(item, dict):
+            continue
+
+        ch_id = item.get("id")
+        if not ch_id:
+            continue
+
+        # A channel without a name is General, which is also how
+        # `find_channel_id` resolves the name "General" back to it.
+        name = str(item.get("name") or "General")
+        ch_type = str(item.get("type") or "standard")
+
+        results.append(
+            IntegrationChannel(
+                id=str(ch_id),
+                name=name,
+                display=name,
+                type=ch_type,  # "standard", "private" or "shared"
+            )
+        )
+
+    return results
+
+
+@extend_schema(tags=["Integration"])
+@control_silo_endpoint
+class OrganizationIntegrationChannelsEndpoint(OrganizationIntegrationBaseEndpoint):
+    publish_status = {
+        "GET": ApiPublishStatus.PUBLIC_EXPERIMENTAL,
+    }
+    owner = ApiOwner.TELEMETRY_EXPERIENCE
+
+    @extend_schema(
+        operation_id="listOrganizationIntegrationChannels",
+        summary="List Messaging Channels for an Integration",
+        parameters=[GlobalParams.ORG_ID_OR_SLUG, GlobalParams.INTEGRATION_ID],
+        responses={
+            200: inline_sentry_response_serializer(
+                "IntegrationChannelsResponse", IntegrationChannelsResponse
+            ),
+            400: RESPONSE_BAD_REQUEST,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+    )
+    def get(
+        self,
+        request: Request,
+        organization_context: RpcUserOrganizationContext,
+        integration_id: int,
+        **kwargs: Any,
+    ) -> Response[IntegrationChannelsResponse] | Response[DetailResponse]:
+        """
+        List all messaging channels for an integration.
+        """
+
+        integration = self.get_integration(organization_context.organization.id, integration_id)
+
+        try:
+            match integration.provider:
+                case IntegrationProviderSlug.SLACK.value:
+                    results = _slack_list_channels(integration_id=integration.id)
+                case IntegrationProviderSlug.DISCORD.value:
+                    results = _discord_list_channels(guild_id=str(integration.external_id))
+                case IntegrationProviderSlug.MSTEAMS.value:
+                    results = _msteams_list_channels(
+                        integration=integration,
+                        team_id=str(integration.external_id),
+                    )
+                case _:
+                    return self.respond(
+                        IntegrationChannelsResponse(
+                            results=[],
+                            warning=f"Channel listing not supported for provider '{integration.provider}'.",
+                        )
+                    )
+        except ApiError as e:
+            return self.respond({"detail": str(e)}, status=400)
+
+        return self.respond(IntegrationChannelsResponse(results=results))

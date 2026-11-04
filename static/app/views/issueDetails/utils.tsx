@@ -1,0 +1,376 @@
+import {useMemo} from 'react';
+import {useQuery, type QueryClient} from '@tanstack/react-query';
+import orderBy from 'lodash/orderBy';
+
+import {
+  bulkUpdate,
+  fetchIssueTagApiOptions,
+  issueTagValuesApiOptions,
+} from 'sentry/actionCreators/group';
+import {
+  organizationTagValuesApiOptions,
+  type OrganizationTagValuesParameters,
+} from 'sentry/actionCreators/tags';
+import type {Client} from 'sentry/api';
+import {t} from 'sentry/locale';
+import {ConfigStore} from 'sentry/stores/configStore';
+import {IssueListCacheStore} from 'sentry/stores/IssueListCacheStore';
+import {useLegacyStore} from 'sentry/stores/useLegacyStore';
+import type {Event} from 'sentry/types/event';
+import type {Group, GroupActivity, TagValue} from 'sentry/types/group';
+import {apiOptions} from 'sentry/utils/api/apiOptions';
+import {defined} from 'sentry/utils/defined';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {Dataset} from 'sentry/views/alerts/rules/metric/types';
+import {useGroupData} from 'sentry/views/issueDetails/groupDataContext';
+import {useGroupId} from 'sentry/views/issueDetails/groupIdContext';
+import {useGroupTags} from 'sentry/views/issueDetails/groupTags/useGroupTags';
+
+export async function markEventSeen(
+  api: Client,
+  orgId: string,
+  projectId: string,
+  groupId: string
+) {
+  IssueListCacheStore.markGroupAsSeen(groupId);
+
+  try {
+    await bulkUpdate(api, {
+      orgId,
+      projectId,
+      itemIds: [groupId],
+      failSilently: true,
+      data: {hasSeen: true},
+    });
+  } catch {
+    // Marking an issue as seen is best-effort
+  }
+}
+
+export function useDefaultIssueEvent() {
+  const user = useLegacyStore(ConfigStore).user;
+  const options = user ? user.options : null;
+  return options?.defaultIssueEvent ?? 'recommended';
+}
+/**
+ * Combines two TagValue arrays and combines TagValue.count upon conflict
+ */
+function mergeAndSortTagValues(
+  tagValues1: TagValue[],
+  tagValues2: TagValue[],
+  sort: 'count' | 'lastSeen' = 'lastSeen'
+): TagValue[] {
+  // A Map, because tag values like "constructor" or "__proto__" collide with
+  // properties every plain object already has.
+  const tagValueCollection = new Map<string, TagValue>();
+  for (const tagValue of [...tagValues1, ...tagValues2]) {
+    // A null value and '' both mean the tag is missing, so they share a key.
+    const key = tagValue.value ?? '';
+    const existing = tagValueCollection.get(key);
+    if (existing) {
+      existing.count += tagValue.count;
+      if (tagValue.lastSeen > existing.lastSeen) {
+        existing.lastSeen = tagValue.lastSeen;
+      }
+    } else {
+      // Copied because the counts get summed in place, and these come from the
+      // query cache.
+      tagValueCollection.set(key, {...tagValue});
+    }
+  }
+  const allTagValues = [...tagValueCollection.values()];
+  if (sort === 'count') {
+    allTagValues.sort((a, b) => b.count - a.count);
+  } else {
+    allTagValues.sort((a, b) => (b.lastSeen < a.lastSeen ? -1 : 1));
+  }
+  return allTagValues;
+}
+
+/**
+ * Fetches a tag's values from the errors and issue platform datasets and
+ * merges them into one list.
+ */
+export async function fetchIssueTagValues(
+  queryClient: QueryClient,
+  params: Omit<OrganizationTagValuesParameters, 'dataset'>,
+  sort?: 'count' | 'lastSeen'
+): Promise<TagValue[]> {
+  const [errorsValues, issuePlatformValues] = await Promise.all([
+    queryClient.fetchQuery(
+      organizationTagValuesApiOptions({...params, dataset: Dataset.ERRORS})
+    ),
+    queryClient.fetchQuery(
+      organizationTagValuesApiOptions({...params, dataset: Dataset.ISSUE_PLATFORM})
+    ),
+  ]);
+  return mergeAndSortTagValues(errorsValues.json, issuePlatformValues.json, sort);
+}
+
+/**
+ * Returns the environment name for an event or null
+ *
+ * @param event
+ */
+export function getEventEnvironment(event: Event) {
+  const tag = event.tags.find(({key}) => key === 'environment');
+
+  return tag ? tag.value : null;
+}
+
+const SUBSCRIPTION_REASONS = {
+  commented: t(
+    "You're receiving workflow notifications because you have commented on this issue."
+  ),
+  assigned: t(
+    "You're receiving workflow notifications because you were assigned to this issue."
+  ),
+  bookmarked: t(
+    "You're receiving workflow notifications because you have bookmarked this issue."
+  ),
+  changed_status: t(
+    "You're receiving workflow notifications because you have changed the status of this issue."
+  ),
+  mentioned: t(
+    "You're receiving workflow notifications because you have been mentioned in this issue."
+  ),
+};
+
+/**
+ * @param group
+ * @param removeLinks add/remove links to subscription reasons text (default: false)
+ * @returns Reason for subscription
+ */
+export function getSubscriptionReason(group: Group) {
+  if (group.subscriptionDetails?.disabled) {
+    return t('You have disabled workflow notifications for this project.');
+  }
+
+  if (!group.isSubscribed) {
+    return t('Subscribe to workflow notifications for this issue');
+  }
+
+  if (group.subscriptionDetails) {
+    const {reason} = group.subscriptionDetails;
+    if (reason === 'unknown') {
+      return t(
+        "You're receiving workflow notifications because you are subscribed to this issue."
+      );
+    }
+
+    if (reason && Object.hasOwn(SUBSCRIPTION_REASONS, reason)) {
+      return SUBSCRIPTION_REASONS[reason as keyof typeof SUBSCRIPTION_REASONS];
+    }
+  }
+
+  return t(
+    "You're receiving updates because you are subscribed to workflow notifications for this project."
+  );
+}
+
+export function getGroupMostRecentActivity(
+  activities: GroupActivity[] | undefined
+): GroupActivity | undefined {
+  // Most recent activity
+  return activities
+    ? orderBy([...activities], ({dateCreated}) => new Date(dateCreated), ['desc'])[0]
+    : undefined;
+}
+
+export enum ReprocessingStatus {
+  REPROCESSED_AND_HASNT_EVENT = 'reprocessed_and_hasnt_event',
+  REPROCESSED_AND_HAS_EVENT = 'reprocessed_and_has_event',
+  REPROCESSING = 'reprocessing',
+  NO_STATUS = 'no_status',
+}
+
+// Reprocessing Checks
+export function getGroupReprocessingStatus(group: Group) {
+  const {status, count, activity: activities} = group;
+  const groupCount = Number(count);
+
+  switch (status) {
+    case 'reprocessing':
+      return ReprocessingStatus.REPROCESSING;
+    case 'unresolved': {
+      const groupMostRecentActivity = getGroupMostRecentActivity(activities);
+      if (groupMostRecentActivity?.type === 'reprocess') {
+        if (groupCount === 0) {
+          return ReprocessingStatus.REPROCESSED_AND_HASNT_EVENT;
+        }
+        return ReprocessingStatus.REPROCESSED_AND_HAS_EVENT;
+      }
+      return ReprocessingStatus.NO_STATUS;
+    }
+    default:
+      return ReprocessingStatus.NO_STATUS;
+  }
+}
+
+export function useEnvironmentsFromUrl(): string[] {
+  const location = useLocation();
+  const envs = location.query.environment;
+
+  const envsArray = useMemo(() => {
+    return typeof envs === 'string' ? [envs] : (envs ?? []);
+  }, [envs]);
+
+  return envsArray;
+}
+
+function getGroupEventDetailsQueryData({
+  environments,
+  query,
+  start,
+  end,
+  statsPeriod,
+}: {
+  query: string | undefined;
+  end?: string;
+  environments?: string[];
+  start?: string;
+  statsPeriod?: string;
+}): Record<string, string | string[]> {
+  const params: Record<string, string | string[]> = {
+    collapse: ['fullRelease'],
+    llmFormat: 'markdown',
+  };
+
+  if (query) {
+    params.query = query;
+  }
+
+  if (environments && environments.length > 0) {
+    params.environment = environments;
+  }
+
+  if (start) {
+    params.start = start;
+  }
+
+  if (end) {
+    params.end = end;
+  }
+
+  if (statsPeriod) {
+    params.statsPeriod = statsPeriod;
+  }
+
+  return params;
+}
+
+export function groupEventApiOptions<T = Event>({
+  orgSlug,
+  groupId,
+  eventId,
+  environments,
+  query,
+  start,
+  end,
+  statsPeriod,
+}: {
+  environments: string[];
+  eventId: string;
+  groupId: string;
+  orgSlug: string;
+  end?: string;
+  query?: string;
+  start?: string;
+  statsPeriod?: string;
+}) {
+  return apiOptions.as<T>()(
+    '/organizations/$organizationIdOrSlug/issues/$issueId/events/$eventId/',
+    {
+      path: {
+        organizationIdOrSlug: orgSlug,
+        issueId: groupId,
+        eventId,
+      },
+      query: getGroupEventDetailsQueryData({
+        environments,
+        query,
+        start,
+        end,
+        statsPeriod,
+      }),
+      staleTime: 30_000,
+    }
+  );
+}
+
+export function useIsSampleEvent(): boolean {
+  const groupId = useGroupId({allowNull: true});
+  const groupData = useGroupData({allowNull: true});
+  const environments = useEnvironmentsFromUrl();
+
+  const {data} = useGroupTags(
+    {
+      groupId: groupId ?? undefined,
+      environment: environments,
+    },
+    // Don't want this query to take precedence over the main requests
+    {enabled: defined(groupData)}
+  );
+  return data?.some(tag => tag.key === 'sample_event') ?? false;
+}
+
+type TagSort = 'date' | 'count';
+const DEFAULT_SORT: TagSort = 'count';
+
+export function usePrefetchTagValues(tagKey: string, groupId: string, enabled: boolean) {
+  const organization = useOrganization();
+  const location = useLocation();
+  const sort = (location.query.tagDrawerSort as TagSort | undefined) ?? DEFAULT_SORT;
+
+  useQuery({
+    ...issueTagValuesApiOptions({
+      organization,
+      groupId,
+      tagKey,
+      sort,
+      cursor: location.query.tagDrawerCursor,
+    }),
+    enabled,
+  });
+
+  useQuery({
+    ...fetchIssueTagApiOptions({
+      organization,
+      groupId,
+      tagKey,
+    }),
+    enabled,
+  });
+}
+
+export function getUserTagValue(tagValue: TagValue): {
+  subtitle: string | null;
+  title: string;
+} {
+  let title: string | null = null;
+  let subtitle: string | null = null;
+  if (defined(tagValue?.name)) {
+    title = tagValue?.name;
+  } else if (defined(tagValue?.email)) {
+    title = tagValue?.email;
+  } else if (defined(tagValue?.username)) {
+    title = title ? title : tagValue?.username;
+  } else if (defined(tagValue?.ip_address) || (defined(tagValue?.ipAddress) && !title)) {
+    title = tagValue?.ip_address ?? tagValue?.ipAddress;
+  }
+
+  if (defined(tagValue?.id)) {
+    title = title ? title : tagValue?.id;
+    if (tagValue?.id && tagValue?.id !== 'None') {
+      subtitle = tagValue?.id;
+    }
+  }
+
+  if (title === subtitle) {
+    subtitle = null;
+  }
+
+  // Fall back to the raw tag value if no user-specific fields are available
+  return {title: title || tagValue.value || '', subtitle};
+}

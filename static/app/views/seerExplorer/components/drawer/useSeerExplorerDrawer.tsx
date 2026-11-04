@@ -1,0 +1,141 @@
+import {useCallback, useEffect, useMemo, useRef} from 'react';
+
+import {useDrawer} from '@sentry/scraps/drawer';
+
+import {t} from 'sentry/locale';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {isSeerExplorerEnabled} from 'sentry/utils/seer/isSeerExplorerEnabled';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import type {ChatPrompt} from 'sentry/views/seerExplorer/chatPrompt';
+import {ExplorerDrawerContent} from 'sentry/views/seerExplorer/components/drawer/explorerDrawerContent';
+import {useSeerExplorerChatDispatch} from 'sentry/views/seerExplorer/seerExplorerChatStateContext';
+import type {SeerExplorerRunId} from 'sentry/views/seerExplorer/types';
+import {usePageReferrer} from 'sentry/views/seerExplorer/utils';
+
+const SEER_EXPLORER_DRAWER_KEY = 'seer-explorer-drawer';
+
+export type OpenSeerExplorerDrawerOptions = {
+  /**
+   * Submit `initialQuery` into the run already open instead of replacing it
+   * with a fresh session.
+   */
+  appendToOpenRun?: boolean;
+  /**
+   * An "Ask Seer" question to show as Seer's. Nothing is sent until the user
+   * replies. It joins the conversation on screen, or a new chat when Explorer
+   * is closed. The provider stores it in chat state; the drawer only opens.
+   */
+  chatPrompt?: ChatPrompt;
+  /**
+   * Optional query string to auto-submit once the drawer opens. Takes effect on
+   * an empty session, or the open one with `appendToOpenRun`.
+   */
+  initialQuery?: string;
+  /**
+   * Optional run ID to open. If provided, opens an existing session.
+   */
+  runId?: SeerExplorerRunId;
+};
+
+export const useSeerExplorerDrawer = (options?: {onClose?: () => void}) => {
+  const organization = useOrganization({allowNull: true});
+  const {openDrawer, closeDrawer, isDrawerOpen} = useDrawer();
+  const dispatch = useSeerExplorerChatDispatch();
+  const {getPageReferrer} = usePageReferrer();
+
+  // Track drawer open state in a ref so callbacks don't go stale
+  const isDrawerOpenRef = useRef(false);
+  useEffect(() => {
+    isDrawerOpenRef.current = isDrawerOpen;
+  }, [isDrawerOpen]);
+
+  const onCloseCallbackRef = useRef(options?.onClose);
+  // oxlint-disable-next-line react/refs
+  onCloseCallbackRef.current = options?.onClose;
+
+  const onOpen = useCallback(() => {
+    trackAnalytics('seer.explorer.global_panel.opened', {
+      referrer: getPageReferrer(),
+      organization,
+      isDrawer: true,
+    });
+  }, [getPageReferrer, organization]);
+
+  const onClose = useCallback(() => {
+    onCloseCallbackRef.current?.();
+  }, []);
+
+  const closeSeerExplorerDrawer = useCallback(() => {
+    if (isDrawerOpenRef.current) {
+      closeDrawer();
+      onClose();
+    }
+  }, [closeDrawer, onClose]);
+
+  const openSeerExplorerDrawer = useCallback(
+    (drawerOptions?: OpenSeerExplorerDrawerOptions) => {
+      const {runId: openRunId, initialQuery, appendToOpenRun} = drawerOptions ?? {};
+
+      if (initialQuery) {
+        // A forwarded query starts a fresh session unless the caller asked to
+        // add to the open run.
+        if (!appendToOpenRun) {
+          dispatch({type: 'set run id', payload: null});
+        }
+      } else if (isDrawerOpenRef.current) {
+        return;
+      } else if (openRunId !== undefined) {
+        dispatch({type: 'set run id', payload: openRunId});
+      }
+
+      openDrawer(
+        () => (
+          <ExplorerDrawerContent
+            getPageReferrer={getPageReferrer}
+            initialQuery={initialQuery}
+            appendInitialQuery={appendToOpenRun}
+          />
+        ),
+        {
+          ariaLabel: t('Seer Explorer Drawer'),
+          drawerKey: SEER_EXPLORER_DRAWER_KEY,
+          drawerWidth: '30%',
+          resizable: true,
+          mode: 'passive',
+          onOpen,
+          onClose,
+        }
+      );
+    },
+    [openDrawer, onOpen, onClose, dispatch, getPageReferrer]
+  );
+
+  const toggleSeerExplorerDrawer = useCallback(() => {
+    if (isDrawerOpenRef.current) {
+      closeSeerExplorerDrawer();
+    } else {
+      openSeerExplorerDrawer();
+    }
+  }, [closeSeerExplorerDrawer, openSeerExplorerDrawer]);
+
+  const disabledReturn = useMemo(
+    () => ({
+      openSeerExplorerDrawer: () => {},
+      closeSeerExplorerDrawer: () => {},
+      toggleSeerExplorerDrawer: () => {},
+      isOpen: false as const,
+    }),
+    []
+  );
+
+  if (!isSeerExplorerEnabled(organization)) {
+    return disabledReturn;
+  }
+
+  return {
+    openSeerExplorerDrawer,
+    closeSeerExplorerDrawer,
+    toggleSeerExplorerDrawer,
+    isOpen: isDrawerOpen,
+  };
+};

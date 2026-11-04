@@ -1,0 +1,83 @@
+import {useState} from 'react';
+
+import {SegmentedControl} from '@sentry/scraps/segmentedControl';
+
+import {StructuredData} from 'sentry/components/structuredEventData';
+import {KeyValueTableCard} from 'sentry/components/tables/keyValueTable';
+import {t} from 'sentry/locale';
+import type {Event} from 'sentry/types/event';
+import {EntryType} from 'sentry/types/event';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+import {FoldSection} from 'sentry/views/issueDetails/foldSection';
+
+import type {HelpProps} from './help';
+import {CSPHelp as Help} from './help';
+
+type View = 'report' | 'raw' | 'help';
+
+function getView(view: View, data: Record<any, any>, meta: Record<any, any>) {
+  switch (view) {
+    case 'report':
+      return (
+        <KeyValueTableCard
+          variant="label"
+          contentItems={Object.entries(data).map(([key, value]) => ({
+            item: {
+              key,
+              subject: key,
+              value: (
+                <StructuredData
+                  withAnnotatedText
+                  value={value}
+                  maxDefaultDepth={2}
+                  meta={meta?.[key]?.['']}
+                />
+              ),
+            },
+          }))}
+          sortAlphabetically
+        />
+      );
+    case 'raw':
+      return <pre>{JSON.stringify({'csp-report': data}, null, 2)}</pre>;
+    case 'help':
+      return <Help data={data as HelpProps['data']} />;
+    default:
+      throw new TypeError(`Invalid view: ${view}`);
+  }
+}
+
+type Props = {
+  data: Record<string, any>;
+  event: Event;
+};
+
+export function Csp({data, event}: Props) {
+  const [view, setView] = useState<View>('report');
+
+  const entryIndex = event.entries.findIndex(entry => entry.type === EntryType.CSP);
+  const meta = event._meta?.entries?.[entryIndex]?.data;
+
+  const cleanData =
+    data.original_policy === 'string'
+      ? {
+          ...data,
+          // Hide the report-uri since this is redundant and silly
+          original_policy: data.original_policy.replace(/(;\s+)?report-uri [^;]+/, ''),
+        }
+      : data;
+
+  const actions = (
+    <SegmentedControl aria-label={t('View')} size="xs" value={view} onChange={setView}>
+      <SegmentedControl.Item key="report">{t('Report')}</SegmentedControl.Item>
+      <SegmentedControl.Item key="raw">{t('Raw')}</SegmentedControl.Item>
+      <SegmentedControl.Item key="help">{t('Help')}</SegmentedControl.Item>
+    </SegmentedControl>
+  );
+
+  return (
+    <FoldSection title={t('CSP Report')} actions={actions} sectionKey={SectionKey.CSP}>
+      {getView(view, cleanData, meta)}
+    </FoldSection>
+  );
+}

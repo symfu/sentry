@@ -1,0 +1,565 @@
+import {render, screen, userEvent, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import type {
+  AggregationKeyWithAlias,
+  QueryFieldValue,
+} from 'sentry/utils/discover/fields';
+import {decodeList} from 'sentry/utils/queryString';
+import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+import {MetricSelectRow} from 'sentry/views/dashboards/widgetBuilder/components/visualize/traceMetrics/metricSelectRow';
+import {
+  useWidgetBuilderContext,
+  WidgetBuilderProvider,
+} from 'sentry/views/dashboards/widgetBuilder/contexts/widgetBuilderContext';
+import {serializeFields} from 'sentry/views/dashboards/widgetBuilder/utils/serialization.ts';
+import {FieldValueKind} from 'sentry/views/discover/table/types';
+
+const DASHBOARD_WIDGET_BUILDER_PATHNAME =
+  '/organizations/org-slug/dashboards/new/widget/new/';
+
+describe('MetricSelectRow', () => {
+  beforeEach(() => {
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      method: 'GET',
+      body: [],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [
+          {
+            'metric.name': 'alpha_metric',
+            'metric.type': 'counter',
+            'count(metric.name)': 1,
+          },
+          {
+            'metric.name': 'beta_metric',
+            'metric.type': 'counter',
+            'count(metric.name)': 1,
+          },
+          {
+            'metric.name': 'counter_metric',
+            'metric.type': 'counter',
+            'count(metric.name)': 1,
+          },
+          {
+            'metric.name': 'distribution_metric',
+            'metric.type': 'distribution',
+            'count(metric.name)': 1,
+          },
+          {
+            'metric.name': 'gauge_metric',
+            'metric.type': 'gauge',
+            'count(metric.name)': 1,
+          },
+        ],
+      },
+    });
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+    MockApiClient.clearMockResponses();
+  });
+
+  it('allows selection for multiple metrics', async () => {
+    const aggregates: QueryFieldValue[] = [
+      {
+        kind: 'function',
+        function: [
+          'per_second' as AggregationKeyWithAlias,
+          'value',
+          'alpha_metric',
+          'counter',
+          '-',
+        ],
+      },
+      {
+        kind: 'function',
+        function: ['sum', 'value', 'alpha_metric', 'counter', 'none'],
+      },
+    ];
+    render(
+      <WidgetBuilderProvider>
+        {aggregates.map((aggregate, index) => (
+          <MetricSelectRow key={index} field={aggregate} index={index} disabled={false} />
+        ))}
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              yAxis: [
+                'per_second(value,alpha_metric,counter,none)',
+                'sum(value,alpha_metric,counter,none)',
+              ],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.LINE,
+            },
+          },
+        },
+      }
+    );
+
+    // Both metric selectors show the same metric value (alphabetically first)
+    const metricSelectors = await screen.findAllByRole('button', {name: 'alpha_metric'});
+    expect(metricSelectors).toHaveLength(2);
+
+    // Change the first metric to 'beta_metric'
+    await userEvent.click(metricSelectors[0]!);
+    await userEvent.click(await screen.findByRole('option', {name: 'beta_metric'}));
+
+    // Both metrics should be selected
+    expect(screen.getByRole('button', {name: 'beta_metric'})).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'alpha_metric'})).toBeInTheDocument();
+  });
+
+  it('preserves table grouping fields when updating an aggregate', async () => {
+    function MetricSelectRows() {
+      const {state} = useWidgetBuilderContext();
+
+      return state.fields?.map((field, index) => (
+        <MetricSelectRow key={index} field={field} index={index} disabled={false} />
+      ));
+    }
+
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRows />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.TABLE,
+              field: [
+                'span.op',
+                'span.description',
+                'sum(value,alpha_metric,counter,none)',
+                'count(value,alpha_metric,counter,none)',
+              ],
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelectors = await screen.findAllByRole('button', {name: 'alpha_metric'});
+    await userEvent.click(metricSelectors[0]!);
+    await userEvent.click(await screen.findByRole('option', {name: 'beta_metric'}));
+
+    await waitFor(() => {
+      expect(decodeList(router.location.query.field)).toEqual([
+        'span.op',
+        'span.description',
+        'sum(value,beta_metric,counter,none)',
+        'count(value,alpha_metric,counter,none)',
+      ]);
+    });
+  });
+
+  it('replaces invalid aggregates when changing to an incompatible metric type', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['p50', 'value', 'distribution_metric', 'distribution', 'none'],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              yAxis: ['p50(value,distribution_metric,distribution,none)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.LINE,
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelector = await screen.findByRole('button', {
+      name: 'distribution_metric',
+    });
+
+    // Change to counter_metric (p50 is not valid for counter)
+    await userEvent.click(metricSelector);
+    await userEvent.click(await screen.findByRole('option', {name: 'counter_metric'}));
+
+    // p50 is invalid for counter, so it should be replaced with sum
+    await waitFor(() => {
+      expect(decodeList(router.location.query.yAxis)).toEqual(
+        serializeFields([
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['sum', 'value', 'counter_metric', 'counter', 'none'],
+          },
+        ])
+      );
+    });
+  });
+
+  it('preserves valid aggregates when changing metric type', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['sum', 'value', 'counter_metric', 'counter', 'none'],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              yAxis: ['sum(value,counter_metric,counter,none)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.LINE,
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelector = await screen.findByRole('button', {name: 'counter_metric'});
+
+    // Change to distribution_metric (sum is valid for both types)
+    await userEvent.click(metricSelector);
+    await userEvent.click(
+      await screen.findByRole('option', {name: 'distribution_metric'})
+    );
+
+    // sum should remain since it's valid for distribution, but args updated
+    await waitFor(() => {
+      expect(decodeList(router.location.query.yAxis)).toEqual(
+        serializeFields([
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['sum', 'value', 'distribution_metric', 'distribution', 'none'],
+          },
+        ])
+      );
+    });
+  });
+
+  it('only updates the changed row when other rows target the same metric', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: [
+              'per_second' as AggregationKeyWithAlias,
+              'value',
+              'distribution_metric',
+              'distribution',
+              'none',
+            ],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              yAxis: [
+                'per_second(value,distribution_metric,distribution,none)',
+                'p99(value,distribution_metric,distribution,none)',
+              ],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.LINE,
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelector = await screen.findByRole('button', {
+      name: 'distribution_metric',
+    });
+
+    await userEvent.click(metricSelector);
+    await userEvent.click(await screen.findByRole('option', {name: 'counter_metric'}));
+
+    // per_second is valid for counter so it is kept, and p99 is left untouched
+    // because it belongs to a row the user did not change.
+    await waitFor(() => {
+      expect(decodeList(router.location.query.yAxis)).toEqual(
+        serializeFields([
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: [
+              'per_second' as AggregationKeyWithAlias,
+              'value',
+              'counter_metric',
+              'counter',
+              'none',
+            ],
+          },
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['p99', 'value', 'distribution_metric', 'distribution', 'none'],
+          },
+        ])
+      );
+    });
+  });
+
+  it('replaces invalid aggregates for big number display', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['avg', 'value', 'gauge_metric', 'gauge', 'none'],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              field: ['avg(value,gauge_metric,gauge,none)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.BIG_NUMBER,
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelector = await screen.findByRole('button', {name: 'gauge_metric'});
+
+    // Change to counter which doesn't support avg
+    await userEvent.click(metricSelector);
+    await userEvent.click(await screen.findByRole('option', {name: 'counter_metric'}));
+
+    // avg is invalid for counter, replaced with sum
+    await waitFor(() => {
+      expect(decodeList(router.location.query.field)).toEqual(
+        serializeFields([
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['sum', 'value', 'counter_metric', 'counter', 'none'],
+          },
+        ])
+      );
+    });
+  });
+
+  it('uses avg for gauge metrics', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['p50', 'value', 'distribution_metric', 'distribution', 'none'],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              yAxis: ['p50(value,distribution_metric,distribution,none)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.LINE,
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelector = await screen.findByRole('button', {
+      name: 'distribution_metric',
+    });
+
+    // Change to gauge which doesn't support p50
+    await userEvent.click(metricSelector);
+    await userEvent.click(await screen.findByRole('option', {name: 'gauge_metric'}));
+
+    // p50 is invalid for counter, replaced with avg
+    await waitFor(() => {
+      expect(decodeList(router.location.query.yAxis)).toEqual(
+        serializeFields([
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['avg', 'value', 'gauge_metric', 'gauge', 'none'],
+          },
+        ])
+      );
+    });
+  });
+
+  it('converts - to none for unit', async () => {
+    const {router} = render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['sum', 'value', 'counter_metric', 'counter', '-'],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              yAxis: ['sum(value,counter_metric,counter,-)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.LINE,
+            },
+          },
+        },
+      }
+    );
+
+    const metricSelector = await screen.findByRole('button', {name: 'counter_metric'});
+    await userEvent.click(metricSelector);
+    await userEvent.click(await screen.findByRole('option', {name: 'counter_metric'}));
+
+    await waitFor(() => {
+      expect(decodeList(router.location.query.yAxis)).toEqual(
+        serializeFields([
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['sum', 'value', 'counter_metric', 'counter', 'none'],
+          },
+        ])
+      );
+    });
+  });
+
+  it('disables non-distribution metrics when the display type is a heat map', async () => {
+    render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['count', 'value', 'distribution_metric', 'distribution', 'none'],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              field: ['count(value,distribution_metric,distribution,none)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.HEATMAP,
+            },
+          },
+        },
+      }
+    );
+
+    await userEvent.click(
+      await screen.findByRole('button', {name: 'distribution_metric'})
+    );
+
+    // Counters and gauges can't be visualized as a heat map.
+    expect(await screen.findByRole('option', {name: 'counter_metric'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('option', {name: 'gauge_metric'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('option', {name: 'distribution_metric'})).not.toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
+
+  it('does not auto-select a metric when every option is disabled for a heat map', async () => {
+    // A project with only non-distribution metrics: nothing is selectable for a
+    // heat map, so the picker must not fall back to selecting an invalid metric.
+    MockApiClient.clearMockResponses();
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/trace-items/attributes/',
+      method: 'GET',
+      body: [],
+    });
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [
+          {
+            'metric.name': 'counter_metric',
+            'metric.type': 'counter',
+            'count(metric.name)': 1,
+          },
+          {
+            'metric.name': 'gauge_metric',
+            'metric.type': 'gauge',
+            'count(metric.name)': 1,
+          },
+        ],
+      },
+    });
+
+    render(
+      <WidgetBuilderProvider>
+        <MetricSelectRow
+          field={{
+            kind: 'function',
+            function: ['count', 'value', undefined, undefined],
+          }}
+          index={0}
+          disabled={false}
+        />
+      </WidgetBuilderProvider>,
+      {
+        initialRouterConfig: {
+          location: {
+            pathname: DASHBOARD_WIDGET_BUILDER_PATHNAME,
+            query: {
+              field: ['count(value)'],
+              dataset: WidgetType.TRACEMETRICS,
+              displayType: DisplayType.HEATMAP,
+            },
+          },
+        },
+      }
+    );
+
+    // The trigger is disabled while metrics load, then becomes enabled once the
+    // fetch settles and the auto-select effect runs. If an invalid metric had
+    // been auto-selected the trigger would be relabeled to its name; instead it
+    // stays unselected ("None").
+    const trigger = await screen.findByRole('button', {name: 'None'});
+    await waitFor(() => expect(trigger).toBeEnabled());
+    expect(screen.getByRole('button', {name: 'None'})).toBeInTheDocument();
+  });
+});

@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import abc
+import string
+from collections.abc import Collection, Iterable
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from django.db.models import QuerySet
+
+from sentry.models.organization import Organization
+from sentry.organizations.services.organization import RpcOrganization, organization_service
+from sentry.users.models.user import User
+from sentry.users.models.useremail import UserEmail
+from sentry.utils import metrics
+
+
+class AmbiguousUserFromEmail(Exception):
+    def __init__(self, email: str, users: Collection[User]) -> None:
+        super().__init__(f"Resolved {email!r} to {[user.id for user in users]}")
+        self.email = email
+        self.users = tuple(users)
+
+
+_ASCII_CASE_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def ascii_casefold(email: str) -> str:
+    """Lower-case only the ASCII letters of an email address."""
+    return email.translate(_ASCII_CASE_FOLD)
+
+
+def emails_match(a: str, b: str) -> bool:
+    """Case-insensitive email equality, folding ASCII case only."""
+    return ascii_casefold(a) == ascii_casefold(b)
+
+
+class _HasEmail(Protocol):
+    @property
+    def email(self) -> str | None: ...
+
+
+def filter_matching_emails[R: _HasEmail](qs: QuerySet[Any, R], email: str) -> list[R]:
+    """Rows of ``qs`` whose ``email`` field equals ``email``, folding ASCII case only.
+
+    ``email__iexact`` compiles to a locale-aware ``UPPER()`` comparison in PostgreSQL,
+    which can fold distinct Unicode code points together. Keep it for the indexed
+    lookup, then re-check each row with ASCII-only folding.
+    """
+    target = ascii_casefold(email)
+    # ``row.email`` is nullable on some models; the guard is for typing, since
+    # ``email__iexact`` never returns NULL rows.
+    return [
+        row
+        for row in qs.filter(email__iexact=email)
+        if row.email and ascii_casefold(row.email) == target
+    ]
+
+
+def first_matching_email[R: _HasEmail](qs: QuerySet[Any, R], email: str) -> R | None:
+    """The lowest-id row of ``qs`` matching ``email`` (see ``filter_matching_emails``)."""
+    matches = filter_matching_emails(qs.order_by("id"), email)
+    return matches[0] if matches else None
+
+
+def resolve_email_to_user(
+    email: str, organization: Organization | RpcOrganization | None = None
+) -> User | None:
+    candidates = filter_matching_emails(UserEmail.objects.filter(user__is_active=True), email)
+    if not candidates:
+        return None
+    return _EmailResolver(email, organization).resolve(candidates)
+
+
+@dataclass
+class _EmailResolver:
+    email: str
+    organization: Organization | RpcOrganization | None
+
+    def resolve(self, candidates: Collection[UserEmail]) -> User:
+        """Pick the user best matching the email address."""
+
+        if not candidates:
+            raise ValueError
+        if len(candidates) == 1:
+            (unique_email,) = candidates
+            return unique_email.user
+
+        for step_cls in self.get_steps():
+            step = step_cls(self)
+            last_candidates = candidates
+            candidates = tuple(step.apply(candidates))
+            if len(candidates) == 1:
+                # Success: We've narrowed down to only one candidate
+                (choice,) = candidates
+                step.if_conclusive(last_candidates, choice)
+                return choice.user
+            if len(candidates) == 0:
+                # If the step eliminated all, ignore it and go to the next step
+                candidates = last_candidates
+
+        self.if_inconclusive(candidates)
+        raise AmbiguousUserFromEmail(self.email, [ue.user for ue in candidates])
+
+    def if_inconclusive(self, remaining_candidates: Collection[UserEmail]) -> None:
+        """Hook to call if no step resolves to a single user."""
+        metrics.incr("auth.email_resolution.no_resolution", sample_rate=1.0)
+
+    @dataclass
+    class ResolutionStep(abc.ABC):
+        parent: _EmailResolver
+
+        @abc.abstractmethod
+        def apply(self, candidates: Collection[UserEmail]) -> Iterable[UserEmail]:
+            raise NotImplementedError
+
+        def if_conclusive(self, candidates: Collection[UserEmail], choice: UserEmail) -> None:
+            """Hook to call if this step resolves to a single user."""
+
+    class IsVerified(ResolutionStep):
+        """Prefer verified email addresses."""
+
+        def apply(self, candidates: Collection[UserEmail]) -> Iterable[UserEmail]:
+            return (ue for ue in candidates if ue.is_verified)
+
+        def if_conclusive(self, candidates: Collection[UserEmail], choice: UserEmail) -> None:
+            metrics.incr("auth.email_resolution.by_verification", sample_rate=1.0)
+
+    class HasOrgMembership(ResolutionStep):
+        """Prefer users who belong to the organization."""
+
+        def apply(self, candidates: Collection[UserEmail]) -> Iterable[UserEmail]:
+            if not self.parent.organization:
+                return ()
+            candidate_ids = [ue.user_id for ue in candidates]
+            member_summaries = organization_service.get_member_summaries_by_ids(
+                organization_id=self.parent.organization.id, user_ids=candidate_ids
+            )
+            users_in_org = {member_summary.user_id for member_summary in member_summaries}
+            return (ue for ue in candidates if ue.user_id in users_in_org)
+
+        def if_conclusive(self, candidates: Collection[UserEmail], choice: UserEmail) -> None:
+            metrics.incr("auth.email_resolution.by_org_membership", sample_rate=1.0)
+
+    class IsPrimary(ResolutionStep):
+        """Prefer users whose primary address matches the address in question."""
+
+        def apply(self, candidates: Collection[UserEmail]) -> Iterable[UserEmail]:
+            return (ue for ue in candidates if ue.is_primary())
+
+        def if_conclusive(self, candidates: Collection[UserEmail], choice: UserEmail) -> None:
+            metrics.incr("auth.email_resolution.by_primary_email", sample_rate=1.0)
+
+    def get_steps(self) -> Iterable[type[ResolutionStep]]:
+        return (
+            self.IsVerified,
+            self.HasOrgMembership,
+            self.IsPrimary,
+        )

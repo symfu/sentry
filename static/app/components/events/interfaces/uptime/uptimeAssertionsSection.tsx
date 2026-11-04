@@ -1,0 +1,37 @@
+import {KeyValueTableCard} from 'sentry/components/tables/keyValueTable';
+import {t} from 'sentry/locale';
+import type {Event} from 'sentry/types/event';
+import {AssertionFailureTree} from 'sentry/views/detectors/components/uptime/assertions/assertionFailure/assertionFailureTree';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+import {FoldSection} from 'sentry/views/issueDetails/foldSection';
+
+export function UptimeAssertionsSection({event}: {event: Event}) {
+  const evidenceData = event.occurrence?.evidenceData;
+
+  if (!evidenceData?.assertionFailureData) {
+    return null;
+  }
+
+  return (
+    <FoldSection
+      sectionKey={SectionKey.ASSERTIONS}
+      title={t('Assertions')}
+      disableCollapsePersistence
+    >
+      <KeyValueTableCard
+        variant="label"
+        contentItems={[
+          {
+            item: {
+              subject: t('Failure'),
+              key: 'assertion_failure_data',
+              value: (
+                <AssertionFailureTree assertion={evidenceData.assertionFailureData} />
+              ),
+            },
+          },
+        ]}
+      />
+    </FoldSection>
+  );
+}

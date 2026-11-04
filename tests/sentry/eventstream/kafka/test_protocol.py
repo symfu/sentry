@@ -1,28 +1,30 @@
 import pytest
-import pytz
-from datetime import datetime
 
 from sentry.eventstream.kafka.protocol import (
     InvalidPayload,
     InvalidVersion,
     UnexpectedOperation,
     get_task_kwargs_for_message,
+    get_task_kwargs_for_message_from_headers,
 )
+from sentry.testutils.helpers import override_options
 from sentry.utils import json
 
 
-def test_get_task_kwargs_for_message_invalid_payload():
+@override_options({"post-process-forwarder:rapidjson": False})
+def test_get_task_kwargs_for_message_invalid_payload() -> None:
     with pytest.raises(InvalidPayload):
-        get_task_kwargs_for_message('{"format": "invalid"}')
+        get_task_kwargs_for_message(b'{"format": "invalid"}')
 
 
-def test_get_task_kwargs_for_message_invalid_version():
+@override_options({"post-process-forwarder:rapidjson": False})
+def test_get_task_kwargs_for_message_invalid_version() -> None:
     with pytest.raises(InvalidVersion):
-        get_task_kwargs_for_message(json.dumps([0, "insert", {}]))
+        get_task_kwargs_for_message(json.dumps([0, "insert", {}]).encode())
 
 
 @pytest.mark.django_db
-def test_get_task_kwargs_for_message_version_1():
+def test_get_task_kwargs_for_message_version_1() -> None:
     event_data = {
         "project_id": 1,
         "group_id": 2,
@@ -37,37 +39,76 @@ def test_get_task_kwargs_for_message_version_1():
         },
         "extra": {},
         "primary_hash": "49f68a5c8493ec2c0bf489821c21fc3b",
+        "occurrence_id": "123456",
     }
 
-    task_state = {"is_new": True, "is_regression": False, "is_new_group_environment": True}
+    task_state = {
+        "is_new": True,
+        "is_regression": False,
+        "is_new_group_environment": True,
+        "queue": "post_process_errors",
+    }
 
-    kwargs = get_task_kwargs_for_message(json.dumps([1, "insert", event_data, task_state]))
-    event = kwargs.pop("event")
-    assert event.project_id == 1
-    assert event.group_id == 2
-    assert event.event_id == "00000000000010008080808080808080"
-    assert event.message == "message"
-    assert event.platform == "python"
-    assert event.datetime == datetime(2018, 7, 20, 21, 4, 27, 600640, tzinfo=pytz.utc)
+    kwargs = get_task_kwargs_for_message(json.dumps([1, "insert", event_data, task_state]).encode())
+    assert kwargs is not None
+    assert kwargs.pop("project_id") == 1
+    assert kwargs.pop("event_id") == "00000000000010008080808080808080"
+    assert kwargs.pop("group_id") == 2
     assert kwargs.pop("primary_hash") == "49f68a5c8493ec2c0bf489821c21fc3b"
 
     assert kwargs.pop("is_new") is True
     assert kwargs.pop("is_regression") is False
     assert kwargs.pop("is_new_group_environment") is True
+    assert kwargs.pop("group_states") is None
+    assert kwargs.pop("queue") == "post_process_errors"
+    assert kwargs.pop("occurrence_id") == "123456"
 
     assert not kwargs, f"unexpected values remaining: {kwargs!r}"
 
 
-def test_get_task_kwargs_for_message_version_1_skip_consume():
+@override_options({"post-process-forwarder:rapidjson": False})
+def test_get_task_kwargs_for_message_version_1_skip_consume() -> None:
     assert (
-        get_task_kwargs_for_message(json.dumps([1, "insert", {}, {"skip_consume": True}])) is None
+        get_task_kwargs_for_message(json.dumps([1, "insert", {}, {"skip_consume": True}]).encode())
+        is None
     )
 
 
-def test_get_task_kwargs_for_message_version_1_unsupported_operation():
-    assert get_task_kwargs_for_message(json.dumps([1, "delete", {}])) is None
+@override_options({"post-process-forwarder:rapidjson": False})
+def test_get_task_kwargs_for_message_version_1_unsupported_operation() -> None:
+    assert get_task_kwargs_for_message(json.dumps([1, "delete", {}]).encode()) is None
 
 
-def test_get_task_kwargs_for_message_version_1_unexpected_operation():
+@override_options({"post-process-forwarder:rapidjson": False})
+def test_get_task_kwargs_for_message_version_1_unexpected_operation() -> None:
     with pytest.raises(UnexpectedOperation):
-        get_task_kwargs_for_message(json.dumps([1, "invalid", {}, {}]))
+        get_task_kwargs_for_message(json.dumps([1, "invalid", {}, {}]).encode())
+
+
+@pytest.mark.django_db
+def test_get_task_kwargs_for_message_version_1_kafka_headers() -> None:
+    kafka_headers = [
+        ("Received-Timestamp", b"1626301534.910839"),
+        ("event_id", b"00000000000010008080808080808080"),
+        ("project_id", b"1"),
+        ("is_new", b"1"),
+        ("is_new_group_environment", b"1"),
+        ("is_regression", b"0"),
+        ("version", b"2"),
+        ("operation", b"insert"),
+        ("skip_consume", b"0"),
+        ("queue", b"post_process_errors"),
+        ("occurrence_id", b"1234"),
+    ]
+
+    kwargs = get_task_kwargs_for_message_from_headers(kafka_headers)
+    assert kwargs is not None
+    assert kwargs["project_id"] == 1
+    assert kwargs["event_id"] == "00000000000010008080808080808080"
+    assert kwargs["group_id"] is None
+    assert kwargs["primary_hash"] is None
+    assert kwargs["is_new"] is True
+    assert kwargs["is_regression"] is False
+    assert kwargs["is_new_group_environment"] is True
+    assert kwargs["queue"] == "post_process_errors"
+    assert kwargs["occurrence_id"] == "1234"

@@ -1,0 +1,27 @@
+import {useEffect, useRef} from 'react';
+
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useUser} from 'sentry/utils/useUser';
+
+export function useReplayPageview(
+  type: 'replay.details-time-spent' | 'replay.list-time-spent'
+) {
+  const user = useUser();
+  const organization = useOrganization();
+  const startTimeRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    startTimeRef.current = Date.now();
+    const startTime = startTimeRef.current;
+
+    return () => {
+      const endTime = Date.now();
+      trackAnalytics(type, {
+        organization,
+        seconds: (endTime - startTime) / 1000,
+        user_email: user.email,
+      });
+    };
+  }, [organization, type, user.email]);
+}

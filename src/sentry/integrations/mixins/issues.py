@@ -1,0 +1,518 @@
+from __future__ import annotations
+
+import enum
+import logging
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
+from operator import attrgetter
+from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
+
+from sentry import features
+from sentry.auth.principal import RequestPrincipal, acting_user_id, has_user
+from sentry.integrations.base import IntegrationInstallation
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.services.assignment_source import AssignmentSource
+from sentry.integrations.services.integration import integration_service
+from sentry.integrations.tasks.sync_status_inbound import (
+    sync_status_inbound as sync_status_inbound_task,
+)
+from sentry.integrations.types import IntegrationIssueConfigField
+from sentry.integrations.utils.external_issues import maybe_generate_external_issue_details
+from sentry.issues.grouptype import GroupCategory
+from sentry.issues.issue_occurrence import IssueOccurrence
+from sentry.models.activity import Activity
+from sentry.models.group import Group
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.services.eventstore.models import Event, GroupEvent
+from sentry.shared_integrations.exceptions import IntegrationError, IntegrationFormError
+from sentry.silo.base import all_silo_function, cell_silo_function
+from sentry.users.services.user import RpcUser
+from sentry.users.services.user_option import get_option_from_list, user_option_service
+
+IssuePayload: TypeAlias = Mapping[str, Any]
+IssueDefaults: TypeAlias = dict[str, Any]
+IssueSearchResults: TypeAlias = list[dict[str, Any]] | dict[str, Any]
+from sentry.utils.http import absolute_uri
+from sentry.utils.safe import safe_execute
+
+if TYPE_CHECKING:
+    from sentry.integrations.services.integration import RpcIntegration
+
+logger = logging.getLogger("sentry.integrations.issues")
+MAX_CHAR = 50
+
+
+class ResolveSyncAction(enum.Enum):
+    """
+    When an issue's state changes, we may have to sync the state based on the
+    "done" states we get from the API. This enum encapsulates the three options
+    we have: "resolve", "unresolve", or "do nothing".
+    """
+
+    NOOP = 0
+    RESOLVE = 1
+    UNRESOLVE = 2
+
+    @classmethod
+    def from_resolve_unresolve(
+        cls, should_resolve: bool, should_unresolve: bool
+    ) -> ResolveSyncAction:
+        if should_resolve and should_unresolve:
+            logger.warning("sync-config-conflict")
+            return ResolveSyncAction.NOOP
+
+        if should_resolve:
+            return ResolveSyncAction.RESOLVE
+
+        if should_unresolve:
+            return ResolveSyncAction.UNRESOLVE
+
+        return ResolveSyncAction.NOOP
+
+
+class IssueBasicIntegration(IntegrationInstallation, ABC):
+    def should_sync(self, attribute: str, sync_source: AssignmentSource | None = None) -> bool:
+        return False
+
+    def get_group_title(
+        self, group: Group | None, event: Event | GroupEvent | None, **kwargs: object
+    ) -> str:
+        # Imported lazily to avoid a circular import: sentry.notifications.utils
+        # imports sentry.utils.committers -> sentry.api.serializers -> this module.
+        from sentry.notifications.utils import get_notification_group_title
+
+        return get_notification_group_title(group, event, **kwargs)  # type: ignore[arg-type]
+
+    @abstractmethod
+    def get_issue_url(self, key: str) -> str:
+        """
+        Given the key of the external_issue return the external issue link.
+        """
+        raise NotImplementedError
+
+    def get_group_body(
+        self, group: Group, event: Event | GroupEvent | None, **kwargs: object
+    ) -> str:
+        assert event is not None
+        result = []
+        for interface in event.interfaces.values():
+            output = safe_execute(interface.to_string, event)
+            if output:
+                result.append(output)
+        return "\n\n".join(result)
+
+    def get_feedback_issue_body(self, occurrence: IssueOccurrence) -> str:
+        messages = []
+        others = []
+        for evidence in occurrence.evidence_display:
+            if evidence.name == "message":
+                messages.append(evidence)
+            else:
+                others.append(evidence)
+
+        body = ""
+        for message in messages:
+            body += message.value
+            body += "\n\n"
+
+        body += "|  |  |\n"
+        body += "| ------------- | --------------- |\n"
+        for evidence in sorted(others, key=attrgetter("important"), reverse=True):
+            body += f"| **{evidence.name}** | {evidence.value} |\n"
+
+        return body.rstrip("\n")  # remove the last new line
+
+    def get_group_link(self, group: Group, **kwargs: object) -> list[str]:
+        params: dict[str, Any] = {}
+        if kwargs.get("link_referrer"):
+            params["referrer"] = kwargs.get("link_referrer")
+
+        if group.issue_category == GroupCategory.FEEDBACK:
+            return [
+                f"Sentry Feedback: [{group.qualified_short_id}]({absolute_uri(group.get_absolute_url(params=params))})\n"
+            ]
+
+        return [
+            f"Sentry Issue: [{group.qualified_short_id}]({absolute_uri(group.get_absolute_url(params=params))})"
+        ]
+
+    def get_group_description(
+        self, group: Group, event: GroupEvent | None, **kwargs: object
+    ) -> str:
+        output = self.get_group_link(group, **kwargs)
+        if (
+            event
+            and isinstance(event, GroupEvent)
+            and event.occurrence is not None
+            and group.issue_category == GroupCategory.FEEDBACK
+        ):
+            body = ""
+            body = self.get_feedback_issue_body(event.occurrence)
+            output.extend([body])
+        else:
+            body = self.get_group_body(group, event)
+            if body:
+                output.extend(["", "```", body, "```"])
+        return "\n".join(output)
+
+    @all_silo_function
+    def get_create_issue_config(
+        self, group: Group | None, user: RequestPrincipal, **kwargs: object
+    ) -> list[IntegrationIssueConfigField]:
+        """
+        These fields are used to render a form for the user,
+        and are then passed in the format of:
+
+        >>>{'title': 'TypeError: Object [object Object] has no method "updateFrom"'}
+
+        to `create_issue`, which handles creation of the issue
+        in Jira, VSTS, GitHub, etc
+        """
+        if not group:
+            return []
+
+        event = group.get_latest_event()
+
+        default_title = self.get_group_title(group, event, **kwargs)
+        default_description = self.get_group_description(group, event, **kwargs)
+
+        llm_details = maybe_generate_external_issue_details(group=group, user=user, event=event)
+        title = llm_details["title"] if llm_details["title"] else default_title
+        description = (
+            f"**{default_title}**\n\n{llm_details['description']}\n\n---\n\n{default_description}"
+            if llm_details["description"]
+            else default_description
+        )
+
+        return [
+            {
+                "name": "title",
+                "label": "Title",
+                "default": title,
+                "type": "string",
+                "required": True,
+            },
+            {
+                "name": "description",
+                "label": "Description",
+                "default": description,
+                "type": "textarea",
+                "autosize": True,
+                "maxRows": 10,
+            },
+        ]
+
+    def get_link_issue_config(
+        self, group: Group, **kwargs: object
+    ) -> list[IntegrationIssueConfigField]:
+        """
+        Used by the `GroupIntegrationDetailsEndpoint` to create an
+        `ExternalIssue` using title/description obtained from calling
+        `get_issue` described below.
+        """
+        return [{"name": "externalIssue", "label": "Issue", "default": "", "type": "string"}]
+
+    @abstractmethod
+    def get_persisted_default_config_fields(self) -> Sequence[str]:
+        """
+        Returns a list of field names that should have their last used values
+        persisted on a per-project basis.
+        """
+        return []
+
+    def get_persisted_user_default_config_fields(self) -> Sequence[str]:
+        """
+        Returns a list of field names that should have their last used values
+        persisted on a per-project, per-user basis.
+        """
+        return []
+
+    def store_issue_last_defaults(
+        self, project: Project, user: RequestPrincipal, data: IssuePayload
+    ) -> None:
+        """
+        Stores the last used field defaults on a per-project basis. This
+        accepts a dict of values that will be filtered to keys returned by
+        ``get_persisted_default_config_fields`` which will automatically be
+        merged into the associated field config object as the default.
+
+        >>> integ.store_issue_last_defaults(project, user, {'externalProject': 2})
+
+        When the integration is serialized these values will automatically be
+        merged into the field configuration objects.
+
+        NOTE: These are currently stored for both link and create issue, no
+              differentiation is made between the two field configs.
+        """
+        persisted_fields = self.get_persisted_default_config_fields()
+        if persisted_fields and self.org_integration:
+            project_defaults = {k: v for k, v in data.items() if k in persisted_fields}
+            new_config = deepcopy(self.org_integration.config)
+            new_config.setdefault("project_issue_defaults", {}).setdefault(
+                str(project.id), {}
+            ).update(project_defaults)
+            org_integration = integration_service.update_organization_integration(
+                org_integration_id=self.org_integration.id,
+                config=new_config,
+            )
+            if org_integration is not None:
+                self.org_integration = org_integration
+
+        user_persisted_fields = self.get_persisted_user_default_config_fields()
+        # Per-user defaults need a person, which a service account isn't.
+        if user_persisted_fields and has_user(user):
+            user_defaults = {k: v for k, v in data.items() if k in user_persisted_fields}
+            user_option_key = dict(key="issue:defaults", project_id=project.id)
+            options = user_option_service.get_many(
+                filter={"user_ids": [user.id], **user_option_key}
+            )
+            new_user_defaults = get_option_from_list(options, default={}, key="issue:defaults")
+            new_user_defaults.setdefault(self.model.provider, {}).update(user_defaults)
+            if user_defaults != new_user_defaults:
+                user_option_service.set_option(
+                    user_id=user.id, value=new_user_defaults, **user_option_key
+                )
+
+    def get_defaults(self, project: Project, user: RequestPrincipal) -> IssueDefaults:
+        project_defaults = (
+            {}
+            if not self.org_integration
+            else self.org_integration.config.get("project_issue_defaults", {}).get(
+                str(project.id), {}
+            )
+        )
+
+        # Only a user has saved defaults of their own.
+        user_id = acting_user_id(user)
+        if user_id is None:
+            return project_defaults
+
+        user_option_value = get_option_from_list(
+            user_option_service.get_many(
+                filter={"user_ids": [user_id], "keys": ["issue:defaults"], "project_id": project.id}
+            ),
+            key="issue:defaults",
+            default={},
+        )
+
+        user_defaults = user_option_value.get(self.model.provider, {})
+
+        return {**project_defaults, **user_defaults}
+
+    @abstractmethod
+    def create_issue(self, data: IssuePayload, **kwargs: object) -> IssuePayload:
+        """
+        Create an issue via the provider's API and return the issue key,
+        title and description.
+
+        Should also handle API client exceptions and reraise as an
+        IntegrationError (using the `message_from_error` helper).
+
+        >>> def create_issue(self, data, **kwargs):
+        >>>     resp = self.get_client().create_issue(data)
+        >>>     return {
+        >>>         'key': resp['id'],
+        >>>         'title': resp['title'],
+        >>>         'description': resp['description'],
+        >>>     }
+        """
+        raise NotImplementedError
+
+    def get_issue_link_data(self, url: str) -> dict[str, str]:
+        """Translate an issue URL into the provider's existing link form fields."""
+        raise IntegrationFormError(
+            {"externalIssue": "Issue URLs are not supported by this integration"}
+        )
+
+    @abstractmethod
+    def get_issue(self, issue_id: str | int, **kwargs: object) -> IssuePayload:
+        """
+        Get an issue via the provider's API and return the issue key,
+        title and description.
+
+        Should also handle API client exceptions and reraise as an
+        IntegrationError (using the `message_from_error` helper).
+
+        >>> def get_issue(self, data, **kwargs):
+        >>>     resp = self.get_client().get_issue(issue_id)
+        >>>     return {
+        >>>         'key': resp['id'],
+        >>>         'title': resp['title'],
+        >>>         'description': resp['description'],
+        >>>     }
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def search_issues(self, query: str | None, **kwargs: object) -> IssueSearchResults:
+        raise NotImplementedError
+
+    def after_link_issue(
+        self,
+        external_issue: ExternalIssue,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Takes the external issue that has been linked via `get_issue`.
+
+        Does anything needed after an issue has been linked, i.e. creating
+        a comment for a linked issue.
+        """
+
+    def make_external_key(self, data: IssuePayload) -> str:
+        """
+        Takes result of `get_issue` or `create_issue` and returns the formatted key
+        """
+        key = data["key"]
+        return key
+
+    def get_issue_display_name(self, external_issue: ExternalIssue) -> str:
+        """
+        Returns the display name of the issue.
+
+        This is not required but helpful for integrations whose external issue key
+        does not match the desired display name.
+        """
+        return ""
+
+    def map_external_issues_to_annotations(
+        self, external_issues: Iterable[ExternalIssue]
+    ) -> list[dict[str, str]]:
+        annotations = []
+        for ei in external_issues:
+            link = self.get_issue_url(ei.key)
+            label = self.get_issue_display_name(ei) or ei.key
+            annotations.append({"url": link, "displayName": label})
+
+        return annotations
+
+    def get_comment_id(self, comment: IssuePayload) -> str:
+        comment_id = comment["id"]
+        return comment_id
+
+    def create_comment(
+        self, issue_id: str, user_id: int, group_note: Activity
+    ) -> IssuePayload | None:
+        return None
+
+    def update_comment(
+        self, issue_id: str, user_id: int, group_note: Activity
+    ) -> IssuePayload | None:
+        pass
+
+
+@cell_silo_function
+def where_should_sync(
+    integration: RpcIntegration | Integration,
+    key: str,
+    organization_id: int | None = None,
+) -> Sequence[Organization]:
+    """
+    Given an integration, get the list of organizations where the sync type in
+    `key` is enabled. If an optional `organization_id` is passed, then only
+    check the integration for that organization.
+    """
+    kwargs = dict()
+    if organization_id is not None:
+        kwargs["id"] = organization_id
+        ois = integration_service.get_organization_integrations(
+            integration_id=integration.id, organization_id=organization_id
+        )
+    else:
+        ois = integration_service.get_organization_integrations(integration_id=integration.id)
+
+    ois_by_org_id = {oi.organization_id: oi for oi in ois}
+    organizations = Organization.objects.filter(id__in=ois_by_org_id)
+    ret = []
+    for organization in organizations.filter(**kwargs):
+        if features.has("organizations:integrations-issue-sync", organization):
+            installation = integration.get_installation(organization_id=organization.id)
+            # Reuse the org integration fetched above instead of another RPC per org.
+            installation.org_integration = ois_by_org_id[organization.id]
+            if isinstance(installation, IssueBasicIntegration) and installation.should_sync(key):
+                ret.append(organization)
+    return ret
+
+
+class IntegrationSyncTargetNotFound(IntegrationError):
+    pass
+
+
+class IssueSyncIntegration(IssueBasicIntegration, ABC):
+    comment_key: ClassVar[str | None] = None
+    outbound_status_key: ClassVar[str | None] = None
+    inbound_status_key: ClassVar[str | None] = None
+    outbound_assignee_key: ClassVar[str | None] = None
+    inbound_assignee_key: ClassVar[str | None] = None
+
+    def should_sync(self, attribute: str, sync_source: AssignmentSource | None = None) -> bool:
+        key = getattr(self, f"{attribute}_key", None)
+        if key is None or self.org_integration is None:
+            return False
+
+        # Check that the assignment source isn't this same integration in order to
+        # prevent sync-cycles from occurring. This should still allow other
+        # integrations to propagate changes outward.
+        if sync_source and sync_source.integration_id == self.org_integration.integration_id:
+            return False
+
+        value: bool = self.org_integration.config.get(key, False)
+        return value
+
+    @abstractmethod
+    def sync_assignee_outbound(
+        self,
+        external_issue: ExternalIssue,
+        user: RpcUser | None,
+        assign: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Propagate a sentry issue's assignee to a linked issue's assignee.
+        If assign=True, we're assigning the issue. Otherwise, deassign.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def sync_status_outbound(
+        self, external_issue: ExternalIssue, is_resolved: bool, project_id: int
+    ) -> None:
+        """
+        Propagate a sentry issue's status to a linked issue's status.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_resolve_sync_action(self, data: Mapping[str, Any]) -> ResolveSyncAction:
+        """
+        Given webhook data, check whether the status category changed FROM
+        "done" to something else, meaning the Sentry issue should be marked as
+        unresolved or if the status category changed TO "done" from something
+        else, meaning the sentry issue should be marked as resolved.
+
+        Because checking the "done" states can rely on an API call, this function
+        should calculate both "resolve" and "unresolve" to save a round trip.
+        """
+        raise NotImplementedError
+
+    def sync_status_inbound(self, issue_key: str, data: Mapping[str, Any]) -> None:
+        if not where_should_sync(self.model, "inbound_status", self.organization_id):
+            return None
+
+        sync_status_inbound_task.apply_async(
+            kwargs={
+                "integration_id": self.model.id,
+                "organization_id": self.organization_id,
+                "issue_key": issue_key,
+                "data": data,
+            }
+        )
+
+    def migrate_issues(self) -> None:
+        """
+        Migrate the corresponding plugin's issues to the integration and disable the plugins.
+        """
+        pass

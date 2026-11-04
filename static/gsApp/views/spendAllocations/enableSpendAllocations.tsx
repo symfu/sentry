@@ -1,0 +1,84 @@
+import type {Dispatch} from 'react';
+
+import {Button} from '@sentry/scraps/button';
+import {Stack} from '@sentry/scraps/layout';
+
+import type {Client} from 'sentry/api';
+import {Panel} from 'sentry/components/panels/panel';
+import {t} from 'sentry/locale';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+
+type Props = {
+  api: Client;
+  fetchSpendAllocations: () => Promise<void>;
+  hasScope: boolean;
+  orgSlug: string;
+  setErrors: Dispatch<string | null>;
+};
+
+export function EnableSpendAllocations({
+  hasScope,
+  fetchSpendAllocations,
+  api,
+  orgSlug,
+  setErrors,
+}: Props) {
+  const enableAction = async () => {
+    try {
+      // Toggle option; TODO: make sure this is actually redundant before removing this
+      await api.requestPromise(
+        getApiUrl('/organizations/$organizationIdOrSlug/spend-allocations/toggle/', {
+          path: {organizationIdOrSlug: orgSlug},
+        }),
+        {
+          method: 'POST',
+        }
+      );
+      // Create root allocations
+      await api.requestPromise(
+        getApiUrl('/organizations/$organizationIdOrSlug/spend-allocations/index/', {
+          path: {organizationIdOrSlug: orgSlug},
+        }),
+        {
+          method: 'POST',
+        }
+      );
+    } catch (err: any) {
+      if (err.status === 409) {
+        setErrors('Spend Allocations are already enabled');
+      }
+    }
+    await fetchSpendAllocations();
+  };
+
+  return (
+    <Panel>
+      <Stack
+        justify="center"
+        align="center"
+        padding="3xl"
+        style={{minHeight: '200px', textAlign: 'center'}}
+      >
+        <p>{t('Enable the Spend Allocation feature for your organization')}</p>
+        {hasScope && (
+          <Button
+            aria-label={t('Get started')}
+            variant="primary"
+            size="sm"
+            disabled={!hasScope}
+            onClick={enableAction}
+          >
+            {t('Get Started')}
+          </Button>
+        )}
+        {!hasScope && (
+          <p>
+            <strong>
+              {t('Chat with your organization owner to enable spend allocations')}
+            </strong>
+          </p>
+        )}
+      </Stack>
+    </Panel>
+  );
+}

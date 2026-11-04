@@ -1,43 +1,61 @@
+from typing import TYPE_CHECKING, TypeVar
+
 from rest_framework.response import Response
 
-from sentry.api.bases.integration import IntegrationEndpoint
+from sentry.api.base import control_silo_endpoint
+from sentry.integrations.gitlab.integration import GitlabIntegration
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.source_code_management.issues import SourceCodeIssueIntegration
+from sentry.integrations.source_code_management.metrics import SCMIntegrationInteractionType
+from sentry.integrations.source_code_management.search import SourceCodeSearchEndpoint
+from sentry.integrations.types import IntegrationProviderSlug
 from sentry.shared_integrations.exceptions import ApiError
-from sentry.models import Integration
+
+T = TypeVar("T", bound=SourceCodeIssueIntegration)
+
+if TYPE_CHECKING:
+    _SearchEndpointBase = SourceCodeSearchEndpoint[GitlabIntegration]
+else:
+    _SearchEndpointBase = SourceCodeSearchEndpoint
 
 
-class GitlabIssueSearchEndpoint(IntegrationEndpoint):
-    def get(self, request, organization, integration_id):
-        try:
-            integration = Integration.objects.get(
-                organizations=organization, id=integration_id, provider="gitlab"
-            )
-        except Integration.DoesNotExist:
-            return Response(status=404)
+@control_silo_endpoint
+class GitlabIssueSearchEndpoint(_SearchEndpointBase):
+    @property
+    def repository_field(self) -> str:
+        return "project"
 
-        field = request.GET.get("field")
-        query = request.GET.get("query")
-        if field is None:
-            return Response({"detail": "field is a required parameter"}, status=400)
-        if query is None:
-            return Response({"detail": "query is a required parameter"}, status=400)
+    @property
+    def integration_provider(self) -> str:
+        return IntegrationProviderSlug.GITLAB.value
 
-        installation = integration.get_installation(organization.id)
+    @property
+    def installation_class(self) -> type[GitlabIntegration]:
+        return GitlabIntegration
 
-        if field == "externalIssue":
-            project = request.GET.get("project")
-            if project is None:
-                return Response({"detail": "project is a required parameter"}, status=400)
+    def handle_search_issues(self, installation: T, query: str, repo: str | None) -> Response:
+        with self.record_event(
+            SCMIntegrationInteractionType.HANDLE_SEARCH_ISSUES,
+            organization_id=installation.organization_id,
+            integration_id=installation.org_integration.integration_id,
+        ).capture() as lifecycle:
+            assert repo
+
+            full_query: str | None = query
+
             try:
                 iids = [int(query)]
-                query = None
+                full_query = None
             except ValueError:
                 iids = None
 
             try:
-                response = installation.search_issues(query=query, project_id=project, iids=iids)
+                response = installation.search_issues(query=full_query, project_id=repo, iids=iids)
             except ApiError as e:
+                lifecycle.record_failure(e)
                 return Response({"detail": str(e)}, status=400)
 
+            assert isinstance(response, list)
             return Response(
                 [
                     {
@@ -48,16 +66,26 @@ class GitlabIssueSearchEndpoint(IntegrationEndpoint):
                 ]
             )
 
-        elif field == "project":
+    def handle_search_repositories(
+        self, integration: Integration, installation: T, query: str
+    ) -> Response:
+        with self.record_event(
+            SCMIntegrationInteractionType.HANDLE_SEARCH_REPOSITORIES,
+            organization_id=installation.organization_id,
+            integration_id=integration.id,
+        ).capture() as lifecyle:
+            assert isinstance(installation, self.installation_class)
             try:
                 response = installation.search_projects(query)
             except ApiError as e:
+                lifecyle.record_failure(e)
                 return Response({"detail": str(e)}, status=400)
             return Response(
                 [
-                    {"label": project["name_with_namespace"], "value": project["id"]}
+                    {
+                        "label": project["name_with_namespace"],
+                        "value": project["path_with_namespace"],
+                    }
                     for project in response
                 ]
             )
-
-        return Response({"detail": "invalid field value"}, status=400)

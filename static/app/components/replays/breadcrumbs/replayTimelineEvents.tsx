@@ -1,0 +1,251 @@
+import type {Theme} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import {Container} from '@sentry/scraps/layout';
+import type {GraphicsVariant} from '@sentry/scraps/theme';
+import {Tooltip} from '@sentry/scraps/tooltip';
+import {HoverOverlayGroupProvider} from '@sentry/scraps/useHoverOverlay';
+
+import {BreadcrumbItem} from 'sentry/components/replays/breadcrumbs/breadcrumbItem';
+import * as Timeline from 'sentry/components/replays/breadcrumbs/timeline';
+import {getFramesByColumn} from 'sentry/components/replays/utils';
+import {uniq} from 'sentry/utils/array/uniq';
+import {getFrameDetails} from 'sentry/utils/replays/getFrameDetails';
+import {useActiveReplayTab} from 'sentry/utils/replays/hooks/useActiveReplayTab';
+import {useCrumbHandlers} from 'sentry/utils/replays/hooks/useCrumbHandlers';
+import type {ReplayFrame} from 'sentry/utils/replays/types';
+import {isWebVitalFrame} from 'sentry/utils/replays/types';
+
+const NODE_SIZES = [8, 12, 16];
+
+interface Props {
+  durationMs: number;
+  frames: ReplayFrame[];
+  startTimestampMs: number;
+  width: number;
+  className?: string;
+}
+
+export function ReplayTimelineEvents({
+  className,
+  durationMs,
+  frames,
+  startTimestampMs,
+  width,
+}: Props) {
+  const markerWidth = frames.length < 200 ? 4 : frames.length < 500 ? 6 : 10;
+
+  const totalColumns = Math.floor(width / markerWidth);
+  const framesByCol = getFramesByColumn(durationMs, frames, totalColumns);
+
+  return (
+    <Timeline.Columns className={className} totalColumns={totalColumns} remainder={0}>
+      {framesByCol.size > 0 ? (
+        <EventColumns
+          framesByCol={framesByCol}
+          markerWidth={markerWidth}
+          startTimestampMs={startTimestampMs}
+        />
+      ) : null}
+    </Timeline.Columns>
+  );
+}
+
+function EventColumns({
+  framesByCol,
+  markerWidth,
+  startTimestampMs,
+}: {
+  framesByCol: Map<number, ReplayFrame[]>;
+  markerWidth: number;
+  startTimestampMs: number;
+}) {
+  // Share URL subscriptions: per-marker popstate listeners can exceed React's update depth.
+  // Mount only with events so empty timelines don't load Seer setup through this hook.
+  const {setActiveTab} = useActiveReplayTab({});
+
+  return Array.from(framesByCol.entries(), ([column, colFrames]) => (
+    <EventColumn key={column} style={{gridColumn: Math.floor(column)}}>
+      <Event
+        frames={colFrames}
+        markerWidth={markerWidth}
+        setActiveTab={setActiveTab}
+        startTimestampMs={startTimestampMs}
+      />
+    </EventColumn>
+  ));
+}
+
+const EventColumn = styled(Timeline.Col)`
+  pointer-events: auto;
+
+  place-items: stretch;
+  display: grid;
+  align-items: center;
+  position: relative;
+
+  &:hover {
+    z-index: ${p => p.theme.zIndex.initial};
+  }
+`;
+
+type GraphicsVariantTrio =
+  | [GraphicsVariant]
+  | [GraphicsVariant, GraphicsVariant]
+  | [GraphicsVariant, GraphicsVariant, GraphicsVariant];
+
+function Event({
+  frames,
+  markerWidth,
+  setActiveTab,
+  startTimestampMs,
+}: {
+  frames: ReplayFrame[];
+  markerWidth: number;
+  setActiveTab: ReturnType<typeof useActiveReplayTab>['setActiveTab'];
+  startTimestampMs: number;
+}) {
+  const {onMouseEnter, onMouseLeave, onClickTimestamp} = useCrumbHandlers();
+
+  const buttons = frames.map((frame, i) => (
+    <BreadcrumbItem
+      allowShowSnippet={false}
+      frame={frame}
+      showSnippet={false}
+      key={i}
+      onClick={() => {
+        onClickTimestamp(frame);
+        setActiveTab(getFrameDetails(frame).tabKey);
+      }}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      startTimestampMs={startTimestampMs}
+      onInspectorExpanded={() => {}}
+      onShowSnippet={() => {}}
+    />
+  ));
+
+  // Web vital frames render an expandable JSON block that needs more room than
+  // the default tooltip width, otherwise its content wraps to a very tall sliver.
+  const hasWebVitalFrame = frames.some(isWebVitalFrame);
+  const tooltipWidth = hasWebVitalFrame ? 400 : 291;
+  const narrowWidth = hasWebVitalFrame ? 300 : 220;
+
+  // Scope the card's nested hoverable tooltips (e.g. the selector link's own
+  // tooltip in a User Click crumb) to their own hover-overlay delay group.
+  // Otherwise a nested tooltip opening snap-closes this card and unmounts the
+  // link out from under the cursor.
+  const title = (
+    <HoverOverlayGroupProvider>
+      <Container
+        // Cancels the overlay's own padding so the crumbs get the room instead.
+        data-tooltip-section
+        padding="xs"
+        // Viewport-based: the tooltip is portaled to the body, so it has no
+        // query container.
+        width={{zero: `${narrowWidth}px`, 'screen:sm': `${tooltipWidth}px`}}
+        maxHeight="80vh"
+        overflow="auto"
+      >
+        {buttons}
+      </Container>
+    </HoverOverlayGroupProvider>
+  );
+
+  const firstFrame = frames.at(0);
+
+  // We want to show the full variety of colors available.
+  const uniqueColorTokens = uniq(
+    frames.map(frame => getFrameDetails(frame).colorGraphicsToken)
+  );
+
+  // We just need to stack up to 3 times
+  const frameCount = Math.min(uniqueColorTokens.length, 3);
+
+  // Sort the frame colors by color priority
+  const colorOrder = [
+    'danger',
+    'warning',
+    'success',
+    'accent',
+    'neutral',
+  ] as readonly GraphicsVariant[];
+  const getColorPos = (c: GraphicsVariant) => colorOrder.indexOf(c);
+  const sortedUniqueColorTokens = uniqueColorTokens
+    .toSorted((x, y) => getColorPos(x) - getColorPos(y))
+    .slice(0, 3) as GraphicsVariantTrio;
+
+  return (
+    <IconPosition style={{marginLeft: `${markerWidth / 2}px`}}>
+      <Tooltip title={title} maxWidth="none" containerDisplayMode="grid">
+        <IconNode
+          colorTokens={sortedUniqueColorTokens}
+          frameCount={frameCount}
+          onClick={() => {
+            if (firstFrame) {
+              onClickTimestamp(firstFrame);
+            }
+          }}
+        />
+      </Tooltip>
+    </IconPosition>
+  );
+}
+
+const IconPosition = styled('div')`
+  position: absolute;
+  translate: -50% 0;
+`;
+
+const getBackgroundGradient = ({
+  colorTokens,
+  frameCount,
+  theme,
+}: {
+  colorTokens: GraphicsVariantTrio;
+  frameCount: number;
+  theme: Theme;
+}) => {
+  const c0 = theme.tokens.graphics[colorTokens[0]].vibrant;
+  const c1 = colorTokens[1] ? theme.tokens.graphics[colorTokens[1]].vibrant : c0;
+  const c2 = colorTokens[2] ? theme.tokens.graphics[colorTokens[2]].vibrant : c1;
+
+  if (frameCount === 1) {
+    return `background: ${c0};`;
+  }
+  if (frameCount === 2) {
+    return `
+      background: ${c0};
+      background: radial-gradient(
+        circle at center,
+        ${c1} 30%,
+        ${c0} 30%
+      );`;
+  }
+  return `
+    background: ${c0};
+    background: radial-gradient(
+      circle at center,
+      ${c2} 30%,
+      ${c1} 30%,
+      ${c1} 50%,
+      ${c0} 50%
+    );`;
+};
+
+const IconNode = styled('button')<{
+  colorTokens: GraphicsVariantTrio;
+  frameCount: number;
+}>`
+  padding: 0;
+  border: none;
+  grid-column: 1;
+  grid-row: 1;
+  width: ${p => NODE_SIZES[p.frameCount - 1]}px;
+  height: ${p => NODE_SIZES[p.frameCount - 1]}px;
+  border-radius: 50%;
+  color: ${p => p.theme.colors.white};
+  ${getBackgroundGradient}
+  box-shadow: ${p => p.theme.shadow.low};
+  user-select: none;
+`;

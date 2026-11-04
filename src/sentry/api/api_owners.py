@@ -1,0 +1,42 @@
+from enum import Enum
+
+
+class ApiOwner(Enum):
+    """
+    Used to track ownership of APIs
+    Value should map to team's github group
+    """
+
+    AGENT_TRACING = "agent-tracing"
+    ALERTS_MONITORS = "alerts-monitors"
+    BILLING = "revenue"
+    CODING_WORKFLOWS = "agent-interfaces-sentry-backend"
+    COMMUNITY = "app-backend"
+    CRONS = "crons"
+    DASHBOARDS = "dashboards"
+    DATA_BROWSING = "data-browsing"
+    EMERGE_TOOLS = "emerge-tools"
+    EXPLORE = "explore"
+    FEEDBACK = "feedback-backend"
+    FLAG = "replay"
+    FOUNDATIONAL_STORAGE = "foundational-storage"
+    FOUNDATIONS = "foundations"
+    GDX = "gdx"
+    HYBRID_CLOUD = "hybrid-cloud"
+    INFRA_ENG = "sre-infrastructure-engineering"
+    INTEGRATION_PLATFORM = "integration-platform"
+    ISSUE_DETECTION_BACKEND = "issue-detection-backend"
+    ISSUES = "issues-feed"  # Most of these endpoints are owned but all 3 issues teams but APIOwner doesn't allow multiple owners now
+    MESSAGING_INTEGRATIONS = "messaging-integrations"
+    ML_AI = "machine-learning-ai"
+    NOTIFICATIONS = "notifications"
+    OWNERS_INGEST = "ingest"
+    OWNERS_SNUBA = "owners-snuba"
+    PROFILING = "profiling"
+    PROJECT_MANAGEMENT_INTEGRATIONS = "project-management-integrations"
+    REPLAY = "replay"
+    SECURITY = "security"
+    TELEMETRY_EXPERIENCE = "telemetry-experience"
+    UNOWNED = "unowned"
+    VALUE_DISCOVERY = "value-discovery"
+    WEB_FRONTEND_SDKS = "team-javascript-sdks"

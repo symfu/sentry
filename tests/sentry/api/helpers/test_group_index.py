@@ -1,33 +1,138 @@
-from sentry.utils.compat.mock import patch, Mock
-from django.http import QueryDict
+from datetime import UTC, datetime, timedelta
+from time import time
+from typing import Any
+from unittest.mock import MagicMock, Mock, patch
 
-from sentry.models import add_group_to_inbox, GroupInbox, GroupInboxReason, GroupStatus
+import pytest
+from django.http import QueryDict
+from rest_framework.authentication import SessionAuthentication
+from rest_framework.request import Request
+
+from sentry.analytics.events.advanced_search_feature_gated import AdvancedSearchFeatureGateEvent
+from sentry.analytics.events.manual_issue_assignment import ManualIssueAssignment
+from sentry.api.authentication import UserAuthTokenAuthentication
 from sentry.api.helpers.group_index import (
-    validate_search_filter_permissions,
-    ValidationError,
+    get_group_list,
+    get_search_referrer,
     update_groups,
+    validate_search_filter_permissions,
 )
-from sentry.api.issue_search import parse_search_query
-from sentry.testutils import TestCase
+from sentry.api.helpers.group_index.delete import schedule_tasks_to_delete_groups
+from sentry.api.helpers.group_index.update import (
+    get_current_release_version_of_group,
+    get_semver_releases,
+    greatest_semver_release,
+    handle_assigned_to,
+    handle_has_seen,
+    handle_is_bookmarked,
+    handle_is_public,
+    handle_is_subscribed,
+    most_recent_release,
+)
+from sentry.api.helpers.group_index.validators import ValidationError
+from sentry.api.serializers import serialize
+from sentry.api.serializers.models.group import GroupSerializer
+from sentry.grouping.grouptype import ErrorGroupType
+from sentry.hybridcloud.models.outbox import outbox_context
+from sentry.issues.action_log import ActionSource, GroupActionActor, action_context_scope
+from sentry.issues.action_log.types import GroupActionType, GroupActorType
+from sentry.issues.issue_search import parse_search_query
+from sentry.issues.models.groupactionlogentry import GroupActionLogEntry
+from sentry.models.activity import Activity
+from sentry.models.group import Group, GroupStatus
+from sentry.models.groupassignee import GroupAssignee
+from sentry.models.groupbookmark import GroupBookmark
+from sentry.models.grouphash import GroupHash
+from sentry.models.groupinbox import GroupInbox, GroupInboxReason, add_group_to_inbox
+from sentry.models.grouplink import GroupLink
+from sentry.models.groupresolution import GroupResolution
+from sentry.models.groupseen import GroupSeen
+from sentry.models.groupshare import GroupShare
+from sentry.models.groupsnooze import GroupSnooze
+from sentry.models.groupsubscription import GroupSubscription
+from sentry.models.release import ReleaseStatus
+from sentry.notifications.types import GroupSubscriptionReason
+from sentry.snuba.referrer import Referrer
+from sentry.testutils.cases import TestCase
+from sentry.testutils.factories import Factories
+from sentry.testutils.helpers.action_log import action_log_activity_enabled
+from sentry.testutils.helpers.analytics import assert_last_analytics_event
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.pytest.fixtures import django_db_all
+from sentry.testutils.skips import requires_snuba
+from sentry.types.activity import ActivityType
+from sentry.types.actor import Actor
+from sentry.types.group import GroupSubStatus
+from sentry.viewer_context import Actor as ContextActor
+from sentry.viewer_context import (
+    ActorType,
+    ViewerContext,
+    get_viewer_context,
+    viewer_context_scope,
+)
+from sentry.workflow_engine.models import Detector
+
+pytestmark = [requires_snuba]
+
+
+@django_db_all
+@pytest.mark.parametrize("eligible_status", [ReleaseStatus.OPEN, None], ids=["open", "null"])
+def test_resolution_anchor_uses_latest_eligible_observation(
+    factories: Factories, default_group: Group, eligible_status: int | None
+) -> None:
+    now = datetime.now(UTC)
+    project = default_group.project
+    # Prime the general history cache before any release has been observed.
+    assert default_group.get_last_release() is None
+    archived = factories.create_release(
+        project=project, version="archived", status=ReleaseStatus.ARCHIVED
+    )
+    factories.create_group_release(project=project, group=default_group, release=archived)
+    # An unobserved project release is not a replacement for the issue's anchor.
+    factories.create_release(project=project, version="unobserved")
+    assert get_current_release_version_of_group(default_group) is None
+    assert default_group.get_last_release() == archived.version
+
+    older_release = factories.create_release(
+        project=project, version="older", date_added=now - timedelta(days=3), status=eligible_status
+    )
+    newer_release = factories.create_release(
+        project=project, version="newer", date_added=now - timedelta(days=2)
+    )
+    factories.create_group_release(
+        project=project, group=default_group, release=older_release
+    ).update(last_seen=now - timedelta(hours=1))
+    factories.create_group_release(
+        project=project, group=default_group, release=newer_release
+    ).update(last_seen=now - timedelta(hours=2))
+
+    # Resolution anchors follow last-seen order, not release creation order.
+    assert get_current_release_version_of_group(default_group) == older_release.version
+    # The general history cache must retain the archived latest observation,
+    # rather than the eligible release chosen for resolution.
+    assert default_group.get_last_release() == archived.version
 
 
 class ValidateSearchFilterPermissionsTest(TestCase):
-    def run_test(self, query):
+    def run_test(self, query: str) -> None:
         validate_search_filter_permissions(self.organization, parse_search_query(query), self.user)
 
-    def assert_analytics_recorded(self, mock_record):
-        mock_record.assert_called_with(
-            "advanced_search.feature_gated",
-            user_id=self.user.id,
-            default_user_id=self.user.id,
-            organization_id=self.organization.id,
+    def assert_analytics_recorded(self, mock_record: Mock) -> None:
+        assert_last_analytics_event(
+            mock_record,
+            AdvancedSearchFeatureGateEvent(
+                user_id=self.user.id,
+                default_user_id=self.user.id,
+                organization_id=self.organization.id,
+            ),
         )
 
     @patch("sentry.analytics.record")
-    def test_negative(self, mock_record):
+    def test_negative(self, mock_record: Mock) -> None:
         query = "!has:user"
-        with self.feature({"organizations:advanced-search": False}), self.assertRaisesRegexp(
-            ValidationError, ".*negative search.*"
+        with (
+            self.feature({"organizations:advanced-search": False}),
+            pytest.raises(ValidationError, match=".*negative search.*"),
         ):
             self.run_test(query)
 
@@ -35,8 +140,9 @@ class ValidateSearchFilterPermissionsTest(TestCase):
         self.assert_analytics_recorded(mock_record)
 
         query = "!something:123"
-        with self.feature({"organizations:advanced-search": False}), self.assertRaisesRegexp(
-            ValidationError, ".*negative search.*"
+        with (
+            self.feature({"organizations:advanced-search": False}),
+            pytest.raises(ValidationError, match=".*negative search.*"),
         ):
             self.run_test(query)
 
@@ -44,10 +150,11 @@ class ValidateSearchFilterPermissionsTest(TestCase):
         self.assert_analytics_recorded(mock_record)
 
     @patch("sentry.analytics.record")
-    def test_wildcard(self, mock_record):
+    def test_wildcard(self, mock_record: Mock) -> None:
         query = "abc:hello*"
-        with self.feature({"organizations:advanced-search": False}), self.assertRaisesRegexp(
-            ValidationError, ".*wildcard search.*"
+        with (
+            self.feature({"organizations:advanced-search": False}),
+            pytest.raises(ValidationError, match=".*wildcard search.*"),
         ):
             self.run_test(query)
 
@@ -55,8 +162,9 @@ class ValidateSearchFilterPermissionsTest(TestCase):
         self.assert_analytics_recorded(mock_record)
 
         query = "raw * search"
-        with self.feature({"organizations:advanced-search": False}), self.assertRaisesRegexp(
-            ValidationError, ".*wildcard search.*"
+        with (
+            self.feature({"organizations:advanced-search": False}),
+            pytest.raises(ValidationError, match=".*wildcard search.*"),
         ):
             self.run_test(query)
 
@@ -64,98 +172,1817 @@ class ValidateSearchFilterPermissionsTest(TestCase):
         self.assert_analytics_recorded(mock_record)
 
 
+def _wrap_request(http_request: Any, data: dict[str, Any] | None = None) -> Request:
+    drf_request = Request(http_request)
+    drf_request.user = http_request.user
+    if data is not None:
+        setattr(drf_request, "_full_data", data)
+    return drf_request
+
+
+class GetSearchReferrerTest(TestCase):
+    def _request(self, authenticator: Any) -> Request:
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict()
+        request = _wrap_request(http_request)
+        # DRF exposes `successful_authenticator` as a read-only property backed by
+        # `_authenticator`, which it sets during authentication; set it directly here.
+        setattr(request, "_authenticator", authenticator)
+        return request
+
+    def test_session_auth_uses_ui_referrer(self) -> None:
+        request = self._request(SessionAuthentication())
+        assert get_search_referrer(request) == Referrer.SEARCH_GROUP_INDEX
+
+    def test_token_auth_uses_api_referrer(self) -> None:
+        request = self._request(UserAuthTokenAuthentication())
+        assert get_search_referrer(request) == Referrer.SEARCH_GROUP_INDEX_API
+
+    def test_missing_authenticator_uses_api_referrer(self) -> None:
+        request = self._request(None)
+        assert get_search_referrer(request) == Referrer.SEARCH_GROUP_INDEX_API
+
+
 class UpdateGroupsTest(TestCase):
     @patch("sentry.signals.issue_unresolved.send_robust")
     @patch("sentry.signals.issue_ignored.send_robust")
-    def test_unresolving_resolved_group(self, send_robust, send_unresolved):
+    def test_unresolving_resolved_group(self, send_robust: Mock, send_unresolved: Mock) -> None:
         resolved_group = self.create_group(status=GroupStatus.RESOLVED)
         assert resolved_group.status == GroupStatus.RESOLVED
 
-        request = self.make_request(user=self.user, method="GET")
-        request.user = self.user
-        request.data = {"status": "unresolved"}
-        request.GET = QueryDict(query_string=f"id={resolved_group.id}")
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={resolved_group.id}")
+        request = _wrap_request(http_request, data={"status": "unresolved", "substatus": "ongoing"})
 
-        search_fn = Mock()
-        update_groups(request, [self.project], self.organization.id, search_fn)
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
 
         resolved_group.refresh_from_db()
 
         assert resolved_group.status == GroupStatus.UNRESOLVED
+        assert resolved_group.substatus == GroupSubStatus.ONGOING
         assert not send_robust.called
         assert send_unresolved.called
 
+    def test_outer_action_context_overrides_request_source(self) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolved", "substatus": None})
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+
+        with self.assertLogs("sentry.issues.action_log", level="INFO") as logs:
+            with action_context_scope(
+                source=ActionSource.SLACK, actor=GroupActionActor.user(self.user.id)
+            ):
+                update_groups(request, group_list)
+
+        resolve_records = [
+            r
+            for r in logs.records
+            if r.message == "group.action_log" and getattr(r, "action") == "resolve"
+        ]
+        assert len(resolve_records) == 1
+        assert getattr(resolve_records[0], "source") == ActionSource.SLACK
+        assert getattr(resolve_records[0], "actor_id") == str(self.user.id)
+
+    @patch("sentry.signals.issue_ignored.send_robust")
+    def test_bulk_ignore_skips_already_ignored(self, send_robust: Mock) -> None:
+        # One group needs to transition, one is already in the target status.
+        to_ignore = self.create_group(status=GroupStatus.UNRESOLVED)
+        already_ignored = self.create_group(status=GroupStatus.IGNORED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={to_ignore.id}&id={already_ignored.id}")
+        request = _wrap_request(
+            http_request, data={"status": "ignored", "substatus": "archived_forever"}
+        )
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+
+        with self.assertLogs("sentry.issues.action_log", level="INFO") as logs:
+            update_groups(request, group_list)
+
+        # Activity is created only for the group that actually changed.
+        assert (
+            Activity.objects.filter(group=to_ignore, type=ActivityType.SET_IGNORED.value).count()
+            == 1
+        )
+        assert (
+            Activity.objects.filter(
+                group=already_ignored, type=ActivityType.SET_IGNORED.value
+            ).count()
+            == 0
+        )
+
+        # The action log records only the changed group.
+        archive_records = [
+            r
+            for r in logs.records
+            if r.message == "group.action_log" and getattr(r, "action") == "archive"
+        ]
+        assert len(archive_records) == 1
+        assert getattr(archive_records[0], "group_id") == str(to_ignore.id)
+
+        # The issue_ignored signal carries only the changed group.
+        assert send_robust.call_count == 1
+        assert send_robust.call_args.kwargs["group_list"] == [to_ignore]
+
+    @patch("sentry.signals.issue_unignored.send_robust")
+    @patch("sentry.signals.issue_unresolved.send_robust")
+    def test_bulk_unresolve_skips_already_unresolved(
+        self, send_unresolved: Mock, send_unignored: Mock
+    ) -> None:
+        to_unresolve = self.create_group(status=GroupStatus.RESOLVED)
+        already_unresolved = self.create_group(status=GroupStatus.UNRESOLVED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(
+            query_string=f"id={to_unresolve.id}&id={already_unresolved.id}"
+        )
+        request = _wrap_request(http_request, data={"status": "unresolved", "substatus": "ongoing"})
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+
+        with self.assertLogs("sentry.issues.action_log", level="INFO") as logs:
+            update_groups(request, group_list)
+
+        assert (
+            Activity.objects.filter(
+                group=to_unresolve, type=ActivityType.SET_UNRESOLVED.value
+            ).count()
+            == 1
+        )
+        assert (
+            Activity.objects.filter(
+                group=already_unresolved, type=ActivityType.SET_UNRESOLVED.value
+            ).count()
+            == 0
+        )
+
+        unresolve_records = [
+            r
+            for r in logs.records
+            if r.message == "group.action_log" and getattr(r, "action") == "unresolve"
+        ]
+        assert len(unresolve_records) == 1
+        assert getattr(unresolve_records[0], "group_id") == str(to_unresolve.id)
+
+        # RESOLVED -> UNRESOLVED fires issue_unresolved once; issue_unignored never fires.
+        assert send_unresolved.call_count == 1
+        assert send_unresolved.call_args.kwargs["group"] == to_unresolve
+        assert not send_unignored.called
+
+    @patch("sentry.signals.issue_ignored.send_robust")
+    def test_bulk_update_all_already_matching_emits_nothing(self, send_robust: Mock) -> None:
+        g1 = self.create_group(status=GroupStatus.IGNORED)
+        g2 = self.create_group(status=GroupStatus.IGNORED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={g1.id}&id={g2.id}")
+        request = _wrap_request(
+            http_request, data={"status": "ignored", "substatus": "archived_forever"}
+        )
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+
+        # Nothing transitions, so handle_status_update is never called: no Activity,
+        # no action-log entry, and no signal.
+        with self.assertNoLogs("sentry.issues.action_log", level="INFO"):
+            update_groups(request, group_list)
+
+        assert (
+            Activity.objects.filter(group__in=[g1, g2], type=ActivityType.SET_IGNORED.value).count()
+            == 0
+        )
+        assert not send_robust.called
+
     @patch("sentry.signals.issue_resolved.send_robust")
-    def test_resolving_unresolved_group(self, send_robust):
+    def test_resolving_unresolved_group(self, send_robust: Mock) -> None:
         unresolved_group = self.create_group(status=GroupStatus.UNRESOLVED)
         add_group_to_inbox(unresolved_group, GroupInboxReason.NEW)
         assert unresolved_group.status == GroupStatus.UNRESOLVED
 
-        request = self.make_request(user=self.user, method="GET")
-        request.user = self.user
-        request.data = {"status": "resolved"}
-        request.GET = QueryDict(query_string=f"id={unresolved_group.id}")
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={unresolved_group.id}")
+        request = _wrap_request(http_request, data={"status": "resolved", "substatus": None})
 
-        search_fn = Mock()
-        update_groups(request, [self.project], self.organization.id, search_fn)
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
 
         unresolved_group.refresh_from_db()
 
         assert unresolved_group.status == GroupStatus.RESOLVED
         assert not GroupInbox.objects.filter(group=unresolved_group).exists()
         assert send_robust.called
+        # Resolving "now" has no commit associated with it.
+        assert send_robust.call_args.kwargs["commit_id"] is None
+
+    def test_resolving_multiple_groups_marks_activities_bulk(self) -> None:
+        g1 = self.create_group(status=GroupStatus.UNRESOLVED)
+        g2 = self.create_group(status=GroupStatus.UNRESOLVED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={g1.id}&id={g2.id}")
+        request = _wrap_request(http_request, data={"status": "resolved", "substatus": None})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        activities = Activity.objects.filter(
+            group__in=[g1, g2], type=ActivityType.SET_RESOLVED.value
+        )
+        assert len(activities) == 2
+        assert all(activity.data.get("bulk") is True for activity in activities)
+
+    def test_resolving_single_group_is_not_bulk(self) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolved", "substatus": None})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        activity = Activity.objects.get(group=group, type=ActivityType.SET_RESOLVED.value)
+        assert "bulk" not in activity.data
+
+    @patch("sentry.signals.issue_resolved.send_robust")
+    def test_resolving_group_in_commit(self, send_robust: Mock) -> None:
+        unresolved_group = self.create_group(status=GroupStatus.UNRESOLVED)
+        repo = self.create_repo(project=unresolved_group.project)
+        commit = self.create_commit(project=unresolved_group.project, repo=repo)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={unresolved_group.id}")
+        request = _wrap_request(
+            http_request,
+            data={
+                "status": "resolved",
+                "statusDetails": {"inCommit": {"commit": commit.key, "repository": repo.name}},
+            },
+        )
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        unresolved_group.refresh_from_db()
+
+        assert unresolved_group.status == GroupStatus.RESOLVED
+        assert send_robust.called
+        assert send_robust.call_args.kwargs["resolution_type"] == "in_commit"
+        assert send_robust.call_args.kwargs["commit_id"] == commit.id
+
+    @patch(
+        "sentry.workflow_engine.handlers.workflow.workflow_activity_handlers.schedule_process_workflow_activity"
+    )
+    def test_resolving_dispatches_workflow_activity(
+        self, mock_schedule_process_workflow_activity: Mock
+    ) -> None:
+        # Resolving now routes through create_group_activity, which invokes the workflow
+        # engine's generic activity handler and dispatches process_workflow_activity.
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        detector = Detector.objects.get(project=self.project, type=ErrorGroupType.slug)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolved", "substatus": None})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        activity = Activity.objects.get(group=group, type=ActivityType.SET_RESOLVED.value)
+        mock_schedule_process_workflow_activity.assert_called_once_with(
+            activity_id=activity.id,
+            group_id=group.id,
+            detector_id=detector.id,
+        )
+        # A plain resolve has no GroupResolution, so no ident is stamped.
+        assert activity.ident is None
+
+    @patch(
+        "sentry.workflow_engine.handlers.workflow.workflow_activity_handlers.schedule_process_workflow_activity"
+    )
+    def test_resolving_in_release_dispatches_workflow_activity(
+        self, mock_schedule_process_workflow_activity: Mock
+    ) -> None:
+        release = self.create_release(project=self.project, version="test@1.0.0")
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        detector = Detector.objects.get(project=self.project, type=ErrorGroupType.slug)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(
+            http_request,
+            data={"status": "resolved", "statusDetails": {"inRelease": release.version}},
+        )
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        activity = Activity.objects.get(
+            group=group, type=ActivityType.SET_RESOLVED_IN_RELEASE.value
+        )
+        mock_schedule_process_workflow_activity.assert_called_once_with(
+            activity_id=activity.id,
+            group_id=group.id,
+            detector_id=detector.id,
+        )
+        # The release resolution stamps the GroupResolution id onto the activity's ident.
+        resolution = group.groupresolution_set.get()
+        assert activity.ident == str(resolution.id)
+
+    @patch(
+        "sentry.workflow_engine.handlers.workflow.workflow_activity_handlers.schedule_process_workflow_activity"
+    )
+    def test_resolving_in_commit_dispatches_workflow_activity(
+        self, mock_schedule_process_workflow_activity: Mock
+    ) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        repo = self.create_repo(project=group.project)
+        commit = self.create_commit(project=group.project, repo=repo)
+        detector = Detector.objects.get(project=self.project, type=ErrorGroupType.slug)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(
+            http_request,
+            data={
+                "status": "resolved",
+                "statusDetails": {"inCommit": {"commit": commit.key, "repository": repo.name}},
+            },
+        )
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        activity = Activity.objects.get(group=group, type=ActivityType.SET_RESOLVED_IN_COMMIT.value)
+        mock_schedule_process_workflow_activity.assert_called_once_with(
+            activity_id=activity.id,
+            group_id=group.id,
+            detector_id=detector.id,
+        )
 
     @patch("sentry.signals.issue_ignored.send_robust")
-    def test_ignoring_group(self, send_robust):
+    def test_ignoring_group_archived_forever(self, send_robust: Mock) -> None:
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.NEW)
 
-        request = self.make_request(user=self.user, method="GET")
-        request.user = self.user
-        request.data = {"status": "ignored"}
-        request.GET = QueryDict(query_string=f"id={group.id}")
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(
+            http_request, data={"status": "ignored", "substatus": "archived_forever"}
+        )
 
-        search_fn = Mock()
-        update_groups(request, [self.project], self.organization.id, search_fn)
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
 
         group.refresh_from_db()
 
         assert group.status == GroupStatus.IGNORED
+        assert group.substatus == GroupSubStatus.FOREVER
         assert send_robust.called
         assert not GroupInbox.objects.filter(group=group).exists()
 
-    @patch("sentry.signals.issue_unignored.send_robust")
-    def test_unignoring_group(self, send_robust):
-        group = self.create_group(status=GroupStatus.IGNORED)
+    @patch("sentry.signals.issue_ignored.send_robust")
+    def test_ignoring_group_archived_until_condition_met(self, send_robust: Mock) -> None:
+        group = self.create_group()
+        add_group_to_inbox(group, GroupInboxReason.NEW)
 
-        request = self.make_request(user=self.user, method="GET")
-        request.user = self.user
-        request.data = {"status": "unresolved"}
-        request.GET = QueryDict(query_string=f"id={group.id}")
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(
+            http_request,
+            data={
+                "status": "ignored",
+                "substatus": "archived_until_condition_met",
+                "statusDetails": {"ignoreDuration": 1},
+            },
+        )
 
-        search_fn = Mock()
-        update_groups(request, [self.project], self.organization.id, search_fn)
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
 
         group.refresh_from_db()
 
-        assert group.status == GroupStatus.UNRESOLVED
+        assert group.status == GroupStatus.IGNORED
+        assert group.substatus == GroupSubStatus.UNTIL_CONDITION_MET
         assert send_robust.called
+        assert not GroupInbox.objects.filter(group=group).exists()
+        assert GroupSnooze.objects.filter(group=group).exists()
 
-    @patch("sentry.signals.issue_mark_reviewed.send_robust")
-    def test_mark_reviewed_group(self, send_robust):
-        with self.feature("organizations:inbox"):
-            group = self.create_group()
-            add_group_to_inbox(group, GroupInboxReason.NEW)
+    @patch("sentry.signals.issue_unignored.send_robust")
+    def test_unignoring_group(self, send_robust: Mock) -> None:
+        cases: list[dict[str, Any]] = [
+            {
+                "group": self.create_group(
+                    status=GroupStatus.IGNORED, first_seen=datetime.now(UTC) - timedelta(days=8)
+                ),
+                "request_data": {"status": "unresolved"},
+                "expected_substatus": GroupSubStatus.ONGOING,
+            },
+            {
+                "group": self.create_group(
+                    status=GroupStatus.IGNORED, first_seen=datetime.now(UTC) - timedelta(days=8)
+                ),
+                "request_data": {"status": "unresolved", "substatus": "ongoing"},
+                "expected_substatus": GroupSubStatus.ONGOING,
+            },
+            {
+                "group": self.create_group(
+                    status=GroupStatus.IGNORED, first_seen=datetime.now(UTC)
+                ),
+                "request_data": {"status": "unresolved"},
+                "expected_substatus": GroupSubStatus.NEW,
+            },
+        ]
+        for data in cases:
+            group = data["group"]
+            http_request = self.make_request(user=self.user, method="GET")
+            http_request.GET = QueryDict(query_string=f"id={group.id}")
+            request = _wrap_request(http_request, data=data["request_data"])
 
-            request = self.make_request(user=self.user, method="GET")
-            request.user = self.user
-            request.data = {"inbox": False}
-            request.GET = QueryDict(query_string=f"id={group.id}")
-
-            search_fn = Mock()
-            update_groups(request, [self.project], self.organization.id, search_fn)
+            group_list = get_group_list(
+                self.organization.id, [self.project], request.GET.getlist("id")
+            )
+            update_groups(request, group_list)
 
             group.refresh_from_db()
 
-            assert not GroupInbox.objects.filter(group=group).exists()
+            assert group.status == GroupStatus.UNRESOLVED
+            assert group.substatus == data["expected_substatus"]
             assert send_robust.called
+
+    @patch("sentry.signals.issue_mark_reviewed.send_robust")
+    def test_mark_reviewed_group(self, send_robust: Mock) -> None:
+        group = self.create_group()
+        add_group_to_inbox(group, GroupInboxReason.NEW)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"inbox": False})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        group.refresh_from_db()
+
+        assert not GroupInbox.objects.filter(group=group).exists()
+        assert send_robust.called
+
+    @patch("sentry.signals.issue_ignored.send_robust")
+    def test_ignore_with_substatus_archived_until_escalating(self, send_robust: Mock) -> None:
+        group = self.create_group()
+        add_group_to_inbox(group, GroupInboxReason.NEW)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(
+            http_request, data={"status": "ignored", "substatus": "archived_until_escalating"}
+        )
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        group.refresh_from_db()
+
+        assert group.status == GroupStatus.IGNORED
+        assert group.substatus == GroupSubStatus.UNTIL_ESCALATING
+        assert send_robust.called
+        assert not GroupInbox.objects.filter(group=group).exists()
+
+    @patch("sentry.signals.issue_resolved.send_robust")
+    def test_resolving_group_with_short_id(self, send_robust: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        assert group.qualified_short_id is not None
+
+        http_request = self.make_request(
+            user=self.user,
+            method="GET",
+            # The UI calls the endpoint with the short ID, not the group ID
+            GET={"id": group.qualified_short_id},
+        )
+        request = _wrap_request(http_request, data={"status": "resolved", "substatus": None})
+
+        assert request.GET.getlist("id")[0] == group.qualified_short_id
+        assert request.GET.getlist("id")[0].isdigit() is False
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        assert group_list == [group]
+        update_groups(request, group_list)
+
+        group.refresh_from_db()
+
+        assert group.status == GroupStatus.RESOLVED
+        assert send_robust.called
+
+    def test_get_group_list_filters_by_project_access(self) -> None:
+        """
+        Test that get_group_list properly filters groups by project access when using qualified short IDs.
+        This prevents IDOR vulnerabilities where a user could access groups from projects they don't have access to.
+        """
+        # Create a second project in the same organization
+        project2 = self.create_project(organization=self.organization, name="Project 2")
+
+        # Create groups in both projects
+        group1 = self.create_group(project=self.project, status=GroupStatus.UNRESOLVED)
+        group2 = self.create_group(project=project2, status=GroupStatus.UNRESOLVED)
+
+        # User only has access to self.project, not project2
+        # When requesting group2 using qualified short ID, it should be filtered out
+        assert group2.qualified_short_id is not None
+        group_list = get_group_list(
+            self.organization.id, [self.project], [group2.qualified_short_id]
+        )
+
+        # The group from the inaccessible project should be filtered out
+        assert group_list == []
+
+        # But when requesting a group from an accessible project, it should work
+        assert group1.qualified_short_id is not None
+        group_list = get_group_list(
+            self.organization.id, [self.project], [group1.qualified_short_id]
+        )
+        assert group_list == [group1]
+
+        # When user has access to both projects, both groups should be returned
+        assert group1.qualified_short_id is not None
+        assert group2.qualified_short_id is not None
+        group_list = get_group_list(
+            self.organization.id,
+            [self.project, project2],
+            [group1.qualified_short_id, group2.qualified_short_id],
+        )
+        assert set(group_list) == {group1, group2}
+
+    def test_unresolve_clears_commit_resolution_links(self) -> None:
+        """
+        Test that when an issue is unresolved, commit resolution links are deleted
+
+        Steps:
+        1. Resolve issue via commit (no release association)
+        2. Mark as unresolved
+        3. Manually resolve again
+        4. Should not return inCommit in statusDetails
+        """
+        group = self.create_group()
+        repo = self.create_repo(project=group.project)
+        commit = self.create_commit(project=group.project, repo=repo)
+
+        # Step 1: Simulate resolving via commit by creating GroupLink
+        GroupLink.objects.create(
+            group_id=group.id,
+            project_id=group.project_id,
+            linked_type=GroupLink.LinkedType.commit,
+            relationship=GroupLink.Relationship.resolves,
+            linked_id=commit.id,
+        )
+        group.update(status=GroupStatus.RESOLVED)
+
+        # GroupLink is created
+        assert GroupLink.objects.filter(
+            group_id=group.id, relationship=GroupLink.Relationship.resolves
+        ).exists()
+        serialized = serialize(group, self.user, GroupSerializer())
+        assert serialized["status"] == "resolved"
+        assert "inCommit" in serialized["statusDetails"]
+        assert serialized["statusDetails"]["inCommit"] is not None
+
+        # Step 2: Mark as unresolved
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "unresolved"})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        # Step 3: GroupLink is deleted
+        assert not GroupLink.objects.filter(
+            group_id=group.id, relationship=GroupLink.Relationship.resolves
+        ).exists()
+
+        # Step 4: Manually resolve again
+        group.refresh_from_db()
+        assert group.status == GroupStatus.UNRESOLVED
+
+        request = _wrap_request(http_request, data={"status": "resolved"})
+        update_groups(request, group_list)
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.RESOLVED
+
+        # statusDetails should NOT contain inCommit anymore
+        serialized = serialize(group, self.user, GroupSerializer())
+        assert serialized["status"] == "resolved"
+        assert "inCommit" not in serialized["statusDetails"]
+        assert serialized["statusDetails"] == {}
+
+    @with_feature("organizations:release-resolution-finalized-order")
+    def test_resolve_in_next_release_uses_finalized_order(self) -> None:
+        now = datetime.now(UTC)
+        current = self.create_release(version="current", date_added=now - timedelta(days=3))
+        next_release = self.create_release(
+            version="next",
+            date_added=now - timedelta(days=4),
+            date_released=now - timedelta(days=2),
+        )
+        self.create_release(
+            version="old", date_added=now - timedelta(days=1), date_released=now - timedelta(days=5)
+        )
+        group = self.create_group(project=self.project, status=GroupStatus.UNRESOLVED)
+        self.create_group_release(group=group, release=current)
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        resolution = GroupResolution.objects.get(group=group)
+        assert resolution.release_id == next_release.id
+        assert resolution.current_release_version == current.version
+        assert resolution.status == GroupResolution.Status.resolved
+
+    def test_resolve_in_next_release_clears_ineligible_previous_anchor(self) -> None:
+        now = datetime.now(UTC)
+        archived = self.create_release(
+            version="app@999.9+999.9",
+            date_added=now - timedelta(days=2),
+            status=ReleaseStatus.ARCHIVED,
+        )
+        current = self.create_release(version="build-sha", date_added=now - timedelta(days=1))
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+        self.create_group_release(group=group, release=archived)
+        resolution = self.create_group_resolution(
+            group=group,
+            release=archived,
+            current_release_version=archived.version,
+            type=GroupResolution.Type.in_next_release,
+            status=GroupResolution.Status.resolved,
+        )
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+
+        update_groups(request, group_list)
+
+        resolution.refresh_from_db()
+        assert resolution.release_id == current.id
+        assert resolution.current_release_version is None
+        assert resolution.type == GroupResolution.Type.in_next_release
+        assert resolution.status == GroupResolution.Status.pending
+        newer = self.create_release(version="new-build", date_added=now)
+        assert GroupResolution.has_resolution(group, current)
+        assert not GroupResolution.has_resolution(group, newer)
+
+    def test_resolve_in_next_release(self) -> None:
+        self.create_release(project=self.project, version="test@1.0.0.0")
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.RESOLVED
+
+    def test_resolve_in_next_release_ignores_archived_releases(self) -> None:
+        open_release = self.create_release(
+            project=self.project,
+            version="test@1.0.0.0",
+            date_added=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+        self.create_release(
+            project=self.project,
+            version="test@2.0.0.0",
+            date_added=datetime(2024, 1, 2, tzinfo=UTC),
+            status=ReleaseStatus.ARCHIVED,
+        )
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        update_groups(request, group_list)
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.RESOLVED
+        resolution = group.groupresolution_set.get()
+        assert resolution.release == open_release
+
+    def test_resolve_in_next_release_activity_from_action_log(self) -> None:
+        self.create_release(project=self.project, version="test@1.0.0.0")
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        with self.feature({"projects:issue-action-log-write-to-db": False}):
+            note = self.create_group_activity(
+                group=group, type=ActivityType.NOTE.value, data={"text": "no GAL event"}
+            )
+        GroupActionLogEntry.objects.create(
+            group_id=group.id,
+            project_id=group.project_id,
+            type=GroupActionType.RESOLVE.value,
+            actor_type=GroupActorType.USER.value,
+            actor_id=self.user.id,
+            source="web",
+            data={},
+        )
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        with action_log_activity_enabled():
+            response = update_groups(request, group_list)
+
+        activity = response.data["activity"]
+        # the manually logged RESOLVE exists only in GALE, so its presence means
+        # the action log was served rather than Activity
+        assert "set_resolved" in [entry["type"] for entry in activity]
+        assert activity[-1]["id"] == "0"
+        notes = [item for item in activity if item["type"] == "note"]
+        assert len(notes) == 1
+        assert notes[0]["id"] == notes[0]["commentId"] == str(note.id)
+        assert notes[0]["data"]["text"] == "no GAL event"
+
+    def test_resolve_in_next_release_falls_back_when_action_log_is_empty(self) -> None:
+        # A gated project can still read an empty log: the GALE write for this
+        # resolve goes through an outbox that may not have drained yet. Fall back to
+        # Activity rather than omitting the key, matching the other feed endpoints.
+        self.create_release(project=self.project, version="test@1.0.0.0")
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        with (
+            action_log_activity_enabled(),
+            outbox_context(flush=False),
+            self.assertLogs(
+                "sentry.api.serializers.models.groupactionlogentry", level="INFO"
+            ) as logs,
+        ):
+            response = update_groups(request, group_list)
+
+        assert any(
+            record.message == "issues.action_log.activity_read.not_found" for record in logs.records
+        )
+        assert response is not None
+        assert not GroupActionLogEntry.objects.filter(group_id=group.id).exists()
+        assert "set_resolved_in_release" in [item["type"] for item in response.data["activity"]]
+
+    def test_resolve_in_next_release_ignores_action_log_when_disabled(self) -> None:
+        # With the gate closed the log may cover only part of this project's history,
+        # so serving it could silently drop older entries. Fall back to Activity.
+        self.create_release(project=self.project, version="test@1.0.0.0")
+        group = self.create_group(status=GroupStatus.UNRESOLVED)
+        GroupActionLogEntry.objects.create(
+            group_id=group.id,
+            project_id=group.project_id,
+            type=GroupActionType.COMMENT.value,
+            actor_type=GroupActorType.USER.value,
+            actor_id=self.user.id,
+            source="web",
+            data={"comment_id": 123, "text": "hello world"},
+        )
+
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data={"status": "resolvedInNextRelease"})
+
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+        response = update_groups(request, group_list)
+
+        # the COMMENT only exists in the log, so its absence means Activity was served
+        activity = response.data["activity"]
+        assert "note" not in [entry["type"] for entry in activity]
+
+
+@patch("sentry.issues.attributes.produce_snapshot_to_kafka")
+class UpdateGroupsSnapshotTest(TestCase):
+    def _update_groups_and_capture_snapshots(
+        self, group: Group, data: dict[str, Any], produce_snapshot: Mock
+    ) -> list[dict[str, Any]]:
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(query_string=f"id={group.id}")
+        request = _wrap_request(http_request, data=data)
+        group_list = get_group_list(self.organization.id, [self.project], request.GET.getlist("id"))
+
+        produce_snapshot.reset_mock()
+
+        with self.capture_on_commit_callbacks(execute=True):
+            update_groups(request, group_list)
+
+        return [call.args[0] for call in produce_snapshot.call_args_list]
+
+    def _update_status_and_capture_snapshot_statuses(
+        self, group: Group, data: dict[str, Any], produce_snapshot: Mock
+    ) -> list[int]:
+        snapshots = self._update_groups_and_capture_snapshots(group, data, produce_snapshot)
+
+        return [snapshot["status"] for snapshot in snapshots]
+
+    def test_archive_until_escalating_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        emitted_statuses = self._update_status_and_capture_snapshot_statuses(
+            group,
+            {"status": "ignored", "substatus": "archived_until_escalating"},
+            produce_snapshot,
+        )
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.IGNORED
+        assert group.substatus == GroupSubStatus.UNTIL_ESCALATING
+
+        assert emitted_statuses == [GroupStatus.IGNORED]
+
+    def test_archive_forever_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        emitted_statuses = self._update_status_and_capture_snapshot_statuses(
+            group,
+            {"status": "ignored", "substatus": "archived_forever"},
+            produce_snapshot,
+        )
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.IGNORED
+        assert group.substatus == GroupSubStatus.FOREVER
+
+        assert emitted_statuses == [GroupStatus.IGNORED]
+
+    def test_unresolve_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(
+            status=GroupStatus.IGNORED, substatus=GroupSubStatus.UNTIL_ESCALATING
+        )
+
+        emitted_statuses = self._update_status_and_capture_snapshot_statuses(
+            group,
+            {"status": "unresolved", "substatus": "ongoing"},
+            produce_snapshot,
+        )
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.UNRESOLVED
+        assert group.substatus == GroupSubStatus.ONGOING
+
+        assert emitted_statuses == [GroupStatus.UNRESOLVED]
+
+    def test_resolve_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        emitted_statuses = self._update_status_and_capture_snapshot_statuses(
+            group,
+            {"status": "resolved", "substatus": None},
+            produce_snapshot,
+        )
+
+        group.refresh_from_db()
+        assert group.status == GroupStatus.RESOLVED
+
+        assert emitted_statuses == [GroupStatus.RESOLVED]
+
+    def test_assign_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        snapshots = self._update_groups_and_capture_snapshots(
+            group, {"assignedTo": f"user:{self.user.id}"}, produce_snapshot
+        )
+
+        assert GroupAssignee.objects.filter(group=group, user_id=self.user.id).exists()
+
+        assert [snapshot["assignee_user_id"] for snapshot in snapshots] == [self.user.id]
+
+    def test_reassign_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        new_assignee = self.create_user()
+
+        self.create_member(organization=self.organization, user=new_assignee, teams=[self.team])
+
+        with action_context_scope(source=ActionSource.SYSTEM):
+            GroupAssignee.objects.assign(group, self.user)
+
+        snapshots = self._update_groups_and_capture_snapshots(
+            group, {"assignedTo": f"user:{new_assignee.id}"}, produce_snapshot
+        )
+
+        assert GroupAssignee.objects.filter(group=group, user_id=new_assignee.id).exists()
+
+        assert [snapshot["assignee_user_id"] for snapshot in snapshots] == [new_assignee.id]
+
+    def test_unassign_emits_one_snapshot(self, produce_snapshot: Mock) -> None:
+        group = self.create_group(status=GroupStatus.UNRESOLVED, substatus=GroupSubStatus.ONGOING)
+
+        with action_context_scope(source=ActionSource.SYSTEM):
+            GroupAssignee.objects.assign(group, self.user)
+
+        snapshots = self._update_groups_and_capture_snapshots(
+            group, {"assignedTo": ""}, produce_snapshot
+        )
+
+        assert not GroupAssignee.objects.filter(group=group).exists()
+
+        assert [snapshot["assignee_user_id"] for snapshot in snapshots] == [None]
+
+
+class MergeGroupsTest(TestCase):
+    @patch("sentry.api.helpers.group_index.update.handle_merge")
+    def test_simple(self, mock_handle_merge: MagicMock) -> None:
+        group_ids = [self.create_group().id, self.create_group().id]
+        project = self.project
+
+        http_request = self.make_request(user=self.user, method="PUT")
+        qd = QueryDict(mutable=True)
+        qd.setlist("id", [str(i) for i in group_ids])
+        qd.setlist("project", [str(project.id)])
+        setattr(http_request, "GET", qd)
+        request = _wrap_request(http_request, data={"merge": 1})
+
+        group_list = get_group_list(self.organization.id, [project], group_ids)
+        update_groups(request, group_list)
+
+        call_args = mock_handle_merge.call_args.args
+
+        assert len(call_args) == 3
+        # Have to convert to ids because first argument is a queryset
+        assert [group.id for group in call_args[0]] == group_ids
+        assert call_args[1] == {project.id: project}
+        assert call_args[2] == self.user
+
+    @patch("sentry.api.helpers.group_index.update.handle_merge")
+    def test_multiple_projects(self, mock_handle_merge: MagicMock) -> None:
+        project1 = self.create_project()
+        project2 = self.create_project()
+        projects = [project1, project2]
+        project_ids = [project.id for project in projects]
+
+        group_ids = [
+            self.create_group(project1).id,
+            self.create_group(project2).id,
+        ]
+
+        http_request = self.make_request(user=self.user, method="PUT")
+        qd = QueryDict(mutable=True)
+        qd.setlist("id", [str(i) for i in group_ids])
+        qd.setlist("project", [str(i) for i in project_ids])
+        setattr(http_request, "GET", qd)
+        request = _wrap_request(http_request, data={"merge": 1})
+
+        group_list = get_group_list(self.organization.id, projects, group_ids)
+        response = update_groups(request, group_list)
+
+        assert response.data == {"detail": "Merging across multiple projects is not supported"}
+        assert response.status_code == 400
+        assert mock_handle_merge.call_count == 0
+
+    @patch("sentry.api.helpers.group_index.update.handle_merge")
+    def test_multiple_groups_same_project(self, mock_handle_merge: MagicMock) -> None:
+        """Even if the UI calls with multiple projects, if the groups belong to the same project, we should merge them."""
+        projects = [self.create_project(), self.create_project()]
+        proj1 = projects[0]
+        groups = [self.create_group(proj1), self.create_group(proj1)]
+        group_ids = [g.id for g in groups]
+        project_ids = [p.id for p in projects]
+
+        http_request = self.make_request(user=self.user, method="PUT")
+        qd = QueryDict(mutable=True)
+        qd.setlist("id", [str(i) for i in group_ids])
+        # The two groups belong to the same project, so we should be able to merge them, even though
+        # we're passing multiple project ids
+        qd.setlist("project", [str(i) for i in project_ids])
+        setattr(http_request, "GET", qd)
+        request = _wrap_request(http_request, data={"merge": 1})
+
+        group_list = get_group_list(self.organization.id, projects, group_ids)
+        update_groups(request, group_list)
+
+        call_args = mock_handle_merge.call_args.args
+
+        assert len(call_args) == 3
+        # Have to convert to ids because first argument is a queryset
+        assert sorted(group.id for group in call_args[0]) == sorted(group_ids)
+        assert call_args[1] == {proj1.id: proj1}
+        assert call_args[2] == self.user
+
+    @patch("sentry.api.helpers.group_index.update.handle_merge")
+    def test_no_project_ids_passed(self, mock_handle_merge: MagicMock) -> None:
+        """If 'All Projects' is selected in the issue stream, the UI doesn't send project ids, but
+        we should be able to derive them from the given group ids."""
+        group_ids = [self.create_group().id, self.create_group().id]
+        project = self.project
+
+        http_request = self.make_request(user=self.user, method="PUT")
+        qd = QueryDict(mutable=True)
+        qd.setlist("id", [str(i) for i in group_ids])
+        setattr(http_request, "GET", qd)
+        request = _wrap_request(http_request, data={"merge": 1})
+
+        group_list = get_group_list(self.organization.id, [project], group_ids)
+        update_groups(request, group_list)
+
+        call_args = mock_handle_merge.call_args.args
+
+        assert len(call_args) == 3
+        # Have to convert to ids because first argument is a queryset
+        assert sorted(group.id for group in call_args[0]) == sorted(group_ids)
+        assert call_args[1] == {project.id: project}
+        assert call_args[2] == self.user
+
+    def test_metrics(self) -> None:
+        for referer, expected_referer_tag in [
+            ("https://sentry.io/organizations/dogsaregreat/issues/", "issue stream"),
+            ("https://dogsaregreat.sentry.io/issues/", "issue stream"),
+            (
+                "https://sentry.io/organizations/dogsaregreat/issues/12311121/similar/",
+                "similar issues tab",
+            ),
+            (
+                "https://dogsaregreat.sentry.io/issues/12311121/similar/",
+                "similar issues tab",
+            ),
+            (
+                "https://sentry.io/organizations/dogsaregreat/some/other/path/",
+                "unknown",
+            ),
+            (
+                "https://dogsaregreat.sentry.io/some/other/path/",
+                "unknown",
+            ),
+            (
+                "",
+                "unknown",
+            ),
+        ]:
+            group_ids = [
+                self.create_group(
+                    platform="javascript",
+                    metadata={"sdk": {"name_normalized": "sentry.javascript.nextjs"}},
+                ).id,
+                self.create_group(
+                    platform="javascript",
+                    metadata={"sdk": {"name_normalized": "sentry.javascript.nextjs"}},
+                ).id,
+            ]
+            project = self.project
+
+            http_request = self.make_request(user=self.user, method="PUT")
+            http_request.META = {"HTTP_REFERER": referer}
+            qd = QueryDict(mutable=True)
+            qd.setlist("id", [str(i) for i in group_ids])
+            qd.setlist("project", [str(project.id)])
+            setattr(http_request, "GET", qd)
+            request = _wrap_request(http_request, data={"merge": 1})
+
+            with patch("sentry.api.helpers.group_index.update.metrics.incr") as mock_metrics_incr:
+                group_list = get_group_list(self.organization.id, [project], group_ids)
+                update_groups(request, group_list)
+
+                mock_metrics_incr.assert_any_call(
+                    "grouping.merge_issues",
+                    sample_rate=1.0,
+                    tags={
+                        "platform": "javascript",
+                        "referer": expected_referer_tag,
+                        "sdk": "sentry.javascript.nextjs",
+                    },
+                )
+
+
+class TestHandleIsSubscribed(TestCase):
+    def setUp(self) -> None:
+        self.group = self.create_group()
+        self.group_list = [self.group]
+        self.project_lookup = {self.group.project_id: self.group.project}
+
+    def test_is_subscribed(self) -> None:
+        resp = handle_is_subscribed(True, self.group_list, self.project_lookup, self.user)
+
+        assert GroupSubscription.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert resp["reason"] == "unknown"
+
+    def test_is_subscribed_updates(self) -> None:
+        GroupSubscription.objects.create(
+            group=self.group, project=self.group.project, user_id=self.user.id, is_active=False
+        )
+
+        resp = handle_is_subscribed(True, self.group_list, self.project_lookup, self.user)
+
+        subscription = GroupSubscription.objects.filter(group=self.group, user_id=self.user.id)
+        assert subscription.exists()
+        sub = subscription.first()
+        assert sub is not None
+        assert sub.is_active
+        assert resp["reason"] == "unknown"
+
+
+class TestHandleIsBookmarked(TestCase):
+    def setUp(self) -> None:
+        self.group = self.create_group()
+        self.group_list = [self.group]
+        self.group_ids = [self.group]
+        self.project_lookup = {self.group.project_id: self.group.project}
+
+    def test_is_bookmarked(self) -> None:
+        handle_is_bookmarked(True, self.group_list, self.project_lookup, self.user)
+
+        assert GroupBookmark.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group, user_id=self.user.id, reason=GroupSubscriptionReason.bookmark
+        ).exists()
+
+    def test_not_is_bookmarked(self) -> None:
+        GroupBookmark.objects.create(
+            group=self.group, user_id=self.user.id, project_id=self.group.project_id
+        )
+        GroupSubscription.objects.create(
+            project=self.group.project,
+            group=self.group,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.bookmark,
+        )
+        handle_is_bookmarked(False, self.group_list, self.project_lookup, self.user)
+
+        assert not GroupBookmark.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert not GroupSubscription.objects.filter(group=self.group, user_id=self.user.id).exists()
+
+
+class TestHandleHasSeen(TestCase):
+    def setUp(self) -> None:
+        self.group = self.create_group()
+        self.group_list = [self.group]
+        self.project_lookup = {self.group.project_id: self.group.project}
+
+    def test_has_seen(self) -> None:
+        handle_has_seen(True, self.group_list, self.project_lookup, [self.project], self.user)
+
+        assert GroupSeen.objects.filter(group=self.group, user_id=self.user.id).exists()
+
+    def test_not_has_seen(self) -> None:
+        GroupSeen.objects.create(
+            group=self.group, user_id=self.user.id, project_id=self.group.project_id
+        )
+
+        handle_has_seen(False, self.group_list, self.project_lookup, [self.project], self.user)
+
+        assert not GroupSeen.objects.filter(group=self.group, user_id=self.user.id).exists()
+
+
+class TestHandleIsPublic(TestCase):
+    def setUp(self) -> None:
+        self.group = self.create_group()
+        self.group_list = [self.group]
+        self.project_lookup = {self.group.project_id: self.group.project}
+
+    def test_is_public(self) -> None:
+        share_id = handle_is_public(True, self.group_list, self.project_lookup, self.user)
+
+        new_share = GroupShare.objects.get(group=self.group)
+        assert Activity.objects.filter(
+            group=self.group, type=ActivityType.SET_PUBLIC.value
+        ).exists()
+        assert not Activity.objects.filter(
+            group=self.group, type=ActivityType.SET_PRIVATE.value
+        ).exists()
+
+        assert share_id == new_share.uuid
+
+    def test_is_public_existing_shares(self) -> None:
+        share = GroupShare.objects.create(group=self.group, project=self.group.project)
+
+        share_id = handle_is_public(True, self.group_list, self.project_lookup, self.user)
+
+        new_share = GroupShare.objects.get(group=self.group)
+        assert Activity.objects.filter(
+            group=self.group, type=ActivityType.SET_PRIVATE.value
+        ).exists()
+        assert new_share != share
+        assert Activity.objects.filter(
+            group=self.group, type=ActivityType.SET_PUBLIC.value
+        ).exists()
+        assert share_id == new_share.uuid
+
+    def test_not_is_public(self) -> None:
+        GroupShare.objects.create(group=self.group, project=self.group.project)
+
+        share_id = handle_is_public(False, self.group_list, self.project_lookup, self.user)
+        assert Activity.objects.filter(
+            group=self.group, type=ActivityType.SET_PRIVATE.value
+        ).exists()
+        assert not GroupShare.objects.filter(group=self.group).exists()
+        assert not Activity.objects.filter(
+            group=self.group, type=ActivityType.SET_PUBLIC.value
+        ).exists()
+        assert share_id is None
+
+
+class TestHandleAssignedTo(TestCase):
+    def setUp(self) -> None:
+        self.group = self.create_group()
+        self.group_list = [self.group]
+        self.project_lookup = {self.group.project_id: self.group.project}
+
+    @patch("sentry.analytics.record")
+    def test_assigned_to(self, mock_record: Mock) -> None:
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(self.user.id),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert GroupAssignee.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to == {
+            "email": self.user.email,
+            "id": str(self.user.id),
+            "name": self.user.username,
+            "type": "user",
+        }
+        assert_last_analytics_event(
+            mock_record,
+            ManualIssueAssignment(
+                group_id=self.group.id,
+                organization_id=self.group.project.organization_id,
+                project_id=self.group.project_id,
+                assigned_by=None,
+                had_to_deassign=False,
+            ),
+        )
+
+    @patch("sentry.analytics.record")
+    def test_unassign(self, mock_record: Mock) -> None:
+        # first assign the issue
+        handle_assigned_to(
+            Actor.from_identifier(self.user.id),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+        assert GroupAssignee.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        # then unassign it
+        assigned_to = handle_assigned_to(
+            None, None, None, self.group_list, self.project_lookup, self.user
+        )
+
+        assert not GroupAssignee.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to is None
+        assert_last_analytics_event(
+            mock_record,
+            ManualIssueAssignment(
+                group_id=self.group.id,
+                organization_id=self.group.project.organization_id,
+                project_id=self.group.project_id,
+                assigned_by=None,
+                had_to_deassign=True,
+            ),
+        )
+
+    @patch("sentry.analytics.record")
+    def test_unassign_team(self, mock_record: Mock) -> None:
+        user1 = self.create_user("foo@example.com")
+        user2 = self.create_user("bar@example.com")
+        team1 = self.create_team()
+        member1 = self.create_member(user=user1, organization=self.organization, role="member")
+        member2 = self.create_member(user=user2, organization=self.organization, role="member")
+        self.create_team_membership(team1, member1, role="admin")
+        self.create_team_membership(team1, member2, role="admin")
+
+        # first assign the issue to team1
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(f"team:{team1.id}"),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert GroupAssignee.objects.filter(group=self.group, team_id=team1.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        # then unassign it
+        assigned_to = handle_assigned_to(
+            None, None, None, self.group_list, self.project_lookup, self.user
+        )
+
+        assert not GroupAssignee.objects.filter(group=self.group, team_id=team1.id).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to is None
+        assert_last_analytics_event(
+            mock_record,
+            ManualIssueAssignment(
+                group_id=self.group.id,
+                organization_id=self.group.project.organization_id,
+                project_id=self.group.project_id,
+                assigned_by=None,
+                had_to_deassign=True,
+            ),
+        )
+
+    @patch("sentry.analytics.record")
+    def test_reassign_user(self, mock_record: Mock) -> None:
+        user2 = self.create_user(email="meow@meow.meow")
+
+        # first assign the issue
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(self.user.id),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert GroupAssignee.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        # then assign it to someone else
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(user2.id),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert not GroupAssignee.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupAssignee.objects.filter(group=self.group, user_id=user2.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to == {
+            "email": user2.email,
+            "id": str(user2.id),
+            "name": user2.username,
+            "type": "user",
+        }
+        assert_last_analytics_event(
+            mock_record,
+            ManualIssueAssignment(
+                group_id=self.group.id,
+                organization_id=self.group.project.organization_id,
+                project_id=self.group.project_id,
+                assigned_by=None,
+                had_to_deassign=True,
+            ),
+        )
+        # pass assignedTo but it's the same as the existing assignee
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(user2.id),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+        # assert nothing has changed
+        assert not GroupAssignee.objects.filter(group=self.group, user_id=self.user.id).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=self.user.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupAssignee.objects.filter(group=self.group, user_id=user2.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to == {
+            "email": user2.email,
+            "id": str(user2.id),
+            "name": user2.username,
+            "type": "user",
+        }
+        assert_last_analytics_event(
+            mock_record,
+            ManualIssueAssignment(
+                group_id=self.group.id,
+                organization_id=self.group.project.organization_id,
+                project_id=self.group.project_id,
+                assigned_by=None,
+                had_to_deassign=False,
+            ),
+        )
+
+    @patch("sentry.analytics.record")
+    def test_reassign_team(self, mock_record: Mock) -> None:
+        user1 = self.create_user("foo@example.com")
+        user2 = self.create_user("bar@example.com")
+        team1 = self.create_team()
+        member1 = self.create_member(user=user1, organization=self.organization, role="member")
+        member2 = self.create_member(user=user2, organization=self.organization, role="member")
+        self.create_team_membership(team1, member1, role="admin")
+        self.create_team_membership(team1, member2, role="admin")
+
+        user3 = self.create_user("baz@example.com")
+        user4 = self.create_user("boo@example.com")
+        team2 = self.create_team()
+        member3 = self.create_member(user=user3, organization=self.organization, role="member")
+        member4 = self.create_member(user=user4, organization=self.organization, role="member")
+        self.create_team_membership(team2, member3, role="admin")
+        self.create_team_membership(team2, member4, role="admin")
+
+        # first assign the issue to team1
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(f"team:{team1.id}"),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert GroupAssignee.objects.filter(group=self.group, team=team1.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        # then assign it to team2
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(f"team:{team2.id}"),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert not GroupAssignee.objects.filter(group=self.group, team=team1.id).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert GroupAssignee.objects.filter(group=self.group, team=team2.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user3.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user4.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to == {
+            "id": str(team2.id),
+            "name": team2.slug,
+            "type": "team",
+        }
+        assert_last_analytics_event(
+            mock_record,
+            ManualIssueAssignment(
+                group_id=self.group.id,
+                organization_id=self.group.project.organization_id,
+                project_id=self.group.project_id,
+                assigned_by=None,
+                had_to_deassign=True,
+            ),
+        )
+
+    def test_user_in_reassigned_team(self) -> None:
+        """Test that the correct participants are present when re-assigning from user to team and vice versa"""
+        user1 = self.create_user("foo@example.com")
+        user2 = self.create_user("bar@example.com")
+        team1 = self.create_team()
+        member1 = self.create_member(user=user1, organization=self.organization, role="member")
+        member2 = self.create_member(user=user2, organization=self.organization, role="member")
+        self.create_team_membership(team1, member1, role="admin")
+        self.create_team_membership(team1, member2, role="admin")
+
+        # assign the issue to the team
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(f"team:{team1.id}"),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert GroupAssignee.objects.filter(group=self.group, team=team1.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        # then assign it to user1
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(user1.id),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+
+        assert GroupAssignee.objects.filter(group=self.group, user_id=user1.id).exists()
+        assert not GroupAssignee.objects.filter(group=self.group, team=team1.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert not GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+        assert assigned_to == {
+            "email": user1.email,
+            "id": str(user1.id),
+            "name": user1.username,
+            "type": "user",
+        }
+
+        # assign the issue back to the team
+        assigned_to = handle_assigned_to(
+            Actor.from_identifier(f"team:{team1.id}"),
+            None,
+            None,
+            self.group_list,
+            self.project_lookup,
+            self.user,
+        )
+        assert GroupAssignee.objects.filter(group=self.group, team=team1.id).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user1.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+        assert GroupSubscription.objects.filter(
+            group=self.group,
+            project=self.group.project,
+            user_id=user2.id,
+            reason=GroupSubscriptionReason.assigned,
+        ).exists()
+
+
+class DeleteGroupsTest(TestCase):
+    @patch("sentry.signals.issue_deleted.send_robust")
+    def test_delete_groups_simple(self, send_robust: Mock) -> None:
+        groups = [self.create_group(), self.create_group()]
+        group_ids = [group.id for group in groups]
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(f"id={group_ids[0]}&id={group_ids[1]}")
+        request = _wrap_request(http_request)
+        hashes = ["0" * 32, "1" * 32]
+        for i, group in enumerate(groups):
+            GroupHash.objects.create(project=self.project, group=group, hash=hashes[i])
+            add_group_to_inbox(group, GroupInboxReason.NEW)
+
+        with self.tasks():
+            schedule_tasks_to_delete_groups(request, [self.project], self.organization.id)
+
+        assert (
+            len(GroupHash.objects.filter(project_id=self.project.id, group_id__in=group_ids).all())
+            == 0
+        )
+        assert (
+            len(GroupInbox.objects.filter(project_id=self.project.id, group_id__in=group_ids).all())
+            == 0
+        )
+        assert send_robust.called
+
+    @patch(
+        "sentry.tasks.seer.delete_seer_grouping_records.delete_seer_grouping_records_by_hash.apply_async"
+    )
+    @patch("sentry.signals.issue_deleted.send_robust")
+    def test_delete_groups_deletes_seer_records_by_hash(
+        self, send_robust: Mock, mock_delete_seer_grouping_records_by_hash: MagicMock
+    ) -> None:
+        self.project.update_option("sentry:similarity_backfill_completed", int(time()))
+        request_context = ViewerContext(
+            actor=ContextActor(type=ActorType.USER, actor_id=self.user.id)
+        )
+
+        def assert_viewer_context(*_args: object, **_kwargs: object) -> None:
+            viewer_context = get_viewer_context()
+            assert isinstance(viewer_context, ViewerContext)
+            assert viewer_context.organization_id == self.organization.id
+            assert viewer_context.project_id == self.project.id
+            assert viewer_context.actor.actor_id == self.user.id
+            assert viewer_context.actor.type == ActorType.USER
+
+        mock_delete_seer_grouping_records_by_hash.side_effect = assert_viewer_context
+
+        groups = [self.create_group(), self.create_group()]
+        group_ids = [group.id for group in groups]
+        http_request = self.make_request(user=self.user, method="GET")
+        http_request.GET = QueryDict(f"id={group_ids[0]}&id={group_ids[1]}")
+        request = _wrap_request(http_request)
+        hashes = ["0" * 32, "1" * 32]
+        for i, group in enumerate(groups):
+            GroupHash.objects.create(project=self.project, group=group, hash=hashes[i])
+            add_group_to_inbox(group, GroupInboxReason.NEW)
+
+        with self.tasks(), viewer_context_scope(request_context):
+            schedule_tasks_to_delete_groups(request, [self.project], self.organization.id)
+
+        assert (
+            len(GroupHash.objects.filter(project_id=self.project.id, group_id__in=group_ids).all())
+            == 0
+        )
+        assert (
+            len(GroupInbox.objects.filter(project_id=self.project.id, group_id__in=group_ids).all())
+            == 0
+        )
+        assert send_robust.called
+        mock_delete_seer_grouping_records_by_hash.assert_called_with(
+            args=[self.project.id, hashes, 0]
+        )
+
+
+class GetSemverReleasesTest(TestCase):
+    def test_greatest_semver_releases_with_build_code(self) -> None:
+        """Test get_semver_releases orders releases by semver and build code."""
+        release_1 = self.create_release(version="test@2.2", project=self.project)
+        release_2 = self.create_release(version="test@10.0+1000", project=self.project)
+        release_3 = self.create_release(version="test@2.2-alpha", project=self.project)
+        release_4 = self.create_release(version="test@2.2.3", project=self.project)
+        release_5 = self.create_release(version="test@2.20.3", project=self.project)
+        release_6 = self.create_release(version="test@2.20.3.3", project=self.project)
+        release_7 = self.create_release(version="test@10.0+998", project=self.project)
+        release_8 = self.create_release(version="test@10.0+x22", project=self.project)
+        release_9 = self.create_release(version="test@10.0+a23", project=self.project)
+        release_10 = self.create_release(version="test@10.0", project=self.project)
+        release_11 = self.create_release(version="test@10.0-abc", project=self.project)
+        release_12 = self.create_release(version="test@10.0+999", project=self.project)
+        # Non-semver releases that will be filtered out by filter_to_semver()
+        self.create_release(version="test@some_thing", project=self.project)
+        self.create_release(version="random_junk", project=self.project)
+
+        releases = list(get_semver_releases(self.project))
+
+        expected_order = [
+            release_8,  # test@10.0+x22
+            release_9,  # test@10.0+a23
+            release_2,  # test@10.0+1000
+            release_12,  # test@10.0+999
+            release_7,  # test@10.0+998
+            release_10,  # test@10.0
+            release_11,  # test@10.0-abc
+            release_6,  # test@2.20.3.3
+            release_5,  # test@2.20.3
+            release_4,  # test@2.2.3
+            release_1,  # test@2.2
+            release_3,  # test@2.2-alpha
+        ]
+
+        assert len(releases) == len(expected_order)
+        assert [r.id for r in releases] == [r.id for r in expected_order]
+
+    def test_greatest_semver_release(self) -> None:
+        """Test that greatest_semver_release returns the highest version release."""
+        self.create_release(version="test@1.0", project=self.project)
+        release_2 = self.create_release(version="test@2.0", project=self.project)
+        self.create_release(version="test@1.5", project=self.project)
+
+        greatest = greatest_semver_release(self.project)
+        assert greatest is not None
+        assert greatest.id == release_2.id
+        assert greatest.version == "test@2.0"
+
+    def test_greatest_semver_release_with_build_code(self) -> None:
+        """Test that greatest_semver_release returns the highest version release with the highest build code."""
+        release_with_highest_build = self.create_release(
+            version="test@1.0+100", project=self.project
+        )
+        self.create_release(version="test@1.0+99", project=self.project)
+
+        greatest = greatest_semver_release(self.project)
+        assert greatest is not None
+        assert greatest.id == release_with_highest_build.id
+        assert greatest.version == "test@1.0+100"
+
+
+class TestHandleReleases(TestCase):
+    def test_excludes_archived_releases_from_helpers(self) -> None:
+        """archived releases should not be selected as the most recent release."""
+        open_release = self.create_release(
+            project=self.project,
+            version="test@1.0.0.0",
+            date_added=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+        self.create_release(
+            project=self.project,
+            version="test@1.1.0.0",
+            date_added=datetime(2024, 1, 2, tzinfo=UTC),
+            status=ReleaseStatus.ARCHIVED,
+        )
+
+        assert most_recent_release(self.project) == open_release
+        assert greatest_semver_release(self.project) == open_release
+
+        new_release = self.create_release(
+            project=self.project,
+            version="test@1.2.0.0",
+            date_added=datetime(2024, 1, 3, tzinfo=UTC),
+        )
+        assert most_recent_release(self.project) == new_release
+        assert greatest_semver_release(self.project) == new_release

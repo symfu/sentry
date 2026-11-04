@@ -1,0 +1,114 @@
+import styled from '@emotion/styled';
+import {IconGithub} from '@sentry/icons/github';
+import {IconGitlab} from '@sentry/icons/gitlab';
+import {IconSentry} from '@sentry/icons/sentry';
+
+import {Flex} from '@sentry/scraps/layout';
+import {TextArea} from '@sentry/scraps/textarea';
+
+import {Panel} from 'sentry/components/panels/panel';
+import {PanelBody} from 'sentry/components/panels/panelBody';
+import {PanelHeader} from 'sentry/components/panels/panelHeader';
+import {TimeSince} from 'sentry/components/timeSince';
+import {t} from 'sentry/locale';
+
+type Props = {
+  dateUpdated: string | null;
+  raw: string;
+  type: 'codeowners' | 'issueowners';
+  'data-test-id'?: string;
+  provider?: string;
+};
+
+export function RulesPanel({
+  raw,
+  dateUpdated,
+  provider,
+  type,
+  'data-test-id': dataTestId,
+}: Props) {
+  const icon =
+    provider === 'github' ? (
+      <IconGithub size="sm" />
+    ) : provider === 'gitlab' ? (
+      <IconGitlab size="sm" />
+    ) : (
+      <IconSentry size="sm" />
+    );
+
+  function renderTitle() {
+    switch (type) {
+      case 'codeowners':
+        return 'CODEOWNERS';
+      case 'issueowners':
+        return 'Ownership Rules';
+      default:
+        return null;
+    }
+  }
+
+  return (
+    <Panel data-test-id={dataTestId}>
+      <PanelHeader hasButtons>
+        <Flex align="center" gap="sm">
+          {icon}
+          {renderTitle()}
+        </Flex>
+        <Flex align="center" gap="sm">
+          {dateUpdated && (
+            <SyncDate>
+              {t('Last %s', type === 'codeowners' ? t('synced') : t('edited'))}{' '}
+              <TimeSince date={dateUpdated} />
+            </SyncDate>
+          )}
+        </Flex>
+      </PanelHeader>
+
+      <PanelBody>
+        <InnerPanelBody>
+          <StyledTextArea
+            monospace
+            readOnly
+            value={raw}
+            spellCheck="false"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+          />
+        </InnerPanelBody>
+      </PanelBody>
+    </Panel>
+  );
+}
+
+const InnerPanelBody = styled(PanelBody)`
+  height: auto;
+`;
+
+const StyledTextArea = styled(TextArea)`
+  height: 350px !important;
+  overflow: auto;
+  outline: 0;
+  width: 100%;
+  resize: none;
+  margin: 0;
+  word-break: break-all;
+  white-space: pre-wrap;
+  line-height: ${p => p.theme.space['2xl']};
+  border: none;
+  box-shadow: none;
+  color: transparent;
+  text-shadow: 0 0 0 #9386a0;
+
+  &:hover,
+  &:focus,
+  &:active {
+    border: none;
+    box-shadow: none;
+  }
+`;
+
+const SyncDate = styled('div')`
+  font-weight: ${p => p.theme.font.weight.sans.regular};
+  text-transform: none;
+`;

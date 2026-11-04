@@ -1,0 +1,285 @@
+import {useMemo, useState} from 'react';
+import styled from '@emotion/styled';
+import {IconChevron} from '@sentry/icons/chevron';
+import {useQuery} from '@tanstack/react-query';
+import memoize from 'lodash/memoize';
+
+import {Button, ButtonBar} from '@sentry/scraps/button';
+import {CompactSelect} from '@sentry/scraps/compactSelect';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Switch} from '@sentry/scraps/switch';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+import {Heading, Text} from '@sentry/scraps/text';
+
+import {sentryAppWebhookRequestsApiOptions} from 'sentry/actionCreators/sentryApps';
+import {DateTime} from 'sentry/components/dateTime';
+import InteractionStateLayer from 'sentry/components/interactionStateLayer';
+import {LoadingError} from 'sentry/components/loadingError';
+import {PerformanceDuration} from 'sentry/components/performanceDuration';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {t} from 'sentry/locale';
+import type {SentryApp, SentryAppSchemaIssueLink} from 'sentry/types/integrations';
+import {shouldUse24Hours} from 'sentry/utils/dates';
+import {defined} from 'sentry/utils/defined';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {granularWebhookEvents} from 'sentry/views/settings/organizationDeveloperSettings/constants';
+
+import {useRequestLogDetailsDrawer} from './requestLogDetails';
+import {ResponseCode} from './responseCode';
+import {getWebhookSubjectLabel, WebhookSubject} from './webhookSubjects';
+
+const REQUEST_COLUMNS: TableColumnConfig[] = [
+  {key: 'time', width: '1fr'},
+  {key: 'statusCode', width: '0.5fr'},
+  {key: 'organization', width: '1fr'},
+  {key: 'eventType', width: '1fr'},
+  {key: 'subjectType', width: '0.75fr'},
+  {key: 'subjectId', width: '1fr'},
+  {key: 'duration', width: '0.5fr'},
+];
+
+const INTERNAL_REQUEST_COLUMNS = REQUEST_COLUMNS.filter(
+  column => column.key !== 'organization'
+);
+
+const ALL_EVENTS = t('All Events');
+const MAX_PER_PAGE = 10;
+const EMPTY_VALUE = '—';
+
+const componentHasSelectUri = (issueLinkComponent: SentryAppSchemaIssueLink): boolean => {
+  const hasSelectUri = (fields: any[]): boolean =>
+    fields.some(field => field.type === 'select' && 'uri' in field);
+
+  const createHasSelectUri =
+    hasSelectUri(issueLinkComponent.create.required_fields) ||
+    hasSelectUri(issueLinkComponent.create.optional_fields || []);
+
+  const linkHasSelectUri =
+    hasSelectUri(issueLinkComponent.link.required_fields) ||
+    hasSelectUri(issueLinkComponent.link.optional_fields || []);
+
+  return createHasSelectUri || linkHasSelectUri;
+};
+
+const getEventTypes = memoize((app: SentryApp) => {
+  // TODO(nola): ideally this would be kept in sync with EXTENDED_VALID_EVENTS on the backend
+
+  let issueLinkEvents: string[] = [];
+  const issueLinkComponent = (app.schema.elements || []).find(
+    element => element.type === 'issue-link'
+  );
+  if (issueLinkComponent) {
+    issueLinkEvents = ['external_issue.created', 'external_issue.linked'];
+    if (componentHasSelectUri(issueLinkComponent)) {
+      issueLinkEvents.push('select_options.requested');
+    }
+  }
+
+  const events = [
+    ALL_EVENTS,
+    // Internal apps don't have installation webhooks
+    ...(app.status === 'internal'
+      ? []
+      : ['installation.created', 'installation.deleted']),
+    ...granularWebhookEvents(app.webhookEvents),
+    ...(app.isAlertable
+      ? [
+          'event_alert.triggered',
+          'metric_alert.open',
+          'metric_alert.resolved',
+          'metric_alert.critical',
+          'metric_alert.warning',
+        ]
+      : []),
+    ...issueLinkEvents,
+  ];
+
+  return events;
+});
+
+interface RequestLogProps {
+  app: SentryApp;
+}
+
+export function RequestLog({app}: RequestLogProps) {
+  const organization = useOrganization();
+  const timeFormat = shouldUse24Hours() ? 'MMM D, YYYY HH:mm:ss z' : 'll LTS z';
+  const [currentPage, setCurrentPage] = useState(0);
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const [eventType, setEventType] = useState(ALL_EVENTS);
+
+  const {slug, status} = app;
+  const isInternal = status === 'internal';
+  const openDetails = useRequestLogDetailsDrawer({isInternal, organization});
+
+  const {
+    data: requests = [],
+    isPending,
+    isError,
+  } = useQuery(
+    sentryAppWebhookRequestsApiOptions({
+      appSlug: slug,
+      eventType: eventType === ALL_EVENTS ? undefined : eventType,
+      errorsOnly: errorsOnly || undefined,
+    })
+  );
+
+  const currentRequests = useMemo(
+    () => requests.slice(currentPage * MAX_PER_PAGE, (currentPage + 1) * MAX_PER_PAGE),
+    [currentPage, requests]
+  );
+
+  const hasNextPage = (currentPage + 1) * MAX_PER_PAGE < requests.length;
+  const hasPrevPage = currentPage > 0;
+
+  const handleChangeEventType = (newEventType: string) => {
+    setEventType(newEventType);
+    setCurrentPage(0);
+  };
+
+  const handleChangeErrorsOnly = () => {
+    setErrorsOnly(!errorsOnly);
+    setCurrentPage(0);
+  };
+
+  return (
+    <Stack gap="xl">
+      <Stack gap="md">
+        <Heading as="h5">{t('Request Log')}</Heading>
+
+        <Text>
+          {t(
+            'This log shows the status of any outgoing webhook requests from Sentry to your integration.'
+          )}
+        </Text>
+
+        <Flex align="center" gap="2xl">
+          <CompactSelect
+            trigger={triggerProps => (
+              <OverlayTrigger.Button {...triggerProps}>{eventType}</OverlayTrigger.Button>
+            )}
+            value={eventType}
+            options={getEventTypes(app).map(type => ({
+              value: type,
+              label: type,
+            }))}
+            onChange={opt => handleChangeEventType(opt?.value)}
+          />
+
+          <Flex as="label" align="center" gap="md" marginBottom="0">
+            <Text>{t('Errors Only')}</Text>
+            <Switch checked={errorsOnly} onChange={handleChangeErrorsOnly} />
+          </Flex>
+        </Flex>
+      </Stack>
+
+      {isError ? (
+        <LoadingError />
+      ) : (
+        <SimpleTable
+          columns={isInternal ? INTERNAL_REQUEST_COLUMNS : REQUEST_COLUMNS}
+          header={
+            <SimpleTable.HeaderRow>
+              <SimpleTable.HeaderCell>{t('Time')}</SimpleTable.HeaderCell>
+              <SimpleTable.HeaderCell>{t('Status Code')}</SimpleTable.HeaderCell>
+              {!isInternal && (
+                <SimpleTable.HeaderCell>{t('Organization')}</SimpleTable.HeaderCell>
+              )}
+              <SimpleTable.HeaderCell>{t('Event Type')}</SimpleTable.HeaderCell>
+              <SimpleTable.HeaderCell>{t('Subject Type')}</SimpleTable.HeaderCell>
+              <SimpleTable.HeaderCell>{t('Subject ID')}</SimpleTable.HeaderCell>
+              <SimpleTable.HeaderCell>{t('Duration')}</SimpleTable.HeaderCell>
+            </SimpleTable.HeaderRow>
+          }
+        >
+          {isPending && <SimpleTable.Loading />}
+
+          {!isPending && currentRequests.length === 0 && (
+            <SimpleTable.Empty>
+              {t('No requests found in the last 30 days.')}
+            </SimpleTable.Empty>
+          )}
+
+          {!isPending &&
+            currentRequests.map((request, idx) => (
+              <SimpleTable.Row
+                key={currentPage * MAX_PER_PAGE + idx}
+                data-test-id="request-item"
+              >
+                <SimpleTable.RowCell>
+                  <RowButton
+                    aria-label={t('View request details')}
+                    onClick={() => openDetails(request)}
+                  >
+                    <InteractionStateLayer />
+                    <Text>
+                      <DateTime date={request.date} format={timeFormat} />
+                    </Text>
+                  </RowButton>
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  <ResponseCode code={request.responseCode} />
+                </SimpleTable.RowCell>
+                {!isInternal && (
+                  <SimpleTable.RowCell>
+                    <Text ellipsis>{request.organization?.name}</Text>
+                  </SimpleTable.RowCell>
+                )}
+                <SimpleTable.RowCell>
+                  <Text ellipsis>{request.eventType}</Text>
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  <Text ellipsis>{getWebhookSubjectLabel(request.subjectType)}</Text>
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  <WebhookSubject
+                    subjectType={request.subjectType}
+                    subjectId={request.subjectId}
+                    isInternal={isInternal}
+                    organization={organization}
+                    display="id"
+                  />
+                </SimpleTable.RowCell>
+                <SimpleTable.RowCell>
+                  {defined(request.durationMs) ? (
+                    <PerformanceDuration milliseconds={request.durationMs} abbreviation />
+                  ) : (
+                    <Text>{EMPTY_VALUE}</Text>
+                  )}
+                </SimpleTable.RowCell>
+              </SimpleTable.Row>
+            ))}
+        </SimpleTable>
+      )}
+
+      <Flex justify="end">
+        <ButtonBar>
+          <Button
+            icon={<IconChevron direction="left" />}
+            onClick={() => setCurrentPage(currentPage - 1)}
+            disabled={!hasPrevPage}
+            aria-label={t('Previous page')}
+          />
+          <Button
+            icon={<IconChevron direction="right" />}
+            onClick={() => setCurrentPage(currentPage + 1)}
+            disabled={!hasNextPage}
+            aria-label={t('Next page')}
+          />
+        </ButtonBar>
+      </Flex>
+    </Stack>
+  );
+}
+
+const RowButton = styled('button')`
+  ${SimpleTable.rowLinkStyle}
+
+  background: none;
+  border: none;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  flex-grow: 1;
+`;

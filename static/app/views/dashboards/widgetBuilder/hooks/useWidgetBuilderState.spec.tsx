@@ -1,0 +1,2748 @@
+import {act, renderHookWithProviders} from 'sentry-test/reactTestingLibrary';
+
+import {
+  explodeField,
+  type AggregationKeyWithAlias,
+  type Column,
+} from 'sentry/utils/discover/fields';
+import {DisplayType, WidgetType} from 'sentry/views/dashboards/types';
+import {WidgetBuilderProvider} from 'sentry/views/dashboards/widgetBuilder/contexts/widgetBuilderContext';
+import {
+  BuilderStateAction,
+  useWidgetBuilderState,
+} from 'sentry/views/dashboards/widgetBuilder/hooks/useWidgetBuilderState';
+import {serializeFields} from 'sentry/views/dashboards/widgetBuilder/utils/serialization.ts';
+import {FieldValueKind} from 'sentry/views/discover/table/types';
+
+type Query = Record<string, string | number | string[]>;
+
+function renderWidgetBuilderState(query: Query = {}) {
+  return renderHookWithProviders(() => useWidgetBuilderState(), {
+    additionalWrapper: WidgetBuilderProvider,
+    initialRouterConfig: {location: {pathname: '/mock-pathname/', query}},
+  });
+}
+
+/**
+ * nuqs queues URL writes behind a timer, so tests that assert on the URL have
+ * to let that queue drain first.
+ */
+function flushUrlUpdates() {
+  act(() => {
+    jest.runAllTimers();
+  });
+}
+
+describe('useWidgetBuilderState', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    // nuqs' update queue is a module singleton, so anything a test leaves
+    // pending would be applied on top of the next test's initial URL.
+    flushUrlUpdates();
+    jest.useRealTimers();
+    jest.clearAllMocks();
+  });
+
+  it('returns the widget builder state from the query params', () => {
+    const {result} = renderWidgetBuilderState({
+      title: 'test',
+      description: 'lalala this is a description',
+    });
+
+    expect(result.current.state.title).toBe('test');
+    expect(result.current.state.description).toBe('lalala this is a description');
+  });
+
+  it('sets the new title and description in the query params', () => {
+    const {result, router} = renderWidgetBuilderState();
+    act(() => {
+      result.current.dispatch({
+        type: BuilderStateAction.SET_TITLE,
+        payload: 'new title',
+      });
+    });
+
+    act(() => {
+      result.current.dispatch({
+        type: BuilderStateAction.SET_DESCRIPTION,
+        payload: 'new description',
+      });
+    });
+
+    flushUrlUpdates();
+
+    expect(router.location.query).toEqual(expect.objectContaining({title: 'new title'}));
+    expect(router.location.query).toEqual(
+      expect.objectContaining({description: 'new description'})
+    );
+  });
+
+  it('defers the url write while a field is still being typed into', () => {
+    const {result, router} = renderWidgetBuilderState();
+
+    act(() => {
+      result.current.dispatch(
+        {
+          type: BuilderStateAction.SET_TITLE,
+          payload: 'new title',
+        },
+        {debounceUrl: true}
+      );
+    });
+
+    // Readable straight away, but nothing has reached the URL yet
+    expect(result.current.state.title).toBe('new title');
+    expect(router.location.query).toEqual({});
+
+    // Committing writes it through, cancelling the pending debounce
+    act(() => {
+      result.current.dispatch({
+        type: BuilderStateAction.SET_TITLE,
+        payload: 'new title',
+      });
+    });
+    flushUrlUpdates();
+
+    expect(router.location.query).toEqual(expect.objectContaining({title: 'new title'}));
+  });
+
+  describe('display type', () => {
+    it('returns the display type from the query params', () => {
+      const {result} = renderWidgetBuilderState({displayType: DisplayType.AREA});
+
+      expect(result.current.state.displayType).toBe(DisplayType.AREA);
+    });
+
+    it('returns a default display type from the query params when the display type is not valid', () => {
+      const {result} = renderWidgetBuilderState({displayType: 'invalid'});
+
+      expect(result.current.state.displayType).toBe(DisplayType.TABLE);
+    });
+
+    it('sets the display type in the query params', () => {
+      const {result, router} = renderWidgetBuilderState();
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.AREA,
+        });
+      });
+
+      flushUrlUpdates();
+
+      expect(router.location.query).toEqual(
+        expect.objectContaining({displayType: DisplayType.AREA})
+      );
+    });
+
+    it('persists the values when going from timeseries to timeseries', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: ['event.type'],
+        yAxis: ['count()', 'count_unique(user)'],
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.LINE);
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+      ]);
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.AREA,
+        });
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.AREA);
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+      ]);
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('concatenates the values when going from timeseries to table', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: ['event.type'],
+        yAxis: ['count()', 'count_unique(user)'],
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.LINE);
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+      ]);
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.TABLE);
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('separates the values when going from table to timeseries', () => {
+      // remember, this takes up to 3 yAxes
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        field: [
+          'event.type',
+          'potato',
+          'count()',
+          'count_unique(user)',
+          'count_unique(potato)',
+          'count_unique(thisIsRemoved)',
+        ],
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.TABLE);
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {field: 'potato', alias: undefined, kind: 'field'},
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'potato', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'thisIsRemoved', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.LINE);
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {field: 'potato', alias: undefined, kind: 'field'},
+      ]);
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'potato', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('does not duplicate fields when switching dataset in line chart then display type to table', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        dataset: WidgetType.ERRORS,
+        yAxis: ['count()'],
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.fields).toEqual([]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('does not duplicate fields when changing display from table to chart', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        dataset: WidgetType.ERRORS,
+        field: ['count()'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.SPANS,
+        });
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', 'span.duration', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.yAxis).toEqual([]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', 'span.duration', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('does not duplicate fields when switching dataset in big number then display type to table', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.BIG_NUMBER,
+        dataset: WidgetType.ERRORS,
+        field: ['count()'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.yAxis).toEqual([]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('sets the aggregate as fields when switching to big number', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        field: ['event.type', 'count()'],
+        sort: ['-count()'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.BIG_NUMBER,
+        });
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('selects the first filter when switching to big number', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['event.type', 'count()', 'count_unique(user)'],
+        query: ['event.type:test', 'event.type:test2'],
+      });
+
+      expect(result.current.state.query).toEqual(['event.type:test', 'event.type:test2']);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.BIG_NUMBER,
+        });
+      });
+
+      expect(result.current.state.query).toEqual(['event.type:test']);
+    });
+
+    it('keeps only aggregates and clears sort when switching to heat map', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['event.type', 'count()'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.HEATMAP,
+        });
+      });
+
+      // Columns are dropped; only the aggregate ("Visualize") remains.
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('drops equations when switching to heat map', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['count()', 'equation|count() * 2'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.HEATMAP,
+        });
+      });
+
+      // Only the non-equation aggregate survives.
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('normalizes the aggregate to count() when switching to heat map', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['sum(value,test_metric,distribution,none)'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.HEATMAP,
+        });
+      });
+
+      // The metric is preserved but the function becomes count() — heat maps
+      // always count the metric's value, so the chosen function is irrelevant.
+      expect(result.current.state.fields).toEqual([
+        {
+          kind: 'function',
+          function: ['count', 'value', 'test_metric', 'distribution', 'none'],
+          alias: undefined,
+        },
+      ]);
+    });
+
+    it('drops non-distribution metrics when switching to heat map', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['sum(value,test_metric,counter,none)'],
+        dataset: WidgetType.TRACEMETRICS,
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.HEATMAP,
+        });
+      });
+
+      // Counters can't be heat-mapped, so the metric is dropped and the slot
+      // falls back to the metric-less default (the picker then auto-selects a
+      // distribution metric). The fallback aggregate is count(), not the
+      // default sum() — heat maps always count() the metric.
+      expect(result.current.state.fields).toEqual([
+        {
+          kind: 'function',
+          function: ['count', 'value', undefined, undefined],
+          alias: undefined,
+        },
+      ]);
+    });
+
+    it('selects the first filter when switching to heat map', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['event.type', 'count()'],
+        query: ['event.type:test', 'event.type:test2'],
+      });
+
+      expect(result.current.state.query).toEqual(['event.type:test', 'event.type:test2']);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.HEATMAP,
+        });
+      });
+
+      expect(result.current.state.query).toEqual(['event.type:test']);
+    });
+
+    it('resets selectedAggregate when the display type is switched', () => {
+      const {result} = renderWidgetBuilderState({selectedAggregate: '0'});
+
+      expect(result.current.state.selectedAggregate).toBeUndefined();
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.selectedAggregate).toBeUndefined();
+    });
+
+    it('preserves thresholds when switching to a display type that supports thresholds', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.BIG_NUMBER,
+        thresholds: '{"max_values":{"max1":200,"max2":300},"unit":"milliseconds"}',
+      });
+
+      expect(result.current.state.thresholds).toEqual({
+        max_values: {max1: 200, max2: 300},
+        unit: 'milliseconds',
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.thresholds).toEqual({
+        max_values: {max1: 200, max2: 300},
+        unit: 'milliseconds',
+      });
+    });
+
+    it('removes the threshold time window when switching to a big number', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.LINE,
+        thresholds:
+          '{"max_values":{"max1":200,"max2":300},"unit":null,"timeWindow":"10m"}',
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.BIG_NUMBER,
+        });
+      });
+
+      expect(result.current.state.thresholds).toEqual({
+        max_values: {max1: 200, max2: 300},
+        unit: null,
+      });
+    });
+
+    it('resets thresholds when switching to a display type that does not support thresholds', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.BIG_NUMBER,
+        thresholds: '{"max_values":{"max1":200,"max2":300},"unit":"milliseconds"}',
+      });
+
+      expect(result.current.state.thresholds).toEqual({
+        max_values: {max1: 200, max2: 300},
+        unit: 'milliseconds',
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.thresholds).toBeUndefined();
+    });
+
+    it('sets sort to first available sortable field when switching to release table', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        dataset: WidgetType.RELEASE,
+        field: ['environment', 'crash_free_rate(session)'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {field: 'crash_free_rate(session)', kind: 'desc'},
+      ]);
+    });
+
+    it('sets sort to empty array when switching to release table and no sortable fields are available', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        dataset: WidgetType.RELEASE,
+        field: ['project', 'count_errored(session)'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('sets sort to default sort when switching to chart from non sortable release fields', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.RELEASE,
+        field: ['project', 'count_errored(session)'],
+        displayType: DisplayType.TABLE,
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {field: 'crash_free_rate(session)', kind: 'desc'},
+      ]);
+    });
+
+    it('adds the default y-axis when switching a table to a chart with no aggregate', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.TRANSACTIONS,
+        displayType: DisplayType.TABLE,
+        field: ['transaction'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.fields).toEqual([
+        {field: 'transaction', alias: undefined, kind: 'field'},
+      ]);
+    });
+
+    it('resets limit when the display type is switched to table', () => {
+      const {result} = renderWidgetBuilderState({limit: '3'});
+
+      expect(result.current.state.limit).toBe(3);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.limit).toBeUndefined();
+    });
+
+    it('resets the limit to a valid option when the display type is switched to a chart', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        field: [
+          'count()',
+          'count_unique(user)',
+          'count_web_vitals(measurements.lcp, good)',
+          'project',
+          'environment',
+        ],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.limit).toBe(3);
+    });
+
+    it('does not reset the limit when switching between timeseries charts', () => {
+      // One query and one y-axis is the most permissible setup
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        limit: '3',
+        field: ['project'],
+        yAxis: ['count()'],
+        query: [''],
+      });
+
+      expect(result.current.state.limit).toBe(3);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.AREA,
+        });
+      });
+
+      expect(result.current.state.limit).toBe(3);
+    });
+  });
+
+  describe('dataset', () => {
+    it('returns the dataset from the query params', () => {
+      const {result} = renderWidgetBuilderState({dataset: WidgetType.ISSUE});
+
+      expect(result.current.state.dataset).toBe(WidgetType.ISSUE);
+    });
+
+    it('sets the dataset in the query params', () => {
+      const {result, router} = renderWidgetBuilderState();
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRACEMETRICS,
+        });
+      });
+
+      flushUrlUpdates();
+
+      expect(router.location.query).toEqual(
+        expect.objectContaining({dataset: WidgetType.TRACEMETRICS})
+      );
+    });
+
+    it('returns errors as the default dataset', () => {
+      const {result} = renderWidgetBuilderState({dataset: 'invalid'});
+
+      expect(result.current.state.dataset).toBe(WidgetType.ERRORS);
+    });
+
+    it('resets the display type to table when the dataset is switched to issues', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.TRANSACTIONS,
+        displayType: DisplayType.LINE,
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.LINE);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.ISSUE,
+        });
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.TABLE);
+    });
+
+    it('resets display type to first supported type when switching to dataset with limited display types', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.TRANSACTIONS,
+        displayType: DisplayType.TABLE,
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.TABLE);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.PREPROD_APP_SIZE,
+        });
+      });
+
+      // PREPROD_APP_SIZE only supports LINE, so TABLE should be reset to LINE
+      expect(result.current.state.displayType).toBe(DisplayType.LINE);
+    });
+
+    it('resets the fields, yAxis, query, and sort when the dataset is switched', () => {
+      const {result} = renderWidgetBuilderState({
+        title: 'This title should persist',
+        description: 'This description should persist',
+        dataset: WidgetType.TRANSACTIONS,
+        field: ['event.type', 'potato', 'count()'],
+        yAxis: ['count()', 'count_unique(user)'],
+        query: ['event.type = "test"'],
+        sort: ['-testField'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.SPANS,
+        });
+      });
+
+      expect(result.current.state.title).toBe('This title should persist');
+      expect(result.current.state.description).toBe('This description should persist');
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count', 'span.duration', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.yAxis).toEqual([]);
+      expect(result.current.state.query).toEqual(['']);
+      expect(result.current.state.sort).toEqual([
+        {
+          field: 'count(span.duration)',
+          kind: 'desc',
+        },
+      ]);
+    });
+
+    it('resets the yAxis when the dataset is switched from anything to issues', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.TRANSACTIONS,
+        yAxis: ['count()', 'count_unique(user)'],
+        displayType: DisplayType.LINE,
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.ISSUE,
+        });
+      });
+
+      expect(result.current.state.yAxis).toEqual([]);
+    });
+
+    it('resets the sort when the display type is switched and the sort is not in the new fields', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: ['testField', 'testField2'],
+        sort: ['-project.name'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'project.name', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {
+          field: 'testField',
+          kind: 'desc',
+        },
+      ]);
+    });
+
+    it('keeps sort when the sort is in the new fields', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: ['testField', 'testField2'],
+        sort: ['-testField'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'testField', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {
+          field: 'testField',
+          kind: 'desc',
+        },
+      ]);
+    });
+
+    it('resets selectedAggregate when the dataset is switched', () => {
+      const {result} = renderWidgetBuilderState({
+        selectedAggregate: '0',
+        displayType: DisplayType.BIG_NUMBER,
+        field: ['count_unique(1)', 'count_unique(2)'],
+      });
+
+      expect(result.current.state.selectedAggregate).toBe(0);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.SPANS,
+        });
+      });
+
+      expect(result.current.state.selectedAggregate).toBeUndefined();
+    });
+
+    it('resets the sort when the dataset is switched for big number widgets', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.BIG_NUMBER,
+        sort: ['-testField'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'testField', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('resets thresholds when the dataset is switched', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.BIG_NUMBER,
+        thresholds: '{"max_values":{"max1":200,"max2":300},"unit":"milliseconds"}',
+      });
+
+      expect(result.current.state.thresholds).toEqual({
+        max_values: {max1: 200, max2: 300},
+        unit: 'milliseconds',
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.thresholds).toBeUndefined();
+    });
+
+    it('resets the legend alias when the dataset is switched', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.LINE,
+        legendAlias: ['test'],
+      });
+
+      expect(result.current.state.legendAlias).toEqual(['test']);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.legendAlias).toEqual([]);
+    });
+  });
+
+  describe('fields', () => {
+    it('returns the fields from the query params', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['event.type', 'potato', 'count()'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {field: 'potato', alias: undefined, kind: 'field'},
+        {
+          alias: undefined,
+          kind: 'function',
+          function: ['count', '', undefined, undefined],
+        },
+      ]);
+    });
+
+    it('decodes both JSON formatted fields and non-JSON formatted fields', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['{"field": "event.type", "alias": "test"}', 'p90(transaction.duration)'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: 'test', kind: 'field'},
+        {
+          function: ['p90', 'transaction.duration', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('encodes fields to JSON when they have aliases', () => {
+      const fields = [
+        {field: 'event.type', alias: 'test', kind: FieldValueKind.FIELD},
+        {field: 'event.type', alias: undefined, kind: FieldValueKind.FIELD},
+      ] as Column[];
+      const encodedFields = serializeFields(fields);
+      expect(encodedFields).toEqual([
+        '{"field":"event.type","alias":"test"}',
+        'event.type',
+      ]);
+    });
+
+    it('round trips every field shape through the field and yAxis query params', () => {
+      const columns = [
+        explodeField({field: 'event.type'}),
+        explodeField({field: 'event.type', alias: 'type'}),
+        explodeField({field: 'count()', alias: 'total "events" {x} [y]'}),
+        explodeField({field: 'p90(transaction.duration)'}),
+        explodeField({field: 'count_if(transaction,equals,"{a}")'}),
+        explodeField({field: 'equation|count() * 2'}),
+        explodeField({field: 'equation|count() / 2', alias: 'half'}),
+        explodeField({field: 'calculated|score'}),
+        explodeField({field: '123'}),
+        explodeField({field: 'null'}),
+        explodeField({field: '"quoted"'}),
+      ];
+      const encoded = serializeFields(columns);
+
+      const {result} = renderWidgetBuilderState({field: encoded, yAxis: encoded});
+
+      expect(result.current.state.fields).toEqual(columns);
+      expect(result.current.state.yAxis).toEqual(columns);
+      expect(serializeFields(result.current.state.fields ?? [])).toEqual(encoded);
+      expect(serializeFields(result.current.state.yAxis ?? [])).toEqual(encoded);
+    });
+
+    it.each([
+      '123',
+      'true',
+      'null',
+      '"quoted"',
+      '[1]',
+      '{}',
+      '{"alias":"test"}',
+      '{"field":123,"alias":"test"}',
+      '{"field":null}',
+      '{"field":"event.type"',
+    ])('decodes %s as a plain field when it is not a field object', field => {
+      const {result} = renderWidgetBuilderState({field: [field], yAxis: [field]});
+
+      expect(result.current.state.fields).toEqual([
+        {field, alias: undefined, kind: 'field'},
+      ]);
+      expect(result.current.state.yAxis).toEqual([
+        {field, alias: undefined, kind: 'field'},
+      ]);
+    });
+
+    it.each([
+      ['{"field":"event.type"}', undefined],
+      ['{"field":"event.type","alias":""}', ''],
+      ['{"field":"event.type","alias":"test","width":100}', 'test'],
+      ['{"field":"event.type","alias":5}', undefined],
+      ['{"field":"event.type","alias":true}', undefined],
+      ['{"field":"event.type","alias":null}', undefined],
+      ['{"field":"event.type","alias":{"name":"test"}}', undefined],
+    ])('decodes %s with the alias %p', (field, alias) => {
+      const {result} = renderWidgetBuilderState({field: [field]});
+
+      expect(result.current.state.fields).toStrictEqual([
+        {field: 'event.type', alias, kind: 'field'},
+      ]);
+    });
+
+    it('decodes JSON and plain fields from a SET_STATE payload', () => {
+      const {result} = renderWidgetBuilderState();
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_STATE,
+          payload: {
+            field: ['{"field":"event.type","alias":"type"}', '123'],
+            yAxis: ['{"field":"count()","alias":5}', 'null'],
+          },
+        });
+      });
+
+      expect(result.current.state.fields).toStrictEqual([
+        {field: 'event.type', alias: 'type', kind: 'field'},
+        {field: '123', alias: undefined, kind: 'field'},
+      ]);
+      expect(result.current.state.yAxis).toStrictEqual([
+        {function: ['count', ''], alias: undefined, kind: 'function'},
+        {field: 'null', alias: undefined, kind: 'field'},
+      ]);
+    });
+
+    it('wipes the alias when the dataset is switched', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ERRORS,
+        displayType: DisplayType.TABLE,
+        field: ['{"field":"event.type","alias":"test"}'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: 'test', kind: FieldValueKind.FIELD},
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('wipes the alias when the display type is switched', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        field: ['{"field":"count()","alias":"test"}'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {function: ['count', '', undefined, undefined], alias: 'test', kind: 'function'},
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.LINE,
+        });
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('resets the sort when the field that is being sorted is removed', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['testField'],
+        sort: ['-testField'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'testField', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [{field: 'testField2', kind: FieldValueKind.FIELD}],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'testField2', kind: 'desc'}]);
+    });
+
+    it('modifies the sort when the field that is being sorted is modified', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['testField', 'sortField'],
+        sort: ['-sortField'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'sortField', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [
+            {field: 'testField', kind: FieldValueKind.FIELD},
+            {field: 'newSortField', kind: FieldValueKind.FIELD},
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'newSortField', kind: 'desc'}]);
+    });
+
+    it('does not reset the table sort for issue widgets', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.ISSUE,
+        field: ['testField'],
+        sort: ['-notInFields'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'notInFields', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [{field: 'testField', kind: FieldValueKind.FIELD}],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'notInFields', kind: 'desc'}]);
+    });
+
+    it('adds a default sort when adding a grouping for a timeseries chart', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: [],
+        yAxis: ['count()'],
+      });
+
+      expect(result.current.state.yAxis).toEqual([
+        {function: ['count', '', undefined, undefined], kind: 'function'},
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [{field: 'browser.name', kind: FieldValueKind.FIELD}],
+        });
+      });
+
+      // The y-axis takes priority
+      expect(result.current.state.sort).toEqual([{field: 'count()', kind: 'desc'}]);
+    });
+
+    it('ensures that default sort is not an equation', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: [],
+        yAxis: ['equation|count()+1', 'count()'],
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [{field: 'browser.name', kind: FieldValueKind.FIELD}],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'count()', kind: 'desc'}]);
+    });
+
+    it('ensures the sort is not a disabled release sort option', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.RELEASE,
+        field: ['environment, project, crash_free_rate(session)'],
+        sort: ['-crash_free_rate(session)'],
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {field: 'crash_free_rate(session)', kind: 'desc'},
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [
+            {field: 'environment', kind: FieldValueKind.FIELD},
+            {field: 'project', kind: FieldValueKind.FIELD},
+            {
+              function: ['count_errored', 'session', undefined, undefined, undefined],
+              kind: FieldValueKind.FUNCTION,
+            } as unknown as Column,
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('has no sort when only sortable release field is removed', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.RELEASE,
+        field: ['release', 'project', 'count_errored(session)'],
+        sort: ['-release'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'release', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [
+            {field: 'project', kind: FieldValueKind.FIELD},
+            {
+              function: ['count_errored', 'session', undefined, undefined, undefined],
+              kind: FieldValueKind.FUNCTION,
+            } as unknown as Column,
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('still has no sort when unsortable release field is added', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.RELEASE,
+        field: ['project', 'count_errored(session)'],
+        sort: [],
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [
+            {field: 'environment', kind: FieldValueKind.FIELD},
+            {field: 'project', kind: FieldValueKind.FIELD},
+            {
+              function: ['count_errored', 'session', undefined, undefined, undefined],
+              kind: FieldValueKind.FUNCTION,
+            } as unknown as Column,
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('keeps original sort when an unsortable release field is added', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.RELEASE,
+        field: ['crash_free_rate(session)'],
+        sort: ['-crash_free_rate(session)'],
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {field: 'crash_free_rate(session)', kind: 'desc'},
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [
+            {field: 'project', kind: FieldValueKind.FIELD},
+            {
+              function: ['crash_free_rate', 'session', undefined, undefined, undefined],
+              kind: FieldValueKind.FUNCTION,
+            } as unknown as Column,
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {field: 'crash_free_rate(session)', kind: 'desc'},
+      ]);
+    });
+
+    it('always assigns a limit when there is a y-axis', () => {
+      const {result} = renderWidgetBuilderState({
+        yAxis: ['count()', 'count_unique(user)'],
+        fields: ['event.type'],
+        displayType: DisplayType.LINE,
+        dataset: WidgetType.ERRORS,
+        limit: '5',
+      });
+
+      expect(result.current.state.limit).toBe(5);
+
+      // Changing the dataset will unset the limit
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.TRANSACTIONS,
+        });
+      });
+
+      expect(result.current.state.limit).toBeUndefined();
+
+      // Changing the dataset back and applying a grouping should set a limit
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.ERRORS,
+        });
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [{field: 'event.type', kind: FieldValueKind.FIELD}],
+        });
+      });
+
+      expect(result.current.state.limit).toBe(5);
+    });
+
+    it('preserves the breakdown legend type when there are multiple group bys', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: ['testField'],
+        yAxis: ['count()'],
+        legendType: 'breakdown',
+      });
+
+      expect(result.current.state.legendType).toBe('breakdown');
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_FIELDS,
+          payload: [
+            {field: 'testField', kind: FieldValueKind.FIELD},
+            {field: 'testField2', kind: FieldValueKind.FIELD},
+          ],
+        });
+      });
+
+      expect(result.current.state.legendType).toBe('breakdown');
+    });
+  });
+
+  describe('transformations', () => {
+    it('updates or clears one aggregate across filters without changing sibling pipelines', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        yAxis: ['count()', 'avg(span.duration)'],
+        query: ['environment:prod', 'environment:staging'],
+        transformations: '[{"0":["fill(zero)"]},{"0":["fill(linear)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_AGGREGATE_TRANSFORMATIONS,
+          payload: {index: 1, transformations: ['fill(locf)', 'smooth(sma,5)']},
+        });
+      });
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(zero)'], 1: ['fill(locf)', 'smooth(sma,5)']},
+        {0: ['fill(linear)'], 1: ['fill(locf)', 'smooth(sma,5)']},
+      ]);
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_AGGREGATE_TRANSFORMATIONS,
+          payload: {index: 1, transformations: []},
+        });
+      });
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(zero)']},
+        {0: ['fill(linear)']},
+      ]);
+    });
+
+    it('moves equation pipelines when equations are reordered', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        yAxis: ['count()', 'equation|count() * 2'],
+        transformations: '[{"1":["smooth(sma,3)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {kind: FieldValueKind.EQUATION, field: 'count() * 2'},
+            {kind: FieldValueKind.FUNCTION, function: ['count', '']},
+          ],
+          sourceIndices: [1, 0],
+        });
+      });
+      expect(result.current.state.transformations).toEqual([{0: ['smooth(sma,3)']}]);
+    });
+
+    it('keeps pipelines aligned through duplicate-axis moves, edits, additions, and deletion', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        yAxis: ['count()', 'count()', 'avg(span.duration)'],
+        query: ['environment:prod', 'environment:staging'],
+        transformations:
+          '[{"0":["fill(zero)"],"1":["fill(locf)"],"2":["smooth(sma,3)"]},{"0":["fill(linear)"],"1":["smooth(ema,4,0.5)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {kind: FieldValueKind.FUNCTION, function: ['count', '']},
+            {kind: FieldValueKind.FUNCTION, function: ['avg', 'span.duration']},
+            {kind: FieldValueKind.FUNCTION, function: ['count', '']},
+          ],
+          sourceIndices: [1, 2, 0],
+        });
+      });
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(locf)'], 1: ['smooth(sma,3)'], 2: ['fill(zero)']},
+        {0: ['smooth(ema,4,0.5)'], 2: ['fill(linear)']},
+      ]);
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {kind: FieldValueKind.FUNCTION, function: ['p95', 'span.duration']},
+            ...(result.current.state.yAxis ?? []).slice(1),
+            {kind: FieldValueKind.FUNCTION, function: ['count', '']},
+          ],
+        });
+      });
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(locf)'], 1: ['smooth(sma,3)'], 2: ['fill(zero)']},
+        {0: ['smooth(ema,4,0.5)'], 2: ['fill(linear)']},
+      ]);
+      act(() => {
+        result.current.dispatch({type: BuilderStateAction.DELETE_AGGREGATE, payload: 1});
+      });
+      expect(serializeFields(result.current.state.yAxis ?? [])).toEqual([
+        'p95(span.duration)',
+        'count()',
+        'count()',
+      ]);
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(locf)'], 1: ['fill(zero)']},
+        {0: ['smooth(ema,4,0.5)'], 1: ['fill(linear)']},
+      ]);
+    });
+
+    it('removes a filter pipeline and copies the first pipeline for an appended filter', () => {
+      const {result} = renderWidgetBuilderState({
+        yAxis: ['count()'],
+        query: ['environment:prod', 'environment:staging', 'environment:dev'],
+        transformations:
+          '[{"0":["fill(zero)"]},{"0":["fill(locf)"]},{"0":["smooth(sma,3)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_QUERY,
+          payload: ['environment:prod', 'environment:dev'],
+          removedQueryIndex: 1,
+        });
+      });
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(zero)']},
+        {0: ['smooth(sma,3)']},
+      ]);
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_QUERY,
+          payload: ['environment:prod', 'environment:dev', 'environment:test'],
+        });
+      });
+      expect(result.current.state.transformations).toEqual([
+        {0: ['fill(zero)']},
+        {0: ['smooth(sma,3)']},
+        {0: ['fill(zero)']},
+      ]);
+    });
+
+    it('clears previous pipelines when loading a widget without transformations', () => {
+      const {result} = renderWidgetBuilderState({
+        transformations: '[{"0":["fill(zero)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_STATE,
+          payload: {
+            dataset: WidgetType.LOGS,
+            displayType: DisplayType.LINE,
+            yAxis: ['count()'],
+          },
+        });
+      });
+      expect(result.current.state.dataset).toBe(WidgetType.LOGS);
+      expect(result.current.state.transformations).toBeUndefined();
+    });
+
+    it('loads pipelines when setting the state', () => {
+      const {result} = renderWidgetBuilderState();
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_STATE,
+          payload: {
+            dataset: WidgetType.SPANS,
+            displayType: DisplayType.LINE,
+            yAxis: ['count()', 'count()'],
+            transformations: '[{"1":["fill(zero)"]}]',
+          },
+        });
+      });
+      expect(result.current.state.transformations).toEqual([{1: ['fill(zero)']}]);
+    });
+
+    it('clears previous pipelines when loading a widget with malformed transformations', () => {
+      const {result} = renderWidgetBuilderState({
+        transformations: '[{"0":["fill(zero)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_STATE,
+          payload: {
+            dataset: WidgetType.SPANS,
+            displayType: DisplayType.LINE,
+            yAxis: ['count()'],
+            transformations: '[{"0":"fill(zero)"}]',
+          },
+        });
+      });
+      expect(result.current.state.transformations).toBeUndefined();
+    });
+
+    it('writes pipelines to the URL as JSON', () => {
+      const {result, router} = renderWidgetBuilderState({yAxis: ['count()', 'count()']});
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_AGGREGATE_TRANSFORMATIONS,
+          payload: {index: 1, transformations: ['fill(zero)']},
+        });
+      });
+      flushUrlUpdates();
+      expect(router.location.query.transformations).toBe('[{"1":["fill(zero)"]}]');
+    });
+
+    it.each([
+      'not json',
+      '{"0":["fill(zero)"]}',
+      '[null]',
+      '[["fill(zero)"]]',
+      '[{"-1":["fill(zero)"]}]',
+      '[{"1.5":["fill(zero)"]}]',
+      '[{"0":"fill(zero)"}]',
+      '[{"0":[1]}]',
+    ])('ignores malformed transformation URL data %s', transformations => {
+      const {result} = renderWidgetBuilderState({yAxis: ['count()'], transformations});
+      expect(serializeFields(result.current.state.yAxis ?? [])).toEqual(['count()']);
+      expect(result.current.state.transformations).toBeUndefined();
+    });
+
+    it('normalizes non-canonical transformation indices from the URL', () => {
+      const {result} = renderWidgetBuilderState({
+        yAxis: ['count()', 'count()'],
+        transformations: '[{"01":["fill(zero)"]}]',
+      });
+      expect(result.current.state.transformations).toEqual([{1: ['fill(zero)']}]);
+    });
+
+    it('retains pipelines for timeseries chart changes and clears them on dataset changes', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        yAxis: ['count()'],
+        transformations: '[{"0":["fill(zero)"]}]',
+      });
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.AREA,
+        });
+      });
+      expect(result.current.state.transformations).toEqual([{0: ['fill(zero)']}]);
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.LOGS,
+        });
+      });
+      expect(result.current.state.dataset).toBe(WidgetType.LOGS);
+      expect(result.current.state.transformations).toBeUndefined();
+    });
+  });
+
+  describe('yAxis', () => {
+    it('does not conflict with fields when setting the state', () => {
+      const {result} = renderWidgetBuilderState({
+        field: ['event.type', 'potato', 'count()'],
+        yAxis: ['count()', 'count_unique(user)'],
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: 'field'},
+        {field: 'potato', alias: undefined, kind: 'field'},
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['count_unique', 'user', undefined, undefined],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+    });
+
+    it('clears the sort when the y-axis changes and there is no grouping', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: [],
+        yAxis: ['count()'],
+        sort: ['-count()'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'count()', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {function: ['count_unique', 'user', undefined, undefined], kind: 'function'},
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([]);
+    });
+
+    it('updates the limit when the y-axis changes', () => {
+      const {result} = renderWidgetBuilderState({
+        limit: '5',
+        field: ['event.type'],
+        yAxis: ['count()', 'count_unique(user)'],
+      });
+
+      expect(result.current.state.limit).toBe(5);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {function: ['count', '', undefined, undefined], kind: 'function'},
+            {function: ['count_unique', 'user', undefined, undefined], kind: 'function'},
+            {function: ['count_unique', 'title', undefined, undefined], kind: 'function'},
+          ],
+        });
+      });
+
+      // The resulting limit should be at max 3
+      expect(result.current.state.limit).toBe(3);
+    });
+  });
+
+  describe('sort', () => {
+    it('normalizes aggregate argument separators in the builder state and URL', () => {
+      const {result, router} = renderWidgetBuilderState({
+        dataset: WidgetType.TRACEMETRICS,
+        sort: ['-sum_if(`environment:"prod, us"`, value, alpha_metric, counter, none)'],
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {
+          field: 'sum_if(`environment:"prod, us"`,value,alpha_metric,counter,none)',
+          kind: 'desc',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_SORT,
+          payload: [
+            {
+              field: 'sum_if(`environment:prod`, value, alpha_metric, counter, none)',
+              kind: 'asc',
+            },
+          ],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {
+          field: 'sum_if(`environment:prod`,value,alpha_metric,counter,none)',
+          kind: 'asc',
+        },
+      ]);
+      flushUrlUpdates();
+      expect(router.location.query.sort).toBe(
+        'sum_if(`environment:prod`,value,alpha_metric,counter,none)'
+      );
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_STATE,
+          payload: {
+            sort: ['-sum_if(`environment:staging`, value, alpha_metric, counter, none)'],
+          },
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {
+          field: 'sum_if(`environment:staging`,value,alpha_metric,counter,none)',
+          kind: 'desc',
+        },
+      ]);
+    });
+
+    it('can decode and update sorts', () => {
+      const {result} = renderWidgetBuilderState({
+        sort: ['-testField'],
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'testField', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_SORT,
+          payload: [{field: 'testField', kind: 'asc'}],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([{field: 'testField', kind: 'asc'}]);
+    });
+
+    it('correctly reverses sort between events (freq) and last seen (date) field', () => {
+      const {result} = renderWidgetBuilderState({
+        sort: ['freq'],
+        dataset: WidgetType.ISSUE,
+      });
+
+      // We expect desc even though freq doesn't use '-'
+      expect(result.current.state.sort).toEqual([{field: 'freq', kind: 'desc'}]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_SORT,
+          payload: [{field: 'date', kind: 'desc'}],
+        });
+      });
+
+      // Expect it to switch back to asc for other issue fields
+      expect(result.current.state.sort).toEqual([{field: 'date', kind: 'asc'}]);
+    });
+  });
+
+  describe('limit', () => {
+    it('can decode and update limit', () => {
+      const {result} = renderWidgetBuilderState({
+        limit: '4',
+      });
+
+      expect(result.current.state.limit).toBe(4);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_LIMIT,
+          payload: 10,
+        });
+      });
+
+      expect(result.current.state.limit).toBe(10);
+    });
+  });
+
+  describe('legendAlias', () => {
+    it('can decode and update legendAlias', () => {
+      const {result} = renderWidgetBuilderState({
+        legendAlias: ['test', 'test2'],
+      });
+
+      expect(result.current.state.legendAlias).toEqual(['test', 'test2']);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_LEGEND_ALIAS,
+          payload: ['test3', 'test4'],
+        });
+      });
+
+      expect(result.current.state.legendAlias).toEqual(['test3', 'test4']);
+    });
+  });
+
+  describe('linkedDashboards', () => {
+    it('keeps the valid linked dashboards when the URL has a malformed one', () => {
+      const {result} = renderWidgetBuilderState({
+        linkedDashboards: [
+          '{"dashboardId":5,"field":"project"}',
+          'not json',
+          '{"dashboardId":"6","field":"transaction"}',
+        ],
+      });
+
+      expect(result.current.state.linkedDashboards).toEqual([
+        {dashboardId: '5', field: 'project'},
+        {dashboardId: '6', field: 'transaction'},
+      ]);
+    });
+
+    it('keeps the valid linked dashboards when SET_STATE has a malformed one', () => {
+      const {result} = renderWidgetBuilderState();
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_STATE,
+          payload: {
+            linkedDashboards: ['not json', '{"dashboardId":6,"field":"transaction"}'],
+          },
+        });
+      });
+
+      expect(result.current.state.linkedDashboards).toEqual([
+        {dashboardId: '6', field: 'transaction'},
+      ]);
+    });
+  });
+
+  describe('selectedAggregate', () => {
+    it('can decode and update selectedAggregate', () => {
+      const {result} = renderWidgetBuilderState({
+        selectedAggregate: '0',
+        displayType: DisplayType.BIG_NUMBER,
+        field: ['count()', 'count_unique(user)'],
+      });
+
+      expect(result.current.state.selectedAggregate).toBe(0);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_SELECTED_AGGREGATE,
+          payload: 1,
+        });
+      });
+
+      expect(result.current.state.selectedAggregate).toBe(1);
+    });
+
+    it('can set selectedAggregate to undefined in the URL', () => {
+      const {result, router} = renderWidgetBuilderState({
+        selectedAggregate: '0',
+        displayType: DisplayType.BIG_NUMBER,
+        field: ['count()', 'count_unique(user)'],
+      });
+
+      expect(result.current.state.selectedAggregate).toBe(0);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_SELECTED_AGGREGATE,
+          payload: undefined,
+        });
+      });
+
+      // If selectedAggregate is undefined in the URL, then the widget builder state
+      // will set the selectedAggregate to the last aggregate
+      expect(result.current.state.selectedAggregate).toBe(1);
+
+      flushUrlUpdates();
+
+      expect(router.location.query).not.toHaveProperty('selectedAggregate');
+    });
+  });
+
+  describe('thresholds', () => {
+    it('writes thresholds to the URL as JSON when SET_THRESHOLDS is dispatched', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_THRESHOLDS,
+          payload: {
+            max_values: {max1: 100, max2: 200},
+            unit: 'seconds',
+            preferredPolarity: '+',
+          },
+        });
+      });
+      flushUrlUpdates();
+
+      expect(router.location.query.thresholds).toBe(
+        '{"max_values":{"max1":100,"max2":200},"unit":"seconds","preferredPolarity":"+"}'
+      );
+    });
+
+    it('ignores thresholds when the URL value is malformed', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        thresholds: '{"max_values":{"max1":"abc","max2":200}}',
+      });
+
+      expect(result.current.state.thresholds).toBeUndefined();
+    });
+  });
+
+  describe('traceMetric', () => {
+    it('resets sort when SET_Y_AXIS changes aggregates for trace metrics', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.TRACEMETRICS,
+        displayType: DisplayType.LINE,
+        field: ['project'],
+        yAxis: ['sum(value,my.metric,counter,none)'],
+        sort: ['-sum(value,my.metric,counter,none)'],
+      });
+
+      // Dispatch SET_Y_AXIS with a different aggregate (simulating metric change)
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {
+              kind: 'function',
+              function: ['avg', 'value', 'other.metric', 'gauge', 'none'],
+            },
+          ] as Column[],
+        });
+      });
+
+      // Sort should be updated to the new aggregate
+      expect(result.current.state.sort).toEqual([
+        {kind: 'desc', field: 'avg(value,other.metric,gauge,none)'},
+      ]);
+    });
+
+    it('preserves sort when SET_Y_AXIS keeps the same aggregate string for trace metrics', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.TRACEMETRICS,
+        displayType: DisplayType.LINE,
+        field: ['project'],
+        yAxis: ['sum(value,my.metric,counter,none)'],
+        sort: ['-sum(value,my.metric,counter,none)'],
+      });
+
+      // Dispatch SET_Y_AXIS with the same aggregate (e.g., adding a second one)
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {
+              kind: 'function',
+              function: ['sum', 'value', 'my.metric', 'counter', 'none'],
+            },
+            {
+              kind: 'function',
+              function: ['avg', 'value', 'my.metric', 'counter', 'none'],
+            },
+          ] as Column[],
+        });
+      });
+
+      // Sort should remain on sum since it's still present
+      expect(result.current.state.sort).toEqual([
+        {kind: 'desc', field: 'sum(value,my.metric,counter,none)'},
+      ]);
+    });
+
+    it('retargets sort when SET_Y_AXIS applies a spans series filter', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        field: ['transaction'],
+        yAxis: ['avg(span.duration)'],
+        sort: ['-avg(span.duration)'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {
+              kind: 'function',
+              function: ['avg_if', '`span.op:db`', 'span.duration'],
+            },
+          ] as Column[],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {kind: 'desc', field: 'avg_if(`span.op:db`,span.duration)'},
+      ]);
+    });
+
+    it('retargets sort onto the edited series when SET_Y_AXIS changes a non-first y-axis', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        field: ['transaction'],
+        yAxis: ['avg(span.duration)', 'p95(span.duration)'],
+        sort: ['-p95(span.duration)'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_Y_AXIS,
+          payload: [
+            {
+              kind: 'function',
+              function: ['avg', 'span.duration'],
+            },
+            {
+              kind: 'function',
+              function: ['p95_if', '`span.op:db`', 'span.duration'],
+            },
+          ] as Column[],
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([
+        {kind: 'desc', field: 'p95_if(`span.op:db`,span.duration)'},
+      ]);
+    });
+
+    it('retargets sort to equation[N] when DELETE_AGGREGATE leaves an equation', () => {
+      const {result} = renderWidgetBuilderState({
+        dataset: WidgetType.SPANS,
+        displayType: DisplayType.LINE,
+        field: ['transaction'],
+        yAxis: ['count(span.duration)', 'equation|count(span.duration) / 5'],
+        sort: ['-count(span.duration)'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.DELETE_AGGREGATE,
+          payload: 0,
+        });
+      });
+
+      expect(result.current.state.sort).toEqual([{kind: 'desc', field: 'equation[0]'}]);
+    });
+
+    it('preserves trace metric args when switching from line to categorical bar', () => {
+      const {result, router} = renderWidgetBuilderState({
+        dataset: WidgetType.TRACEMETRICS,
+        displayType: DisplayType.LINE,
+        yAxis: [
+          'sum(value,my.metric,counter,none)',
+          'per_second(value,my.metric,counter,none)',
+        ],
+      });
+
+      // Verify initial yAxis has args preserved from deserialization.
+      // explodeFieldString puts the first 3 args into function[1..3] and
+      // stores all args in the args array when there are more than 3.
+      expect(result.current.state.yAxis).toEqual([
+        {
+          function: ['sum', 'value', 'my.metric', 'counter', 'none'],
+          alias: undefined,
+          kind: 'function',
+        },
+        {
+          function: ['per_second', 'value', 'my.metric', 'counter', 'none'],
+          alias: undefined,
+          kind: 'function',
+        },
+      ]);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.CATEGORICAL_BAR,
+        });
+      });
+
+      flushUrlUpdates();
+
+      // yAxis should be cleared
+      expect(router.location.query).not.toHaveProperty('yAxis');
+
+      // fields should contain the default X-axis (project) plus both aggregates with args
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          field: serializeFields([
+            {kind: FieldValueKind.FIELD, field: 'project'},
+            {
+              kind: FieldValueKind.FUNCTION,
+              function: ['sum', 'value', 'my.metric', 'counter', 'none'],
+            },
+            {
+              kind: FieldValueKind.FUNCTION,
+              function: [
+                'per_second' as AggregationKeyWithAlias,
+                'value',
+                'my.metric',
+                'counter',
+                'none',
+              ],
+            },
+          ]),
+        })
+      );
+
+      // sort should reference the full aggregate string with args
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          sort: '-per_second(value,my.metric,counter,none)',
+        })
+      );
+    });
+  });
+
+  describe('categorical bar chart actions', () => {
+    it('updates only the X-axis field with SET_CATEGORICAL_X_AXIS', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', '', undefined, undefined],
+          },
+        ]),
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_CATEGORICAL_X_AXIS,
+          payload: 'project',
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Should preserve aggregates while updating X-axis
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          field: serializeFields([
+            {kind: FieldValueKind.FIELD, field: 'project'},
+            {
+              kind: FieldValueKind.FUNCTION,
+              function: ['count', '', undefined, undefined],
+            },
+          ]),
+        })
+      );
+    });
+
+    it('resets sort to first aggregate when X-axis changes and sort was on old X-axis', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', '', undefined, undefined],
+          },
+        ]),
+        sort: ['-transaction'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_CATEGORICAL_X_AXIS,
+          payload: 'project',
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Sort should be reset to first aggregate
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          sort: '-count()',
+        })
+      );
+    });
+
+    it('preserves sort when X-axis changes but sort was on aggregate', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', '', undefined, undefined],
+          },
+        ]),
+        sort: ['-count()'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_CATEGORICAL_X_AXIS,
+          payload: 'project',
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Sort should NOT change since it was already on an aggregate
+      expect(router.location.query).toEqual(expect.objectContaining({sort: '-count()'}));
+    });
+
+    it('preserves equation as aggregate when switching to categorical bar', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        field: ['event.type', 'equation|count() / 5'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.CATEGORICAL_BAR,
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Equation should be preserved as the aggregate
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          field: serializeFields([
+            {kind: FieldValueKind.FIELD, field: 'event.type'},
+            {kind: FieldValueKind.EQUATION, field: 'count() / 5'},
+          ]),
+        })
+      );
+
+      // Sort should use equation[0] alias format
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          sort: '-equation[0]',
+        })
+      );
+    });
+
+    it('preserves equation aggregate and equation sort when X-axis changes', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {kind: FieldValueKind.EQUATION, field: 'count() / 5'},
+        ]),
+        sort: ['-equation[0]'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_CATEGORICAL_X_AXIS,
+          payload: 'release',
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Equation should be preserved in fields
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          field: serializeFields([
+            {kind: FieldValueKind.FIELD, field: 'release'},
+            {kind: FieldValueKind.EQUATION, field: 'count() / 5'},
+          ]),
+        })
+      );
+
+      // Sort should NOT be reset since equation[0] is still valid
+      expect(router.location.query).toEqual(
+        expect.objectContaining({sort: '-equation[0]'})
+      );
+    });
+
+    it('resets sort when X-axis changes and sort was on a stale equation alias', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', '', undefined, undefined],
+          },
+        ]),
+        sort: ['-equation[0]'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_CATEGORICAL_X_AXIS,
+          payload: 'release',
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Sort should be reset to first aggregate since there are no equations in fields
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          sort: '-count()',
+        })
+      );
+    });
+
+    it('preserves all aggregates and equations when switching from line to categorical bar', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.LINE,
+        field: [],
+        yAxis: ['count()', 'equation|count() / 5'],
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.CATEGORICAL_BAR,
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Both the function and equation should be preserved
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          field: serializeFields([
+            {kind: FieldValueKind.FIELD, field: 'title'},
+            {
+              kind: FieldValueKind.FUNCTION,
+              function: ['count', '', undefined, undefined],
+            },
+            {kind: FieldValueKind.EQUATION, field: 'count() / 5'},
+          ]),
+        })
+      );
+
+      // Sort should be on the last aggregate (equation) by default
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          sort: '-equation[0]',
+        })
+      );
+    });
+
+    it('selectedAggregate defaults to last aggregate for categorical bar with multiple aggregates', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', '', undefined, undefined],
+          },
+          {kind: FieldValueKind.EQUATION, field: 'count() / 5'},
+        ]),
+      });
+
+      // selectedAggregate should default to the last aggregate index (1, since
+      // there are 2 aggregates: count() and equation)
+      expect(result.current.state.selectedAggregate).toBe(1);
+    });
+
+    it('selectedAggregate is undefined for categorical bar with single aggregate', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'transaction'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', '', undefined, undefined],
+          },
+        ]),
+      });
+
+      // selectedAggregate should be undefined when there's only one aggregate
+      expect(result.current.state.selectedAggregate).toBeUndefined();
+    });
+
+    it('sets default X-axis and aggregate when dataset changes with categorical bar', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.CATEGORICAL_BAR,
+        dataset: WidgetType.SPANS,
+        field: serializeFields([
+          {kind: FieldValueKind.FIELD, field: 'browser.name'},
+          {
+            kind: FieldValueKind.FUNCTION,
+            function: ['count', 'span.duration', undefined, undefined],
+          },
+        ]),
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DATASET,
+          payload: WidgetType.ERRORS,
+        });
+      });
+
+      flushUrlUpdates();
+
+      // Each state setter makes a separate navigate call - check each one
+      // Should set default X-axis field and aggregate for new dataset
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          // Errors dataset defaults: title (X-axis) + count_unique(user) (aggregate)
+          field: serializeFields([
+            {kind: FieldValueKind.FIELD, field: 'title'},
+            {
+              kind: FieldValueKind.FUNCTION,
+              function: ['count_unique', 'user', undefined, undefined],
+            },
+          ]),
+        })
+      );
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          sort: '-count_unique(user)',
+        })
+      );
+      expect(router.location.query).toEqual(
+        expect.objectContaining({
+          limit: '20',
+        })
+      );
+    });
+  });
+  describe('text widget actions', () => {
+    it('clears fields, yAxis, query, sort, limit, and dataset when switching to text display type', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        dataset: WidgetType.ERRORS,
+        field: ['event.type', 'count()'],
+        query: ['event.type:error'],
+        sort: ['-count()'],
+        limit: '5',
+      });
+
+      expect(result.current.state.fields).toEqual([
+        {field: 'event.type', alias: undefined, kind: FieldValueKind.FIELD},
+        {
+          function: ['count', '', undefined, undefined],
+          alias: undefined,
+          kind: FieldValueKind.FUNCTION,
+        },
+      ]);
+      expect(result.current.state.query).toEqual(['event.type:error']);
+      expect(result.current.state.sort).toEqual([{field: 'count()', kind: 'desc'}]);
+      expect(result.current.state.limit).toBe(5);
+      expect(result.current.state.dataset).toBe(WidgetType.ERRORS);
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TEXT,
+        });
+      });
+
+      expect(result.current.state.displayType).toBe(DisplayType.TEXT);
+      expect(result.current.state.fields).toEqual([]);
+      expect(result.current.state.yAxis).toEqual([]);
+      expect(result.current.state.query).toEqual(['']);
+      expect(result.current.state.sort).toEqual([]);
+      expect(result.current.state.limit).toBeUndefined();
+      expect(result.current.state.dataset).toBeUndefined();
+    });
+
+    it('moves URL description into textContent when switching to text display type', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TABLE,
+        description: 'existing description',
+      });
+
+      expect(result.current.state.description).toBe('existing description');
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TEXT,
+        });
+      });
+
+      // The URL description is moved into local textContent state
+      expect(result.current.state.textContent!).toBe('existing description');
+      // And cleared from the URL-backed description field
+      expect(result.current.state.description).toBeUndefined();
+    });
+
+    it('clears textContent when switching away from text display type', () => {
+      const {result} = renderWidgetBuilderState({
+        displayType: DisplayType.TEXT,
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_TEXT_CONTENT,
+          payload: 'text widget content',
+        });
+      });
+
+      expect(result.current.state.textContent!).toBe('text widget content');
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_DISPLAY_TYPE,
+          payload: DisplayType.TABLE,
+        });
+      });
+
+      expect(result.current.state.textContent).toBeUndefined();
+    });
+
+    it('SET_TEXT_CONTENT updates textContent without navigating', () => {
+      const {result, router} = renderWidgetBuilderState({
+        displayType: DisplayType.TEXT,
+      });
+
+      act(() => {
+        result.current.dispatch({
+          type: BuilderStateAction.SET_TEXT_CONTENT,
+          payload: 'new text content',
+        });
+      });
+
+      flushUrlUpdates();
+
+      expect(result.current.state.textContent!).toBe('new text content');
+      // Text content must not be written to the URL to avoid excessive URL length
+      expect(router.location.query).not.toHaveProperty('textContent');
+    });
+  });
+});

@@ -1,0 +1,555 @@
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple
+
+from django.db import IntegrityError, router, transaction
+
+from sentry.integrations.models.repository_project_path_config import RepositoryProjectPathConfig
+from sentry.integrations.source_code_management.path import (
+    is_absolute_scm_path,
+    normalize_repository_source_root,
+    normalize_scm_path,
+)
+from sentry.integrations.source_code_management.repo_trees import (
+    RepoAndBranch,
+    RepoTree,
+)
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.models.projectrepository import ProjectRepository, ProjectRepositorySource
+from sentry.models.repository import Repository
+from sentry.utils import metrics
+from sentry.utils.event_frames import EventFrame, try_munge_frame_path
+
+from .constants import METRIC_PREFIX
+from .errors import (
+    DoesNotFollowJavaPackageNamingConvention,
+    MissingModuleOrAbsPath,
+    NeedsExtension,
+    UnexpectedPathException,
+    UnsupportedFrameInfo,
+)
+from .frame_info import FrameInfo, create_frame_info
+from .integration_utils import InstallationNotFoundError, get_installation
+from .utils.misc import get_straight_path_prefix_end_index
+from .utils.repository import get_repository_by_provider_identity
+
+logger = logging.getLogger(__name__)
+
+
+class CodeMapping(NamedTuple):
+    repo: RepoAndBranch
+    stacktrace_root: str
+    source_path: str
+
+
+SLASH = "/"
+BACKSLASH = "\\"  # This is the Python representation of a single backslash
+
+CodeMappingKey = tuple[str, str]
+
+
+# call generate_code_mappings() after you initialize CodeMappingTreesHelper
+class CodeMappingTreesHelper:
+    platform: str | None = None
+
+    def __init__(self, trees: Mapping[str, RepoTree]):
+        self.trees = trees
+        # Multiple source roots may legitimately share the same stack root in one monorepo.
+        self.code_mappings: dict[CodeMappingKey, CodeMapping] = {}
+
+    def generate_code_mappings(
+        self, frames: Sequence[Mapping[str, Any]], platform: str | None = None
+    ) -> list[CodeMapping]:
+        """Generate code mappings based on the initial trees object and the list of stack traces"""
+        # We need to make sure that calling this method with a new list of stack traces
+        # should always start with a clean slate
+        self.code_mappings = {}
+        self.platform = platform
+
+        with metrics.timer(
+            f"{METRIC_PREFIX}.generate_code_mappings.duration", tags={"platform": platform}
+        ):
+            buckets: dict[str, list[FrameInfo]] = self._stacktrace_buckets(frames)
+
+            # We reprocess stackframes until we are told that no code mappings were produced
+            # This is order to reprocess past stackframes in light of newly discovered code mappings
+            # This allows for idempotency since the order of the stackframes will not matter
+            # This has no performance issue because stackframes that match an existing code mapping
+            # will be skipped
+            while True:
+                if not self._process_stackframes(buckets):
+                    break
+
+        return list(self.code_mappings.values())
+
+    def get_file_and_repo_matches(self, frame_filename: FrameInfo) -> list[dict[str, str]]:
+        """List all the files in a repo that match the frame_filename"""
+        file_matches = []
+        for repo_full_name in self.trees.keys():
+            repo_tree = self.trees[repo_full_name]
+            matches = [
+                src_path
+                for src_path in repo_tree.files
+                if self._is_potential_match(src_path, frame_filename)
+            ]
+
+            for file in matches:
+                stack_path = frame_filename.raw_path
+                source_path = file
+                extra = {"stack_path": stack_path, "source_path": source_path}
+
+                try:
+                    stack_root, source_root = find_roots(
+                        frame_filename, source_path, repo_tree.files
+                    )
+                except UnexpectedPathException:
+                    logger.warning("Unexpected format for stack_path or source_path", extra=extra)
+                    continue
+
+                extra.update({"stack_root": stack_root, "source_root": source_root})
+                if stack_path.replace(stack_root, source_root, 1).replace("\\", "/") != source_path:
+                    logger.warning(
+                        "Unexpected stack_path/source_path found. A code mapping was not generated.",
+                        extra=extra,
+                    )
+                else:
+                    file_matches.append(
+                        {
+                            "filename": file,
+                            "repo_name": repo_tree.repo.name,
+                            "repo_branch": repo_tree.repo.branch,
+                            "stacktrace_root": stack_root,
+                            "source_path": source_root,
+                        }
+                    )
+        return file_matches
+
+    def _stacktrace_buckets(
+        self, frames: Sequence[Mapping[str, Any]]
+    ) -> dict[str, list[FrameInfo]]:
+        """Groups stacktraces into buckets based on the root of the stacktrace path"""
+        buckets: defaultdict[str, list[FrameInfo]] = defaultdict(list)
+        for frame in frames:
+            try:
+                frame_filename = create_frame_info(frame, self.platform)
+                # Any files without a top directory will be grouped together
+                buckets[frame_filename.stack_root].append(frame_filename)
+            except UnsupportedFrameInfo:
+                logger.warning("Frame's filepath not supported: %s", frame.get("filename"))
+            except MissingModuleOrAbsPath:
+                logger.warning("Do not panic. I'm collecting this data.")
+            except NeedsExtension:
+                logger.warning("Needs extension: %s", frame.get("filename"))
+            except DoesNotFollowJavaPackageNamingConvention:
+                pass
+            except Exception:
+                logger.exception("Unable to split stacktrace path into buckets")
+
+        return buckets
+
+    def _process_stackframes(self, buckets: Mapping[str, Sequence[FrameInfo]]) -> bool:
+        """This processes all stackframes and returns if a new code mapping has been generated"""
+        reprocess = False
+        for stackframes in buckets.values():
+            for frame_filename in stackframes:
+                for code_mapping in self._find_code_mappings(frame_filename):
+                    mapping_key = (code_mapping.stacktrace_root, code_mapping.source_path)
+                    if mapping_key not in self.code_mappings:
+                        # This allows processing some stack frames that
+                        # were matching more than one file
+                        reprocess = True
+                        self.code_mappings[mapping_key] = code_mapping
+        return reprocess
+
+    def _find_code_mappings(self, frame_filename: FrameInfo) -> list[CodeMapping]:
+        """Look for the file path through all the trees and generate code mappings for it."""
+        code_mappings: list[CodeMapping] = []
+        # XXX: This will need optimization by changing the data structure of the trees
+        for repo_full_name in self.trees.keys():
+            try:
+                code_mappings.extend(
+                    self._generate_code_mapping_from_tree(
+                        self.trees[repo_full_name], frame_filename
+                    )
+                )
+            except NotImplementedError:
+                logger.exception(
+                    "Code mapping failed for module with no package name. Processing continues."
+                )
+            except Exception:
+                logger.exception("Unexpected error. Processing continues.")
+
+        if len(code_mappings) == 0:
+            logger.warning("No files matched for %s", frame_filename.raw_path)
+            return []
+
+        unique_code_mappings = {
+            (code_mapping.stacktrace_root, code_mapping.source_path): code_mapping
+            for code_mapping in code_mappings
+        }
+        if len({code_mapping.repo.name for code_mapping in unique_code_mappings.values()}) > 1:
+            logger.warning("More than one repo matched %s", frame_filename.raw_path)
+            return []
+
+        return list(unique_code_mappings.values())
+
+    def _generate_code_mapping_from_tree(
+        self,
+        repo_tree: RepoTree,
+        frame_filename: FrameInfo,
+    ) -> list[CodeMapping]:
+        """
+        Finds a match in the repo tree and generates a code mapping for it. At most one code mapping is generated, if any.
+        If more than one potential match is found, do not generate a code mapping and return an empty list.
+        """
+        matched_files = [
+            src_path
+            for src_path in repo_tree.files
+            if self._is_potential_match(src_path, frame_filename)
+        ]
+
+        if len(matched_files) == 0:
+            return []
+
+        if len(matched_files) > 1 and not all(
+            frame_filename.has_source_roots_override(source_path, repo_tree.files)
+            for source_path in matched_files
+        ):
+            return []
+
+        code_mappings: dict[tuple[str, str], CodeMapping] = {}
+        for source_path in matched_files:
+            stack_path = frame_filename.raw_path
+            extra = {"stack_path": stack_path, "source_path": source_path}
+            try:
+                stack_root, source_root = find_roots(frame_filename, source_path, repo_tree.files)
+            except UnexpectedPathException:
+                logger.warning("Unexpected format for stack_path or source_path", extra=extra)
+                continue
+
+            extra.update({"stack_root": stack_root, "source_root": source_root})
+            if stack_path.replace(stack_root, source_root, 1).replace("\\", "/") != source_path:
+                logger.warning(
+                    "Unexpected stack_path/source_path found. A code mapping was not generated.",
+                    extra=extra,
+                )
+                continue
+
+            code_mapping = CodeMapping(
+                repo=repo_tree.repo,
+                stacktrace_root=stack_root,
+                source_path=source_root,
+            )
+            code_mappings[(code_mapping.stacktrace_root, code_mapping.source_path)] = code_mapping
+
+        if len(matched_files) > 1 and len(code_mappings) != len(matched_files):
+            return []
+
+        return list(code_mappings.values())
+
+    def _is_potential_match(self, src_file: str, frame_filename: FrameInfo) -> bool:
+        """
+        Tries to see if the stacktrace without the root matches the file from the
+        source code. Use existing code mappings to exclude some source files
+        """
+
+        def _list_endswith(l1: Sequence[str], l2: Sequence[str]) -> bool:
+            if len(l2) > len(l1):
+                l1, l2 = l2, l1
+            l1_idx = len(l1) - 1
+            l2_idx = len(l2) - 1
+
+            while l2_idx >= 0:
+                if l2[l2_idx] != l1[l1_idx]:
+                    return False
+                l1_idx -= 1
+                l2_idx -= 1
+            return True
+
+        # Exit early because we should not be processing source files for existing code maps
+        if self._matches_existing_code_mappings(src_file):
+            return False
+
+        src_file_items = src_file.split("/")
+        frame_items = frame_filename.normalized_path.split("/")
+
+        if len(src_file_items) > len(frame_items):  # Mono repos
+            return _list_endswith(src_file_items, frame_items)
+        elif len(frame_items) > len(src_file_items):  # Absolute paths
+            return _list_endswith(frame_items, src_file_items)
+        else:  # exact match
+            return src_file == frame_filename.normalized_path
+
+    def _matches_existing_code_mappings(self, src_file: str) -> bool:
+        """Check if the source file is already covered by an existing code mapping"""
+        return any(
+            code_mapping.source_path
+            for code_mapping in self.code_mappings.values()
+            if src_file.startswith(f"{code_mapping.source_path}/")
+        )
+
+    def __repr__(self) -> str:
+        return f"CodeMappingTreesHelper(trees={self.trees}, code_mappings={self.code_mappings})"
+
+
+def _path_relative_to_root(path: str, root: str) -> str | None:
+    if path == root:
+        return ""
+
+    root_prefix = f"{root.rstrip('/')}/"
+    if not path.startswith(root_prefix):
+        return None
+    return path[len(root_prefix) :]
+
+
+def _map_frame_path_to_source_path(
+    frame_path: str, stack_root: str, source_root: str
+) -> str | None:
+    if not frame_path.startswith(stack_root):
+        return None
+
+    is_directory_mapping = not stack_root or stack_root.endswith(("/", "\\"))
+    normalized_source_root = normalize_repository_source_root(source_root)
+    if normalized_source_root is None:
+        return None
+
+    mapped_path = frame_path.replace(stack_root, source_root, 1).replace("\\", "/").lstrip("/")
+
+    source_path = normalize_scm_path(mapped_path)
+    if (
+        source_path is None
+        or not source_path
+        or is_absolute_scm_path(source_path)
+        or source_path == ".."
+        or source_path.startswith("../")
+    ):
+        return None
+
+    if normalized_source_root:
+        if is_directory_mapping:
+            if _path_relative_to_root(source_path, normalized_source_root) is None:
+                return None
+        elif not source_path.startswith(normalized_source_root):
+            return None
+
+    return source_path
+
+
+def convert_stacktrace_frame_path_to_source_path(
+    frame: EventFrame,
+    code_mapping: RepositoryProjectPathConfig,
+    platform: str | None,
+    sdk_name: str | None,
+) -> str | None:
+    """
+    Applies the given code mapping to the given stacktrace frame and returns the source path.
+
+    If the code mapping does not apply to the frame, returns None.
+    """
+
+    # In most cases, code mappings get applied to frame.filename, but some platforms such as Java
+    # contain folder info in other parts of the frame (e.g. frame.module="com.example.app.MainActivity"
+    # gets transformed to "com/example/app/MainActivity.java"), so in those cases we use the
+    # transformed path instead.
+    stacktrace_path = (
+        try_munge_frame_path(frame=frame, platform=platform, sdk_name=sdk_name) or frame.filename
+    )
+
+    candidate_paths = (
+        stacktrace_path,
+        frame.abs_path,
+    )
+    for candidate_path in candidate_paths:
+        if not candidate_path:
+            continue
+        source_path = _map_frame_path_to_source_path(
+            candidate_path,
+            code_mapping.stack_root,
+            code_mapping.source_root,
+        )
+        if source_path:
+            return source_path
+
+    return None
+
+
+def create_code_mapping(
+    organization: Organization,
+    code_mapping: CodeMapping,
+    project: Project,
+) -> RepositoryProjectPathConfig:
+    installation = get_installation(organization)
+    # It helps with typing since org_integration can be None
+    if not installation.org_integration:
+        raise InstallationNotFoundError
+
+    provider = f"integrations:{installation.model.provider}"
+    try:
+        repository, _ = Repository.objects.get_or_create(
+            name=code_mapping.repo.name,
+            organization_id=organization.id,
+            defaults={
+                "integration_id": installation.model.id,
+                "external_id": code_mapping.repo.external_id,
+                "provider": provider,
+            },
+        )
+    except IntegrityError:
+        existing = get_repository_by_provider_identity(
+            organization.id, provider, code_mapping.repo.external_id
+        )
+        if existing is None:
+            raise
+        repository = existing
+    with transaction.atomic(using=router.db_for_write(RepositoryProjectPathConfig)):
+        project_repo, _ = ProjectRepository.objects.get_or_create_with_source(
+            project_id=project.id,
+            repository_id=repository.id,
+            source=ProjectRepositorySource.MANUAL,
+        )
+        new_code_mapping, _ = RepositoryProjectPathConfig.objects.update_or_create(
+            project_repository=project_repo,
+            stack_root=code_mapping.stacktrace_root,
+            source_root=code_mapping.source_path,
+            defaults={
+                "organization_id": organization.id,
+                "integration_id": installation.model.id,
+                "organization_integration_id": installation.org_integration.id,
+                "default_branch": code_mapping.repo.branch,
+                "automatically_generated": False,
+            },
+        )
+
+    return new_code_mapping
+
+
+def get_sorted_code_mapping_configs(project: Project) -> list[RepositoryProjectPathConfig]:
+    """
+    Returns the code mapping config list for a project sorted based on precedence.
+    User generated code mappings are evaluated before Sentry generated code mappings.
+    Code mappings with absolute path stack roots are evaluated before relative path stack roots.
+    Code mappings with more defined stack trace roots are evaluated before less defined stack trace
+    roots.
+
+    `project`: The project to get the list of sorted code mapping configs for
+    """
+
+    # xxx(meredith): if there are ever any changes to this query, make
+    # sure that we are still ordering by `id` because we want to make sure
+    # the ordering is deterministic
+    # codepath mappings must have an associated integration for stacktrace linking.
+    configs = (
+        RepositoryProjectPathConfig.objects.filter(
+            project_repository__project=project,
+            organization_integration_id__isnull=False,
+        )
+        .select_related(
+            "project_repository",
+            "project_repository__project",
+            "project_repository__repository",
+        )
+        .order_by("id")
+    )
+
+    sorted_configs: list[RepositoryProjectPathConfig] = []
+
+    try:
+        for config in configs:
+            inserted = False
+            for index, sorted_config in enumerate(sorted_configs):
+                # This check will ensure that all user defined code mappings will come before Sentry generated ones
+                if (
+                    (sorted_config.automatically_generated and not config.automatically_generated)
+                    or (  # Insert absolute paths before relative paths
+                        not sorted_config.stack_root.startswith("/")
+                        and config.stack_root.startswith("/")
+                    )
+                    or (  # Insert more defined stack roots before less defined ones
+                        (sorted_config.automatically_generated == config.automatically_generated)
+                        and config.stack_root.startswith(sorted_config.stack_root)
+                    )
+                ):
+                    sorted_configs.insert(index, config)
+                    inserted = True
+                    break
+            if not inserted:
+                # Insert the code mapping at the back if it's Sentry generated or at the front if it is user defined
+                if config.automatically_generated:
+                    sorted_configs.insert(len(sorted_configs), config)
+                else:
+                    sorted_configs.insert(0, config)
+    except Exception:
+        logger.exception("There was a failure sorting the code mappings")
+
+    return sorted_configs
+
+
+def find_roots(
+    frame_filename: FrameInfo, source_path: str, repo_files: Sequence[str] | None = None
+) -> tuple[str, str]:
+    """
+    Returns a tuple containing the stack_root, and the source_root.
+    If there is no overlap, raise an exception since this should not happen
+    """
+    if not source_path:
+        raise UnexpectedPathException("Source path is empty")
+
+    stack_path = frame_filename.raw_path
+    stack_root = ""
+    if stack_path[0] == "/" or stack_path[0] == "\\":
+        stack_root += stack_path[0]
+        stack_path = stack_path[1:]
+
+    if stack_path == source_path:
+        # e.g. stack_path: foo/foo.py -> source_path: foo/foo.py
+        return (stack_root, "")
+    elif source_path.endswith(stack_path):
+        if stack_path.find("/") == -1:
+            # Single-file path (e.g. stack_path: foo.py -> source_path: src/foo.py)
+            return ("", source_path.replace(stack_path, ""))
+        else:
+            # "Packaged" logic
+            # e.g. stack_path: some_package/src/foo.py -> source_path: src/foo.py
+            source_prefix = source_path.rpartition(stack_path)[0]
+            return frame_filename.resolve_source_roots(
+                source_path=source_path,
+                source_prefix=source_prefix,
+                stack_root_prefix=stack_root,
+                repo_files=repo_files,
+            )
+    elif stack_path.endswith(source_path):
+        stack_prefix = stack_path.rpartition(source_path)[0]
+        return (f"{stack_root}{stack_prefix}", "")
+
+    stack_path_delim = SLASH if SLASH in stack_path else BACKSLASH
+    if stack_path_delim == BACKSLASH:
+        stack_path = stack_path.replace(BACKSLASH, SLASH)
+    if (straight_path_idx := get_straight_path_prefix_end_index(stack_path)) > 0:
+        stack_root += stack_path[:straight_path_idx]
+        stack_path = stack_path[straight_path_idx:]
+
+    overlap_to_check: list[str] = stack_path.split(SLASH)
+    stack_root_items: list[str] = []
+
+    while overlap_to_check:
+        if (overlap := SLASH.join(overlap_to_check)) and source_path.endswith(overlap):
+            source_root = source_path.rpartition(overlap)[0]
+            stack_root += stack_path_delim.join(stack_root_items)
+
+            if stack_root and stack_root[-1] != stack_path_delim:  # append trailing slash
+                stack_root = f"{stack_root}{stack_path_delim}"
+            if source_root and source_root[-1] != SLASH:
+                source_root = f"{source_root}{SLASH}"
+
+            return (stack_root, source_root)
+
+        # increase stack root specificity, decrease overlap specifity
+        stack_root_items.append(overlap_to_check.pop(0))
+
+    # validate_source_url should have ensured the file names match
+    # so if we get here something went wrong and there is a bug
+    raise UnexpectedPathException("Could not find common root from paths")

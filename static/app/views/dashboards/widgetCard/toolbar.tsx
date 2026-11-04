@@ -1,0 +1,120 @@
+import styled from '@emotion/styled';
+import {IconCopy} from '@sentry/icons/copy';
+import {IconDelete} from '@sentry/icons/delete';
+import {IconEdit} from '@sentry/icons/edit';
+import {IconGrabbable} from '@sentry/icons/grabbable';
+// eslint-disable-next-line no-restricted-imports
+import color from 'color';
+
+import {Button} from '@sentry/scraps/button';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {t} from 'sentry/locale';
+import {DRAG_HANDLE_CLASS} from 'sentry/views/dashboards/constants';
+
+type ToolbarProps = {
+  disableDuplicate?: boolean;
+  disableEdit?: boolean;
+  disabledReason?: string;
+  isMobile?: boolean;
+  onDelete?: () => void;
+  onDuplicate?: () => void;
+  onEdit?: () => void;
+};
+
+export function Toolbar({
+  isMobile,
+  onEdit,
+  onDelete,
+  onDuplicate,
+  disableEdit,
+  disableDuplicate,
+  disabledReason,
+}: ToolbarProps) {
+  return (
+    <ToolbarPanel>
+      <IconContainer>
+        {!isMobile && (
+          <GrabbableButton
+            size="xs"
+            aria-label={t('Drag Widget')}
+            icon={<IconGrabbable />}
+            variant="transparent"
+            className={DRAG_HANDLE_CLASS}
+          />
+        )}
+        {onEdit && (
+          <Tooltip
+            skipWrapper
+            title={disabledReason}
+            disabled={!disabledReason || !disableEdit}
+          >
+            <Button
+              data-test-id="widget-edit"
+              aria-label={t('Edit Widget')}
+              size="xs"
+              variant="transparent"
+              onClick={onEdit}
+              icon={<IconEdit />}
+              disabled={disableEdit}
+            />
+          </Tooltip>
+        )}
+        {onDuplicate && (
+          <Tooltip
+            skipWrapper
+            title={disabledReason}
+            disabled={!disabledReason || !disableDuplicate}
+          >
+            <Button
+              aria-label={t('Duplicate Widget')}
+              size="xs"
+              variant="transparent"
+              onClick={onDuplicate}
+              icon={<IconCopy />}
+              disabled={disableDuplicate}
+            />
+          </Tooltip>
+        )}
+        {onDelete && (
+          <Button
+            data-test-id="widget-delete"
+            aria-label={t('Delete Widget')}
+            variant="transparent"
+            size="xs"
+            onClick={onDelete}
+            icon={<IconDelete />}
+          />
+        )}
+      </IconContainer>
+    </ToolbarPanel>
+  );
+}
+
+const ToolbarPanel = styled('div')`
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+
+  width: 100%;
+  height: 100%;
+
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+
+  background-color: ${p =>
+    color(p.theme.tokens.background.secondary).alpha(0.7).string()};
+  border-radius: calc(${p => p.theme.radius.md} - 1px);
+`;
+
+const IconContainer = styled('div')`
+  display: flex;
+  margin: ${p => p.theme.space.md};
+  touch-action: none;
+`;
+
+const GrabbableButton = styled(Button)`
+  cursor: grab;
+`;

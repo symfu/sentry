@@ -1,34 +1,69 @@
-from django.conf.urls import url
+from django.urls import re_path
 
-from .ui_hook import JiraUiHookView
-from .issue_hook import JiraIssueHookView
-from .descriptor import JiraDescriptorEndpoint
-from .installed import JiraInstalledEndpoint
-from .search import JiraSearchEndpoint
-from .uninstalled import JiraUninstalledEndpoint
-from .webhooks import JiraIssueUpdatedWebhook
-from .extension_configuration import JiraExtensionConfigurationView
-
+from .endpoints import JiraDescriptorEndpoint, JiraSearchEndpoint
+from .views import (
+    JiraConfigureRedirectView,
+    JiraSentryInstallationView,
+    JiraSentryIssueDetailsControlView,
+    JiraSentryIssueDetailsView,
+)
+from .webhooks import (
+    JiraIssueUpdatedWebhook,
+    JiraSentryInstalledWebhook,
+    JiraSentryUninstalledWebhook,
+)
 
 urlpatterns = [
-    url(r"^ui-hook/$", JiraUiHookView.as_view()),
-    url(r"^descriptor/$", JiraDescriptorEndpoint.as_view()),
-    url(r"^installed/$", JiraInstalledEndpoint.as_view()),
-    url(r"^uninstalled/$", JiraUninstalledEndpoint.as_view()),
-    url(
+    re_path(
+        r"^ui-hook/$",
+        JiraSentryInstallationView.as_view(),
+        name="sentry-extensions-jira-ui-hook",
+    ),
+    re_path(
+        r"^descriptor/$",
+        JiraDescriptorEndpoint.as_view(),
+        name="sentry-extensions-descriptor",
+    ),
+    re_path(
+        r"^installed/$",
+        JiraSentryInstalledWebhook.as_view(),
+        name="sentry-extensions-jira-installed",
+    ),
+    re_path(
+        r"^uninstalled/$",
+        JiraSentryUninstalledWebhook.as_view(),
+        name="sentry-extensions-jira-uninstalled",
+    ),
+    re_path(
         r"^issue-updated/$",
         JiraIssueUpdatedWebhook.as_view(),
         name="sentry-extensions-jira-issue-updated",
     ),
-    url(
-        r"^search/(?P<organization_slug>[^\/]+)/(?P<integration_id>\d+)/$",
+    re_path(
+        r"^search/(?P<organization_id_or_slug>[^/]+)/(?P<integration_id>\d+)/$",
         JiraSearchEndpoint.as_view(),
         name="sentry-extensions-jira-search",
     ),
-    url(r"^configure/$", JiraExtensionConfigurationView.as_view()),
-    url(
-        r"^issue/(?P<issue_key>[^\/]+)/$",
-        JiraIssueHookView.as_view(),
+    # The Jira UI hook links here with `signed_params`. We forward those to the
+    # link view, which opens the install pipeline modal to finish the install.
+    re_path(
+        r"^configure/$",
+        JiraConfigureRedirectView.as_view(),
+        name="sentry-extensions-jira-configuration",
+    ),
+    # TODO(cells): Legacy URL, remove once Atlassian marketplace version updated.
+    # Our descriptor now correctly points at `/issue-details/{key}/`, but
+    # Atlassian only re-snapshots it when a new Marketplace version of `sentry.io.jira` is
+    # published — existing tenants keep hitting this path until that happens. Routed to the
+    # control view by `JiraRequestParser.immediate_response_cell_classes`.
+    re_path(
+        r"^issue/(?P<issue_key>[^/]+)/$",
+        JiraSentryIssueDetailsView.as_view(),
         name="sentry-extensions-jira-issue-hook",
+    ),
+    re_path(
+        r"^issue-details/(?P<issue_key>[^/]+)/$",
+        JiraSentryIssueDetailsControlView.as_view(),
+        name="sentry-extensions-jira-issue-hook-control",
     ),
 ]

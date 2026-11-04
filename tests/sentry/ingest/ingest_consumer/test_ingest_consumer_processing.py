@@ -1,37 +1,190 @@
-import uuid
-import pytest
-import time
+from __future__ import annotations
 
-from sentry.utils import json
-from sentry.ingest.ingest_consumer import (
-    process_event,
+import datetime
+import time
+import uuid
+import zipfile
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager
+from io import BytesIO
+from typing import Any, ContextManager
+from unittest.mock import MagicMock, patch
+
+import msgpack
+import orjson
+import pytest
+from arroyo.backends.kafka.consumer import KafkaPayload
+from arroyo.backends.local.backend import LocalBroker
+from arroyo.backends.local.storages.memory import MemoryMessageStorage
+from arroyo.types import Partition, Topic
+from django.conf import settings
+from django.core.cache.backends.base import BaseCache
+from django.utils import timezone
+from pytest_django.live_server_helper import LiveServer
+
+from sentry.attachments import (
+    CachedAttachment,
+    MissingAttachmentChunks,
+    get_attachments_for_event,
+    store_attachments_for_event,
+)
+from sentry.constants import DataCategory
+from sentry.event_manager import EventManager
+from sentry.ingest.consumer.processors import (
+    collect_span_metrics,
     process_attachment_chunk,
+    process_event,
     process_individual_attachment,
     process_userreport,
 )
-from sentry.event_manager import EventManager
-from sentry.models import EventAttachment, EventUser, File, UserReport
+from sentry.ingest.consumer.simple_event import (
+    INLINE_SAVE_EVENT_OPTION,
+    INLINE_SAVE_EVENT_TRANSACTION_OPTION,
+    process_event_from_kafka,
+)
+from sentry.ingest.types import ConsumerType
+from sentry.lang.native.utils import STORE_CRASH_REPORTS_ALL
+from sentry.models.debugfile import create_files_from_dif_zip
+from sentry.models.eventattachment import V2_PREFIX, EventAttachment, PendingEventAttachment
+from sentry.models.project import Project
+from sentry.models.userreport import UserReport
+from sentry.objectstore import UsecaseId, get_session
+from sentry.services import eventstore
+from sentry.services.eventstore.processing import (
+    event_processing_store,
+    transaction_processing_store,
+)
+from sentry.tasks.store import save_event_attachments
+from sentry.testutils.factories import Factories, get_fixture_path
+from sentry.testutils.helpers.features import Feature
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.helpers.usage_accountant import usage_accountant_backend
+from sentry.testutils.objectstore import debug_files_test_both_backends
+from sentry.testutils.pytest.fixtures import django_db_all
+from sentry.testutils.skips import requires_objectstore, requires_snuba, requires_symbolicator
+from sentry.testutils.thread_leaks.pytest import thread_leak_allowlist
+from sentry.utils.eventuser import EventUser
+from sentry.utils.json import loads
+from sentry.utils.safe import get_path
+
+pytestmark = [requires_snuba]
+
+PROGUARD_UUID = "467ade76-6d0b-11ed-a1eb-0242ac120002"
+PROGUARD_SOURCE = b"""\
+org.slf4j.helpers.Util$ClassContextSecurityManager -> org.a.b.g$a:
+    65:65:void <init>() -> <init>
+    67:67:java.lang.Class[] getClassContext() -> a
+    69:69:java.lang.Class[] getExtraClassContext() -> a
+    65:65:void <init>(org.slf4j.helpers.Util$1) -> <init>
+"""
 
 
-def get_normalized_event(data, project):
+def get_normalized_event(data: dict[str, Any], project: Project) -> dict[str, Any]:
     mgr = EventManager(data, project=project)
     mgr.normalize()
     return dict(mgr.get_data())
 
 
 @pytest.fixture
-def preprocess_event(monkeypatch):
+def save_event_transaction() -> Generator[MagicMock]:
+    with patch("sentry.ingest.consumer.processors.save_event_transaction") as mck:
+        yield mck
+
+
+@pytest.fixture
+def save_event_feedback() -> Generator[MagicMock]:
+    with patch("sentry.ingest.consumer.processors.save_event_feedback") as mck:
+        yield mck
+
+
+@pytest.fixture
+def preprocess_event() -> Generator[list[dict[str, object]]]:
     calls = []
 
-    def inner(**kwargs):
+    def inner(**kwargs: object) -> None:
         calls.append(kwargs)
 
-    monkeypatch.setattr("sentry.ingest.ingest_consumer.preprocess_event", inner)
-    return calls
+    with patch("sentry.ingest.consumer.processors.preprocess_event", inner):
+        yield calls
 
 
-@pytest.mark.django_db
-def test_deduplication_works(default_project, task_runner, preprocess_event):
+@django_db_all
+@pytest.mark.parametrize(
+    "rate,disable_store,expected_writes", [(0.0, True, 1), (1.0, False, 1), (1.0, True, 0)]
+)
+def test_ingest_conditions_working_payload_write(
+    default_project: Project,
+    preprocess_event: list[dict[str, object]],
+    rate: float,
+    disable_store: bool,
+    expected_writes: int,
+) -> None:
+    data = get_normalized_event({"message": "inline event"}, default_project)
+    data["type"] = "error"
+    with (
+        override_options(
+            {"store.enable-inline-payloads": rate, "store.disable-processing-store": disable_store}
+        ),
+        patch.object(event_processing_store, "store", wraps=event_processing_store.store) as store,
+        patch("sentry.ingest.consumer.processors.record") as record,
+    ):
+        process_event(
+            ConsumerType.Events,
+            {
+                "payload": orjson.dumps(data),
+                "start_time": time.time(),
+                "event_id": data["event_id"],
+                "project_id": default_project.id,
+            },
+            project=default_project,
+        )
+
+    assert store.call_count == expected_writes
+    assert record.call_count == expected_writes
+    (kwargs,) = preprocess_event
+    assert kwargs["data"] == data
+    assert bool(kwargs["cache_key"]) is bool(expected_writes)
+
+
+@django_db_all
+def test_ingest_inline_only_event_saves_without_working_payload(
+    default_project: Project, task_runner: Callable[[], ContextManager[None]]
+) -> None:
+    payload = get_normalized_event({"message": "inline event"}, default_project)
+    event_id = payload["event_id"]
+    with (
+        override_options(
+            {"store.enable-inline-payloads": 1.0, "store.disable-processing-store": True}
+        ),
+        patch.object(event_processing_store, "store", wraps=event_processing_store.store) as store,
+        patch.object(event_processing_store, "get", wraps=event_processing_store.get) as get,
+        task_runner(),
+    ):
+        process_event(
+            ConsumerType.Events,
+            {
+                "payload": orjson.dumps(payload),
+                "start_time": time.time(),
+                "event_id": event_id,
+                "project_id": default_project.id,
+            },
+            project=default_project,
+        )
+
+    store.assert_not_called()
+    assert get.call_count == 1
+    assert get.call_args.kwargs == {"unprocessed": True}
+    event = eventstore.backend.get_event_by_id(default_project.id, event_id)
+    assert event is not None
+    assert event.data["logentry"]["formatted"] == "inline event"
+
+
+@django_db_all
+def test_deduplication_works(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    preprocess_event: list[dict[str, object]],
+) -> None:
     payload = get_normalized_event({"message": "hello world"}, default_project)
     event_id = payload["event_id"]
     project_id = default_project.id
@@ -39,14 +192,15 @@ def test_deduplication_works(default_project, task_runner, preprocess_event):
 
     for _ in range(2):
         process_event(
+            ConsumerType.Events,
             {
-                "payload": json.dumps(payload),
+                "payload": orjson.dumps(payload).decode(),
                 "start_time": start_time,
                 "event_id": event_id,
                 "project_id": project_id,
                 "remote_addr": "127.0.0.1",
             },
-            projects={default_project.id: default_project},
+            project=default_project,
         )
 
     (kwargs,) = preprocess_event
@@ -56,63 +210,455 @@ def test_deduplication_works(default_project, task_runner, preprocess_event):
         "event_id": event_id,
         "project": default_project,
         "start_time": start_time,
+        "has_attachments": False,
     }
 
 
-@pytest.mark.django_db
-@pytest.mark.parametrize("missing_chunks", (True, False))
-def test_with_attachments(default_project, task_runner, missing_chunks, monkeypatch):
-    monkeypatch.setattr("sentry.features.has", lambda *a, **kw: True)
-
+@django_db_all
+def test_process_event_from_kafka(
+    default_project: Project, preprocess_event: list[dict[str, object]]
+) -> None:
     payload = get_normalized_event({"message": "hello world"}, default_project)
     event_id = payload["event_id"]
-    attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
     project_id = default_project.id
     start_time = time.time() - 3600
 
-    if not missing_chunks:
-        process_attachment_chunk(
-            {
-                "payload": b"Hello ",
-                "event_id": event_id,
-                "project_id": project_id,
-                "id": attachment_id,
-                "chunk_index": 0,
-            },
-            projects={default_project.id: default_project},
-        )
+    message = msgpack.packb(
+        {
+            "payload": orjson.dumps(payload).decode(),
+            "start_time": start_time,
+            "event_id": event_id,
+            "project_id": project_id,
+            "remote_addr": "127.0.0.1",
+            "type": "event",
+        }
+    )
 
-        process_attachment_chunk(
-            {
-                "payload": b"World!",
-                "event_id": event_id,
-                "project_id": project_id,
-                "id": attachment_id,
-                "chunk_index": 1,
-            },
-            projects={default_project.id: default_project},
-        )
+    process_event_from_kafka(message)
 
-    with task_runner():
+    (kwargs,) = preprocess_event
+    assert kwargs == {
+        "cache_key": f"e:{event_id}:{project_id}",
+        "data": payload,
+        "event_id": event_id,
+        "project": default_project,
+        "start_time": start_time,
+        "has_attachments": False,
+    }
+
+
+@django_db_all
+def test_process_event_from_kafka_inlines_preprocess_save_event_with_option(
+    default_project: Project, preprocess_event: list[dict[str, object]]
+) -> None:
+    payload = get_normalized_event({"message": "hello world"}, default_project)
+    event_id = payload["event_id"]
+    project_id = default_project.id
+    start_time = time.time() - 3600
+
+    message = msgpack.packb(
+        {
+            "payload": orjson.dumps(payload).decode(),
+            "start_time": start_time,
+            "event_id": event_id,
+            "project_id": project_id,
+            "remote_addr": "127.0.0.1",
+            "type": "event",
+        }
+    )
+
+    with override_options({INLINE_SAVE_EVENT_OPTION: True}):
+        process_event_from_kafka(message)
+
+    (kwargs,) = preprocess_event
+    assert kwargs == {
+        "cache_key": f"e:{event_id}:{project_id}",
+        "data": payload,
+        "event_id": event_id,
+        "project": default_project,
+        "start_time": start_time,
+        "has_attachments": False,
+        "inline_save_event": True,
+    }
+
+
+@django_db_all
+def test_process_event_from_kafka_transaction_spawns_save_event_transaction_by_default(
+    default_project: Project,
+    preprocess_event: list[dict[str, object]],
+    save_event_transaction: MagicMock,
+) -> None:
+    project_id = default_project.id
+    now = datetime.datetime.now()
+    event = {
+        "type": "transaction",
+        "timestamp": now.isoformat(),
+        "start_timestamp": now.isoformat(),
+        "spans": [],
+        "contexts": {
+            "trace": {
+                "parent_span_id": "8988cec7cc0779c1",
+                "type": "trace",
+                "op": "foobar",
+                "trace_id": "a7d67cf796774551a95be6543cacd459",
+                "span_id": "babaae0d4b7512d9",
+                "status": "ok",
+            }
+        },
+    }
+    payload = get_normalized_event(event, default_project)
+    event_id = payload["event_id"]
+    start_time = time.time() - 3600
+    message = msgpack.packb(
+        {
+            "payload": orjson.dumps(payload).decode(),
+            "start_time": start_time,
+            "event_id": event_id,
+            "project_id": project_id,
+            "remote_addr": "127.0.0.1",
+            "type": "event",
+        }
+    )
+
+    process_event_from_kafka(message)
+
+    assert not len(preprocess_event)
+    assert save_event_transaction.call_count == 0
+    assert save_event_transaction.delay.call_args[0] == ()
+    assert save_event_transaction.delay.call_args[1] == dict(
+        cache_key=f"e:{event_id}:{project_id}",
+        data=None,
+        start_time=start_time,
+        event_id=event_id,
+        project_id=project_id,
+    )
+
+
+@django_db_all
+def test_process_event_from_kafka_transaction_saves_inline_with_option(
+    default_project: Project,
+    preprocess_event: list[dict[str, object]],
+    save_event_transaction: MagicMock,
+) -> None:
+    project_id = default_project.id
+    now = datetime.datetime.now()
+    event = {
+        "type": "transaction",
+        "timestamp": now.isoformat(),
+        "start_timestamp": now.isoformat(),
+        "spans": [],
+        "contexts": {
+            "trace": {
+                "parent_span_id": "8988cec7cc0779c1",
+                "type": "trace",
+                "op": "foobar",
+                "trace_id": "a7d67cf796774551a95be6543cacd459",
+                "span_id": "babaae0d4b7512d9",
+                "status": "ok",
+            }
+        },
+    }
+    payload = get_normalized_event(event, default_project)
+    event_id = payload["event_id"]
+    start_time = time.time() - 3600
+    message = msgpack.packb(
+        {
+            "payload": orjson.dumps(payload).decode(),
+            "start_time": start_time,
+            "event_id": event_id,
+            "project_id": project_id,
+            "remote_addr": "127.0.0.1",
+            "type": "event",
+        }
+    )
+
+    with override_options({INLINE_SAVE_EVENT_TRANSACTION_OPTION: True}):
+        process_event_from_kafka(message)
+
+    assert not len(preprocess_event)
+    assert save_event_transaction.call_args[0] == ()
+    assert save_event_transaction.call_args[1] == dict(
+        cache_key=f"e:{event_id}:{project_id}",
+        data=None,
+        start_time=start_time,
+        event_id=event_id,
+        project_id=project_id,
+    )
+    assert save_event_transaction.delay.call_count == 0
+
+
+@django_db_all
+@pytest.mark.parametrize("disable_store,expected_writes", [(False, 1), (True, 0)])
+@pytest.mark.parametrize("save_synchronously", (False, True))
+def test_inline_transaction(
+    default_project: Project,
+    save_event_transaction: MagicMock,
+    disable_store: bool,
+    expected_writes: int,
+    save_synchronously: bool,
+) -> None:
+    data = get_normalized_event(
+        {
+            "type": "transaction",
+            "transaction": "inline transaction",
+            "start_timestamp": time.time() - 1,
+            "timestamp": time.time(),
+            "contexts": {"trace": {"trace_id": "a" * 32, "span_id": "b" * 16, "op": "http.server"}},
+        },
+        default_project,
+    )
+    with (
+        override_options(
+            {"store.enable-inline-payloads": 1.0, "store.disable-processing-store": disable_store}
+        ),
+        patch.object(
+            transaction_processing_store, "store", wraps=transaction_processing_store.store
+        ) as store,
+        patch("sentry.ingest.consumer.processors.track_sampled_event") as track,
+    ):
         process_event(
+            ConsumerType.Transactions,
             {
-                "payload": json.dumps(payload),
+                "payload": orjson.dumps(data),
+                "start_time": time.time(),
+                "event_id": data["event_id"],
+                "project_id": default_project.id,
+            },
+            project=default_project,
+            inline_save_event_transaction=save_synchronously,
+        )
+
+    assert store.call_count == expected_writes
+    assert track.call_count == expected_writes
+    kwargs = {False: save_event_transaction.delay, True: save_event_transaction}[
+        save_synchronously
+    ].call_args.kwargs
+    assert kwargs["data"] == data
+    assert bool(kwargs["cache_key"]) is bool(expected_writes)
+
+
+@django_db_all
+def test_transactions_spawn_save_event_transaction(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    preprocess_event: list[dict[str, object]],
+    save_event_transaction: MagicMock,
+) -> None:
+    project_id = default_project.id
+    now = datetime.datetime.now()
+    event = {
+        "type": "transaction",
+        "timestamp": now.isoformat(),
+        "start_timestamp": now.isoformat(),
+        "spans": [],
+        "contexts": {
+            "trace": {
+                "parent_span_id": "8988cec7cc0779c1",
+                "type": "trace",
+                "op": "foobar",
+                "trace_id": "a7d67cf796774551a95be6543cacd459",
+                "span_id": "babaae0d4b7512d9",
+                "status": "ok",
+            }
+        },
+    }
+    payload = get_normalized_event(event, default_project)
+    event_id = payload["event_id"]
+    start_time = time.time() - 3600
+    process_event(
+        ConsumerType.Events,
+        {
+            "payload": orjson.dumps(payload).decode(),
+            "start_time": start_time,
+            "event_id": event_id,
+            "project_id": project_id,
+            "remote_addr": "127.0.0.1",
+        },
+        project=default_project,
+    )
+    assert not len(preprocess_event)
+    assert save_event_transaction.delay.call_args[0] == ()
+    assert save_event_transaction.delay.call_args[1] == dict(
+        cache_key=f"e:{event_id}:{project_id}",
+        data=None,
+        start_time=start_time,
+        event_id=event_id,
+        project_id=project_id,
+    )
+
+
+@django_db_all
+def test_accountant_transaction(default_project: Project) -> None:
+    storage: MemoryMessageStorage[KafkaPayload] = MemoryMessageStorage()
+    broker = LocalBroker(storage)
+    topic = Topic("shared-resources-usage")
+    broker.create_topic(topic, 1)
+    producer = broker.get_producer()
+
+    with (
+        override_options(
+            {"shared_resources_accounting_enabled": [settings.EVENT_PROCESSING_STORE]}
+        ),
+        usage_accountant_backend(producer),
+    ):
+        now = datetime.datetime.now()
+        event = {
+            "type": "transaction",
+            "timestamp": now.isoformat(),
+            "start_timestamp": now.isoformat(),
+            "spans": [],
+            "contexts": {
+                "trace": {
+                    "parent_span_id": "8988cec7cc0779c1",
+                    "type": "trace",
+                    "op": "foobar",
+                    "trace_id": "a7d67cf796774551a95be6543cacd459",
+                    "span_id": "babaae0d4b7512d9",
+                    "status": "ok",
+                }
+            },
+        }
+        payload = get_normalized_event(event, default_project)
+        serialized = orjson.dumps(payload).decode()
+        process_event(
+            ConsumerType.Events,
+            {
+                "payload": serialized,
+                "start_time": time.time() - 3600,
+                "event_id": payload["event_id"],
+                "project_id": default_project.id,
+                "remote_addr": "127.0.0.1",
+            },
+            project=default_project,
+        )
+
+    msg1 = broker.consume(Partition(topic, 0), 0)
+    assert msg1 is not None
+    consumed_payload = msg1.payload
+    assert consumed_payload is not None
+    formatted = loads(consumed_payload.value.decode("utf-8"))
+    assert formatted["shared_resource_id"] == settings.EVENT_PROCESSING_STORE
+    assert formatted["app_feature"] == "transactions"
+    assert formatted["usage_unit"] == "bytes"
+    assert formatted["amount"] == len(serialized)
+
+
+@django_db_all
+def test_feedbacks_spawn_save_event_feedback(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    preprocess_event: list[dict[str, object]],
+    save_event_feedback: MagicMock,
+) -> None:
+    with patch("sentry.features.has", return_value=True):
+        project_id = default_project.id
+        now = datetime.datetime.now()
+        event: dict[str, Any] = {
+            "type": "feedback",
+            "timestamp": now.isoformat(),
+            "start_timestamp": now.isoformat(),
+            "spans": [],
+            "contexts": {
+                "feedback": {
+                    "contact_email": "test_test.com",
+                    "message": "I really like this user-feedback feature!",
+                    "replay_id": "ec3b4dc8b79f417596f7a1aa4fcca5d2",
+                    "url": "https://docs.sentry.io/platforms/javascript/",
+                    "name": "Colton Allen",
+                    "type": "feedback",
+                },
+            },
+        }
+        payload = get_normalized_event(event, default_project)
+        event_id = payload["event_id"]
+        start_time = time.time() - 3600
+        process_event(
+            ConsumerType.Events,
+            {
+                "payload": orjson.dumps(payload).decode(),
                 "start_time": start_time,
                 "event_id": event_id,
                 "project_id": project_id,
                 "remote_addr": "127.0.0.1",
-                "attachments": [
-                    {
-                        "id": attachment_id,
-                        "name": "lol.txt",
-                        "content_type": "text/plain",
-                        "attachment_type": "custom.attachment",
-                        "chunks": 2,
-                    }
-                ],
             },
-            projects={default_project.id: default_project},
+            project=default_project,
         )
+    assert not len(preprocess_event)
+    assert save_event_feedback.delay.call_args[0] == ()
+    # Feedback data is passed inline; nothing is stored in the processing store,
+    # so no cache_key is threaded through.
+    assert save_event_feedback.delay.call_args[1]["cache_key"] is None
+    assert (
+        save_event_feedback.delay.call_args[1]["data"]["contexts"]["feedback"]
+        == event["contexts"]["feedback"]
+    )
+    assert save_event_feedback.delay.call_args[1]["data"]["type"] == "feedback"
+
+    # The feedback payload must not be left orphaned in the processing store.
+    assert event_processing_store.get(f"e:{event_id}:{project_id}") is None
+
+
+@django_db_all
+@pytest.mark.parametrize("missing_chunks", (True, False))
+def test_with_attachments(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    missing_chunks: bool,
+    django_cache: BaseCache,
+) -> None:
+    retention_days = 66
+
+    with patch("sentry.features.has", return_value=True):
+        payload = get_normalized_event({"message": "hello world"}, default_project)
+        event_id = payload["event_id"]
+        attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
+        project_id = default_project.id
+        start_time = time.time() - 3600
+
+        if not missing_chunks:
+            process_attachment_chunk(
+                {
+                    "payload": b"Hello ",
+                    "event_id": event_id,
+                    "project_id": project_id,
+                    "id": attachment_id,
+                    "chunk_index": 0,
+                }
+            )
+            process_attachment_chunk(
+                {
+                    "payload": b"World!",
+                    "event_id": event_id,
+                    "project_id": project_id,
+                    "id": attachment_id,
+                    "chunk_index": 1,
+                }
+            )
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with task_runner():
+            process_event(
+                ConsumerType.Events,
+                {
+                    "payload": orjson.dumps(payload).decode(),
+                    "start_time": start_time,
+                    "event_id": event_id,
+                    "project_id": project_id,
+                    "remote_addr": "127.0.0.1",
+                    "attachments": [
+                        {
+                            "id": attachment_id,
+                            "name": "lol.txt",
+                            "content_type": "text/plain",
+                            "attachment_type": "custom.attachment",
+                            "size": len(b"Hello World!"),
+                            "chunks": 2,
+                            "retention_days": retention_days,
+                        }
+                    ],
+                },
+                project=default_project,
+            )
 
     persisted_attachments = list(
         EventAttachment.objects.filter(project_id=project_id, event_id=event_id)
@@ -120,87 +666,493 @@ def test_with_attachments(default_project, task_runner, missing_chunks, monkeypa
 
     if not missing_chunks:
         (attachment,) = persisted_attachments
-        file = File.objects.get(id=attachment.file_id)
-        assert file.type == "custom.attachment"
-        assert file.headers == {"Content-Type": "text/plain"}
-        file_contents = file.getfile()
-        assert file_contents.read() == b"Hello World!"
-        assert file_contents.name == "lol.txt"
+        assert attachment.content_type == "text/plain"
+        assert attachment.name == "lol.txt"
+        with attachment.getfile() as file:
+            assert file.read() == b"Hello World!"
+        delta = attachment.date_expires - (now + datetime.timedelta(days=retention_days))
+        assert abs(delta.total_seconds()) < 3600
     else:
         assert not persisted_attachments
 
 
-@pytest.mark.django_db
+@django_db_all
+@pytest.mark.parametrize("cache_key", (None, "", "e:working-event"))
+def test_save_cached_attachments_with_optional_event_cache_key(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    django_cache: BaseCache,
+    cache_key: str | None,
+) -> None:
+    payload = get_normalized_event({"message": "hello world"}, default_project)
+    event_id = payload["event_id"]
+    chunked_data = b"chunked attachment" * 20
+    process_attachment_chunk(
+        {
+            "payload": chunked_data,
+            "event_id": event_id,
+            "project_id": default_project.id,
+            "id": 0,
+            "chunk_index": 0,
+        }
+    )
+    store_attachments_for_event(
+        default_project,
+        payload,
+        [
+            CachedAttachment(id=0, name="chunked.txt", chunks=1, size=len(chunked_data)),
+            CachedAttachment(id=1, name="unchunked.txt", data=b"unchunked attachment"),
+            CachedAttachment(id=2, name="limited.txt", data=b"limited", rate_limited=True),
+        ],
+        timeout=3600,
+    )
+    cached_attachments = list(get_attachments_for_event(payload))
+
+    with (
+        patch("sentry.features.has", return_value=True),
+        override_options({"objectstore.enable_for.attachments": 0.0}),
+        task_runner(),
+    ):
+        save_event_attachments(
+            cache_key=cache_key,
+            data=payload,
+            project_id=default_project.id,
+            event_id=event_id,
+            start_time=time.time(),
+        )
+
+    attachments = EventAttachment.objects.filter(
+        project_id=default_project.id, event_id=event_id
+    ).order_by("name")
+    assert [attachment.name for attachment in attachments] == ["chunked.txt", "unchunked.txt"]
+    for attachment, expected in zip(attachments, (chunked_data, b"unchunked attachment")):
+        with attachment.getfile() as file:
+            assert file.read() == expected
+    assert "_attachments" not in payload
+    for cached_attachment in cached_attachments:
+        with pytest.raises(MissingAttachmentChunks):
+            cached_attachment.load_data()
+
+
+@debug_files_test_both_backends
+class TestDeobfuscateViewHierarchy:
+    @django_db_all
+    @requires_symbolicator
+    @thread_leak_allowlist(reason="django dev server", issue=97036)
+    def test_deobfuscate_view_hierarchy(
+        self,
+        default_project: Project,
+        task_runner: Callable[[], ContextManager[None]],
+        live_server: LiveServer,
+    ) -> None:
+        with override_options({"system.url-prefix": live_server.url}):
+            do_process_view_hierarchy(default_project, task_runner)
+
+    @django_db_all
+    @requires_objectstore
+    @requires_symbolicator
+    @thread_leak_allowlist(reason="django dev server", issue=97036)
+    def test_deobfuscate_view_hierarchy_with_objectstore_attachment(
+        self,
+        default_project: Project,
+        task_runner: Callable[[], ContextManager[None]],
+        live_server: LiveServer,
+    ) -> None:
+        with override_options({"system.url-prefix": live_server.url}):
+            # this stores the attachment during processing in objectstore:
+            do_process_view_hierarchy(default_project, task_runner)
+            # this passes an already stored attachment to the ingest consumer:
+            do_process_view_hierarchy(default_project, task_runner, use_objectstore=True)
+
+
+@debug_files_test_both_backends
+class TestSymbolicateFlamegraph:
+    @django_db_all
+    @requires_symbolicator
+    @thread_leak_allowlist(reason="django dev server", issue=97036)
+    def test_symbolicate_flamegraph_attachment(
+        self,
+        default_project: Project,
+        task_runner: Callable[[], ContextManager[None]],
+        live_server: LiveServer,
+    ) -> None:
+        do_process_flamegraph(default_project, task_runner, live_server)
+
+    @django_db_all
+    @requires_objectstore
+    @requires_symbolicator
+    @thread_leak_allowlist(reason="django dev server", issue=97036)
+    def test_symbolicate_stored_flamegraph_attachment(
+        self,
+        default_project: Project,
+        task_runner: Callable[[], ContextManager[None]],
+        live_server: LiveServer,
+    ) -> None:
+        do_process_flamegraph(default_project, task_runner, live_server, use_objectstore=True)
+
+
+def do_process_flamegraph(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    live_server: LiveServer,
+    use_objectstore: bool = False,
+) -> None:
+    default_project.update_option("sentry:builtin_symbol_sources", [])
+    event = get_normalized_event(
+        {"platform": "other", "message": "Flamegraph symbolication"}, default_project
+    )
+    with zipfile.ZipFile(BytesIO(), "w") as archive:
+        archive.write(get_fixture_path("native", "hello.dsym"), "dSYM/hello")
+        create_files_from_dif_zip(archive, project=default_project)
+    diagnostic = {
+        "version": "1",
+        "platform": "cocoa",
+        "frames": [{"instruction_addr": "0x100000fa0"}],
+        "debug_meta": {
+            "images": [
+                {
+                    "type": "macho",
+                    "debug_id": "502fc0a5-1ec1-3e47-9998-684fa139dca7",
+                    "image_addr": "0x100000000",
+                    "image_size": 4096,
+                    "arch": "x86_64",
+                }
+            ]
+        },
+        "nodes": [{"frame_id": 0, "sample_count": 10}],
+        "trees": [{"roots": [0]}],
+    }
+    attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
+    raw = orjson.dumps(diagnostic)
+    attachment_metadata = {
+        "id": attachment_id,
+        "name": "flamegraph.json",
+        "content_type": "application/json",
+        "attachment_type": "event.flamegraph",
+        "size": len(raw),
+    }
+    if use_objectstore:
+        session = get_session(UsecaseId.ATTACHMENTS, default_project)
+        stored_id = session.put(raw)
+        attachment_metadata["stored_id"] = stored_id
+    else:
+        process_attachment_chunk(
+            {
+                "payload": raw,
+                "event_id": event["event_id"],
+                "project_id": default_project.id,
+                "id": attachment_id,
+                "chunk_index": 0,
+            }
+        )
+        attachment_metadata["chunks"] = 1
+    with (
+        Feature({"organizations:flamegraph-attachments": True}),
+        override_options({"system.url-prefix": live_server.url}),
+        patch("sentry.auth.system.is_internal_ip", return_value=True),
+        task_runner(),
+    ):
+        process_event(
+            ConsumerType.Events,
+            {
+                "payload": orjson.dumps(event).decode(),
+                "start_time": time.time(),
+                "event_id": event["event_id"],
+                "project_id": default_project.id,
+                "remote_addr": "127.0.0.1",
+                "attachments": [attachment_metadata],
+            },
+            project=default_project,
+        )
+    attachment = EventAttachment.objects.get(
+        project_id=default_project.id, event_id=event["event_id"]
+    )
+    assert attachment.type == "event.flamegraph"
+    assert attachment.content_type == "application/json"
+    with attachment.getfile() as file:
+        processed = orjson.loads(file.read())
+    assert processed["frames"][0]["function"] == "main"
+    assert processed["frames"][0]["instruction_addr"] == "0x100000fa0"
+    assert processed["trees"] == diagnostic["trees"]
+    assert processed["nodes"] == diagnostic["nodes"]
+    assert processed["_symbolication"]["status"] == "completed"
+    assert attachment.size == len(orjson.dumps(processed))
+    if use_objectstore:
+        assert attachment.blob_path == V2_PREFIX + stored_id
+        stored = session.get(stored_id)
+        assert stored is not None
+        assert orjson.loads(stored.payload.read()) == processed
+
+
+def do_process_view_hierarchy(
+    project: Project, task_runner: Callable[[], ContextManager[None]], use_objectstore: bool = False
+) -> None:
+    payload = get_normalized_event(
+        {
+            "message": "hello world",
+            "debug_meta": {"images": [{"uuid": PROGUARD_UUID, "type": "proguard"}]},
+        },
+        project,
+    )
+    event_id = payload["event_id"]
+    attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
+    start_time = time.time() - 3600
+
+    # Create the proguard file
+    with zipfile.ZipFile(BytesIO(), "w") as f:
+        f.writestr(f"proguard/{PROGUARD_UUID}.txt", PROGUARD_SOURCE)
+        create_files_from_dif_zip(f, project=project)
+
+    expected_response = b'{"rendering_system":"Test System","windows":[{"identifier":"parent","type":"org.slf4j.helpers.Util$ClassContextSecurityManager","children":[{"identifier":"child","type":"org.slf4j.helpers.Util$ClassContextSecurityManager"}]}]}'
+    obfuscated_view_hierarchy = {
+        "rendering_system": "Test System",
+        "windows": [
+            {
+                "identifier": "parent",
+                "type": "org.a.b.g$a",
+                "children": [
+                    {
+                        "identifier": "child",
+                        "type": "org.a.b.g$a",
+                    }
+                ],
+            }
+        ],
+    }
+    attachment_payload = orjson.dumps(obfuscated_view_hierarchy)
+    attachment_metadata = {
+        "id": attachment_id,
+        "name": "view_hierarchy.json",
+        "content_type": "application/json",
+        "attachment_type": "event.view_hierarchy",
+        "size": len(attachment_payload),
+    }
+
+    stored_id = None
+    if not use_objectstore:
+        process_attachment_chunk(
+            {
+                "payload": attachment_payload,
+                "event_id": event_id,
+                "project_id": project.id,
+                "id": attachment_id,
+                "chunk_index": 0,
+            }
+        )
+        attachment_metadata["chunks"] = 1
+    else:
+        session = get_session(UsecaseId.ATTACHMENTS, project)
+        stored_id = session.put(attachment_payload)
+        attachment_metadata["stored_id"] = stored_id
+
+    with task_runner():
+        process_event(
+            ConsumerType.Events,
+            {
+                "payload": orjson.dumps(payload).decode(),
+                "start_time": start_time,
+                "event_id": event_id,
+                "project_id": project.id,
+                "remote_addr": "127.0.0.1",
+                "attachments": [attachment_metadata],
+            },
+            project=project,
+        )
+
+    persisted_attachments = list(
+        EventAttachment.objects.filter(project_id=project.id, event_id=event_id)
+    )
+    (attachment,) = persisted_attachments
+    assert attachment.content_type == "application/json"
+    assert attachment.name == "view_hierarchy.json"
+    with attachment.getfile() as file:
+        assert file.read() == expected_response
+    if stored_id:
+        stored = session.get(stored_id)
+        assert stored is not None
+        assert stored.payload.read() == expected_response
+
+
+@django_db_all
+@requires_objectstore
+@requires_symbolicator
+@thread_leak_allowlist(reason="django dev server", issue=97036)
+def test_process_stored_attachment(
+    default_project: Project,
+    task_runner: Callable[[], ContextManager[None]],
+    set_sentry_option: Callable[[str, object], AbstractContextManager[None]],
+    live_server: LiveServer,
+) -> None:
+    with set_sentry_option("system.url-prefix", live_server.url):
+        payload = get_normalized_event(
+            {
+                "platform": "native",
+                "exception": {
+                    "values": [
+                        {
+                            "type": "minidump",
+                            "value": "Minidump",
+                            "mechanism": {"type": "minidump", "handled": False, "synthetic": True},
+                        }
+                    ]
+                },
+            },
+            default_project,
+        )
+        event_id = payload["event_id"]
+        attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
+        project_id = default_project.id
+        start_time = time.time() - 3600
+
+        default_project.update_option("sentry:store_crash_reports", STORE_CRASH_REPORTS_ALL)
+
+        with open(get_fixture_path("native", "threadnames.dmp"), "rb") as f:
+            attachment_payload = f.read()
+
+        stored_id = get_session(UsecaseId.ATTACHMENTS, default_project).put(attachment_payload)
+
+        with task_runner():
+            process_event(
+                ConsumerType.Events,
+                {
+                    "payload": orjson.dumps(payload).decode(),
+                    "start_time": start_time,
+                    "event_id": event_id,
+                    "project_id": project_id,
+                    "remote_addr": "127.0.0.1",
+                    "attachments": [
+                        {
+                            "id": attachment_id,
+                            "name": "test.dmp",
+                            "content_type": "application/octet-stream",
+                            "attachment_type": "event.minidump",
+                            "size": len(attachment_payload),
+                            "stored_id": stored_id,
+                        }
+                    ],
+                },
+                project=default_project,
+            )
+
+        persisted_attachments = list(
+            EventAttachment.objects.filter(project_id=project_id, event_id=event_id)
+        )
+        (attachment,) = persisted_attachments
+        assert attachment.name == "test.dmp"
+        with attachment.getfile() as file:
+            assert file.read() == attachment_payload
+
+        event = eventstore.backend.get_event_by_id(project_id, event_id)
+        assert event
+        thread_name = get_path(event.data, "threads", "values", 1, "name")
+        assert thread_name == "sentry-http"
+
+
+@django_db_all
+@pytest.mark.parametrize("feature_enabled", [True, False], ids=["with_feature", "without_feature"])
 @pytest.mark.parametrize(
-    "event_attachments", [True, False], ids=["with_feature", "without_feature"]
-)
-@pytest.mark.parametrize(
-    "chunks", [(b"Hello ", b"World!"), (b"",), ()], ids=["basic", "zerolen", "nochunks"]
+    "attachment",
+    [
+        ([b"Hello ", b"World!"], "event.attachment", "text/plain"),
+        ([b""], "event.attachment", "text/plain"),
+        ([], "event.attachment", "text/plain"),
+        (
+            [b'{"rendering_system":"flutter","windows":[]}'],
+            "event.view_hierarchy",
+            "application/json",
+        ),
+        (b"inline attachment", "event.attachment", "text/plain"),
+    ],
+    ids=["basic", "zerolen", "nochunks", "view_hierarchy", "inline"],
 )
 @pytest.mark.parametrize("with_group", [True, False], ids=["with_group", "without_group"])
 def test_individual_attachments(
-    default_project, factories, monkeypatch, event_attachments, chunks, with_group
-):
-    monkeypatch.setattr("sentry.features.has", lambda *a, **kw: event_attachments)
+    default_project: Project,
+    factories: Factories,
+    feature_enabled: bool,
+    attachment: tuple[bytes | list[bytes], str, str],
+    with_group: bool,
+    django_cache: BaseCache,
+) -> None:
+    retention_days = 66
 
-    event_id = "515539018c9b4260a6f999572f1661ee"
-    attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
-    project_id = default_project.id
-    group_id = None
+    with patch("sentry.features.has", return_value=feature_enabled):
+        event_id = uuid.uuid4().hex
+        attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
+        project_id = default_project.id
+        group_id = None
 
-    if with_group:
-        event = factories.store_event(
-            data={"event_id": event_id, "message": "existence is pain"}, project_id=project_id
-        )
+        if with_group:
+            event = factories.store_event(
+                data={"event_id": event_id, "message": "existence is pain"}, project_id=project_id
+            )
 
-        group_id = event.group.id
-        assert group_id, "this test requires a group to work"
+            assert event.group is not None
+            group_id = event.group.id
+            assert group_id, "this test requires a group to work"
 
-    for i, chunk in enumerate(chunks):
-        process_attachment_chunk(
+        chunks, attachment_type, content_type = attachment
+        attachment_meta = {
+            "id": attachment_id,
+            "name": "foo.txt",
+            "content_type": content_type,
+            "attachment_type": attachment_type,
+            "chunks": len(chunks),
+            "retention_days": retention_days,
+        }
+        if isinstance(chunks, bytes):
+            attachment_meta["data"] = chunks
+            expected_content = chunks
+        else:
+            for i, chunk in enumerate(chunks):
+                process_attachment_chunk(
+                    {
+                        "payload": chunk,
+                        "event_id": event_id,
+                        "project_id": project_id,
+                        "id": attachment_id,
+                        "chunk_index": i,
+                    }
+                )
+            expected_content = b"".join(chunks)
+        attachment_meta["size"] = len(expected_content)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        process_individual_attachment(
             {
-                "payload": chunk,
+                "type": "attachment",
+                "attachment": attachment_meta,
                 "event_id": event_id,
                 "project_id": project_id,
-                "id": attachment_id,
-                "chunk_index": i,
             },
-            projects={default_project.id: default_project},
+            project=default_project,
         )
 
-    process_individual_attachment(
-        {
-            "type": "attachment",
-            "attachment": {
-                "attachment_type": "event.attachment",
-                "chunks": len(chunks),
-                "content_type": "application/octet-stream",
-                "id": attachment_id,
-                "name": "foo.txt",
-            },
-            "event_id": event_id,
-            "project_id": project_id,
-        },
-        projects={default_project.id: default_project},
-    )
+    model = EventAttachment if with_group else PendingEventAttachment
 
-    attachments = list(EventAttachment.objects.filter(project_id=project_id, event_id=event_id))
+    attachments = list(model.objects.filter(project_id=project_id, event_id=event_id))
 
-    if not event_attachments:
+    if not feature_enabled:
         assert not attachments
     else:
-        (attachment,) = attachments
-        file = File.objects.get(id=attachment.file_id)
-        assert file.type == "event.attachment"
-        assert file.headers == {"Content-Type": "application/octet-stream"}
-        assert attachment.group_id == group_id
-        file_contents = file.getfile()
-        assert file_contents.read() == b"".join(chunks)
-        assert file_contents.name == "foo.txt"
+        (stored_attachment,) = attachments
+        assert stored_attachment.name == "foo.txt"
+        if with_group:
+            assert isinstance(stored_attachment, EventAttachment)
+            assert stored_attachment.group_id == group_id
+        assert stored_attachment.content_type == content_type
+
+        with stored_attachment.getfile() as file_contents:
+            assert file_contents.read() == expected_content
+
+        delta = stored_attachment.final_expiry_date() - (
+            now + datetime.timedelta(days=retention_days)
+        )
+        assert abs(delta.total_seconds()) < 3600
 
 
-@pytest.mark.django_db
-def test_userreport(default_project, monkeypatch):
+@django_db_all
+def test_userreport(django_cache: BaseCache, default_project: Project) -> None:
     """
     Test that user_report-type kafka messages end up in a user report being
     persisted. We additionally test some logic around upserting data in
@@ -214,37 +1166,223 @@ def test_userreport(default_project, monkeypatch):
     mgr.normalize()
     mgr.save(default_project.id)
 
-    (evtuser,) = EventUser.objects.all()
-    assert not evtuser.name
-
     assert not UserReport.objects.all()
 
     assert process_userreport(
         {
             "type": "user_report",
             "start_time": start_time,
-            "payload": json.dumps(
+            "payload": orjson.dumps(
                 {
                     "name": "Hans Gans",
                     "event_id": event_id,
                     "comments": "hello world",
                     "email": "markus+dontatme@sentry.io",
                 }
-            ),
+            ).decode(),
             "project_id": default_project.id,
         },
-        projects={default_project.id: default_project},
+        project=default_project,
     )
 
     (report,) = UserReport.objects.all()
     assert report.comments == "hello world"
 
-    (evtuser,) = EventUser.objects.all()
-    assert evtuser.name == "Hans Gans"
+
+@django_db_all
+def test_individual_attachment_before_event(
+    django_cache: BaseCache, default_project: Project, factories: Factories
+) -> None:
+    """
+    An attachment that is ingested before its event is parked in
+    `PendingEventAttachment` and promoted once the event arrives.
+    """
+    from sentry.utils.outcomes import Outcome, track_outcome
+
+    event_id = uuid.uuid4().hex
+    retention_days = 66
+    payload = b"Hello World!"
+
+    mock_track_outcome = patch("sentry.event_manager.track_outcome", wraps=track_outcome)
+
+    with (
+        Feature(
+            {
+                "organizations:event-attachments": True,
+            }
+        ),
+        mock_track_outcome as track,
+    ):
+        process_individual_attachment(
+            {
+                "type": "attachment",
+                "attachment": {
+                    "id": "ca90fb45-6dd9-40a0-a18f-8693aa621abb",
+                    "name": "foo.txt",
+                    "content_type": "text/plain",
+                    "attachment_type": "event.attachment",
+                    "chunks": 0,
+                    "data": payload,
+                    "size": len(payload),
+                    "retention_days": retention_days,
+                },
+                "event_id": event_id,
+                "project_id": default_project.id,
+            },
+            project=default_project,
+        )
+
+        pending = list(PendingEventAttachment.objects.filter(project_id=default_project.id))
+        stored = list(EventAttachment.objects.filter(project_id=default_project.id))
+
+        # Parked, not stored, and not billed yet.
+        (pending_attachment,) = pending
+        assert not stored
+        assert pending_attachment.event_id == event_id
+        assert pending_attachment.name == "foo.txt"
+        # Short TTL so it gets reaped if the event never shows up, but the real
+        # retention date is kept around for the promoted row.
+        assert pending_attachment.date_expires < timezone.now() + datetime.timedelta(hours=2)
+        assert pending_attachment.date_expires_retention > timezone.now() + datetime.timedelta(
+            days=retention_days - 1
+        )
+        assert track.call_count == 0
+
+        # Now the event arrives.
+        manager = EventManager({"event_id": event_id, "message": "existence is pain"})
+        manager.normalize()
+        event = manager.save(default_project.id)
+
+    assert not PendingEventAttachment.objects.filter(project_id=default_project.id).exists()
+
+    (attachment,) = EventAttachment.objects.filter(project_id=default_project.id)
+    assert attachment.event_id == event_id
+    assert attachment.name == "foo.txt"
+    assert attachment.content_type == "text/plain"
+    assert attachment.size == len(payload)
+    with attachment.getfile() as file_contents:
+        assert file_contents.read() == payload
+    # The promoted row carries the full retention, not the pending TTL.
+    delta = attachment.date_expires - (timezone.now() + datetime.timedelta(days=retention_days))
+    assert abs(delta.total_seconds()) < 3600
+
+    # The promoted attachment is linked to the group and billed on promotion.
+    assert attachment.group_id == event.group_id
+    attachment_outcomes = [
+        call.kwargs
+        for call in track.mock_calls
+        if call.kwargs.get("category") == DataCategory.ATTACHMENT
+    ]
+    assert len(attachment_outcomes) == 1
+    assert attachment_outcomes[0]["outcome"] == Outcome.ACCEPTED
+    assert attachment_outcomes[0]["quantity"] == len(payload)
+    assert attachment_outcomes[0]["event_id"] == event_id
 
 
-@pytest.mark.django_db
-def test_userreport_reverse_order(default_project, monkeypatch):
+@django_db_all
+def test_individual_attachment_before_transaction(
+    django_cache: BaseCache, default_project: Project
+) -> None:
+    """
+    An attachment can also be parked ahead of a *transaction*.
+
+    Transactions never get a group and are saved by `save_transaction_events`, not
+    `save_error_events`, so promotion has to happen there too. Without it the row is
+    never promoted and expires with its blob after `PENDING_ATTACHMENT_TTL`.
+    """
+    from sentry.utils.outcomes import Outcome, track_outcome
+
+    event_id = uuid.uuid4().hex
+    retention_days = 66
+    payload = b"Hello World!"
+    now = timezone.now()
+
+    with (
+        Feature(
+            {
+                "organizations:event-attachments": True,
+            }
+        ),
+        patch("sentry.event_manager.track_outcome", wraps=track_outcome) as track,
+    ):
+        process_individual_attachment(
+            {
+                "type": "attachment",
+                "attachment": {
+                    "id": "ca90fb45-6dd9-40a0-a18f-8693aa621abb",
+                    "name": "foo.txt",
+                    "content_type": "text/plain",
+                    "attachment_type": "event.attachment",
+                    "chunks": 0,
+                    "data": payload,
+                    "size": len(payload),
+                    "retention_days": retention_days,
+                },
+                "event_id": event_id,
+                "project_id": default_project.id,
+            },
+            project=default_project,
+        )
+
+        # Parked, not stored, and not billed yet.
+        (pending_attachment,) = PendingEventAttachment.objects.filter(project_id=default_project.id)
+        assert pending_attachment.event_id == event_id
+        assert not EventAttachment.objects.filter(project_id=default_project.id).exists()
+        assert track.call_count == 0
+
+        # Now the transaction arrives.
+        manager = EventManager(
+            {
+                "event_id": event_id,
+                "type": "transaction",
+                "transaction": "wait",
+                "contexts": {
+                    "trace": {
+                        "op": "foobar",
+                        "trace_id": "a0fa8803753e40fd8124b21eeb2986b5",
+                        "span_id": "bf5be759039ede9a",
+                    }
+                },
+                "spans": [],
+                "start_timestamp": (now - datetime.timedelta(seconds=1)).isoformat(),
+                "timestamp": now.isoformat(),
+            }
+        )
+        manager.normalize()
+        event = manager.save(default_project.id)
+
+    assert event.get_event_type() == "transaction"
+    assert event.group_id is None
+
+    assert not PendingEventAttachment.objects.filter(project_id=default_project.id).exists()
+
+    (attachment,) = EventAttachment.objects.filter(project_id=default_project.id)
+    assert attachment.event_id == event_id
+    assert attachment.name == "foo.txt"
+    assert attachment.content_type == "text/plain"
+    assert attachment.size == len(payload)
+    # A transaction has no group, so neither does its attachment.
+    assert attachment.group_id is None
+    with attachment.getfile() as file_contents:
+        assert file_contents.read() == payload
+    # The promoted row carries the full retention, not the pending TTL.
+    delta = attachment.date_expires - (timezone.now() + datetime.timedelta(days=retention_days))
+    assert abs(delta.total_seconds()) < 3600
+
+    # Billed exactly once, on promotion.
+    attachment_outcomes = [
+        call.kwargs
+        for call in track.mock_calls
+        if call.kwargs.get("category") == DataCategory.ATTACHMENT
+    ]
+    assert len(attachment_outcomes) == 1
+    assert attachment_outcomes[0]["outcome"] == Outcome.ACCEPTED
+    assert attachment_outcomes[0]["quantity"] == len(payload)
+    assert attachment_outcomes[0]["event_id"] == event_id
+
+
+@django_db_all
+def test_userreport_reverse_order(django_cache: BaseCache, default_project: Project) -> None:
     """
     Test that ingesting a userreport before the event works. This is relevant
     for unreal crashes where the userreport is processed immediately in the
@@ -257,17 +1395,17 @@ def test_userreport_reverse_order(default_project, monkeypatch):
         {
             "type": "user_report",
             "start_time": start_time,
-            "payload": json.dumps(
+            "payload": orjson.dumps(
                 {
                     "name": "Hans Gans",
                     "event_id": event_id,
                     "comments": "hello world",
                     "email": "markus+dontatme@sentry.io",
                 }
-            ),
+            ).decode(),
             "project_id": default_project.id,
         },
-        projects={default_project.id: default_project},
+        project=default_project,
     )
 
     mgr = EventManager(data={"event_id": event_id, "user": {"email": "markus+dontatme@sentry.io"}})
@@ -278,36 +1416,54 @@ def test_userreport_reverse_order(default_project, monkeypatch):
     (report,) = UserReport.objects.all()
     assert report.comments == "hello world"
 
-    (evtuser,) = EventUser.objects.all()
+    event = eventstore.backend.get_event_by_id(default_project.id, event_id)
+    assert event is not None
+    evtuser = EventUser.from_event(event)
     # Event got saved after user report, and the sync only works in the
     # opposite direction. That's fine, we just accept it.
     assert evtuser.name is None
 
 
-@pytest.mark.django_db
-def test_individual_attachments_missing_chunks(default_project, factories, monkeypatch):
-    monkeypatch.setattr("sentry.features.has", lambda *a, **kw: True)
+@django_db_all
+def test_individual_attachments_missing_chunks(
+    default_project: Project, factories: Factories
+) -> None:
+    with patch("sentry.features.has", return_value=True):
+        event_id = "515539018c9b4260a6f999572f1661ee"
+        attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
+        project_id = default_project.id
 
-    event_id = "515539018c9b4260a6f999572f1661ee"
-    attachment_id = "ca90fb45-6dd9-40a0-a18f-8693aa621abb"
-    project_id = default_project.id
-
-    process_individual_attachment(
-        {
-            "type": "attachment",
-            "attachment": {
-                "attachment_type": "event.attachment",
-                "chunks": 123,
-                "content_type": "application/octet-stream",
-                "id": attachment_id,
-                "name": "foo.txt",
+        process_individual_attachment(
+            {
+                "type": "attachment",
+                "attachment": {
+                    "attachment_type": "event.attachment",
+                    "chunks": 123,
+                    "content_type": "application/octet-stream",
+                    "id": attachment_id,
+                    "name": "foo.txt",
+                },
+                "event_id": event_id,
+                "project_id": project_id,
             },
-            "event_id": event_id,
-            "project_id": project_id,
-        },
-        projects={default_project.id: default_project},
-    )
+            project=default_project,
+        )
 
     attachments = list(EventAttachment.objects.filter(project_id=project_id, event_id=event_id))
 
     assert not attachments
+
+
+@django_db_all
+def test_collect_span_metrics(default_project: Project) -> None:
+    with Feature({"organizations:dynamic-sampling": True, "organization:am3-tier": True}):
+        with patch("sentry.ingest.consumer.processors.metrics") as mock_metrics:
+            assert mock_metrics.incr.call_count == 0
+            collect_span_metrics(default_project, {"spans": [1, 2, 3]})
+            assert mock_metrics.incr.call_count == 0
+
+    with Feature({"organizations:dynamic-sampling": False, "organization:am3-tier": False}):
+        with patch("sentry.ingest.consumer.processors.metrics") as mock_metrics:
+            assert mock_metrics.incr.call_count == 0
+            collect_span_metrics(default_project, {"spans": [1, 2, 3]})
+            assert mock_metrics.incr.call_count == 1

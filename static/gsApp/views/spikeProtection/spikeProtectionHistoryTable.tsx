@@ -1,0 +1,320 @@
+import styled from '@emotion/styled';
+import {IconSettings} from '@sentry/icons/settings';
+import {IconTelescope} from '@sentry/icons/telescope';
+
+import {Button, LinkButton} from '@sentry/scraps/button';
+import {InfoTip} from '@sentry/scraps/info';
+import {Flex} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+import {Text} from '@sentry/scraps/text';
+
+import {addErrorMessage, addSuccessMessage} from 'sentry/actionCreators/indicator';
+import {DiscoverButton} from 'sentry/components/discoverButton';
+import {DocumentationHint} from 'sentry/components/documentationHint';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {Panel} from 'sentry/components/panels/panel';
+import {Placeholder} from 'sentry/components/placeholder';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {t, tct} from 'sentry/locale';
+import type {DataCategoryInfo} from 'sentry/types/core';
+import type {ProjectSummaryWithOptions} from 'sentry/types/project';
+import {defined} from 'sentry/utils/defined';
+import {getExactDuration} from 'sentry/utils/duration/getExactDuration';
+import {decodeScalar} from 'sentry/utils/queryString';
+import {useApi} from 'sentry/utils/useApi';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {makeDiscoverPathname} from 'sentry/views/discover/pathnames';
+import {
+  formatUsageWithUnits,
+  getFormatUsageOptions,
+} from 'sentry/views/organizationStats/utils';
+
+import {useSubscription} from 'getsentry/hooks/useSubscription';
+import {
+  SpendVisibilityEvents,
+  trackSpendVisibilityAnaltyics,
+} from 'getsentry/utils/trackSpendVisibilityAnalytics';
+import {
+  SPIKE_PROTECTION_DOCS_LINK,
+  SPIKE_PROTECTION_ERROR_MESSAGE,
+} from 'getsentry/views/spikeProtection/constants';
+import {SpikeProtectionTimeDetails} from 'getsentry/views/spikeProtection/spikeProtectionTimeDetails';
+import type {SpikeDetails} from 'getsentry/views/spikeProtection/types';
+
+import {isSpikeProtectionEnabled} from './spikeProtectionProjectToggle';
+
+type Props = {
+  dataCategoryInfo: DataCategoryInfo;
+  onEnableSpikeProtection: () => void;
+  project: ProjectSummaryWithOptions;
+  spikes: SpikeDetails[];
+  isLoading?: boolean;
+};
+
+const SPIKE_COLUMNS: TableColumnConfig[] = [
+  {key: 'time', width: 'auto'},
+  {key: 'threshold', width: 'auto'},
+  {key: 'duration', width: 'auto'},
+  {key: 'dropped', width: 'auto'},
+  {key: 'actions', width: 'auto'},
+];
+
+function EnableSpikeProtectionButton({
+  onEnableSpikeProtection,
+  project,
+  ...props
+}: {
+  onEnableSpikeProtection: () => void;
+  project: ProjectSummaryWithOptions;
+}) {
+  const api = useApi();
+  const organization = useOrganization();
+  const subscription = useSubscription();
+  const endpoint = `/organizations/${organization.slug}/spike-protections/`;
+
+  async function enableSpikeProtection() {
+    try {
+      await api.requestPromise(endpoint, {
+        method: 'POST',
+        data: {projects: [project.slug]},
+      });
+      addSuccessMessage(
+        tct('[action] spike protection for [project]', {
+          action: t('Enabled'),
+          project: project.slug,
+        })
+      );
+      trackSpendVisibilityAnaltyics(SpendVisibilityEvents.SP_PROJECT_TOGGLED, {
+        organization,
+        subscription: subscription ?? undefined,
+        project_id: project.id,
+        value: true,
+        view: 'project_stats',
+      });
+      onEnableSpikeProtection();
+    } catch {
+      addErrorMessage(SPIKE_PROTECTION_ERROR_MESSAGE);
+    }
+  }
+
+  return (
+    <Button
+      size="sm"
+      onClick={() => {
+        enableSpikeProtection();
+      }}
+      {...props}
+      data-test-id="enable-sp-button"
+    >
+      {t('Enable Spike Protection')}
+    </Button>
+  );
+}
+
+const HEADERS = [
+  t('Past Spikes'),
+  t('Initial Threshold'),
+  t('Duration'),
+  t('Events Dropped'),
+  null, // Discover Query button
+];
+
+function SpikeRow({
+  dataCategoryInfo,
+  project,
+  spike,
+}: {
+  dataCategoryInfo: DataCategoryInfo;
+  project: ProjectSummaryWithOptions;
+  spike: SpikeDetails;
+}) {
+  const organization = useOrganization();
+  const subscription = useSubscription();
+  // ms -> s, rounds up to get duration in minutes
+  // rounding up to match the formatted date and time values
+  const millisecondsPerSecond = 1000;
+  const secondsPerMinute = 60;
+  const duration = spike.end
+    ? Math.ceil(
+        (new Date(spike.end).valueOf() - new Date(spike.start).valueOf()) /
+          (millisecondsPerSecond * secondsPerMinute)
+      ) * secondsPerMinute
+    : null;
+  return (
+    <SimpleTable.Row>
+      <SimpleTable.RowCell>
+        <SpikeProtectionTimeDetails spike={spike} />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        {defined(spike.threshold)
+          ? formatUsageWithUnits(
+              spike.threshold,
+              dataCategoryInfo.plural,
+              getFormatUsageOptions(dataCategoryInfo.plural)
+            )
+          : '-'}
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        {duration ? getExactDuration(duration, true) : t('Ongoing')}
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        {spike.dropped
+          ? formatUsageWithUnits(
+              spike.dropped,
+              dataCategoryInfo.plural,
+              getFormatUsageOptions(dataCategoryInfo.plural)
+            )
+          : '-'}
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell justify="end">
+        <DiscoverButton
+          icon={<IconTelescope size="sm" />}
+          data-test-id="spike-protection-discover-button"
+          onClick={() =>
+            trackSpendVisibilityAnaltyics(SpendVisibilityEvents.SP_DISCOVER_CLICKED, {
+              organization,
+              subscription: subscription ?? undefined,
+              view: 'project_stats',
+            })
+          }
+          to={{
+            pathname: makeDiscoverPathname({
+              organization,
+              path: '/',
+            }),
+            query: {
+              project: [project.id],
+              start: decodeScalar(spike.start),
+              end: decodeScalar(spike.end),
+            },
+          }}
+        >
+          {t('Open in Explore')}
+        </DiscoverButton>
+      </SimpleTable.RowCell>
+    </SimpleTable.Row>
+  );
+}
+
+function SpikeHistoryContent({
+  dataCategoryInfo,
+  onEnableSpikeProtection,
+  project,
+  spikes,
+  isLoading,
+}: Props) {
+  const organization = useOrganization();
+
+  if (isLoading) {
+    return (
+      <Placeholder height="150px">
+        <LoadingIndicator mini />
+      </Placeholder>
+    );
+  }
+
+  if (!isSpikeProtectionEnabled(project)) {
+    return (
+      <EmptySpikeHistory data-test-id="spike-history-disabled">
+        <b>{t('Spike Protection Disabled')}</b>
+        <p>{t('Spike Protection is currently disabled for this project.')}</p>
+        <div>
+          <EnableSpikeProtectionButton
+            project={project}
+            onEnableSpikeProtection={onEnableSpikeProtection}
+          />
+        </div>
+      </EmptySpikeHistory>
+    );
+  }
+
+  if (spikes.length === 0) {
+    return (
+      <EmptySpikeHistory data-test-id="spike-history-empty">
+        <b>{t('No Significant Spikes')}</b>
+        <p>
+          {t(
+            'Spike Protection is enabled for this project, but there are no significant spikes that lasted 2hrs or longer.'
+          )}
+          <br />
+          {tct('Please see the [auditLogLink: audit log] for all detected spikes.', {
+            auditLogLink: <Link to={`/settings/${organization.slug}/audit-log/`} />,
+          })}
+        </p>
+      </EmptySpikeHistory>
+    );
+  }
+
+  return (
+    <SimpleTable
+      columns={SPIKE_COLUMNS}
+      header={
+        <SimpleTable.HeaderRow>
+          {HEADERS.map((header, i) => (
+            <SimpleTable.HeaderCell key={i}>{header}</SimpleTable.HeaderCell>
+          ))}
+        </SimpleTable.HeaderRow>
+      }
+    >
+      {spikes.map(spike => (
+        <SpikeRow
+          key={spike.start}
+          dataCategoryInfo={dataCategoryInfo}
+          project={project}
+          spike={spike}
+        />
+      ))}
+    </SimpleTable>
+  );
+}
+
+export function SpikeProtectionHistoryTable(props: Props) {
+  const organization = useOrganization();
+
+  return (
+    <div data-test-id="spike-protection-history-table">
+      <Flex align="center" marginBottom="xl" gap="md">
+        <Flex flex="1" align="center" gap="sm">
+          <Text bold size="lg" variant="secondary">
+            {t('Spike Protection')}
+          </Text>
+          <InfoTip
+            title={
+              <DocumentationHint docsUrl={SPIKE_PROTECTION_DOCS_LINK}>
+                {t(
+                  'Sentry applies a dynamic rate limit to your account designed to protect you from short-term spikes.'
+                )}
+              </DocumentationHint>
+            }
+            size="sm"
+            position="right"
+          />
+        </Flex>
+        <LinkButton
+          size="sm"
+          icon={<IconSettings />}
+          to={`/settings/${organization.slug}/spike-protection/`}
+        >
+          {t('Spike Protection Settings')}
+        </LinkButton>
+      </Flex>
+      <SpikeHistoryContent {...props} />
+    </div>
+  );
+}
+
+const EmptySpikeHistory = styled(Panel)`
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  text-align: center;
+  padding: ${p => p.theme.space['3xl']} ${p => p.theme.space.xl};
+  b {
+    font-size: ${p => p.theme.font.size.lg};
+    margin-bottom: ${p => p.theme.space.md};
+  }
+  p:last-child {
+    margin: 0;
+  }
+`;

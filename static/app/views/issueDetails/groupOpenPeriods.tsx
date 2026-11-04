@@ -1,0 +1,203 @@
+import {Link} from 'react-router';
+import styled from '@emotion/styled';
+import {IconSeer} from '@sentry/icons/seer';
+import {useQuery} from '@tanstack/react-query';
+import orderBy from 'lodash/orderBy';
+
+import {Flex} from '@sentry/scraps/layout';
+import {COL_WIDTH_UNDEFINED} from '@sentry/scraps/table';
+
+import {DateTime} from 'sentry/components/dateTime';
+import {DataGrid, type GridColumnOrder} from 'sentry/components/tables/dataGrid';
+import {t} from 'sentry/locale';
+import type {GroupOpenPeriodActivity} from 'sentry/types/group';
+import {selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {getShortEventId} from 'sentry/utils/events';
+import {parseLinkHeader} from 'sentry/utils/parseLinkHeader';
+import {unreachable} from 'sentry/utils/unreachable';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useParams} from 'sentry/utils/useParams';
+import {openPeriodsApiOptions} from 'sentry/views/detectors/hooks/useOpenPeriods';
+import {investigationCandidatesQueryOptions} from 'sentry/views/investigations/api';
+import type {MetricOpenPeriodInvestigationSource} from 'sentry/views/investigations/types';
+import {
+  getInvestigationPath,
+  useInvestigationsEnabled,
+} from 'sentry/views/investigations/utils';
+import {EventListTable} from 'sentry/views/issueDetails/eventListTable';
+
+interface OpenPeriodDisplayData {
+  description: string;
+  end: React.ReactNode;
+  eventId: React.ReactNode;
+  investigation: React.ReactNode;
+  openPeriod: React.ReactNode;
+  start: React.ReactNode;
+}
+
+function getOpenPeriodActivityTypeLabel(activity: GroupOpenPeriodActivity): string {
+  switch (activity.type) {
+    case 'opened':
+      return t('Issue regressed');
+    case 'closed':
+      return t('Resolved');
+    case 'status_change':
+      return t('Priority updated to %s', activity.value);
+    default:
+      unreachable(activity.type);
+      return t('Updated');
+  }
+}
+
+// TODO(snigdha): make this work for the old UI
+function IssueOpenPeriodsList() {
+  const organization = useOrganization();
+  const location = useLocation();
+  const params = useParams<{groupId: string}>();
+  const {
+    data: response,
+    isPending,
+    error,
+  } = useQuery({
+    ...openPeriodsApiOptions({
+      organization,
+      groupId: params.groupId,
+      cursor: location.query?.cursor,
+      limit: 10,
+    }),
+    select: selectJsonWithHeaders,
+  });
+  const openPeriods = response?.json ?? [];
+  const investigationsEnabled = useInvestigationsEnabled();
+  const candidateSources: MetricOpenPeriodInvestigationSource[] = openPeriods.map(
+    period => ({
+      type: 'metric_open_period',
+      ref: {groupId: params.groupId, openPeriodId: period.id},
+    })
+  );
+  const {data: candidates} = useQuery({
+    ...investigationCandidatesQueryOptions({
+      organizationSlug: organization.slug,
+      sources: candidateSources,
+    }),
+    enabled: investigationsEnabled && candidateSources.length > 0,
+  });
+
+  const data = openPeriods.flatMap((period, periodIndex) => {
+    const candidate = candidates?.items[periodIndex];
+    const periodActivities = orderBy(
+      period.activities.filter(activity => activity.type !== 'closed'),
+      'dateCreated',
+      'desc'
+    );
+
+    return periodActivities.map((activity, index) => {
+      const startDate = new Date(activity.dateCreated);
+      const endDate =
+        index === 0 ? (period.end ? new Date(period.end) : undefined) : undefined;
+
+      return {
+        openPeriod: activity.type === 'opened' ? `#${period.id}` : undefined,
+        eventId: activity.eventId ? (
+          <EventIdLink
+            to={`/organizations/${organization.slug}/issues/${params.groupId}/events/${activity.eventId}/`}
+          >
+            {getShortEventId(activity.eventId)}
+          </EventIdLink>
+        ) : (
+          '—'
+        ),
+        description: getOpenPeriodActivityTypeLabel(activity),
+        start: <DateTime date={startDate} />,
+        end: endDate ? <DateTime date={endDate} /> : undefined,
+        investigation:
+          activity.type === 'opened' && candidate?.status === 'view' ? (
+            <Link to={getInvestigationPath(organization.slug, candidate.investigationId)}>
+              <Flex as="span" align="center" gap="xs">
+                <IconSeer size="xs" />
+                {candidate.investigationId}
+              </Flex>
+            </Link>
+          ) : undefined,
+      };
+    });
+  });
+
+  const columnOrder: Array<GridColumnOrder<string>> = [
+    {key: 'openPeriod', width: COL_WIDTH_UNDEFINED, name: t('Open Period')},
+    {key: 'eventId', width: 100, name: t('Event ID')},
+    {key: 'description', width: COL_WIDTH_UNDEFINED, name: t('Description')},
+    {key: 'start', width: COL_WIDTH_UNDEFINED, name: t('Start')},
+    {key: 'end', width: COL_WIDTH_UNDEFINED, name: t('End')},
+    ...(investigationsEnabled
+      ? [
+          {
+            key: 'investigation',
+            width: COL_WIDTH_UNDEFINED,
+            name: t('Investigation'),
+          },
+        ]
+      : []),
+  ];
+
+  const renderBodyCell = (
+    col: GridColumnOrder<string>,
+    dataRow: OpenPeriodDisplayData
+  ) => {
+    const column = col.key as keyof OpenPeriodDisplayData;
+
+    return <AlignLeft>{dataRow[column]}</AlignLeft>;
+  };
+
+  const links = parseLinkHeader(response?.headers.Link ?? '');
+  const totalCount = response?.headers['X-Hits'];
+  const previousDisabled = links.previous?.results === false;
+  const nextDisabled = links.next?.results === false;
+
+  return (
+    <EventListTable
+      title={t('All Open Periods')}
+      pagination={{
+        enabled: true,
+        links,
+        paginatorType: 'offset',
+        pageCount: openPeriods.length,
+        totalCount,
+        previousDisabled,
+        nextDisabled,
+        tableUnits: t('open periods'),
+      }}
+    >
+      <DataGrid
+        isLoading={isPending}
+        data={data}
+        error={error}
+        columnOrder={columnOrder}
+        grid={{
+          renderBodyCell,
+        }}
+      />
+    </EventListTable>
+  );
+}
+
+const AlignLeft = styled('span')`
+  text-align: left;
+  width: 100%;
+`;
+
+// The EventListTable hides link styling if they aren't in the first column
+// so we have to style it manually
+const EventIdLink = styled(Link)`
+  &&& {
+    color: ${p => p.theme.tokens.interactive.link.accent.rest};
+    text-decoration: none;
+
+    &:hover {
+      color: ${p => p.theme.tokens.interactive.link.accent.hover};
+    }
+  }
+`;
+
+export default IssueOpenPeriodsList;

@@ -1,0 +1,71 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+
+import {Alert} from '@sentry/scraps/alert';
+import {ExternalLink, Link} from '@sentry/scraps/link';
+
+import {List} from 'sentry/components/list';
+import {ListItem} from 'sentry/components/list/listItem';
+import {t, tct} from 'sentry/locale';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+
+interface Props {
+  orgSlug: string;
+}
+
+export function MissingReplayAlert({orgSlug}: Props) {
+  const reasons = [
+    t('The replay is still processing.'),
+    tct(
+      'The replay was rate-limited and could not be accepted. [link:View the stats page] for more information.',
+      {
+        link: (
+          <Link to={normalizeUrl(`/settings/${orgSlug}/stats/?dataCategory=replays`)} />
+        ),
+      }
+    ),
+    t('The replay has been deleted by a member in your organization.'),
+    t('There were network errors and the replay was not saved.'),
+    tct(
+      "An ad-blocker was turned on for the user's session. [link:Read our docs] for a workaround.",
+      {
+        link: (
+          <ExternalLink href="https://docs.sentry.io/platforms/javascript/troubleshooting/#dealing-with-ad-blockers" />
+        ),
+      }
+    ),
+  ];
+  return (
+    <Alert.Container>
+      <Alert
+        variant="info"
+        data-test-id="replay-error"
+        expand={
+          <Fragment>
+            <ListIntro>{t('Other reasons may include:')}</ListIntro>
+            <List symbol="bullet">
+              {reasons.map((reason, i) => (
+                <ListItem key={i}>{reason}</ListItem>
+              ))}
+            </List>
+          </Fragment>
+        }
+      >
+        {tct(
+          "A replay isn't available for this event. To learn more, [statsLink:check your replay usage].",
+          {
+            statsLink: (
+              <Link
+                to={normalizeUrl(`/settings/${orgSlug}/stats/?dataCategory=replays`)}
+              />
+            ),
+          }
+        )}
+      </Alert>
+    </Alert.Container>
+  );
+}
+
+const ListIntro = styled('div')`
+  line-height: 2em;
+`;

@@ -1,61 +1,272 @@
-from django.test import RequestFactory
-from exam import fixture
+from functools import cached_property
+from typing import Any
+from unittest.mock import MagicMock, patch
 
-from sentry.testutils import TestCase
+from django.http import HttpRequest
+from django.test import RequestFactory, override_settings
+from rest_framework.request import Request
+
+from sentry.auth.principal import acting_user_id
+from sentry.auth.services.auth import AuthenticatedToken
 from sentry.middleware.auth import AuthenticationMiddleware
-from sentry.models import UserIP
+from sentry.models.apikey import ApiKey
+from sentry.models.apitoken import ApiToken
+from sentry.seer import agent_token
+from sentry.service_accounts.auth import is_service_account_auth
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.outbox import outbox_runner
+from sentry.testutils.silo import all_silo_test, assume_test_silo_mode, cell_silo_test
+from sentry.users.models.user import User
+from sentry.users.models.userip import UserIP
+from sentry.users.services.user.service import user_service
+from sentry.utils import jwt
 from sentry.utils.auth import login
+from sentry.viewer_context import Actor, ActorType, ViewerContext, encode_viewer_context
 
 
+@all_silo_test
 class AuthenticationMiddlewareTestCase(TestCase):
-    middleware = fixture(AuthenticationMiddleware)
+    middleware = cached_property(AuthenticationMiddleware)
 
-    @fixture
-    def request(self):
+    def assert_user_equals(self, request: HttpRequest) -> None:
+        assert request.user == user_service.get_user(user_id=self.user.id)
+
+    @cached_property
+    def request(self) -> Any:
         rv = RequestFactory().get("/")
         rv.session = self.session
         return rv
 
-    def test_process_request_anon(self):
-        self.middleware.process_request(self.request)
-        assert self.request.user.is_anonymous()
-
-    def test_process_request_user(self):
-        request = self.request
-        assert login(request, self.user)
+    def test_process_request_anon(self) -> None:
+        request = Request(self.request)
         self.middleware.process_request(request)
-        assert request.user.is_authenticated()
-        assert request.user == self.user
-        assert "_nonce" not in request.session
-        assert UserIP.objects.filter(user=self.user, ip_address="127.0.0.1").exists()
+        assert request.user.is_anonymous
+        assert request.auth is None
 
-    def test_process_request_good_nonce(self):
-        request = self.request
+    def test_process_request_user(self) -> None:
+        request = Request(self.request)
+        with assume_test_silo_mode(SiloMode.MONOLITH):
+            assert login(request, self.user)
+        with outbox_runner():
+            self.middleware.process_request(request)
+            # Force the user object to materialize
+            acting_user_id(request.user)
+
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.user.refresh_from_db()
+            assert UserIP.objects.filter(user_id=self.user.id, ip_address="127.0.0.1").exists()
+
+        assert request.user.is_authenticated
+        self.assert_user_equals(request)
+        assert "_nonce" not in request.session
+
+    def test_process_request_good_nonce(self) -> None:
+        request = Request(self.request)
         user = self.user
         user.session_nonce = "xxx"
-        user.save()
-        assert login(request, user)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            user.save()
+            assert login(request, user)
         self.middleware.process_request(request)
-        assert request.user.is_authenticated()
-        assert request.user == self.user
+        assert request.user.is_authenticated
+        self.assert_user_equals(request)
         assert request.session["_nonce"] == "xxx"
 
-    def test_process_request_missing_nonce(self):
-        request = self.request
+    def test_process_request_missing_nonce(self) -> None:
+        request = Request(self.request)
         user = self.user
         user.session_nonce = "xxx"
-        user.save()
-        assert login(request, user)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            user.save()
+            assert login(request, user)
         del request.session["_nonce"]
         self.middleware.process_request(request)
-        assert request.user.is_anonymous()
+        assert request.user.is_anonymous
 
-    def test_process_request_bad_nonce(self):
+    def test_process_request_bad_nonce(self) -> None:
         request = self.request
         user = self.user
         user.session_nonce = "xxx"
-        user.save()
-        assert login(request, user)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            user.save()
+            assert login(request, user)
         request.session["_nonce"] = "gtfo"
         self.middleware.process_request(request)
-        assert request.user.is_anonymous()
+        assert request.user.is_anonymous
+
+    def test_process_request_valid_authtoken(self) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            token = ApiToken.objects.create(user=self.user, scope_list=["event:read", "org:read"])
+        request = Request(self.make_request(method="GET"))
+        request.META["HTTP_AUTHORIZATION"] = f"Bearer {token.token}"
+        self.middleware.process_request(request)
+        self.assert_user_equals(request)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            assert AuthenticatedToken.from_token(request.auth) == AuthenticatedToken.from_token(
+                token
+            )
+
+    def test_process_request_invalid_authtoken(self) -> None:
+        request = Request(self.make_request(method="GET"))
+        request.META["HTTP_AUTHORIZATION"] = "Bearer absadadafdf"
+        self.middleware.process_request(request)
+        # Should swallow errors and pass on
+        assert request.user.is_anonymous
+        assert request.auth is None
+
+    def _agent_token(self, user: User) -> str:
+        token, _ = agent_token.encode_agent_token(
+            user_id=user.id,
+            organization_id=self.organization.id,
+            scopes=["org:read"],
+            session_id="s1",
+        )
+        return token
+
+    def test_process_request_valid_agent_token(self) -> None:
+        with (
+            override_settings(SEER_API_SHARED_SECRET="test-secret"),
+            self.feature(agent_token.FEATURE_FLAG),
+        ):
+            request = Request(self.make_request(method="GET", path="/api/0/organizations/"))
+            request.META["HTTP_AUTHORIZATION"] = f"Bearer {self._agent_token(self.user)}"
+            self.middleware.process_request(request)
+        assert request.user.is_authenticated
+        assert acting_user_id(request.user) == self.user.id
+        assert request.auth is not None
+        assert request.auth.kind == agent_token.AGENT_TOKEN_KIND
+        assert request.auth.user_id == self.user.id
+        assert request.auth.organization_id == self.organization.id
+
+    def test_process_request_invalid_agent_token(self) -> None:
+        request = Request(self.make_request(method="GET", path="/api/0/organizations/"))
+        invalid_token = jwt.encode(
+            {"aud": agent_token.AGENT_TOKEN_AUDIENCE},
+            "wrong-secret",
+            headers={"typ": agent_token.AGENT_TOKEN_TYPE},
+        )
+        request.META["HTTP_AUTHORIZATION"] = f"Bearer {invalid_token}"
+        with (
+            override_settings(SEER_API_SHARED_SECRET="test-secret"),
+            self.feature(agent_token.FEATURE_FLAG),
+        ):
+            self.middleware.process_request(request)
+        # Swallowed like any other bad credential; DRF delivers the real 401 later.
+        assert request.user.is_anonymous
+        assert request.auth is None
+
+    def test_process_request_agent_token_supplies_compatibility_user_on_non_api_path(self) -> None:
+        with (
+            override_settings(SEER_API_SHARED_SECRET="test-secret"),
+            self.feature(agent_token.FEATURE_FLAG),
+        ):
+            request = Request(self.make_request(method="GET", path="/organizations/"))
+            request.META["HTTP_AUTHORIZATION"] = f"Bearer {self._agent_token(self.user)}"
+            self.middleware.process_request(request)
+        assert request.user.is_authenticated
+        assert acting_user_id(request.user) == self.user.id
+        assert request.auth is not None
+        assert request.auth.user_id == self.user.id
+
+    def test_process_request_agent_token_wins_over_session(self) -> None:
+        session_user = self.create_user()
+        request = Request(self.make_request(method="GET", path="/api/0/organizations/"))
+        with assume_test_silo_mode(SiloMode.MONOLITH):
+            assert login(request, session_user)
+        with (
+            override_settings(SEER_API_SHARED_SECRET="test-secret"),
+            self.feature(agent_token.FEATURE_FLAG),
+        ):
+            request.META["HTTP_AUTHORIZATION"] = f"Bearer {self._agent_token(self.user)}"
+            self.middleware.process_request(request)
+        assert request.user.is_authenticated
+        assert acting_user_id(request.user) == self.user.id
+        assert acting_user_id(request.user) != session_user.id
+        assert request.auth is not None
+        assert request.auth.user_id == self.user.id
+
+    def test_process_request_valid_apikey(self) -> None:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            apikey = ApiKey.objects.create(
+                organization_id=self.organization.id, allowed_origins="*"
+            )
+            request = Request(self.make_request(method="GET"))
+            request.META["HTTP_AUTHORIZATION"] = self.create_basic_auth_header(apikey.key)
+
+        self.middleware.process_request(request)
+        # ApiKey is tied to an organization not user
+        assert request.user.is_anonymous
+        assert AuthenticatedToken.from_token(request.auth) == AuthenticatedToken.from_token(apikey)
+
+    def test_process_request_invalid_apikey(self) -> None:
+        request = Request(self.make_request(method="GET"))
+        request.META["HTTP_AUTHORIZATION"] = b"Basic adfasdfasdfsadfsaf"
+
+        self.middleware.process_request(request)
+        # Should swallow errors and pass on
+        assert request.user.is_anonymous
+        assert request.auth is None
+
+    def test_process_request_rpc_path_ignored(self) -> None:
+        request = Request(
+            self.make_request(
+                method="GET", path="/api/0/internal/rpc/organization/get_organization_by_id"
+            )
+        )
+        request.META["HTTP_AUTHORIZATION"] = b"Rpcsignature not-a-checksum"
+
+        self.middleware.process_request(request)
+        # No errors, and no user identified.
+        assert request.user.is_anonymous
+        assert request.auth is None
+
+    @patch("sentry.users.models.userip.geo_by_addr")
+    def test_process_request_log_userip(self, mock_geo_by_addr: MagicMock) -> None:
+        mock_geo_by_addr.return_value = {
+            "country_code": "US",
+            "region": "CA",
+            "subdivision": "San Francisco",
+        }
+        request = Request(self.request)
+        request.META["REMOTE_ADDR"] = "8.8.8.8"
+        with assume_test_silo_mode(SiloMode.MONOLITH):
+            assert login(request, self.user)
+
+        with outbox_runner():
+            self.middleware.process_request(request)
+            # Should be logged in and have logged a UserIp record.
+            assert acting_user_id(request.user) == self.user.id
+            assert mock_geo_by_addr.call_count == 1
+
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            assert UserIP.objects.count() > 0
+            userip = UserIP.objects.get(user_id=self.user.id)
+        assert userip.ip_address == "8.8.8.8"
+        assert userip.country_code == "US"
+        assert userip.region_code == "CA"
+
+
+@cell_silo_test
+class ServiceAccountAuthenticationMiddlewareTest(TestCase):
+    SHARED_SECRET = "a-long-secret-key"
+
+    @override_settings(SEER_API_SHARED_SECRET=SHARED_SECRET)
+    @with_feature("organizations:service-accounts")
+    def test_service_account_stays_off_the_django_request(self) -> None:
+        service_account = self.create_service_account(organization=self.organization)
+        context = ViewerContext(
+            actor=Actor(type=ActorType.SERVICE_ACCOUNT, actor_id=service_account.id),
+            organization_id=self.organization.id,
+        )
+        request: Any = self.make_request(method="GET")
+        request.META["HTTP_X_VIEWER_CONTEXT"] = encode_viewer_context(
+            context, key=self.SHARED_SECRET
+        )
+
+        AuthenticationMiddleware(lambda r: r).process_request(request)
+
+        # Only DRF puts the account on request.user, so Django views never treat it as logged in.
+        assert request.user.is_anonymous
+        assert is_service_account_auth(request.auth)

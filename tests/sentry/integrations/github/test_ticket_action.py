@@ -1,0 +1,194 @@
+from collections.abc import Iterator
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+import responses
+from rest_framework.test import APITestCase as BaseAPITestCase
+
+from sentry.integrations.github import client
+from sentry.integrations.github.actions.create_ticket import GitHubCreateTicketAction
+from sentry.integrations.github.integration import GitHubIntegration
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.services.integration.serial import serialize_integration
+from sentry.issues.action_log import SYSTEM_ACTOR, ActionSource, action_context_scope
+from sentry.issues.action_log.types import CreateExternalIssueAction
+from sentry.models.activity import Activity
+from sentry.models.repository import Repository
+from sentry.models.rule import Rule
+from sentry.services.eventstore.models import GroupEvent
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import RuleTestCase
+from sentry.testutils.helpers.action_log import capture_action_log
+from sentry.testutils.helpers.integrations import get_installation_of_type
+from sentry.testutils.helpers.notifications import create_notification_action_context
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.testutils.skips import requires_snuba
+from sentry.types.activity import ActivityType
+from sentry.types.rules import RuleFuture
+
+pytestmark = [requires_snuba]
+
+
+class GitHubTicketRulesTestCase(RuleTestCase, BaseAPITestCase):
+    rule_cls = GitHubCreateTicketAction
+    repo_name = "foo/bar"
+    assignee = "sentry_user"
+    labels = ["bug", "invalid"]
+    issue_num = 1
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.integration = self.create_integration(
+            organization=self.organization,
+            provider="github",
+            name="Github",
+            external_id="1",
+            metadata={
+                "domain_name": "github.com/foo",
+                "verify_ssl": True,
+            },
+        )
+
+        self.installation = get_installation_of_type(
+            GitHubIntegration, self.integration, self.organization.id
+        )
+
+        self.login_as(user=self.user)
+        responses.add(
+            method=responses.POST,
+            url="https://api.github.com/app/installations/1/access_tokens",
+            body='{"token": "12345token", "expires_at": "2099-01-01T00:00:00Z"}',
+            status=200,
+            content_type="application/json",
+        )
+
+    @pytest.fixture(autouse=True)
+    def stub_get_jwt(self) -> Iterator[None]:
+        with patch.object(client, "get_jwt", return_value="jwt_token_1"):
+            yield
+
+    def trigger(self, event: GroupEvent, rule_object: Rule) -> Any:
+        action = rule_object.data.get("actions", ())[0]
+        context = create_notification_action_context(rule_object)
+        action_inst = self.get_rule(data=action, context=context)
+        results = list(action_inst.after(event=event))
+        assert len(results) == 1
+
+        rule_future = RuleFuture(context=context, kwargs=results[0].kwargs)
+        return results[0].callback(event, futures=[rule_future])
+
+    def get_key(self, event: GroupEvent) -> Any:
+        return ExternalIssue.objects.get_linked_issues(
+            event, serialize_integration(self.integration)
+        ).values_list("key", flat=True)[0]
+
+    @responses.activate()
+    def test_ticket_rules(self) -> None:
+        title = "sample title"
+        sample_description = "sample bug report"
+        html_url = f"https://github.com/foo/bar/issues/{self.issue_num}"
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            Repository.objects.create(
+                name=self.repo_name,
+                provider="integrations:github",
+                organization_id=self.organization.id,
+                integration_id=self.integration.id,
+            )
+
+        responses.add(
+            method=responses.POST,
+            url="https://api.github.com/repos/foo/bar/issues",
+            json={
+                "number": self.issue_num,
+                "title": title,
+                "body": sample_description,
+                "html_url": html_url,
+            },
+            status=200,
+        )
+        responses.add(
+            method=responses.GET,
+            url=f"https://api.github.com/repos/foo/bar/issues/{self.issue_num}",
+            json={
+                "number": "1",
+                "title": title,
+                "body": sample_description,
+                "html_url": html_url,
+            },
+            status=200,
+        )
+
+        # Create a new Rule
+        rule_object = self.create_project_rule(
+            project=self.project,
+            name="hello world",
+            action_match="any",
+            frequency=5,
+            action_data=[
+                {
+                    "id": "sentry.integrations.github.notify_action.GitHubCreateTicketAction",
+                    "integration": self.integration.id,
+                    "dynamic_form_fields": [{"random": "garbage"}],
+                    "repo": self.repo_name,
+                    "assignee": self.assignee,
+                    "labels": self.labels,
+                }
+            ],
+        )
+
+        event = self.get_group_event()
+
+        # Trigger its `after`
+        with (
+            action_context_scope(ActionSource.SYSTEM),
+            capture_action_log() as action_log,
+        ):
+            self.trigger(event, rule_object)
+
+        action_log.assert_logged(
+            CreateExternalIssueAction,
+            group_id=event.group_id,
+            source=ActionSource.SYSTEM,
+            actor=SYSTEM_ACTOR,
+            provider="github",
+        )
+
+        # assert ticket created in DB
+        key = self.get_key(event)
+        assert key == f"{self.repo_name}#{self.issue_num}"
+        external_issue = ExternalIssue.objects.get(key=key)
+        external_issue_count = len(ExternalIssue.objects.filter(key=key))
+        assert external_issue_count == 1
+
+        activity = Activity.objects.get(
+            group_id=event.group_id, type=ActivityType.CREATE_ISSUE.value
+        )
+        assert activity.project_id == event.project_id
+        assert activity.user_id is None
+        assert activity.data == {
+            "title": external_issue.title,
+            "provider": self.installation.model.get_provider().name,
+            "location": self.installation.get_issue_url(external_issue.key),
+            "label": self.installation.get_issue_display_name(external_issue) or external_issue.key,
+            "new": True,
+        }
+
+        # assert ticket created in GitHub
+        data = self.installation.get_issue(
+            key, data={"repo": self.repo_name, "externalIssue": self.issue_num}
+        )
+        assert sample_description in data["description"]
+
+        # Trigger its `after` _again_
+        self.trigger(event, rule_object)
+
+        # assert new ticket NOT created in DB
+        assert ExternalIssue.objects.count() == external_issue_count
+        assert (
+            Activity.objects.filter(
+                group_id=event.group_id, type=ActivityType.CREATE_ISSUE.value
+            ).count()
+            == 1
+        )

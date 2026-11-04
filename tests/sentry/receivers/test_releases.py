@@ -1,56 +1,223 @@
+from datetime import timedelta
 from hashlib import sha1
-from sentry.utils.compat.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
-from sentry.models import (
-    add_group_to_inbox,
-    Activity,
-    Commit,
-    CommitAuthor,
-    Group,
-    GroupAssignee,
-    GroupInbox,
-    GroupInboxReason,
-    GroupLink,
-    GroupStatus,
-    GroupSubscription,
-    OrganizationMember,
-    Release,
-    Repository,
-    UserEmail,
-    UserOption,
+import pytest
+from django.db import IntegrityError, router, transaction
+from django.utils import timezone
+
+from sentry.buffer.base import Buffer
+from sentry.integrations.source_code_management.metrics import (
+    SCMIntegrationInteractionType,
+    SCMResolutionHaltReason,
 )
-from sentry.testutils import TestCase
+from sentry.integrations.types import ExternalProviders
+from sentry.issues.action_log.types import (
+    PullRequestClosedAction,
+    PullRequestMergedAction,
+    PullRequestReopenedAction,
+    PullRequestUnlinkedAction,
+)
+from sentry.models.activity import Activity
+from sentry.models.commit import Commit
+from sentry.models.commitauthor import CommitAuthor
+from sentry.models.group import Group, GroupStatus
+from sentry.models.groupassignee import GroupAssignee
+from sentry.models.grouphistory import GroupHistory, GroupHistoryStatus
+from sentry.models.groupinbox import GroupInbox, GroupInboxReason, add_group_to_inbox
+from sentry.models.grouplink import GroupLink
+from sentry.models.groupresolution import GroupResolution
+from sentry.models.groupsubscription import GroupSubscription
+from sentry.models.organizationmember import OrganizationMember
+from sentry.models.pullrequest import PullRequest, PullRequestLifecycleState
+from sentry.models.release import Release
+from sentry.models.releases.release_project import ReleaseProject
+from sentry.models.repository import Repository
+from sentry.receivers.releases import _capture_pull_request_link
+from sentry.signals import buffer_incr_complete, receivers_raise_on_send
+from sentry.silo.base import SiloMode
+from sentry.tasks.clear_expired_resolutions import clear_expired_resolutions
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.action_log import capture_action_log
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.types.activity import ActivityType
+from sentry.users.models.user_option import UserOption
+from sentry.users.models.useremail import UserEmail
+from sentry.viewer_context import Actor, ActorType, ViewerContext, get_viewer_context
+
+
+class InvalidateReleaseCacheTest(TestCase):
+    @with_feature("organizations:release-resolution-finalized-order")
+    def test_cache_failure_does_not_fail_commit_or_skip_reevaluation(self) -> None:
+        release = self.create_release(version="cache-failure")
+        finalized_at = timezone.now()
+        with (
+            patch("sentry.receivers.releases.cache") as release_cache,
+            patch("sentry.receivers.releases.logger.exception") as log_exception,
+            patch("sentry.receivers.releases.clear_expired_resolutions.delay") as enqueue,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            release_cache.delete.side_effect = ConnectionError("cache down")
+            with transaction.atomic(using=router.db_for_write(Release)):
+                release.update(date_released=finalized_at)
+
+        release_cache.delete.assert_called_once_with(
+            Release.get_cache_key(release.organization_id, release.version)
+        )
+        log_exception.assert_called_once_with(
+            "release.cache_invalidation_failed",
+            extra={"release_id": release.id, "organization_id": release.organization_id},
+        )
+        enqueue.assert_called_once_with(release_id=release.id)
+        release.refresh_from_db()
+        assert release.date_released == finalized_at
+
+    def test_finalization_invalidates_cache_with_flag_disabled(self) -> None:
+        release = self.create_release(version="cached")
+        assert Release.get_or_create(self.project, release.version).date_released is None
+        with (
+            self.feature({"organizations:release-resolution-finalized-order": False}),
+            patch("sentry.receivers.releases.clear_expired_resolutions.delay") as enqueue,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            with transaction.atomic(using=router.db_for_write(Release)):
+                release.update(date_released=timezone.now())
+                assert Release.get_or_create(self.project, release.version).date_released is None
+        assert (
+            Release.get_or_create(self.project, release.version).date_released
+            == release.date_released
+        )
+        enqueue.assert_not_called()
 
 
 class ResolveGroupResolutionsTest(TestCase):
-    @patch("sentry.tasks.clear_expired_resolutions.clear_expired_resolutions.delay")
-    def test_simple(self, mock_delay):
-        release = Release.objects.create(version="a", organization_id=self.project.organization_id)
-        release.add_project(self.project)
+    @with_feature("organizations:release-resolution-finalized-order")
+    def test_finalization_advances_pending_resolution(self) -> None:
+        now = timezone.now()
+        anchor = self.create_release(version="anchor", date_added=now - timedelta(days=2))
+        precreated = self.create_release(version="next", date_added=now - timedelta(days=3))
+        group = self.create_group(project=self.project, status=GroupStatus.RESOLVED)
+        resolution = self.create_group_resolution(
+            group=group,
+            release=anchor,
+            current_release_version=anchor.version,
+            type=GroupResolution.Type.in_next_release,
+            status=GroupResolution.Status.pending,
+        )
+
+        with (
+            patch(
+                "sentry.receivers.releases.clear_expired_resolutions.delay",
+                side_effect=clear_expired_resolutions,
+            ),
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            with transaction.atomic(using=router.db_for_write(Release)):
+                precreated.update(date_released=now - timedelta(days=1))
+                resolution.refresh_from_db()
+                assert resolution.status == GroupResolution.Status.pending
+
+        resolution.refresh_from_db()
+        assert resolution.status == GroupResolution.Status.resolved
+        assert resolution.release_id == precreated.id
+        assert resolution.current_release_version == anchor.version
+        group.refresh_from_db()
+        assert group.status == GroupStatus.RESOLVED
+
+    @with_feature("organizations:release-resolution-finalized-order")
+    def test_save_finalization_schedules_reevaluation(self) -> None:
+        release = self.create_release(version="saved")
+        Release.get_or_create(self.project, release.version)
+        with (
+            patch("sentry.receivers.releases.clear_expired_resolutions.delay") as enqueue,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            release.date_released = timezone.now()
+            release.save()
+        enqueue.assert_called_once_with(release_id=release.id)
+        assert (
+            Release.get_or_create(self.project, release.version).date_released
+            == release.date_released
+        )
+
+    @with_feature("organizations:release-resolution-finalized-order")
+    def test_unrelated_update_does_not_schedule_reevaluation(self) -> None:
+        release = self.create_release(version="unchanged-date")
+        with (
+            patch("sentry.receivers.releases.clear_expired_resolutions.delay") as enqueue,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            release.update(ref="new-ref")
+        enqueue.assert_not_called()
+
+    @with_feature("organizations:release-resolution-finalized-order")
+    def test_rolled_back_finalization_does_not_schedule_reevaluation(self) -> None:
+        release = self.create_release(version="rolled-back")
+        with (
+            patch("sentry.receivers.releases.clear_expired_resolutions.delay") as enqueue,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            with pytest.raises(ValueError), transaction.atomic(using=router.db_for_write(Release)):
+                release.update(date_released=timezone.now())
+                raise ValueError("roll back the date update")
+        enqueue.assert_not_called()
+        release.refresh_from_db()
+        assert release.date_released is None
+
+    @patch("sentry.receivers.releases.clear_expired_resolutions.delay")
+    def test_simple(self, mock_delay: MagicMock) -> None:
+        with self.capture_on_commit_callbacks(execute=True):
+            release = Release.objects.create(
+                version="a", organization_id=self.project.organization_id
+            )
+            release.add_project(self.project)
 
         mock_delay.assert_called_once_with(release_id=release.id)
 
 
 class ResolvedInCommitTest(TestCase):
-    def assertResolvedFromCommit(self, group, commit):
+    """
+    Tests for resolved_in_commit signal handler.
+
+    Commits with "Fixes ISSUE-123" create GroupLinks and REFERENCED_IN_COMMIT
+    Activity entries, but do NOT immediately resolve issues. Resolution happens
+    when a release is created that includes these commits, via update_group_resolutions().
+    """
+
+    def assertLinkedFromCommitDeferred(self, group: Group, commit: Commit) -> None:
+        """Assert that a GroupLink and Activity were created, but issue is NOT resolved."""
         assert GroupLink.objects.filter(
             group_id=group.id, linked_type=GroupLink.LinkedType.commit, linked_id=commit.id
         ).exists()
-        assert Group.objects.filter(
-            id=group.id, status=GroupStatus.RESOLVED, resolved_at__isnull=False
+        activity = Activity.objects.get(
+            group=group,
+            type=ActivityType.REFERENCED_IN_COMMIT.value,
+        )
+        assert activity.data == {"commit": commit.id}
+        assert not Activity.objects.filter(
+            group=group, type=ActivityType.SET_RESOLVED_IN_COMMIT.value
         ).exists()
-        assert not GroupInbox.objects.filter(group=group).exists()
+        assert not GroupHistory.objects.filter(
+            group=group, status=GroupHistoryStatus.SET_RESOLVED_IN_COMMIT
+        ).exists()
+        # Issue should NOT be resolved immediately - resolution happens via releases
+        assert not Group.objects.filter(id=group.id, status=GroupStatus.RESOLVED).exists()
+        # Inbox should NOT be modified
+        assert GroupInbox.objects.filter(group=group).exists()
 
-    def assertNotResolvedFromCommit(self, group, commit):
+    def assertNotLinkedFromCommit(self, group: Group, commit: Commit) -> None:
+        """Assert that no GroupLink exists for this commit."""
         assert not GroupLink.objects.filter(
             group_id=group.id, linked_type=GroupLink.LinkedType.commit, linked_id=commit.id
         ).exists()
         assert not Group.objects.filter(id=group.id, status=GroupStatus.RESOLVED).exists()
         assert GroupInbox.objects.filter(group=group).exists()
 
-    # TODO(dcramer): pull out short ID matching and expand regexp tests
-    def test_simple_no_author(self):
+    @receivers_raise_on_send()
+    def test_simple_no_author(self) -> None:
+        """Commits create links but don't resolve issues."""
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.MANUAL)
 
@@ -63,9 +230,11 @@ class ResolvedInCommitTest(TestCase):
             message=f"Foo Biz\n\nFixes {group.qualified_short_id}",
         )
 
-        self.assertResolvedFromCommit(group, commit)
+        self.assertLinkedFromCommitDeferred(group, commit)
 
-    def test_updating_commit(self):
+    @receivers_raise_on_send()
+    def test_updating_commit(self) -> None:
+        """Updating a commit message creates links but doesn't resolve."""
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.MANUAL)
 
@@ -77,14 +246,16 @@ class ResolvedInCommitTest(TestCase):
             organization_id=group.organization.id,
         )
 
-        self.assertNotResolvedFromCommit(group, commit)
+        self.assertNotLinkedFromCommit(group, commit)
 
         commit.message = f"Foo Biz\n\nFixes {group.qualified_short_id}"
         commit.save()
 
-        self.assertResolvedFromCommit(group, commit)
+        self.assertLinkedFromCommitDeferred(group, commit)
 
-    def test_updating_commit_with_existing_grouplink(self):
+    @receivers_raise_on_send()
+    def test_updating_commit_with_existing_grouplink(self) -> None:
+        """Updating commit with existing link keeps deferred state."""
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.MANUAL)
 
@@ -97,14 +268,15 @@ class ResolvedInCommitTest(TestCase):
             message=f"Foo Biz\n\nFixes {group.qualified_short_id}",
         )
 
-        self.assertResolvedFromCommit(group, commit)
+        self.assertLinkedFromCommitDeferred(group, commit)
 
         commit.message = f"Foo Bar Biz\n\nFixes {group.qualified_short_id}"
         commit.save()
 
-        self.assertResolvedFromCommit(group, commit)
+        self.assertLinkedFromCommitDeferred(group, commit)
 
-    def test_removes_group_link_when_message_changes(self):
+    @receivers_raise_on_send()
+    def test_removes_group_link_when_message_changes(self) -> None:
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.MANUAL)
 
@@ -117,15 +289,15 @@ class ResolvedInCommitTest(TestCase):
             message=f"Foo Biz\n\nFixes {group.qualified_short_id}",
         )
 
-        self.assertResolvedFromCommit(group, commit)
+        self.assertLinkedFromCommitDeferred(group, commit)
 
         commit.message = "no groups here"
         commit.save()
 
-        add_group_to_inbox(group, GroupInboxReason.MANUAL)
-        self.assertNotResolvedFromCommit(group, commit)
+        self.assertNotLinkedFromCommit(group, commit)
 
-    def test_no_matching_group(self):
+    @receivers_raise_on_send()
+    def test_no_matching_group(self) -> None:
         repo = Repository.objects.create(name="example", organization_id=self.organization.id)
 
         commit = Commit.objects.create(
@@ -139,51 +311,87 @@ class ResolvedInCommitTest(TestCase):
             linked_type=GroupLink.LinkedType.commit, linked_id=commit.id
         ).exists()
 
-    def test_matching_author_with_assignment(self):
+    @receivers_raise_on_send()
+    def test_matching_author_with_assignment(self) -> None:
+        """Commits assign users but don't resolve issues."""
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.MANUAL)
         user = self.create_user(name="Foo Bar", email="foo@example.com", is_active=True)
-        email = UserEmail.get_primary_email(user=user)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            email = UserEmail.objects.get_primary_email(user=user)
         email.is_verified = True
-        email.save()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            email.save()
         repo = Repository.objects.create(name="example", organization_id=self.group.organization.id)
-        OrganizationMember.objects.create(organization=group.project.organization, user=user)
-        UserOption.objects.set_value(user=user, key="self_assign_issue", value="1")
+        OrganizationMember.objects.create(organization=group.project.organization, user_id=user.id)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            UserOption.objects.set_value(user=user, key="self_assign_issue", value="1")
 
-        commit = Commit.objects.create(
-            key=sha1(uuid4().hex.encode("utf-8")).hexdigest(),
-            organization_id=group.organization.id,
-            repository_id=repo.id,
-            message=f"Foo Biz\n\nFixes {group.qualified_short_id}",
-            author=CommitAuthor.objects.create(
-                organization_id=group.organization.id, name=user.name, email=user.email
-            ),
+        author = CommitAuthor.objects.create(
+            organization_id=group.organization.id, name=user.name, email=user.email
         )
+        author.preload_users()
 
-        self.assertResolvedFromCommit(group, commit)
+        captured_contexts: list[ViewerContext | None] = []
+        with (
+            self.assertLogs("sentry.issues.action_log", level="INFO") as logs,
+            patch("sentry.models.groupassignee.issue_assigned.send_robust") as send_robust,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            send_robust.side_effect = lambda **kwargs: captured_contexts.append(
+                get_viewer_context()
+            )
+            commit = Commit.objects.create(
+                key=sha1(uuid4().hex.encode("utf-8")).hexdigest(),
+                organization_id=group.organization.id,
+                repository_id=repo.id,
+                message=f"Foo Biz\n\nFixes {group.qualified_short_id}",
+                author=author,
+            )
 
-        assert GroupAssignee.objects.filter(group=group, user=user).exists()
+        self.assertLinkedFromCommitDeferred(group, commit)
+
+        assert GroupAssignee.objects.filter(group=group, user_id=user.id).exists()
+        assert captured_contexts == [
+            ViewerContext(
+                actor=Actor(type=ActorType.USER, actor_id=user.id),
+                organization_id=group.organization.id,
+                project_id=group.project_id,
+            )
+        ]
+
+        # The self-assign is attributed to the commit author, not logged as a system action.
+        assign_records = [r for r in logs.records if r.__dict__.get("action") == "assign"]
+        assert len(assign_records) == 1
+        assert assign_records[0].__dict__["actor_id"] == str(user.id)
+        assert assign_records[0].__dict__["actor_type"] == "user"
+        assert assign_records[0].__dict__["source"] == "system"
 
         assert Activity.objects.filter(
-            project=group.project, group=group, type=Activity.ASSIGNED, user=user
+            project=group.project, group=group, type=ActivityType.ASSIGNED.value, user_id=user.id
         )[0].data == {
             "assignee": str(user.id),
             "assigneeEmail": user.email,
+            "assigneeName": user.name,
             "assigneeType": "user",
         }
 
-        assert GroupSubscription.objects.filter(group=group, user=user).exists()
+        assert GroupSubscription.objects.filter(group=group, user_id=user.id).exists()
 
-    def test_matching_author_without_assignment(self):
+    @receivers_raise_on_send()
+    def test_matching_author_without_assignment(self) -> None:
+        """Commits subscribe users but don't resolve issues."""
         group = self.create_group()
         add_group_to_inbox(group, GroupInboxReason.MANUAL)
         user = self.create_user(name="Foo Bar", email="foo@example.com", is_active=True)
-        email = UserEmail.get_primary_email(user=user)
-        email.is_verified = True
-        email.save()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            email = UserEmail.objects.get_primary_email(user=user)
+            email.is_verified = True
+            email.save()
+            UserOption.objects.set_value(user=user, key="self_assign_issue", value="0")
+
         repo = Repository.objects.create(name="example", organization_id=self.group.organization.id)
-        OrganizationMember.objects.create(organization=group.project.organization, user=user)
-        UserOption.objects.set_value(user=user, key="self_assign_issue", value="0")
+        OrganizationMember.objects.create(organization=group.project.organization, user_id=user.id)
 
         commit = Commit.objects.create(
             key=sha1(uuid4().hex.encode("utf-8")).hexdigest(),
@@ -195,10 +403,506 @@ class ResolvedInCommitTest(TestCase):
             ),
         )
 
-        self.assertResolvedFromCommit(group, commit)
+        self.assertLinkedFromCommitDeferred(group, commit)
 
         assert not Activity.objects.filter(
-            project=group.project, group=group, type=Activity.ASSIGNED, user=user
+            project=group.project, group=group, type=ActivityType.ASSIGNED.value, user_id=user.id
         ).exists()
 
-        assert GroupSubscription.objects.filter(group=group, user=user).exists()
+        assert GroupSubscription.objects.filter(group=group, user_id=user.id).exists()
+
+
+class ResolvedInPullRequestTest(TestCase):
+    def _create_pull_request_author(
+        self, github_username: str, organization_id: int
+    ) -> CommitAuthor:
+        author = self.create_commit_author(
+            organization_id=organization_id,
+            email=f"{github_username}@localhost",
+        )
+        author.update(name=github_username, external_id=f"github:{github_username}")
+        return author
+
+    def _create_resolving_pull_request(
+        self, group: Group, repo: Repository, author: CommitAuthor
+    ) -> PullRequest:
+        return self.create_pull_request(
+            key="1",
+            repository_id=repo.id,
+            organization_id=group.organization.id,
+            title="very cool PR to fix the thing",
+            message=f"Foo Biz\n\nFixes {group.qualified_short_id}",
+            author=author,
+        )
+
+    @patch("sentry.receivers.releases.SCMIntegrationInteractionEvent")
+    @receivers_raise_on_send()
+    def test_link_records_lifecycle_outcome(self, mock_lifecycle_event: MagicMock) -> None:
+        group = self.create_group()
+        integration = self.create_integration(
+            organization=group.organization,
+            external_id="github:1",
+            provider="github",
+        )
+        repo = self.create_repo(
+            project=group.project,
+            provider="integrations:github",
+            integration_id=integration.id,
+        )
+        author = self._create_pull_request_author("newdev", group.organization.id)
+
+        self._create_resolving_pull_request(group, repo, author)
+
+        mock_lifecycle_event.assert_called_once_with(
+            interaction_type=SCMIntegrationInteractionType.LINK_ISSUE_TO_PR,
+            provider_key="github",
+            organization_id=group.organization.id,
+            integration_id=integration.id,
+        )
+        mock_lifecycle_event.return_value.capture.assert_called_once_with(assume_success=False)
+        lifecycle = mock_lifecycle_event.return_value.capture.return_value.__enter__.return_value
+        lifecycle.record_success.assert_called_once_with()
+
+    @receivers_raise_on_send()
+    def test_link_race_records_halt(self) -> None:
+        group = self.create_group()
+        pull_request_id = 123
+        GroupLink.objects.create(
+            group=group,
+            project_id=group.project_id,
+            linked_type=GroupLink.LinkedType.pull_request,
+            relationship=GroupLink.Relationship.resolves,
+            linked_id=pull_request_id,
+        )
+        event = MagicMock()
+
+        with _capture_pull_request_link(
+            event,
+            group_id=group.id,
+            pull_request_id=pull_request_id,
+        ):
+            MagicMock(side_effect=IntegrityError)()
+
+        lifecycle = event.capture.return_value.__enter__.return_value
+        lifecycle.record_halt.assert_called_once_with(
+            SCMResolutionHaltReason.GROUP_LINK_ALREADY_EXISTS
+        )
+        lifecycle.record_success.assert_not_called()
+
+    @receivers_raise_on_send()
+    def test_non_duplicate_integrity_error_records_failure_and_is_suppressed(self) -> None:
+        group = self.create_group()
+        event = MagicMock()
+        error = IntegrityError()
+
+        with _capture_pull_request_link(
+            event,
+            group_id=group.id,
+            pull_request_id=123,
+        ):
+            MagicMock(side_effect=error)()
+
+        lifecycle = event.capture.return_value.__enter__.return_value
+        lifecycle.record_halt.assert_not_called()
+        lifecycle.record_failure.assert_called_once_with(error)
+        lifecycle.record_success.assert_not_called()
+
+    @receivers_raise_on_send()
+    def test_existing_link_does_not_record_another_attempt(self) -> None:
+        group = self.create_group()
+        integration = self.create_integration(
+            organization=group.organization,
+            external_id="github:1",
+            provider="github",
+        )
+        repo = self.create_repo(
+            project=group.project,
+            provider="integrations:github",
+            integration_id=integration.id,
+        )
+        author = self._create_pull_request_author("newdev", group.organization.id)
+        pull_request = self._create_resolving_pull_request(group, repo, author)
+
+        with patch(
+            "sentry.receivers.releases.SCMIntegrationInteractionEvent"
+        ) as mock_lifecycle_event:
+            pull_request.save()
+
+        mock_lifecycle_event.assert_not_called()
+
+    @receivers_raise_on_send()
+    def test_matching_external_actor_sets_activity_user(self) -> None:
+        group = self.create_group()
+        user = self.create_user(name="Foo Bar", email="foo@example.com", is_active=True)
+        self.create_member(organization=group.organization, user=user)
+        integration = self.create_integration(
+            organization=group.organization,
+            external_id="github:1",
+            provider="github",
+        )
+        self.create_external_user(
+            user=user,
+            organization=group.organization,
+            integration=integration,
+            provider=ExternalProviders.GITHUB.value,
+            external_name="@newdev",
+        )
+        other_user = self.create_user(email="other@example.com")
+        self.create_member(organization=group.organization, user=other_user)
+        other_integration = self.create_integration(
+            organization=group.organization,
+            external_id="github:2",
+            provider="github",
+        )
+        self.create_external_user(
+            user=other_user,
+            organization=group.organization,
+            integration=other_integration,
+            provider=ExternalProviders.GITHUB.value,
+            external_name="@newdev",
+        )
+        repo = self.create_repo(
+            project=group.project,
+            provider="integrations:github",
+            integration_id=integration.id,
+        )
+        author = self._create_pull_request_author("newdev", group.organization.id)
+
+        captured_contexts: list[ViewerContext | None] = []
+        with (
+            patch("sentry.models.groupassignee.issue_assigned.send_robust") as send_robust,
+            self.capture_on_commit_callbacks(execute=True),
+        ):
+            send_robust.side_effect = lambda **kwargs: captured_contexts.append(
+                get_viewer_context()
+            )
+            pull_request = self._create_resolving_pull_request(group, repo, author)
+
+        activity = Activity.objects.get(
+            group=group,
+            type=ActivityType.SET_RESOLVED_IN_PULL_REQUEST.value,
+        )
+        assert activity.user_id == user.id
+        assert activity.data == {"pull_request": pull_request.id}
+        assert GroupAssignee.objects.filter(group=group, user_id=user.id).exists()
+        assert captured_contexts == [
+            ViewerContext(
+                actor=Actor(type=ActorType.USER, actor_id=user.id),
+                organization_id=group.organization.id,
+                project_id=group.project_id,
+            )
+        ]
+
+    @receivers_raise_on_send()
+    def test_author_from_different_organization_does_not_set_activity_user(self) -> None:
+        group = self.create_group()
+        user = self.create_user(name="Foo Bar", email="foo@example.com", is_active=True)
+        other_organization = self.create_organization(owner=user)
+        self.create_member(organization=group.organization, user=user)
+        integration = self.create_integration(
+            organization=other_organization,
+            external_id="github:1",
+            provider="github",
+        )
+        self.create_external_user(
+            user=user,
+            organization=other_organization,
+            integration=integration,
+            provider=ExternalProviders.GITHUB.value,
+            external_name="@newdev",
+        )
+        repo = self.create_repo(project=group.project, provider="integrations:github")
+        author = self._create_pull_request_author("newdev", other_organization.id)
+
+        self._create_resolving_pull_request(group, repo, author)
+
+        activity = Activity.objects.get(
+            group=group,
+            type=ActivityType.SET_RESOLVED_IN_PULL_REQUEST.value,
+        )
+        assert activity.user_id is None
+        assert not GroupAssignee.objects.filter(group=group).exists()
+
+    @receivers_raise_on_send()
+    def test_external_actor_user_must_be_organization_member(self) -> None:
+        group = self.create_group()
+        user = self.create_user(name="Foo Bar", email="foo@example.com", is_active=True)
+        integration = self.create_integration(
+            organization=group.organization,
+            external_id="github:1",
+            provider="github",
+        )
+        self.create_external_user(
+            user=user,
+            organization=group.organization,
+            integration=integration,
+            provider=ExternalProviders.GITHUB.value,
+            external_name="@newdev",
+        )
+        repo = self.create_repo(
+            project=group.project,
+            provider="integrations:github",
+            integration_id=integration.id,
+        )
+        author = self._create_pull_request_author("newdev", group.organization.id)
+
+        self._create_resolving_pull_request(group, repo, author)
+
+        activity = Activity.objects.get(
+            group=group,
+            type=ActivityType.SET_RESOLVED_IN_PULL_REQUEST.value,
+        )
+        assert activity.user_id is None
+        assert not GroupAssignee.objects.filter(group=group).exists()
+
+
+class ProjectHasReleasesReceiverTest(TestCase):
+    @receivers_raise_on_send()
+    def test(self) -> None:
+        buffer = Buffer()
+        rp = ReleaseProject.objects.get_or_create(release=self.release, project=self.project)[0]
+        self.project.flags.has_releases = False
+        self.project.update(flags=self.project.flags)
+        buffer.process(
+            ReleaseProject,
+            {"new_groups": 1},
+            {"release_id": rp.release_id, "project_id": rp.project_id},
+        )
+        self.project.refresh_from_db()
+        assert self.project.flags.has_releases
+
+    @receivers_raise_on_send()
+    def test_deleted_release_project(self) -> None:
+        # Should just not raise an error here if the `ReleaseProject` does not exist
+        buffer_incr_complete.send_robust(
+            model=ReleaseProject,
+            columns={},
+            filters={"release_id": -1, "project_id": -2},
+            sender=ReleaseProject,
+        )
+
+
+class PullRequestLifecycleSignalTest(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.create_repo(project=self.project, name="example/repo")
+        self.group = self.create_group(project=self.project)
+        self.pull_request = self.create_pull_request(
+            repository_id=self.repo.id, organization_id=self.organization.id, key="1"
+        )
+        self.pull_request.message = f"Fixes {self.group.qualified_short_id}"
+        GroupLink.objects.create(
+            group_id=self.group.id,
+            project_id=self.group.project_id,
+            linked_type=GroupLink.LinkedType.pull_request,
+            relationship=GroupLink.Relationship.resolves,
+            linked_id=self.pull_request.id,
+        )
+
+    def _save_with_state(self, state: str) -> None:
+        self.pull_request.state = state
+        self.pull_request.save()
+
+    def _link_pr(self, group: Group, key: str, state: str | None) -> PullRequest:
+        pr = self.create_pull_request(
+            repository_id=self.repo.id, organization_id=self.organization.id, key=key
+        )
+        pr.message = f"Fixes {group.qualified_short_id}"
+        PullRequest.objects.filter(id=pr.id).update(state=state, message=pr.message)
+        GroupLink.objects.create(
+            group_id=group.id,
+            project_id=group.project_id,
+            linked_type=GroupLink.LinkedType.pull_request,
+            relationship=GroupLink.Relationship.resolves,
+            linked_id=pr.id,
+        )
+        return pr
+
+    def test_closed_emits_activity(self) -> None:
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_CLOSED.value
+        )
+        assert activity.ident == str(self.pull_request.id)
+        assert activity.data == {
+            "pull_request": self.pull_request.id,
+            "has_other_open_prs": False,
+        }
+
+    def test_open_sibling_pr_counts_as_remaining(self) -> None:
+        self._link_pr(self.group, key="2", state=PullRequestLifecycleState.OPEN)
+
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_CLOSED.value
+        )
+        assert activity.data["has_other_open_prs"] is True
+
+    def test_null_state_sibling_counts_as_remaining(self) -> None:
+        self._link_pr(self.group, key="2", state=None)
+
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_CLOSED.value
+        )
+        assert activity.data["has_other_open_prs"] is True
+
+    def test_merged_sibling_does_not_count_as_remaining(self) -> None:
+        self._link_pr(self.group, key="2", state=PullRequestLifecycleState.MERGED)
+
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_CLOSED.value
+        )
+        assert activity.data["has_other_open_prs"] is False
+
+    def test_last_open_pr_closing_reports_zero_remaining(self) -> None:
+        other = self._link_pr(self.group, key="2", state=PullRequestLifecycleState.OPEN)
+
+        # First PR closes while the second is still open.
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+        first_activity = Activity.objects.get(
+            group=self.group,
+            type=ActivityType.PULL_REQUEST_CLOSED.value,
+            ident=str(self.pull_request.id),
+        )
+        assert first_activity.data["has_other_open_prs"] is True
+
+        # The second (and last) PR closes -> nothing open remains.
+        other.state = PullRequestLifecycleState.CLOSED
+        other.save()
+        second_activity = Activity.objects.get(
+            group=self.group,
+            type=ActivityType.PULL_REQUEST_CLOSED.value,
+            ident=str(other.id),
+        )
+        assert second_activity.data["has_other_open_prs"] is False
+
+    def test_per_group_counts_when_pr_links_two_groups(self) -> None:
+        other_group = self.create_group(project=self.project)
+        # The closing PR also links the second group.
+        GroupLink.objects.create(
+            group_id=other_group.id,
+            project_id=other_group.project_id,
+            linked_type=GroupLink.LinkedType.pull_request,
+            relationship=GroupLink.Relationship.resolves,
+            linked_id=self.pull_request.id,
+        )
+        # Only the second group has another open PR.
+        self._link_pr(other_group, key="2", state=PullRequestLifecycleState.OPEN)
+
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+
+        first = Activity.objects.get(group=self.group, type=ActivityType.PULL_REQUEST_CLOSED.value)
+        second = Activity.objects.get(
+            group=other_group, type=ActivityType.PULL_REQUEST_CLOSED.value
+        )
+        assert first.data["has_other_open_prs"] is False
+        assert second.data["has_other_open_prs"] is True
+
+    def test_merged_emits_activity(self) -> None:
+        with capture_action_log() as action_log:
+            self._save_with_state(PullRequestLifecycleState.MERGED)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_MERGED.value
+        )
+        assert activity.data == {
+            "pull_request": self.pull_request.id,
+            "has_other_open_prs": False,
+        }
+        action_log.assert_logged(
+            PullRequestMergedAction,
+            group_id=self.group.id,
+            pull_request=self.pull_request.id,
+            has_other_open_prs=False,
+        )
+
+    def test_superseded_emits_closed_activity(self) -> None:
+        with capture_action_log() as action_log:
+            self._save_with_state(PullRequestLifecycleState.SUPERSEDED)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_CLOSED.value
+        )
+        assert activity.data == {
+            "pull_request": self.pull_request.id,
+            "has_other_open_prs": False,
+        }
+        action_log.assert_logged(
+            PullRequestClosedAction,
+            group_id=self.group.id,
+            pull_request=self.pull_request.id,
+            has_other_open_prs=False,
+        )
+
+    def test_reopened_emits_activity(self) -> None:
+        PullRequest.objects.filter(id=self.pull_request.id).update(
+            state=PullRequestLifecycleState.CLOSED
+        )
+        self.pull_request.state = PullRequestLifecycleState.CLOSED
+
+        with capture_action_log() as action_log:
+            self._save_with_state(PullRequestLifecycleState.OPEN)
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_REOPENED.value
+        )
+        assert activity.data == {"pull_request": self.pull_request.id}
+        action_log.assert_logged(
+            PullRequestReopenedAction,
+            group_id=self.group.id,
+            pull_request=self.pull_request.id,
+        )
+
+    def test_unlinked_emits_activity(self) -> None:
+        self.pull_request.message = "No issue reference"
+        with capture_action_log() as action_log:
+            self.pull_request.save()
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_UNLINKED.value
+        )
+        assert activity.data == {
+            "pull_request": self.pull_request.id,
+            "has_other_open_prs": False,
+        }
+        action_log.assert_logged(
+            PullRequestUnlinkedAction,
+            group_id=self.group.id,
+            pull_request=self.pull_request.id,
+            has_other_open_prs=False,
+        )
+
+    def test_unlinked_with_open_sibling_reports_remaining(self) -> None:
+        self._link_pr(self.group, key="2", state=PullRequestLifecycleState.OPEN)
+        self.pull_request.message = "No issue reference"
+
+        self.pull_request.save()
+
+        activity = Activity.objects.get(
+            group=self.group, type=ActivityType.PULL_REQUEST_UNLINKED.value
+        )
+        assert activity.data["has_other_open_prs"] is True
+
+    def test_open_does_not_emit_activity(self) -> None:
+        self._save_with_state(PullRequestLifecycleState.OPEN)
+
+        assert not Activity.objects.filter(
+            type__in=(
+                ActivityType.PULL_REQUEST_CLOSED.value,
+                ActivityType.PULL_REQUEST_REOPENED.value,
+                ActivityType.PULL_REQUEST_MERGED.value,
+                ActivityType.PULL_REQUEST_UNLINKED.value,
+            )
+        ).exists()
+
+    def test_resaving_closed_pr_does_not_duplicate(self) -> None:
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+        self._save_with_state(PullRequestLifecycleState.CLOSED)
+
+        assert Activity.objects.filter(type=ActivityType.PULL_REQUEST_CLOSED.value).count() == 1

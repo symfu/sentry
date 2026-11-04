@@ -1,0 +1,662 @@
+import hashlib
+import hmac
+import logging
+from dataclasses import replace
+from typing import Any, Literal, NotRequired, TypedDict
+from urllib.parse import urlparse
+
+import orjson
+from django.conf import settings
+from sentry_sdk import traces
+from urllib3 import BaseHTTPResponse, HTTPConnectionPool, Retry
+
+from sentry.net.http import connection_from_url
+from sentry.utils import metrics
+from sentry.viewer_context import (
+    Actor,
+    ActorType,
+    ViewerContext,
+    encode_viewer_context,
+    get_acting_user_id,
+    get_viewer_context,
+    observe_viewer_context_propagation,
+)
+
+
+class SeerViewerContext(TypedDict, total=False):
+    organization_id: int
+    # TODO(jeremy.stanley): user_id is int | None as a temporary state while
+    # consolidating viewer context across call sites. Some pass request.user.id
+    # (which can be None for anonymous users), others omit the key entirely.
+    # Once all call sites are wired up, tighten this to int and ensure callers
+    # only set user_id when an authenticated user is present.
+    user_id: int | None
+
+
+logger = logging.getLogger(__name__)
+
+
+class MissingViewerContextError(RuntimeError):
+    """Raised when a Sentry-to-Seer request has no ambient ViewerContext."""
+
+
+seer_summarization_default_connection_pool = connection_from_url(
+    settings.SEER_SUMMARIZATION_URL,
+    timeout=settings.SEER_DEFAULT_TIMEOUT,
+)
+
+seer_autofix_default_connection_pool = connection_from_url(
+    settings.SEER_AUTOFIX_URL,
+    timeout=settings.SEER_DEFAULT_TIMEOUT,
+)
+
+seer_anomaly_detection_default_connection_pool = connection_from_url(
+    settings.SEER_ANOMALY_DETECTION_URL,
+    timeout=settings.SEER_DEFAULT_TIMEOUT,
+)
+
+seer_grouping_default_connection_pool = connection_from_url(
+    settings.SEER_GROUPING_URL,
+    timeout=settings.SEER_DEFAULT_TIMEOUT,
+)
+
+
+def _resolve_viewer_context(
+    explicit: SeerViewerContext | None = None,
+    endpoint: str | None = None,
+) -> ViewerContext:
+    """Require an ambient ViewerContext and merge legacy explicit fields into it.
+
+    SeerViewerContext remains temporarily supported for caller migration, but
+    it is never sufficient on its own. Explicit non-None fields win. On
+    logs a warning and strips actor elevation for safety.
+    """
+    vc = get_viewer_context()
+
+    if vc is None:
+        logger.warning(
+            "seer.viewer_context_not_set",
+            extra={
+                "explicit_org_id": explicit.get("organization_id") if explicit else None,
+                "explicit_user_id": explicit.get("user_id") if explicit else None,
+                "endpoint": endpoint,
+            },
+            stack_info=True,
+        )
+        metrics.incr(
+            "seer.viewer_context_resolution",
+            tags={"outcome": "contextvar_missing", "endpoint": endpoint or "unknown"},
+        )
+        raise MissingViewerContextError("ViewerContext is required for Seer requests")
+
+    if explicit is None:
+        return vc
+
+    explicit_org_id = explicit.get("organization_id")
+    explicit_user_id = explicit.get("user_id")
+
+    has_mismatch = False
+    org_id = vc.organization_id
+    user_id = get_acting_user_id(vc)
+    actor = vc.actor
+
+    if explicit_org_id is not None:
+        if org_id is not None and org_id != explicit_org_id:
+            logger.warning(
+                "seer.viewer_context_mismatch",
+                extra={
+                    "field": "organization_id",
+                    "contextvar": org_id,
+                    "explicit": explicit_org_id,
+                    "endpoint": endpoint,
+                },
+            )
+            has_mismatch = True
+        org_id = explicit_org_id
+
+    if explicit_user_id is not None:
+        # A service account is its own principal; never re-attribute it to a human.
+        is_service_account = actor.type == ActorType.SERVICE_ACCOUNT
+        if (user_id is not None or is_service_account) and user_id != explicit_user_id:
+            logger.warning(
+                "seer.viewer_context_mismatch",
+                extra={
+                    "field": "user_id",
+                    "contextvar": user_id,
+                    "explicit": explicit_user_id,
+                    "endpoint": endpoint,
+                },
+            )
+            has_mismatch = True
+        if actor.type == ActorType.USER:
+            actor = replace(actor, actor_id=explicit_user_id)
+        elif actor.type == ActorType.AGENT:
+            actor = replace(actor, delegated_user_id=explicit_user_id)
+        elif not is_service_account:
+            actor = Actor(type=ActorType.USER, actor_id=explicit_user_id)
+
+    metrics.incr(
+        "seer.viewer_context_resolution",
+        tags={
+            "outcome": "mismatch" if has_mismatch else "match",
+            "has_project": str(vc.project_id is not None).lower(),
+            "endpoint": endpoint or "unknown",
+        },
+    )
+
+    if has_mismatch:
+        return replace(
+            vc,
+            organization_id=org_id,
+            actor=replace(actor, superuser=None),
+            project_id=None,
+        )
+    return replace(vc, organization_id=org_id, actor=actor)
+
+
+@traces.trace
+def make_signed_seer_api_request(
+    connection_pool: HTTPConnectionPool,
+    path: str,
+    body: bytes,
+    timeout: int | float | None = None,
+    retries: int | None | Retry = None,
+    metric_tags: dict[str, Any] | None = None,
+    method: str = "POST",
+    viewer_context: SeerViewerContext | None = None,
+    metrics_endpoint: str | None = None,
+) -> BaseHTTPResponse:
+    """Send a signed request to Seer.
+
+    All outbound Sentry-to-Seer HTTP requests must go through this function so
+    ViewerContext propagation, signing, tracing, and metrics remain consistent.
+    Use metrics_endpoint as a low-cardinality endpoint tag when the request path varies.
+    """
+    host = connection_pool.host
+    if connection_pool.port:
+        host += ":" + str(connection_pool.port)
+
+    url = f"{connection_pool.scheme}://{host}{path}"
+    parsed = urlparse(url)
+
+    resolved = _resolve_viewer_context(viewer_context, endpoint=metrics_endpoint or parsed.path)
+    observe_viewer_context_propagation("seer_rpc_out", ctx=resolved)
+    # Fail closed: a request without a signed ViewerContext must never reach Seer.
+    viewer_context_header = encode_viewer_context(resolved)
+
+    auth_headers = sign_with_seer_secret(body)
+
+    headers: dict[str, str] = {
+        "content-type": "application/json;charset=utf-8",
+        **auth_headers,
+        "X-Viewer-Context": viewer_context_header,
+    }
+
+    options: dict[str, Any] = {}
+    if timeout:
+        options["timeout"] = timeout
+    if retries is not None:
+        options["retries"] = retries
+
+    request_target = f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
+
+    timer_tags = {"endpoint": parsed.path, **(metric_tags or {})}
+    if metrics_endpoint is not None:
+        timer_tags["endpoint"] = metrics_endpoint
+
+    with metrics.timer(
+        "seer.request_to_seer",
+        sample_rate=1.0,
+        tags=timer_tags,
+    ) as tags:
+        tags["status_class"] = "error"
+        response = connection_pool.urlopen(
+            method,
+            request_target,
+            body=body,
+            headers=headers,
+            **options,
+        )
+        tags["status_class"] = f"{response.status // 100}xx"
+        return response
+
+
+class OrgProjectKnowledgeProjectData(TypedDict):
+    project_id: int
+    slug: str
+    sdk_name: str
+    error_count: int
+    transaction_count: int
+    instrumentation: list[str]
+    top_transactions: list[str]
+    top_span_operations: list[tuple[str, str]]
+
+
+class OrgProjectKnowledgeIndexRequest(TypedDict):
+    org_id: int
+    projects: list[OrgProjectKnowledgeProjectData]
+
+
+class AgentIndexProject(TypedDict):
+    org_id: int
+    project_id: int
+
+
+class AgentIndexRequest(TypedDict):
+    projects: list[AgentIndexProject]
+
+
+class AgentExportIndexesRequest(TypedDict):
+    org_id: int
+
+
+class AgentIndexSentryKnowledgeRequest(TypedDict):
+    replace_existing: bool
+
+
+class LlmGenerateRequest(TypedDict):
+    provider: str
+    model: str
+    referrer: str
+    prompt: str
+    system_prompt: str
+    temperature: float
+    max_tokens: int
+    response_schema: NotRequired[dict[str, Any]]
+    timeout: NotRequired[float | None]
+    reasoning: NotRequired[Literal["off", "low", "med", "high"] | None]
+    # Groups this call's gen_ai spans into a Sentry AI Monitoring conversation.
+    # Seer cannot infer identity for a proxied call, so omitting this (or passing
+    # None) means "not part of any conversation" and the spans carry no
+    # conversation id. Prefer a stable subject key (e.g. f"autofix_{run_id}");
+    # pass None for calls that are not conversations, such as classification,
+    # scoring, or telemetry processing.
+    conversation_id: NotRequired[str | None]
+
+
+class OneShotRunRequest(TypedDict):
+    # The registered one-shot to dispatch to on the Seer side (see the ONESHOTS
+    # registry in seer/automation/oneshots/). The `payload` shape is defined by
+    # that one-shot and parsed against its contract.
+    oneshot_id: str
+    payload: dict[str, Any]
+
+
+class RepoDetails(TypedDict):
+    project_ids: list[int]
+    provider: str
+    owner: str
+    name: str
+    external_id: str
+    languages: list[str]
+    integration_id: NotRequired[str | None]
+
+
+class AgentIndexOrgRepoRequest(TypedDict):
+    org_id: int
+    repos: list[RepoDetails]
+
+
+def make_org_repo_knowledge_index_request(
+    body: AgentIndexOrgRepoRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/automation/explorer/index/org-repo-knowledge",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_org_project_knowledge_index_request(
+    body: OrgProjectKnowledgeIndexRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/automation/explorer/index/org-project-knowledge",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_index_sentry_knowledge_request(
+    body: AgentIndexSentryKnowledgeRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/automation/explorer/index/sentry-knowledge",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_agent_export_indexes_request(
+    body: AgentExportIndexesRequest,
+    viewer_context: SeerViewerContext,
+    timeout: int | float | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/automation/explorer/export-indexes",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_agent_index_request(
+    body: AgentIndexRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/automation/explorer/index",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_seer_models_request(
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/models",
+        body=b"",
+        timeout=timeout,
+        method="GET",
+        viewer_context=viewer_context,
+    )
+
+
+def make_llm_generate_request(
+    body: LlmGenerateRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/llm/generate",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        metric_tags={"referrer": body["referrer"]},
+        viewer_context=viewer_context,
+    )
+
+
+def make_oneshot_request(
+    body: OneShotRunRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/automation/oneshot/run",
+        body=orjson.dumps(body, option=orjson.OPT_NON_STR_KEYS),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+class SummarizeIssueRequest(TypedDict):
+    group_id: int
+    issue: dict[str, Any]
+    trace_tree: NotRequired[dict[str, Any] | None]
+    organization_slug: str
+    organization_id: int
+    project_id: int
+    experiment_variant: NotRequired[str | None]
+
+
+class LightweightRCAClusterRequest(TypedDict):
+    group_id: int
+    issue: dict[str, Any]
+    organization_slug: str
+    organization_id: int
+    project_id: int
+
+
+class SupergroupsGetRequest(TypedDict):
+    organization_id: int
+    supergroup_id: int
+
+
+class SupergroupsGetByGroupIdsRequest(TypedDict):
+    organization_id: int
+    group_ids: list[int]
+
+
+class SupergroupDetailData(TypedDict):
+    id: int
+    title: str
+    summary: str
+    error_type: str
+    code_area: str
+    group_ids: list[int]
+    project_ids: list[int]
+    created_at: str
+    updated_at: str
+
+
+class SupergroupsByGroupIdsResponse(TypedDict):
+    data: list[SupergroupDetailData]
+
+
+class ServiceMapUpdateRequest(TypedDict):
+    organization_id: int
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+
+
+class SearchAgentStateRequest(TypedDict):
+    run_id: int
+    organization_id: int
+
+
+class SearchAgentStartRequest(TypedDict):
+    org_id: int
+    org_slug: str
+    project_ids: list[int]
+    natural_language_query: str
+    strategy: str
+    external_idempotency_key: NotRequired[str]
+    user_email: NotRequired[str]
+    timezone: NotRequired[str]
+    options: NotRequired[dict[str, Any]]
+
+
+class TranslateAgenticRequest(TypedDict):
+    org_id: int
+    org_slug: str
+    project_ids: list[int]
+    natural_language_query: str
+    strategy: str
+    user_email: NotRequired[str]
+    timezone: NotRequired[str]
+    options: NotRequired[dict[str, Any]]
+
+
+class CompareDistributionsRequest(TypedDict):
+    baseline: list[dict[str, Any]]
+    outliers: list[dict[str, Any]]
+    total_baseline: int
+    total_outliers: int
+    config: dict[str, Any]
+    meta: dict[str, Any]
+
+
+def make_summarize_issue_request(
+    body: SummarizeIssueRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_summarization_default_connection_pool,
+        "/v1/automation/summarize/issue",
+        body=orjson.dumps(body, option=orjson.OPT_NON_STR_KEYS),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_lightweight_rca_cluster_request(
+    body: LightweightRCAClusterRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v0/issues/supergroups/cluster-lightweight",
+        body=orjson.dumps(body, option=orjson.OPT_NON_STR_KEYS),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_supergroups_get_request(
+    body: SupergroupsGetRequest,
+    viewer_context: SeerViewerContext,
+    timeout: int | float | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v0/issues/supergroups/get",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_supergroups_get_by_group_ids_request(
+    body: SupergroupsGetByGroupIdsRequest,
+    viewer_context: SeerViewerContext,
+    timeout: int | float | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v0/issues/supergroups/get-by-group-ids",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_service_map_update_request(
+    body: ServiceMapUpdateRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/explorer/service-map/update",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_search_agent_state_request(
+    body: SearchAgentStateRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/assisted-query/state",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_search_agent_start_request(
+    body: SearchAgentStartRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/assisted-query/start",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_translate_agentic_request(
+    body: TranslateAgenticRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_autofix_default_connection_pool,
+        "/v1/assisted-query/translate-agentic",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def make_compare_distributions_request(
+    body: CompareDistributionsRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    return make_signed_seer_api_request(
+        seer_anomaly_detection_default_connection_pool,
+        "/v1/workflows/compare/cohort",
+        body=orjson.dumps(body),
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+class DeleteGroupingRecordsByProjectRequest(TypedDict):
+    project_id: int
+
+
+def make_delete_grouping_records_by_project_request(
+    body: DeleteGroupingRecordsByProjectRequest,
+    timeout: int | float | None = None,
+    viewer_context: SeerViewerContext | None = None,
+) -> BaseHTTPResponse:
+    project_id = body["project_id"]
+    return make_signed_seer_api_request(
+        seer_grouping_default_connection_pool,
+        f"/v0/issues/similar-issues/grouping-record/delete/{project_id}",
+        body=b"",
+        metrics_endpoint="/v0/issues/similar-issues/grouping-record/delete/:project_id",
+        method="GET",
+        timeout=timeout,
+        viewer_context=viewer_context,
+    )
+
+
+def sign_with_seer_secret(body: bytes) -> dict[str, str]:
+    auth_headers: dict[str, str] = {}
+    if settings.SEER_API_SHARED_SECRET:
+        signature = hmac.new(
+            settings.SEER_API_SHARED_SECRET.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+        auth_headers["Authorization"] = f"Rpcsignature rpc0:{signature}"
+    else:
+        # TODO(jstanley): remove this once the shared secret is confirmed to always be set
+        logger.warning(
+            "settings.SEER_API_SHARED_SECRET is not set. Unable to add auth headers for call to Seer."
+        )
+        metrics.incr("seer.unsigned_request", sample_rate=1.0)
+    return auth_headers

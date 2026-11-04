@@ -1,29 +1,141 @@
-from rest_framework import permissions
+from __future__ import annotations
 
-from sentry.api.exceptions import SuperuserRequired
-from sentry.api.exceptions import SsoRequired, TwoFactorRequired
+import logging
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+from django.conf import settings
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated  # noqa: S012
+from rest_framework.request import Request
+
+from sentry.api.exceptions import (
+    INSUFFICIENT_SCOPE_ATTR,
+    InsufficientScope,
+    MemberDisabledOverLimit,
+    SsoRequired,
+    SuperuserRequired,
+    TwoFactorRequired,
+)
 from sentry.auth import access
-from sentry.auth.superuser import is_active_superuser
+from sentry.auth.deprecated_scope_translation import record_deprecated_scope_translation
+from sentry.auth.principal import acting_user_id, has_user
+from sentry.auth.staff import has_staff_option, is_active_staff
+from sentry.auth.superuser import SUPERUSER_ORG_ID, is_active_superuser
 from sentry.auth.system import is_system_auth
+from sentry.demo_mode.utils import get_readonly_scopes, is_demo_mode_enabled, is_demo_user
+from sentry.hybridcloud.rpc import extract_id_from
+from sentry.models.apiscopes import add_scope_hierarchy
+from sentry.models.orgauthtoken import is_org_auth_token_auth, update_org_auth_token_last_used
+from sentry.organizations.services.organization import (
+    RpcOrganization,
+    RpcUserOrganizationContext,
+)
+from sentry.seer import agent_token
 from sentry.utils import auth
 
+logger = logging.getLogger(__name__)
 
-class RelayPermission(permissions.BasePermission):
-    def has_permission(self, request, view):
+if TYPE_CHECKING:
+    from rest_framework.views import APIView
+
+    from sentry.models.organization import Organization
+    from sentry.models.project import Project
+
+
+def _least_privileged_scope(allowed_scopes: set[str]) -> str | None:
+    """Choose the weakest user-grantable scope; break unrelated ties deterministically."""
+    grantable_scopes = allowed_scopes - settings.SENTRY_TOKEN_ONLY_SCOPES - settings.GRANULAR_SCOPES
+    for scope in sorted(grantable_scopes):
+        implied = set(settings.SENTRY_SCOPE_HIERARCHY_MAPPING.get(scope, ()))
+        if not implied.intersection(grantable_scopes - {scope}):
+            return scope
+    return min(grantable_scopes) if grantable_scopes else None
+
+
+def enforce_scope(
+    request: Request, required_scope: str, *, projects: Sequence[Project] = ()
+) -> None:
+    """
+    Require a scope and distinguish token failures from other denials.
+
+    When projects are provided, require that the requestor be able to obtain
+    the scope for every project. If not, raise PermissionDenied instead of an
+    insufficient-scope challenge since new scopes won't give them project access
+    """
+    if request.access.has_scope(required_scope):
+        return
+    if required_scope in add_scope_hierarchy(list(request.access.scopes)):
+        return
+    if (
+        agent_token.is_agent_auth(request.auth)
+        and required_scope not in settings.SENTRY_TOKEN_ONLY_SCOPES
+    ):
+        scope_can_be_granted = request.access.would_have_scope_with_added_auth_scope(required_scope)
+        if projects:
+            scope_can_be_granted = all(
+                request.access.would_have_project_scope_with_added_auth_scope(
+                    project, required_scope
+                )
+                for project in projects
+            )
+        if scope_can_be_granted:
+            raise InsufficientScope([required_scope])
+    raise PermissionDenied
+
+
+class RelayPermission(BasePermission):
+    def has_permission(self, request: Request, view: object) -> bool:
         return getattr(request, "relay", None) is not None
 
 
-class SystemPermission(permissions.BasePermission):
-    def has_permission(self, request, view):
+class SystemPermission(BasePermission):
+    def has_permission(self, request: Request, view: object) -> bool:
         return is_system_auth(request.auth)
 
 
-class NoPermission(permissions.BasePermission):
-    def has_permission(self, request, view):
+class NoPermission(BasePermission):
+    def has_permission(self, request: Request, view: object) -> bool:
         return False
 
 
-class ScopedPermission(permissions.BasePermission):
+class SuperuserPermission(BasePermission):
+    """
+    This permission class is used for endpoints that should ONLY be accessible
+    by superuser.
+    """
+
+    def has_permission(self, request: Request, view: object) -> bool:
+        return is_active_superuser(request)
+
+
+class StaffPermission(BasePermission):
+    """
+    This permission class is used for endpoints that should ONLY be accessible
+    by staff.
+    """
+
+    def has_permission(self, request: Request, view: object) -> bool:
+        return is_active_staff(request)
+
+
+# NOTE(schew2381): This is a temporary permission that does NOT perform an OR
+# between SuperuserPermission and StaffPermission. Instead, it uses StaffPermission
+# if the option is enabled for the user, and otherwise checks SuperuserPermission. We
+# need this to handle the transition for endpoints that will only be accessible to
+# staff but not superuser, that currently use SuperuserPermission. Once staff is
+# released to the everyone, we can delete this permission and use StaffPermission
+class SuperuserOrStaffFeatureFlaggedPermission(BasePermission):
+    def has_permission(self, request: Request, view: object) -> bool:
+        enforce_staff_permission = has_staff_option(request.user)
+
+        if enforce_staff_permission:
+            return StaffPermission().has_permission(request, view)
+
+        return SuperuserPermission().has_permission(request, view)
+
+
+class ScopedPermission(BasePermission):
     """
     Permissions work depending on the type of authentication:
 
@@ -34,72 +146,335 @@ class ScopedPermission(permissions.BasePermission):
     - APIKeys specify their scope, and work as expected.
     """
 
-    scope_map = {"HEAD": (), "GET": (), "POST": (), "PUT": (), "PATCH": (), "DELETE": ()}
+    scope_map: dict[str, Sequence[str]] = {
+        "HEAD": (),
+        "GET": (),
+        "POST": (),
+        "PUT": (),
+        "PATCH": (),
+        "DELETE": (),
+    }
 
-    def has_permission(self, request, view):
+    def has_permission(self, request: Request, view: APIView) -> bool:
         # session-based auth has all scopes for a logged in user
-        if not getattr(request, "auth", None):
-            return request.user.is_authenticated()
+        if not request.auth:
+            return request.user.is_authenticated
 
+        if is_org_auth_token_auth(request.auth):
+            # Ensure we always update the last used date for the org auth token.
+            # At this point, we don't have the projects yet, so we only update the org auth token's
+            # last used date, clearing the project_last_used_id. We call this method again in endpoints
+            # where a project is available to update the project_last_used_id.
+            update_org_auth_token_last_used(request.auth, [])
+
+        assert request.method is not None
         allowed_scopes = set(self.scope_map.get(request.method, []))
+        # Only AuthenticatedToken translates deprecated scopes; raw token models passed
+        # through the internal API client report their stored scopes from get_scopes().
+        get_stored_scopes = getattr(request.auth, "get_stored_scopes", request.auth.get_scopes)
+        record_deprecated_scope_translation(
+            get_stored_scopes(), tags={"endpoint": type(view).__name__}
+        )
         current_scopes = request.auth.get_scopes()
-        return any(s in allowed_scopes for s in current_scopes)
-
-    def has_object_permission(self, request, view, obj):
+        if any(s in allowed_scopes for s in current_scopes):
+            return True
+        if allowed_scopes:
+            # Token-authorized (request.auth is set) but under-scoped. Record the required
+            # scopes so permission_denied can advertise them via RFC 6750 insufficient_scope;
+            # has_permission itself stays a plain bool. (Skipped when no scope could satisfy
+            # the method, e.g. an unset scope_map entry, to avoid an empty challenge.)
+            unsatisfied_scopes = allowed_scopes
+            if agent_token.is_agent_auth(request.auth):
+                required_scope = _least_privileged_scope(allowed_scopes)
+                if required_scope is None:
+                    unsatisfied_scopes = set()
+                else:
+                    unsatisfied_scopes = {required_scope}
+            if unsatisfied_scopes:
+                setattr(request, INSUFFICIENT_SCOPE_ATTR, unsatisfied_scopes)
         return False
 
-
-class SuperuserPermission(permissions.BasePermission):
-    def has_permission(self, request, view):
-        if is_active_superuser(request):
-            return True
-        if request.user.is_authenticated() and request.user.is_superuser:
-            raise SuperuserRequired
+    def has_object_permission(self, request: Request, view: APIView, obj: Any) -> bool:
         return False
 
 
 class SentryPermission(ScopedPermission):
-    def is_not_2fa_compliant(self, request, organization):
+    def is_not_2fa_compliant(
+        self, request: Request, organization: RpcOrganization | Organization
+    ) -> bool:
         return False
 
-    def needs_sso(self, request, organization):
+    def needs_sso(self, request: Request, organization: Organization | RpcOrganization) -> bool:
         return False
 
-    def determine_access(self, request, organization):
+    def is_member_disabled_from_limit(
+        self,
+        request: Request,
+        organization: RpcUserOrganizationContext | RpcOrganization | Organization,
+    ) -> bool:
+        return False
+
+    # This wide typing on organization gives us a lot of flexibility as we move forward with hybrid cloud.
+    # Once we have fully encircled all call sites (which are MANY!) we can collapse the typing around a single
+    # usage (likely the RpcUserOrganizationContext, which is necessary for access and organization details).
+    # For now, this wide typing allows incremental rollout of those changes.  Be mindful how you use
+    # organization in this method to stay compatible with all 3 paths.
+    def determine_access(
+        self,
+        request: Request,
+        organization: RpcUserOrganizationContext | Organization | RpcOrganization,
+    ) -> None:
         from sentry.api.base import logger
 
-        if request.user and request.user.is_authenticated() and request.auth:
-            request.access = access.from_request(
-                request, organization, scopes=request.auth.get_scopes()
+        user_id = acting_user_id(request.user)
+        agent_auth = request.auth if agent_token.is_agent_auth(request.auth) else None
+
+        org_context: RpcUserOrganizationContext | None
+        if isinstance(organization, RpcUserOrganizationContext):
+            org_context = organization
+        else:
+            org_context = access.get_organization_access_context(
+                request, organization_id=extract_id_from(organization)
             )
 
-        elif request.auth:
-            request.access = access.from_auth(request.auth, organization)
+        if org_context is None:
+            assert False, "Failed to fetch organization in determine_access"
 
-        else:
-            request.access = access.from_request(request, organization)
+        organization = org_context.organization
+        extra = {"organization_id": organization.id, "user_id": user_id}
 
-            if auth.is_user_signed_request(request):
-                # if the user comes from a signed request
-                # we let them pass if sso is enabled
-                logger.info(
-                    "access.signed-sso-passthrough",
-                    extra={"organization_id": organization.id, "user_id": request.user.id},
+        if request.auth:
+            if agent_auth is not None:
+                request.access = access.from_rpc_auth(
+                    auth=agent_auth, rpc_user_org_context=org_context
                 )
-            elif request.user.is_authenticated():
-                # session auth needs to confirm various permissions
-                if self.needs_sso(request, organization):
+            elif has_user(request.user):
+                request.access = access.from_request_org_and_scopes(
+                    request=request,
+                    rpc_user_org_context=org_context,
+                    scopes=request.auth.get_scopes(),
+                )
+            else:
+                # A credential with no person behind it: an org token, an API key or a
+                # service account. Agents take the branch above.
+                request.access = access.from_rpc_auth(
+                    auth=request.auth, rpc_user_org_context=org_context
+                )
 
-                    logger.info(
-                        "access.must-sso",
-                        extra={"organization_id": organization.id, "user_id": request.user.id},
-                    )
+            if org_context.member and self.is_not_2fa_compliant(request, organization):
+                logger.info(
+                    "access.not-2fa-compliant.auth-token",
+                    extra=extra,
+                )
+                raise TwoFactorRequired()
 
-                    raise SsoRequired(organization)
+            if self.is_member_disabled_from_limit(request, org_context):
+                logger.info(
+                    "access.member-disabled-from-limit",
+                    extra=extra,
+                )
+                raise MemberDisabledOverLimit(organization)
 
-                if self.is_not_2fa_compliant(request, organization):
-                    logger.info(
-                        "access.not-2fa-compliant",
-                        extra={"organization_id": organization.id, "user_id": request.user.id},
-                    )
-                    raise TwoFactorRequired()
+            return
+
+        request.access = access.from_request_org_and_scopes(
+            request=request,
+            rpc_user_org_context=org_context,
+        )
+
+        if auth.is_user_signed_request(request) or auth.is_user_from_viewer_context(request):
+            # Signed requests and viewer-context-authenticated service
+            # callbacks already carry a trusted assertion of user identity, so
+            # they should not depend on browser-session SSO completion.
+            logger.info(
+                "access.signed-sso-passthrough",
+                extra=extra,
+            )
+        elif request.user.is_authenticated:
+            # session auth needs to confirm various permissions
+            if self.needs_sso(request, organization):
+                logger.info(
+                    "access.must-sso",
+                    extra=extra,
+                )
+
+                after_login_redirect = request.META.get("HTTP_REFERER", "")
+                if not auth.is_valid_redirect(
+                    after_login_redirect, allowed_hosts=(request.get_host(),)
+                ):
+                    after_login_redirect = None
+
+                raise SsoRequired(
+                    organization=organization,
+                    request=request,
+                    after_login_redirect=after_login_redirect,
+                )
+
+            if self.is_not_2fa_compliant(request, organization):
+                logger.info(
+                    "access.not-2fa-compliant",
+                    extra=extra,
+                )
+                if request.user.is_superuser and extract_id_from(organization) != SUPERUSER_ORG_ID:
+                    raise SuperuserRequired()
+
+                raise TwoFactorRequired()
+
+            if self.is_member_disabled_from_limit(request, org_context):
+                logger.info(
+                    "access.member-disabled-from-limit",
+                    extra=extra,
+                )
+                raise MemberDisabledOverLimit(organization)
+
+
+class StaffPermissionMixin(SentryPermission):
+    """
+    Sentry endpoints that should be accessible by staff but have an existing permission
+    class (that is not StaffPermission) require this mixin because staff does not give
+    any scopes.
+    NOTE: This mixin MUST be the leftmost parent class in the child class declaration in
+    order to work properly. See 'OrganizationAndStaffPermission' for an example of this or
+    https://www.python.org/download/releases/2.3/mro/ to learn more.
+    """
+
+    staff_allowed_methods = {"GET", "POST", "PUT", "DELETE"}
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        """
+        Calls the parent class's has_permission method. If it returns False or
+        raises an exception and the method is allowed by the mixin, we then check
+        if the request is from an active staff. Raised exceptions are not caught
+        if the request is not allowed by the mixin or from an active staff.
+        """
+        try:
+            if super().has_permission(request, view):
+                return True
+        except Exception:
+            if not (request.method in self.staff_allowed_methods and is_active_staff(request)):
+                raise
+            return True
+        return request.method in self.staff_allowed_methods and is_active_staff(request)
+
+    def has_object_permission(self, request: Request, view: APIView, obj: Any) -> bool:
+        """
+        Calls the parent class's has_object_permission method. If it returns False or
+        raises an exception and the method is allowed by the mixin, we then check
+        if the request is from an active staff. Raised exceptions are not caught
+        if the request is not allowed by the mixin or from an active staff.
+        """
+        try:
+            if super().has_object_permission(request, view, obj):
+                return True
+        except Exception:
+            if not (request.method in self.staff_allowed_methods and is_active_staff(request)):
+                raise
+            return True
+        return request.method in self.staff_allowed_methods and is_active_staff(request)
+
+    def is_not_2fa_compliant(
+        self, request: Request, organization: RpcOrganization | Organization
+    ) -> bool:
+        return super().is_not_2fa_compliant(request, organization) and not is_active_staff(request)
+
+
+class DemoSafePermission(SentryPermission):
+    """
+    A permission class that extends `SentryPermission` to provide read-only access for users
+    in a demo mode. This class modifies the access control logic to ensure that users identified
+    as read-only can only perform safe operations, such as GET and HEAD requests, on resources.
+    """
+
+    def determine_access(
+        self,
+        request: Request,
+        organization: RpcUserOrganizationContext | Organization | RpcOrganization,
+    ) -> None:
+        if not is_demo_user(request.user):
+            return super().determine_access(request, organization)
+
+        org_context: RpcUserOrganizationContext | None = None
+        if isinstance(organization, RpcUserOrganizationContext):
+            org_context = organization
+        else:
+            org_context = access.get_organization_access_context(
+                request, organization_id=extract_id_from(organization)
+            )
+
+        assert org_context is not None, "Failed to fetch organization in determine_access"
+
+        if org_context.member and is_demo_mode_enabled():
+            readonly_scopes = get_readonly_scopes()
+            org_context.member.scopes = sorted(readonly_scopes)
+            request.access = access.from_request_org_and_scopes(
+                request=request,
+                rpc_user_org_context=org_context,
+                scopes=readonly_scopes,
+            )
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        if is_demo_user(request.user):
+            if not is_demo_mode_enabled() or request.method not in SAFE_METHODS:
+                return False
+
+        return super().has_permission(request, view)
+
+    def has_object_permission(self, request: Request, view: APIView, obj: Any) -> bool:
+        if is_demo_user(request.user):
+            if not is_demo_mode_enabled() or request.method not in SAFE_METHODS:
+                return False
+
+        return super().has_object_permission(request, view, obj)
+
+
+class DisallowImpersonatedTokenCreation(BasePermission):
+    """
+    Blocks non-safe requests (POST, PUT, DELETE) during impersonation sessions.
+    Prevents creating/modifying/revoking tokens as another user.
+    """
+
+    def has_permission(self, request: Request, view: object) -> bool:
+        if request.method in SAFE_METHODS:
+            return True
+        actual_user = getattr(request, "actual_user", None)
+        if actual_user is not None:
+            logger.warning(
+                "impersonation.token_creation_blocked",
+                extra={
+                    "actual_user_id": actual_user.id,
+                    "impersonated_user_id": acting_user_id(request.user),
+                    "method": request.method,
+                    "path": request.path,
+                },
+            )
+            return False
+        return True
+
+
+class DisallowAgentToken(BasePermission):
+    def has_permission(self, request: Request, view: object) -> bool:
+        return not agent_token.is_agent_auth(request.auth)
+
+
+class SentryIsAuthenticated(IsAuthenticated):
+    """
+    Used to deny access for demo users in both view and object permission checks.
+
+    WARNING: Setting ``permission_classes = (SentryIsAuthenticated,)`` on an endpoint grants
+    access to ANY authenticated user, regardless of the endpoint's base class. For example,
+    an endpoint that extends ``OrganizationEndpoint`` will NOT enforce organization membership
+    or scoped access — any logged-in user can call it. Only use this permission class on
+    endpoints that are intentionally open to all authenticated users.
+    """
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        if is_demo_user(request.user):
+            return False
+
+        return super().has_permission(request, view)
+
+    def has_object_permission(self, request: Request, view: APIView, obj: Any) -> bool:
+        if is_demo_user(request.user):
+            return False
+
+        return super().has_object_permission(request, view, obj)

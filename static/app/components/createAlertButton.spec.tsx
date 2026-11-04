@@ -1,0 +1,171 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {ProjectFixture} from 'sentry-fixture/project';
+
+import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
+
+import {CreateAlertFromViewButton} from 'sentry/components/createAlertButton';
+import {ProjectsStore} from 'sentry/stores/projectsStore';
+import {EventView} from 'sentry/utils/discover/eventView';
+import {DEFAULT_EVENT_VIEW} from 'sentry/views/discover/results/data';
+
+const onClickMock = jest.fn();
+
+describe('CreateAlertFromViewButton', () => {
+  const organization = OrganizationFixture();
+
+  beforeEach(() => {
+    ProjectsStore.loadInitialData([]);
+  });
+
+  afterEach(() => {
+    jest.resetAllMocks();
+  });
+
+  it('should trigger onClick callback', async () => {
+    const eventView = EventView.fromSavedQuery({
+      ...DEFAULT_EVENT_VIEW,
+      query: 'event.type:error',
+      projects: [2],
+    });
+    render(
+      <CreateAlertFromViewButton
+        organization={organization}
+        eventView={eventView}
+        projects={[ProjectFixture()]}
+        onClick={onClickMock}
+      />
+    );
+    await userEvent.click(screen.getByRole('button', {name: 'Create Monitor'}));
+    expect(onClickMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables the button for org-member', () => {
+    const eventView = EventView.fromSavedQuery({
+      ...DEFAULT_EVENT_VIEW,
+    });
+    const noAccessOrg = {
+      ...organization,
+      access: [],
+    };
+    const projects = [
+      {
+        ...ProjectFixture(),
+        access: [],
+      },
+    ];
+    ProjectsStore.loadInitialData(projects);
+
+    render(
+      <CreateAlertFromViewButton
+        organization={noAccessOrg}
+        eventView={eventView}
+        projects={projects}
+        onClick={onClickMock}
+      />,
+      {
+        organization: noAccessOrg,
+      }
+    );
+
+    expect(screen.getByRole('button', {name: 'Create Monitor'})).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
+
+  it('enables the button for org-owner/manager', () => {
+    const eventView = EventView.fromSavedQuery({
+      ...DEFAULT_EVENT_VIEW,
+    });
+    const projects = [
+      {
+        ...ProjectFixture(),
+        access: [],
+      },
+    ];
+    ProjectsStore.loadInitialData(projects);
+
+    render(
+      <CreateAlertFromViewButton
+        organization={organization}
+        eventView={eventView}
+        projects={projects}
+        onClick={onClickMock}
+      />,
+      {
+        organization,
+      }
+    );
+
+    expect(screen.getByRole('button', {name: 'Create Monitor'})).toBeEnabled();
+  });
+
+  it('enables the button for team-admin', () => {
+    const eventView = EventView.fromSavedQuery({
+      ...DEFAULT_EVENT_VIEW,
+    });
+    const noAccessOrg = {
+      ...organization,
+      access: [],
+    };
+    const projects = [
+      {
+        ...ProjectFixture(),
+        id: '1',
+        slug: 'admin-team',
+        access: ['alerts:write' as const],
+      },
+      {
+        ...ProjectFixture(),
+        id: '2',
+        slug: 'contributor-team',
+        access: ['alerts:read' as const],
+      },
+    ];
+    ProjectsStore.loadInitialData(projects);
+
+    render(
+      <CreateAlertFromViewButton
+        organization={noAccessOrg}
+        eventView={eventView}
+        projects={projects}
+        onClick={onClickMock}
+      />,
+      {
+        organization: noAccessOrg,
+      }
+    );
+
+    expect(screen.getByRole('button', {name: 'Create Monitor'})).toBeEnabled();
+  });
+
+  it('removes a duplicate project filter', async () => {
+    const projects = [ProjectFixture()];
+    ProjectsStore.loadInitialData(projects);
+
+    const eventView = EventView.fromSavedQuery({
+      ...DEFAULT_EVENT_VIEW,
+      query: 'event.type:error project:project-slug',
+      projects: [2],
+    });
+    const {router} = render(
+      <CreateAlertFromViewButton
+        organization={organization}
+        eventView={eventView}
+        projects={projects}
+        onClick={onClickMock}
+      />
+    );
+    await userEvent.click(screen.getByRole('button'));
+    expect(router.location).toEqual(
+      expect.objectContaining({
+        pathname: '/organizations/org-slug/monitors/new/settings',
+        query: expect.objectContaining({
+          detectorType: 'metric_issue',
+          query: 'event.type:error ',
+          project: '2',
+        }),
+      })
+    );
+  });
+});

@@ -6,7 +6,7 @@ CLIENT_SECRET = settings.GITHUB_API_SECRET
 
 REQUIRE_VERIFIED_EMAIL = settings.GITHUB_REQUIRE_VERIFIED_EMAIL
 
-ERR_NO_ORG_ACCESS = "You do not have access to the required GitHub organization."
+ERR_NO_ORG_ACCESS = "Your GitHub account must be a member of the linked organization to access this Sentry organization. Contact your admin to request access."
 
 ERR_NO_PRIMARY_EMAIL = (
     "We were unable to find a primary email address associated with your GitHub account."
@@ -19,8 +19,6 @@ ERR_NO_SINGLE_PRIMARY_EMAIL = (
 ERR_NO_VERIFIED_PRIMARY_EMAIL = (
     "We were unable to find a verified, primary email address associated with your GitHub account."
 )
-
-ERR_NO_SINGLE_VERIFIED_PRIMARY_EMAIL = "We were unable to find a single verified, primary email address associated with your GitHub account."
 
 # we request repo as we share scopes with the other GitHub integration
 SCOPE = "user:email,read:org,repo"

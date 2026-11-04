@@ -1,15 +1,35 @@
-from io import BytesIO
+from unittest.mock import patch
 
-from sentry.models import EventAttachment, File
-from sentry.testutils import APITestCase, PermissionTestCase
-from sentry.testutils.helpers.datetime import iso_format, before_now
+import pytest
+import requests
+from django.test import override_settings
+
+from sentry.attachments.base import CachedAttachment
+from sentry.issues.action_log import GroupActionActor
+from sentry.issues.action_log.types import DeletedAttachmentAction
+from sentry.models.activity import Activity
+from sentry.models.eventattachment import EventAttachment
+from sentry.testutils.cases import APITestCase, PermissionTestCase, TestCase
+from sentry.testutils.helpers.action_log import capture_action_log
+from sentry.testutils.helpers.datetime import before_now
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.helpers.options import override_options
+from sentry.testutils.helpers.response import close_streaming_response
+from sentry.testutils.skips import requires_objectstore, requires_snuba
+from sentry.types.activity import ActivityType
+
+pytestmark = [requires_snuba]
+
+ATTACHMENT_CONTENT = b"File contents here" * 10_000
 
 
-class CreateAttachmentMixin:
-    def create_attachment(self):
+class CreateAttachmentMixin(TestCase):
+    def create_attachment(
+        self, content: bytes | None = None, group_id: int | None = None
+    ) -> EventAttachment:
         self.project = self.create_project()
         self.release = self.create_release(self.project, self.user)
-        min_ago = iso_format(before_now(minutes=1))
+        min_ago = before_now(minutes=1).isoformat()
         self.event = self.store_event(
             data={
                 "fingerprint": ["group1"],
@@ -19,90 +39,268 @@ class CreateAttachmentMixin:
             project_id=self.project.id,
         )
 
-        self.file = File.objects.create(name="hello.png", type="image/png; foo=bar")
-        self.file.putfile(BytesIO(b"File contents here"))
+        data = content if content is not None else ATTACHMENT_CONTENT
+        attachment = CachedAttachment(
+            name="hello.png", content_type="image/png; foo=bar", data=data
+        )
+        file = EventAttachment.putfile(self.project.id, attachment)
 
+        assert attachment.name is not None
         self.attachment = EventAttachment.objects.create(
             event_id=self.event.event_id,
             project_id=self.event.project_id,
-            file_id=self.file.id,
-            type=self.file.type,
-            name="hello.png",
+            group_id=group_id,
+            type=attachment.type,
+            name=attachment.name,
+            content_type=file.content_type,
+            size=file.size,
+            sha1=file.sha1,
+            # storage:
+            blob_path=file.blob_path,
         )
-        assert self.attachment.mimetype == "image/png"
 
         return self.attachment
 
 
 class EventAttachmentDetailsTest(APITestCase, CreateAttachmentMixin):
-    def test_simple(self):
+    @with_feature("organizations:event-attachments")
+    def test_simple(self) -> None:
         self.login_as(user=self.user)
 
         self.create_attachment()
         path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/"
 
-        with self.feature("organizations:event-attachments"):
-            response = self.client.get(path)
+        response = self.client.get(path)
 
         assert response.status_code == 200, response.content
         assert response.data["id"] == str(self.attachment.id)
-        assert response.data["mimetype"] == self.attachment.mimetype
+        assert response.data["mimetype"] == "image/png"
+        assert response.data["event_id"] == self.event.event_id
 
-    def test_download(self):
+    @with_feature("organizations:event-attachments")
+    def test_non_integer_attachment_id(self) -> None:
+        self.login_as(user=self.user)
+        self.create_attachment()
+        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/invalid/"
+
+        response = self.client.get(path)
+
+        assert response.status_code == 404
+
+    @with_feature("organizations:event-attachments")
+    def test_out_of_range_attachment_id(self) -> None:
+        self.login_as(user=self.user)
+        self.create_attachment()
+        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/999999999999999999999/"
+
+        response = self.client.delete(path)
+
+        assert response.status_code == 404
+
+    @with_feature("organizations:event-attachments")
+    def test_download(self) -> None:
         self.login_as(user=self.user)
 
-        self.create_attachment()
-        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/?download"
+        # Attachments not backed by Objectstore are streamed through Sentry.
+        with override_options({"objectstore.enable_for.attachments": 0}):
+            self.create_attachment()
 
-        with self.feature("organizations:event-attachments"):
-            response = self.client.get(path)
+        assert not self.attachment.uses_objectstore()
+        path1 = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/?download"
+
+        response = self.client.get(path1)
 
         assert response.status_code == 200, response.content
         assert response.get("Content-Disposition") == 'attachment; filename="hello.png"'
-        assert response.get("Content-Length") == str(self.file.size)
-        assert response.get("Content-Type") == "application/octet-stream"
-        assert b"File contents here" == BytesIO(b"".join(response.streaming_content)).getvalue()
+        assert response.get("Content-Length") == str(self.attachment.size)
+        assert response.get("Content-Type") == "image/png"
+        assert close_streaming_response(response) == ATTACHMENT_CONTENT
 
-    def test_delete(self):
+    @with_feature("organizations:event-attachments")
+    @requires_objectstore
+    def test_download_objectstore_redirects_internal_to_objectstore(self) -> None:
+        self.login_as(user=self.user)
+
+        with override_options({"objectstore.enable_for.attachments": 1}):
+            attachment = self.create_attachment()
+            assert attachment.uses_objectstore()
+
+            path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{attachment.id}/?download"
+            with patch("sentry.auth.system.is_internal_ip", return_value=True):
+                response = self.client.get(path)
+
+            assert response.status_code == 302
+            location = response["Location"]
+            # Internal callers are redirected straight to Objectstore, not through the cell proxy.
+            assert "/organizations/" not in location
+            # In dev/test the host may be rewritten to the Docker-internal `objectstore`
+            # hostname (so Symbolicator can reach it); rewrite it back so we can follow it.
+            downloaded = requests.get(location.replace("://objectstore:", "://127.0.0.1:"))
+            assert downloaded.status_code == 200, downloaded.text
+            assert downloaded.content == ATTACHMENT_CONTENT
+
+    @with_feature("organizations:event-attachments")
+    @requires_objectstore
+    def test_download_objectstore_redirects_external_to_cell_proxy(self) -> None:
+        self.login_as(user=self.user)
+
+        with override_options({"objectstore.enable_for.attachments": 1}):
+            attachment = self.create_attachment()
+            assert attachment.uses_objectstore()
+
+            path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{attachment.id}/?download"
+            with patch("sentry.auth.system.is_internal_ip", return_value=False):
+                response = self.client.get(path)
+
+            assert response.status_code == 302
+            location = response["Location"]
+            assert (
+                f"/organizations/{self.organization.id}/objectstore/v1/objects/attachments/"
+                in location
+            )
+            assert "os_auth=" in location
+
+    @with_feature("organizations:event-attachments")
+    def test_zero_sized_attachment(self) -> None:
+        self.login_as(user=self.user)
+
+        self.create_attachment(b"")
+
+        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/"
+
+        response = self.client.get(path)
+
+        assert response.status_code == 200, response.content
+        assert response.data["id"] == str(self.attachment.id)
+        assert response.data["event_id"] == self.event.event_id
+        assert response.data["size"] == 0
+        assert response.data["sha1"] is None
+
+        path = f"{path}?download"
+
+        response = self.client.get(path)
+
+        assert response.status_code == 200, response.content
+        assert response.get("Content-Disposition") == 'attachment; filename="hello.png"'
+        assert response.get("Content-Length") == "0"
+        assert response.get("Content-Type") == "image/png"
+        assert close_streaming_response(response) == b""
+
+    @with_feature("organizations:event-attachments")
+    def test_delete(self) -> None:
         self.login_as(user=self.user)
 
         self.create_attachment()
         path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/"
 
-        with self.feature("organizations:event-attachments"):
-            response = self.client.delete(path)
+        response = self.client.delete(path)
 
         assert response.status_code == 204, response.content
         assert EventAttachment.objects.count() == 0
 
+    @with_feature("organizations:event-attachments")
+    def test_delete_activity_no_group(self) -> None:
+        self.login_as(user=self.user)
+
+        self.create_attachment(group_id=None)
+        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/"
+        response = self.client.delete(path)
+        assert response.status_code == 204
+
+        # an activity with no group cannot be associated with an issue or displayed in an issue details page
+        with pytest.raises(Activity.DoesNotExist):
+            Activity.objects.get(type=ActivityType.DELETED_ATTACHMENT.value)
+
+    @with_feature("organizations:event-attachments")
+    def test_delete_activity_with_group(self) -> None:
+        self.login_as(user=self.user)
+
+        group_id = self.create_group().id
+        self.create_attachment(group_id=group_id)
+        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/"
+        response = self.client.delete(path)
+        assert response.status_code == 204
+
+        delete_activity = Activity.objects.get(type=ActivityType.DELETED_ATTACHMENT.value)
+        assert delete_activity.project == self.project
+        assert delete_activity.group_id == group_id
+        assert delete_activity.group is not None
+        assert delete_activity.group.id == group_id
+
+    @with_feature("organizations:event-attachments")
+    def test_delete_activity_attributes_to_request_user(self) -> None:
+        self.login_as(user=self.user)
+
+        group_id = self.create_group().id
+        self.create_attachment(group_id=group_id)
+        path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/"
+        with capture_action_log() as log:
+            response = self.client.delete(path)
+        assert response.status_code == 204
+
+        log.assert_logged(
+            DeletedAttachmentAction, group_id=group_id, actor=GroupActionActor.user(self.user.id)
+        )
+
 
 class EventAttachmentDetailsPermissionTest(PermissionTestCase, CreateAttachmentMixin):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
-        self.create_attachment()
+        # `PermissionTestCase` treats any 3xx as "access denied", so keep the attachment on
+        # the streaming path rather than the Objectstore redirect.
+        with override_options({"objectstore.enable_for.attachments": 0}):
+            self.create_attachment()
         self.path = f"/api/0/projects/{self.organization.slug}/{self.project.slug}/events/{self.event.event_id}/attachments/{self.attachment.id}/?download"
 
-    def test_member_can_access_by_default(self):
-        with self.feature("organizations:event-attachments"):
-            self.assert_member_can_access(self.path)
-            self.assert_can_access(self.owner, self.path)
+    @with_feature("organizations:event-attachments")
+    def test_member_can_access_by_default(self) -> None:
+        close_streaming_response(self.assert_member_can_access(self.path))
+        close_streaming_response(self.assert_can_access(self.owner, self.path))
 
-    def test_member_cannot_access_for_owner_role(self):
+    @with_feature("organizations:event-attachments")
+    def test_member_cannot_access_for_owner_role(self) -> None:
         self.organization.update_option("sentry:attachments_role", "owner")
-        with self.feature("organizations:event-attachments"):
-            self.assert_member_cannot_access(self.path)
-            self.assert_can_access(self.owner, self.path)
+        self.assert_member_cannot_access(self.path)
+        close_streaming_response(self.assert_can_access(self.owner, self.path))
 
-    def test_random_user_cannot_access(self):
+    @with_feature("organizations:event-attachments")
+    def test_random_user_cannot_access(self) -> None:
         self.organization.update_option("sentry:attachments_role", "owner")
         user = self.create_user()
 
-        with self.feature("organizations:event-attachments"):
-            self.assert_cannot_access(user, self.path)
+        self.assert_cannot_access(user, self.path)
 
-    def test_superuser_can_access(self):
+    @with_feature("organizations:event-attachments")
+    def test_superuser_can_access(self) -> None:
         self.organization.update_option("sentry:attachments_role", "owner")
         superuser = self.create_user(is_superuser=True)
 
-        with self.feature("organizations:event-attachments"):
-            self.assert_can_access(superuser, self.path)
+        close_streaming_response(self.assert_can_access(superuser, self.path))
+
+        with self.settings(SENTRY_SELF_HOSTED=False):
+            close_streaming_response(self.assert_can_access(superuser, self.path))
+            self.assert_can_access(superuser, self.path, method="DELETE")
+
+    @with_feature("organizations:event-attachments")
+    @override_options({"superuser.read-write.ga-rollout": True})
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_superuser_read_access(self) -> None:
+        self.organization.update_option("sentry:attachments_role", "owner")
+        superuser = self.create_user(is_superuser=True)
+
+        close_streaming_response(self.assert_can_access(superuser, self.path))
+
+        self.assert_cannot_access(superuser, self.path, method="DELETE")
+
+    @with_feature("organizations:event-attachments")
+    @override_options({"superuser.read-write.ga-rollout": True})
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_superuser_write_can_access(self) -> None:
+        self.organization.update_option("sentry:attachments_role", "owner")
+        superuser = self.create_user(is_superuser=True)
+
+        self.add_user_permission(superuser, "superuser.write")
+
+        close_streaming_response(self.assert_can_access(superuser, self.path))
+
+        self.assert_can_access(superuser, self.path, method="DELETE")

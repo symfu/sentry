@@ -1,8 +1,16 @@
-from sentry.utils.imports import import_submodules
 from sentry.rules import rules
 
-from .notify_action import JiraCreateTicketAction
+from .actions import JiraCreateTicketAction
+from .client import JiraCloudClient
+from .handlers import JiraActionHandler  # noqa: F401,F403
+from .integration import JiraIntegration, JiraIntegrationProvider
 
-import_submodules(globals(), __name__, __path__)
+__all__ = (
+    "JiraCloudClient",
+    "JiraCreateTicketAction",
+    "JiraIntegration",
+    "JiraIntegrationProvider",
+)
+
 
 rules.add(JiraCreateTicketAction)

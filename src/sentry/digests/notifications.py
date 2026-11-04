@@ -1,187 +1,154 @@
-import functools
-from functools import reduce
-import itertools
+from __future__ import annotations
+
 import logging
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple, TypeAlias
 
-from collections import OrderedDict, defaultdict, namedtuple
-
-from sentry.app import tsdb
-from sentry.digests import Record
-from sentry.models import Project, Group, GroupStatus, Rule
-from sentry.utils.dates import to_timestamp
+from sentry import tsdb
+from sentry.digests.types import Notification, Record, RecordWithRuleObjects
+from sentry.models.group import Group, GroupStatus
+from sentry.models.project import Project
+from sentry.notifications.types import ActionTargetType, FallthroughChoiceType, NotificationOrigin
+from sentry.notifications.utils.rules import get_notification_origins
+from sentry.services.eventstore.models import GroupEvent
+from sentry.tsdb.base import TSDBModel
 
 logger = logging.getLogger("sentry.digests")
 
-Notification = namedtuple("Notification", "event rules")
+Digest: TypeAlias = dict[NotificationOrigin, dict[Group, list[RecordWithRuleObjects]]]
 
 
-def split_key(key):
-    from sentry.mail.adapter import ActionTargetType
+class DigestInfo(NamedTuple):
+    digest: Digest
+    event_counts: dict[int, int]
+    user_counts: Mapping[int, int]
 
-    key_parts = key.split(":", 4)
+
+def split_key(
+    key: str,
+) -> tuple[Project, ActionTargetType, int | str | None, FallthroughChoiceType | None]:
+    key_parts = key.split(":", 5)
     project_id = key_parts[2]
-    # XXX: We transitioned to new style keys (len == 5) a while ago on sentry.io. But
-    # on-prem users might transition at any time, so we need to keep this transition
-    # code around for a while, maybe indefinitely.
-    if len(key_parts) == 5:
+    # XXX: We transitioned to new style keys (len == 5) a while ago on
+    # sentry.io. But self-hosted users might transition at any time, so we need
+    # to keep this transition code around for a while, maybe indefinitely.
+    target_identifier: int | str | None = None
+    if len(key_parts) == 6:
         target_type = ActionTargetType(key_parts[3])
-        target_identifier = key_parts[4] if key_parts[4] else None
+        if key_parts[4]:
+            if key_parts[4] == "None":
+                target_identifier = key_parts[4]
+            else:
+                target_identifier = int(key_parts[4])
+        try:
+            fallthrough_choice = FallthroughChoiceType(key_parts[5])
+        except ValueError:
+            fallthrough_choice = None
+    elif len(key_parts) == 5:
+        target_type = ActionTargetType(key_parts[3])
+        if key_parts[4]:
+            if key_parts[4] == "None":
+                target_identifier = key_parts[4]
+            else:
+                target_identifier = int(key_parts[4])
+        fallthrough_choice = None
     else:
         target_type = ActionTargetType.ISSUE_OWNERS
         target_identifier = None
-    return Project.objects.get(pk=project_id), target_type, target_identifier
+        fallthrough_choice = None
+    return Project.objects.get(pk=project_id), target_type, target_identifier, fallthrough_choice
 
 
-def unsplit_key(project, target_type, target_identifier):
-    return "mail:p:{}:{}:{}".format(
-        project.id, target_type.value, target_identifier if target_identifier is not None else ""
-    )
+def unsplit_key(
+    project: Project,
+    target_type: ActionTargetType,
+    target_identifier: int | None,
+    fallthrough_choice: FallthroughChoiceType | None,
+) -> str:
+    target_str = target_identifier if target_identifier is not None else ""
+    fallthrough = fallthrough_choice.value if fallthrough_choice is not None else ""
+    return f"mail:p:{project.id}:{target_type.value}:{target_str}:{fallthrough}"
 
 
-def event_to_record(event, rules):
-    if not rules:
-        logger.warning("Creating record for %r that does not contain any rules!", event)
+def event_to_record(
+    event: GroupEvent,
+    origins: Sequence[NotificationOrigin],
+    notification_uuid: str | None = None,
+) -> Record:
+    if not origins:
+        logger.warning(
+            "Creating record for %s that does not contain any notification origins!", event
+        )
 
+    workflow_ids = []
+    for origin in origins:
+        assert origin.workflow_id is not None
+        workflow_ids.append(origin.workflow_id)
     return Record(
         event.event_id,
-        Notification(event, [rule.id for rule in rules]),
-        to_timestamp(event.datetime),
+        Notification(event, workflow_ids, notification_uuid),
+        event.datetime.timestamp(),
     )
 
 
-def fetch_state(project, records):
-    # This reads a little strange, but remember that records are returned in
-    # reverse chronological order, and we query the database in chronological
-    # order.
-    # NOTE: This doesn't account for any issues that are filtered out later.
-    start = records[-1].datetime
-    end = records[0].datetime
+def _bind_records(
+    records: Sequence[Record], groups: dict[int, Group], rules: dict[int, NotificationOrigin]
+) -> list[RecordWithRuleObjects]:
+    ret = []
+    for record in records:
+        if record.value.event.group_id is None:
+            continue
+        group = groups.get(record.value.event.group_id)
+        if group is None:
+            logger.debug("%s could not be associated with a group.", record)
+            continue
+        elif group.get_status() != GroupStatus.UNRESOLVED:
+            continue
 
-    groups = Group.objects.in_bulk(record.value.event.group_id for record in records)
-    return {
-        "project": project,
-        "groups": groups,
-        "rules": Rule.objects.in_bulk(
-            itertools.chain.from_iterable(record.value.rules for record in records)
-        ),
-        "event_counts": tsdb.get_sums(tsdb.models.group, list(groups.keys()), start, end),
-        "user_counts": tsdb.get_distinct_counts_totals(
-            tsdb.models.users_affected_by_group, list(groups.keys()), start, end
-        ),
-    }
+        record.value.event.group = group
 
+        record_rules = [
+            rule
+            for rule in (rules.get(rule_id) for rule_id in record.value.rules)
+            if rule is not None
+        ]
+        ret.append(record.with_rules(record_rules))
 
-def attach_state(project, groups, rules, event_counts, user_counts):
-    for id, group in groups.items():
-        assert group.project_id == project.id, "Group must belong to Project"
-        group.project = project
-        group.event_count = 0
-        group.user_count = 0
-
-    for id, rule in rules.items():
-        assert rule.project_id == project.id, "Rule must belong to Project"
-        rule.project = project
-
-    for id, event_count in event_counts.items():
-        groups[id].event_count = event_count
-
-    for id, user_count in user_counts.items():
-        groups[id].user_count = user_count
-
-    return {"project": project, "groups": groups, "rules": rules}
+    return ret
 
 
-class Pipeline:
-    def __init__(self):
-        self.operations = []
-
-    def __call__(self, sequence):
-        return reduce(lambda x, operation: operation(x), self.operations, sequence)
-
-    def apply(self, function):
-        def operation(sequence):
-            result = function(sequence)
-            logger.debug("%r applied to %s items.", function, len(sequence))
-            return result
-
-        self.operations.append(operation)
-        return self
-
-    def filter(self, function):
-        def operation(sequence):
-            result = [s for s in sequence if function(s)]
-            logger.debug("%r filtered %s items to %s.", function, len(sequence), len(result))
-            return result
-
-        self.operations.append(operation)
-        return self
-
-    def map(self, function):
-        def operation(sequence):
-            result = [function(s) for s in sequence]
-            logger.debug("%r applied to %s items.", function, len(sequence))
-            return result
-
-        self.operations.append(operation)
-        return self
-
-    def reduce(self, function, initializer):
-        def operation(sequence):
-            result = reduce(function, sequence, initializer(sequence))
-            logger.debug("%r reduced %s items to %s.", function, len(sequence), len(result))
-            return result
-
-        self.operations.append(operation)
-        return self
+def _group_records(
+    records: Sequence[RecordWithRuleObjects],
+    groups: dict[int, Group],
+    rules: dict[int, NotificationOrigin],
+) -> Digest:
+    grouped: Digest = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        assert record.value.event.group is not None
+        for rule in record.value.rules:
+            grouped[rule][record.value.event.group].append(record)
+    return grouped
 
 
-def rewrite_record(record, project, groups, rules):
-    event = record.value.event
-
-    # Reattach the group to the event.
-    group = groups.get(event.group_id)
-    if group is not None:
-        event.group = group
-    else:
-        logger.debug("%r could not be associated with a group.", record)
-        return
-
-    return Record(
-        record.key,
-        Notification(event, [_f for _f in [rules.get(id) for id in record.value.rules] if _f]),
-        record.timestamp,
-    )
-
-
-def group_records(groups, record):
-    group = record.value.event.group
-    rules = record.value.rules
-    if not rules:
-        logger.debug("%r has no associated rules, and will not be added to any groups.", record)
-
-    for rule in rules:
-        groups[rule][group].append(record)
-
-    return groups
-
-
-def sort_group_contents(rules):
-    for key, groups in rules.items():
-        rules[key] = OrderedDict(
+def _sort_digest(
+    digest: Digest, event_counts: dict[int, int], user_counts: Mapping[Any, int]
+) -> Digest:
+    # sort inner groups dict by (event_count, user_count) descending
+    for key, rule_groups in digest.items():
+        digest[key] = dict(
             sorted(
-                groups.items(),
+                rule_groups.items(),
                 # x = (group, records)
-                key=lambda x: (x[0].event_count, x[0].user_count),
+                key=lambda x: (event_counts[x[0].id], user_counts[x[0].id]),
                 reverse=True,
             )
         )
-    return rules
 
-
-def sort_rule_groups(rules):
-    return OrderedDict(
+    # sort outer rules dict by number of groups (descending)
+    return dict(
         sorted(
-            rules.items(),
+            digest.items(),
             # x = (rule, groups)
             key=lambda x: len(x[1]),
             reverse=True,
@@ -189,29 +156,65 @@ def sort_rule_groups(rules):
     )
 
 
-def build_digest(project, records, state=None):
-    records = list(records)
+def _build_digest_impl(
+    records: Sequence[Record],
+    groups: dict[int, Group],
+    rules: dict[int, NotificationOrigin],
+    event_counts: dict[int, int],
+    user_counts: Mapping[Any, int],
+) -> Digest:
+    # sans-io implementation details
+    bound_records = _bind_records(records, groups, rules)
+    grouped = _group_records(bound_records, groups, rules)
+    return _sort_digest(grouped, event_counts=event_counts, user_counts=user_counts)
+
+
+def get_rules_from_workflows(
+    project: Project, workflow_ids: set[int]
+) -> dict[int, NotificationOrigin]:
+    origins = get_notification_origins(project, workflow_ids=workflow_ids)
+    return {origin.workflow_id: origin for origin in origins if origin.workflow_id is not None}
+
+
+def build_digest(project: Project, records: Sequence[Record]) -> DigestInfo:
     if not records:
-        return
+        return DigestInfo({}, {}, {})
 
-    # XXX: This is a hack to allow generating a mock digest without actually
-    # doing any real IO!
-    if state is None:
-        state = fetch_state(project, records)
+    # This reads a little strange, but remember that records are returned in
+    # reverse chronological order, and we query the database in chronological
+    # order.
+    # NOTE: This doesn't account for any issues that are filtered out later.
+    start = records[-1].datetime
+    end = records[0].datetime
 
-    state = attach_state(**state)
+    workflow_ids: set[int] = set()
 
-    def check_group_state(record):
-        return record.value.event.group.get_status() == GroupStatus.UNRESOLVED
+    for record in records:
+        workflow_ids.update(record.value.rules)
 
-    pipeline = (
-        Pipeline()
-        .map(functools.partial(rewrite_record, **state))
-        .filter(bool)
-        .filter(check_group_state)
-        .reduce(group_records, lambda sequence: defaultdict(lambda: defaultdict(list)))
-        .apply(sort_group_contents)
-        .apply(sort_rule_groups)
+    groups = Group.objects.in_bulk(record.value.event.group_id for record in records)
+    group_ids = list(groups)
+    origins = get_notification_origins(project, workflow_ids=workflow_ids)
+    rules = {origin.workflow_id: origin for origin in origins if origin.workflow_id is not None}
+
+    for group_id, g in groups.items():
+        assert g.project_id == project.id, "Group must belong to Project"
+
+    tenant_ids: dict[str, int | str] = {"organization_id": project.organization_id}
+    event_counts = tsdb.backend.get_timeseries_sums(
+        TSDBModel.group,
+        group_ids,
+        start,
+        end,
+        tenant_ids=tenant_ids,
     )
+    user_counts = tsdb.backend.get_distinct_counts_totals(
+        TSDBModel.users_affected_by_group,
+        group_ids,
+        start,
+        end,
+        tenant_ids=tenant_ids,
+    )
+    digest = _build_digest_impl(records, groups, rules, event_counts, user_counts)
 
-    return pipeline(records)
+    return DigestInfo(digest, event_counts, user_counts)

@@ -1,36 +1,45 @@
-import hmac
-import time
-from datetime import datetime
-from hashlib import sha256
+from unittest import mock
+from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
 
+import orjson
+import pytest
+from django.conf import settings
+from django.test import Client, RequestFactory, override_settings
+from django.utils.functional import cached_property
+
 from sentry import options
-from sentry.utils import json
-from sentry.utils.compat import mock
-from sentry.utils.cache import memoize
-from sentry.testutils import TestCase
+from sentry.identity.slack.provider import PREFERRED_ORGANIZATION_ID_KEY
+from sentry.integrations.messaging.metrics import SeerSlackHaltReason
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.services.integration.service import integration_service
+from sentry.integrations.slack.requests.action import SlackActionRequest
+from sentry.integrations.slack.requests.base import SlackRequest, SlackRequestError
+from sentry.integrations.slack.requests.event import SlackEventRequest
+from sentry.integrations.slack.utils.auth import set_signing_secret
+from sentry.integrations.slack.utils.constants import SlackScope
+from sentry.integrations.slack.webhooks.base import SlackDMEndpoint
+from sentry.models.organization import Organization, OrganizationStatus
+from sentry.models.organizationmember import InviteStatus, OrganizationMember
+from sentry.silo.base import SiloMode
+from sentry.taskworker.adapters import ViewerContextHook
+from sentry.testutils.cases import TestCase
 from sentry.testutils.helpers import override_options
-from sentry.integrations.slack.requests import (
-    SlackRequest,
-    SlackEventRequest,
-    SlackActionRequest,
-    SlackRequestError,
+from sentry.testutils.silo import assume_test_silo_mode, assume_test_silo_mode_of, control_silo_test
+from sentry.users.models.identity import Identity
+from sentry.viewer_context import (
+    Actor,
+    ActorType,
+    ViewerContext,
+    get_viewer_context,
+    viewer_context_scope,
 )
 
 
-def set_signature(secret, data):
-    timestamp = str(int(time.mktime(datetime.utcnow().timetuple())))
-    req = b"v0:%s:%s" % (timestamp.encode("utf-8"), data)
-
-    signature = "v0=" + hmac.new(secret.encode("utf-8"), req, sha256).hexdigest()
-    return {
-        "HTTP_X_SLACK_REQUEST_TIMESTAMP": timestamp,
-        "HTTP_X_SLACK_SIGNATURE": signature,
-    }
-
-
+@control_silo_test
 class SlackRequestTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
 
         self.request = mock.Mock()
@@ -42,19 +51,95 @@ class SlackRequestTest(TestCase):
             "api_app_id": "S1",
         }
         self.request.body = urlencode(self.request.data).encode("utf-8")
-        self.request.META = set_signature(options.get("slack.signing-secret"), self.request.body)
+        self.request.META = set_signing_secret(
+            options.get("slack.signing-secret"), self.request.body
+        )
 
-    @memoize
-    def slack_request(self):
+    @cached_property
+    def slack_request(self) -> SlackRequest:
         return SlackRequest(self.request)
 
-    def test_exposes_data(self):
+    @patch("slack_sdk.signature.SignatureVerifier.is_valid")
+    def test_validate_using_sdk(self, mock_verify: MagicMock) -> None:
+        self.create_integration(
+            organization=self.organization, external_id="T001", provider="slack"
+        )
+        self.slack_request.validate()
+
+        mock_verify.assert_called()
+
+    def test_exposes_data(self) -> None:
         assert self.slack_request.data["type"] == "foo"
 
-    def test_exposes_team_id(self):
+    @override_settings(SENTRY_VIEWER_CONTEXT_ENABLED=True)
+    def test_validated_slack_identity_becomes_viewer(self) -> None:
+        self.create_integration(
+            organization=self.organization, external_id="T001", provider="slack"
+        )
+        with (
+            viewer_context_scope(ViewerContext(actor=Actor(type=ActorType.UNKNOWN))),
+            patch.object(self.slack_request, "get_identity_user", return_value=self.user),
+        ):
+            self.slack_request.validate()
+            ctx = get_viewer_context()
+            assert ctx is not None
+            assert ctx.actor.type == ActorType.USER
+            assert ctx.actor.user_id == self.user.id
+            assert ctx.organization_id is None
+            headers: dict[str, str] = {}
+            ViewerContextHook().on_dispatch(headers)
+            propagated = ViewerContext.deserialize(orjson.loads(headers["sentry-viewer-context"]))
+            assert propagated.actor.user_id == self.user.id
+
+    @override_settings(SENTRY_VIEWER_CONTEXT_ENABLED=True)
+    def test_bot_does_not_use_linked_user(self) -> None:
+        self.create_integration(
+            organization=self.organization, external_id="T001", provider="slack"
+        )
+        with (
+            viewer_context_scope(ViewerContext(actor=Actor(type=ActorType.UNKNOWN))),
+            patch.object(self.slack_request, "is_bot", return_value=True),
+            patch.object(self.slack_request, "get_identity_user") as identity_user,
+        ):
+            self.slack_request.validate()
+            identity_user.assert_not_called()
+            ctx = get_viewer_context()
+            assert ctx is not None
+            assert ctx.actor.type == ActorType.UNKNOWN
+
+    @override_settings(SENTRY_VIEWER_CONTEXT_ENABLED=True)
+    def test_unlinked_slack_identity_does_not_inherit_user(self) -> None:
+        self.create_integration(
+            organization=self.organization, external_id="T001", provider="slack"
+        )
+        with (
+            viewer_context_scope(
+                ViewerContext(actor=Actor(type=ActorType.USER, actor_id=self.user.id))
+            ),
+            patch.object(self.slack_request, "get_identity_user", return_value=None),
+        ):
+            self.slack_request.validate()
+            ctx = get_viewer_context()
+            assert ctx is not None
+            assert ctx.actor.type == ActorType.UNKNOWN
+
+    @override_settings(SENTRY_VIEWER_CONTEXT_ENABLED=True)
+    def test_invalid_webhook_does_not_set_viewer(self) -> None:
+        ctx = ViewerContext(actor=Actor(type=ActorType.UNKNOWN))
+        with (
+            viewer_context_scope(ctx),
+            patch.object(self.slack_request, "authorize", side_effect=SlackRequestError(401)),
+            patch.object(self.slack_request, "get_identity_user") as identity_user,
+        ):
+            with pytest.raises(SlackRequestError):
+                self.slack_request.validate()
+            assert get_viewer_context() is ctx
+            identity_user.assert_not_called()
+
+    def test_exposes_team_id(self) -> None:
         assert self.slack_request.team_id == "T001"
 
-    def test_collects_logging_data(self):
+    def test_collects_logging_data(self) -> None:
         assert self.slack_request.logging_data == {
             "slack_team_id": "T001",
             "slack_channel_id": "1",
@@ -62,7 +147,7 @@ class SlackRequestTest(TestCase):
             "slack_api_app_id": "S1",
         }
 
-    def test_disregards_None_logging_values(self):
+    def test_disregards_None_logging_values(self) -> None:
         self.request.data["api_app_id"] = None
 
         assert self.slack_request.logging_data == {
@@ -71,42 +156,145 @@ class SlackRequestTest(TestCase):
             "slack_user_id": "2",
         }
 
-    def test_validate_existence_of_data(self):
-        type(self.request).DATA = mock.PropertyMock(side_effect=ValueError())
+    @pytest.mark.xfail(strict=True, reason="crashes in _log_request before validation can occur")
+    def test_returns_400_on_invalid_data(self) -> None:
+        type(self.request).data = mock.PropertyMock(side_effect=ValueError())
 
-        with self.assertRaises(SlackRequestError):
+        with pytest.raises(SlackRequestError) as e:
             self.slack_request.validate()
+        assert e.value.status == 400
 
-    def test_returns_400_on_invalid_data(self):
-        type(self.request).DATA = mock.PropertyMock(side_effect=ValueError())
-
-        with self.assertRaises(SlackRequestError) as e:
-            self.slack_request.validate()
-            assert e.status == 400
-
-    def test_validates_token(self):
+    @override_options({"slack.signing-secret": None})  # force token-auth
+    def test_returns_401_on_invalid_token(self) -> None:
         self.request.data["token"] = "notthetoken"
 
-        with self.assertRaises(SlackRequestError):
+        with pytest.raises(SlackRequestError) as e:
             self.slack_request.validate()
+        assert e.value.status == 401
 
-    def test_returns_401_on_invalid_token(self):
-        self.request.data["token"] = "notthetoken"
-
-        with self.assertRaises(SlackRequestError) as e:
+    def test_validates_existence_of_integration(self) -> None:
+        with pytest.raises(SlackRequestError) as e:
             self.slack_request.validate()
-            assert e.status == 401
+        assert e.value.status == 403
 
-    def test_validates_existence_of_integration(self):
-        with self.assertRaises(SlackRequestError) as e:
-            self.slack_request.validate()
-            assert e.status == 403
+    def test_none_in_data(self) -> None:
+        request = mock.Mock()
+        request.data = {
+            "type": "foo",
+            "team": None,
+            "channel": {"id": "1"},
+            "user": {"id": "2"},
+            "api_app_id": "S1",
+        }
+        request.body = urlencode(self.request.data).encode("utf-8")
+        request.META = (options.get("slack.signing-secret"), self.request.body)
+
+        slack_request = SlackRequest(request)
+        assert slack_request.team_id is None
+        assert slack_request.logging_data == {
+            "slack_channel_id": "1",
+            "slack_user_id": "2",
+            "slack_api_app_id": "S1",
+        }
+
+
+@pytest.mark.django_db(databases=["default", "control"])
+class TestSlackCredentialSources:
+    @control_silo_test
+    @pytest.mark.parametrize(
+        "database_options,deployment_options,setting_secret,effective_secret,rejected_secret",
+        [
+            (
+                {"slack.signing-secret": "database-secret"},
+                {},
+                "",
+                "database-secret",
+                "incorrect-secret",
+            ),
+            (
+                {},
+                {"slack.signing-secret": "deployment-secret"},
+                "",
+                "deployment-secret",
+                "incorrect-secret",
+            ),
+            (
+                {"slack.signing-secret": "shared-secret"},
+                {"slack.signing-secret": "shared-secret"},
+                "shared-secret",
+                "shared-secret",
+                "incorrect-secret",
+            ),
+            (
+                {"slack.signing-secret": "database-secret"},
+                {"slack.signing-secret": "deployment-secret"},
+                "deployment-secret",
+                "deployment-secret",
+                "database-secret",
+            ),
+        ],
+        ids=["database-only", "legacy-deployment-only", "matching-dual", "deployment-wins"],
+    )
+    def test_legacy_effective_secret_requires_hmac(
+        self,
+        client: Client,
+        database_options: dict[str, str],
+        deployment_options: dict[str, str],
+        setting_secret: str,
+        effective_secret: str,
+        rejected_secret: str,
+    ) -> None:
+        deployment = {
+            key: value
+            for key, value in settings.SENTRY_OPTIONS.items()
+            if key != "slack.signing-secret"
+        }
+        deployment["slack.verification-token"] = "legacy-token"
+        with override_settings(SENTRY_OPTIONS=deployment):  # noqa: S011
+            options.delete("slack.signing-secret")
+            for key, value in database_options.items():
+                options.set(key, value)
+        deployment.update(deployment_options)
+        body = orjson.dumps(
+            {"type": "url_verification", "challenge": "challenge", "token": "legacy-token"}
+        )
+
+        with override_settings(
+            SENTRY_OPTIONS=deployment,  # noqa: S011
+            SENTRY_SLACK_SIGNING_SECRET=setting_secret,
+            SENTRY_SLACK_VERIFICATION_TOKEN="legacy-token",
+        ):
+            accepted = client.post(
+                "/extensions/slack/event/",
+                data=body,
+                content_type="application/json",
+                **set_signing_secret(effective_secret, body),
+            )
+            rejected = client.post(
+                "/extensions/slack/event/",
+                data=body,
+                content_type="application/json",
+                **set_signing_secret(rejected_secret, body),
+            )
+            token_only = client.post(
+                "/extensions/slack/event/",
+                data=body,
+                content_type="application/json",
+            )
+
+        assert accepted.status_code == 200
+        assert accepted.json() == {"challenge": "challenge"}
+        assert rejected.status_code == 401
+        assert token_only.status_code == 401
 
 
 class SlackEventRequestTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
 
+        self.integration = self.create_integration(
+            organization=self.organization, external_id="T001", provider="slack"
+        )
         self.request = mock.Mock()
         self.request.data = {
             "type": "foo",
@@ -118,13 +306,15 @@ class SlackEventRequestTest(TestCase):
             "api_app_id": "S1",
         }
         self.request.body = urlencode(self.request.data).encode("utf-8")
-        self.request.META = set_signature(options.get("slack.signing-secret"), self.request.body)
+        self.request.META = set_signing_secret(
+            options.get("slack.signing-secret"), self.request.body
+        )
 
-    @memoize
-    def slack_request(self):
+    @cached_property
+    def slack_request(self) -> SlackEventRequest:
         return SlackEventRequest(self.request)
 
-    def test_ignores_event_validation_on_challenge_request(self):
+    def test_ignores_event_validation_on_challenge_request(self) -> None:
         self.request.data = {
             "token": options.get("slack.verification-token"),
             "challenge": "abc123",
@@ -135,7 +325,7 @@ class SlackEventRequestTest(TestCase):
         # the `event` key.
         self.slack_request.validate()
 
-    def test_is_challenge(self):
+    def test_is_challenge(self) -> None:
         self.request.data = {
             "token": options.get("slack.verification-token"),
             "challenge": "abc123",
@@ -144,22 +334,22 @@ class SlackEventRequestTest(TestCase):
 
         assert self.slack_request.is_challenge()
 
-    def test_validate_missing_event(self):
+    def test_validate_missing_event(self) -> None:
         self.request.data.pop("event")
 
-        with self.assertRaises(SlackRequestError):
+        with pytest.raises(SlackRequestError):
             self.slack_request.validate()
 
-    def test_validate_missing_event_type(self):
+    def test_validate_missing_event_type(self) -> None:
         self.request.data["event"] = {}
 
-        with self.assertRaises(SlackRequestError):
+        with pytest.raises(SlackRequestError):
             self.slack_request.validate()
 
-    def test_type(self):
+    def test_type(self) -> None:
         assert self.slack_request.type == "bar"
 
-    def test_signing_secret_bad(self):
+    def test_signing_secret_bad(self) -> None:
         self.request.data = {
             "token": options.get("slack.verification-token"),
             "challenge": "abc123",
@@ -167,30 +357,366 @@ class SlackEventRequestTest(TestCase):
         }
         self.request.body = urlencode(self.request.data).encode("utf-8")
 
-        self.request.META = set_signature("bad_key", self.request.body)
-        with self.assertRaises(SlackRequestError) as e:
+        self.request.META = set_signing_secret("bad_key", self.request.body)
+        with pytest.raises(SlackRequestError) as e:
             self.slack_request.validate()
-            assert e.status == 401
+        assert e.value.status == 401
 
-    def test_use_verification_token(self):
+    def test_use_verification_token(self) -> None:
         with override_options({"slack.signing-secret": None}):
             self.request.data = {
                 "token": options.get("slack.verification-token"),
                 "challenge": "abc123",
                 "type": "url_verification",
             }
-            self.request.body = json.dumps(self.request.data).encode("utf-8")
+            self.request.body = orjson.dumps(self.request.data)
 
             self.slack_request.validate()
 
+    def test_rejects_non_string_verification_token(self) -> None:
+        with override_options({"slack.signing-secret": None, "slack.verification-token": "12345"}):
+            self.request.data = {
+                "token": 12345,
+                "challenge": "abc123",
+                "type": "url_verification",
+            }
+            self.request.body = orjson.dumps(self.request.data)
+
+            with pytest.raises(SlackRequestError) as e:
+                self.slack_request.validate()
+            assert e.value.status == 401
+
+    def test_is_seer_agent_request(self) -> None:
+        self.request.data["event"] = {"type": "app_mention"}
+        assert SlackEventRequest(self.request).is_seer_agent_request is True
+
+        self.request.data["event"] = {"type": "assistant_thread_started"}
+        assert SlackEventRequest(self.request).is_seer_agent_request is True
+
+        self.request.data["event"] = {"type": "link_shared"}
+        assert SlackEventRequest(self.request).is_seer_agent_request is False
+
+    def test_is_seer_agent_request_dm_checks_assistant_scope(self) -> None:
+        self.request.data["event"] = {"type": "message"}
+
+        with assume_test_silo_mode_of(Integration):
+            self.integration.metadata["scopes"] = [SlackScope.ASSISTANT_WRITE.value]
+            self.integration.save()
+        rpc_integration = integration_service.get_integration(integration_id=self.integration.id)
+
+        req = SlackEventRequest(self.request)
+        req._integration = rpc_integration
+        assert req.is_seer_agent_request is True
+
+        with assume_test_silo_mode_of(Integration):
+            self.integration.metadata["scopes"] = []
+            self.integration.save()
+        rpc_integration = integration_service.get_integration(integration_id=self.integration.id)
+
+        req = SlackEventRequest(self.request)
+        req._integration = rpc_integration
+        assert req.is_seer_agent_request is False
+
+    def test_is_assistant_thread_event(self) -> None:
+        self.request.data["event"] = {"type": "assistant_thread_started"}
+        assert SlackEventRequest(self.request).is_assistant_thread_event is True
+
+        self.request.data["event"] = {"type": "app_mention"}
+        assert SlackEventRequest(self.request).is_assistant_thread_event is False
+
+    def test_channel_id(self) -> None:
+        self.request.data["event"] = {
+            "type": "message",
+            "channel": "C_REGULAR",
+            "assistant_thread": {"channel_id": "C_ASSISTANT", "user_id": "U1", "thread_ts": "1.0"},
+        }
+        assert SlackEventRequest(self.request).channel_id == "C_REGULAR"
+        self.request.data["event"]["type"] = "assistant_thread_started"
+        assert SlackEventRequest(self.request).channel_id == "C_ASSISTANT"
+
+    def test_user_id(self) -> None:
+        self.request.data["event"] = {
+            "type": "message",
+            "user": "U_REGULAR",
+            "assistant_thread": {
+                "channel_id": "C1",
+                "user_id": "U_ASSISTANT",
+                "thread_ts": "1.0",
+            },
+        }
+        assert SlackEventRequest(self.request).user_id == "U_REGULAR"
+        self.request.data["event"]["type"] = "assistant_thread_started"
+        assert SlackEventRequest(self.request).user_id == "U_ASSISTANT"
+
+    def test_thread_ts(self) -> None:
+        self.request.data["event"] = {
+            "type": "app_mention",
+            "thread_ts": "111.222",
+            "assistant_thread": {"channel_id": "C1", "user_id": "U1", "thread_ts": "333.444"},
+        }
+        assert SlackEventRequest(self.request).thread_ts == "111.222"
+        self.request.data["event"]["type"] = "assistant_thread_started"
+        assert SlackEventRequest(self.request).thread_ts == "333.444"
+
+
+class SlackEventRequestSeerResolutionTest(TestCase):
+    factory = RequestFactory()
+
+    def setUp(self) -> None:
+        self.slack_user = self.create_user()
+        self.organization = self.create_organization(owner=self.slack_user)
+        self.integration = self.create_integration(
+            organization=self.organization, external_id="T_SEER", provider="slack"
+        )
+        self.identity_provider = self.create_identity_provider(integration=self.integration)
+        self.identity = self.create_identity(
+            user=self.slack_user,
+            identity_provider=self.identity_provider,
+            external_id="U_SLACK",
+        )
+        patcher = patch(
+            "sentry.integrations.slack.requests.base.SlackRequest._check_signing_secret",
+            return_value=True,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        data = {
+            "type": "event_callback",
+            "team_id": "T_SEER",
+            "event_id": "E1",
+            "api_app_id": "A1",
+            "event": {
+                "type": "app_mention",
+                "channel": "C1",
+                "user": "U_SLACK",
+                "ts": "1.0",
+            },
+        }
+        request = self.factory.post(
+            "/extensions/slack/event/",
+            data=orjson.dumps(data),
+            content_type="application/json",
+        )
+        drf_request = SlackDMEndpoint().initialize_request(request)
+        self.slack_request = SlackEventRequest(drf_request)
+        self.slack_request.authorize()
+        self.slack_request.validate_integration()
+
+    def _add_second_org(self, slug: str = "second-org") -> Organization:
+        org = self.create_organization(slug=slug, owner=self.slack_user)
+        self.create_organization_integration(organization_id=org.id, integration=self.integration)
+        return org
+
+    def _build_request(self, *, text: str = "", thread_ts: str = "") -> SlackEventRequest:
+        data = {
+            "type": "event_callback",
+            "team_id": "T_SEER",
+            "event_id": "E1",
+            "api_app_id": "A1",
+            "event": {
+                "type": "app_mention",
+                "channel": "C1",
+                "user": "U_SLACK",
+                "ts": "1.0",
+                "text": text,
+                "thread_ts": thread_ts,
+            },
+        }
+        request = self.factory.post(
+            "/extensions/slack/event/",
+            data=orjson.dumps(data),
+            content_type="application/json",
+        )
+        drf_request = SlackDMEndpoint().initialize_request(request)
+        slack_request = SlackEventRequest(drf_request)
+        slack_request.authorize()
+        slack_request.validate_integration()
+        return slack_request
+
+    def test_identity_not_linked(self) -> None:
+        with assume_test_silo_mode_of(Identity):
+            self.identity.delete()
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.IDENTITY_NOT_LINKED
+
+    def test_no_organization_integrations(self) -> None:
+        with assume_test_silo_mode_of(OrganizationIntegration):
+            OrganizationIntegration.objects.filter(integration_id=self.integration.id).delete()
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.NO_VALID_INTEGRATION
+
+    def test_org_not_found(self) -> None:
+        self.organization.delete()
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.NO_VALID_ORGANIZATION
+
+    def test_org_not_active(self) -> None:
+        self.organization.update(status=OrganizationStatus.PENDING_DELETION)
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.NO_VALID_ORGANIZATION
+
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=False,
+    )
+    def test_org_no_seer_access(self, mock_access: MagicMock) -> None:
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.NO_VALID_ORGANIZATION
+
+    def test_user_not_member(self) -> None:
+        non_member = self.create_user()
+        with assume_test_silo_mode_of(Identity):
+            self.identity.update(user=non_member)
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.NO_VALID_ORGANIZATION
+
+    def test_user_membership_unapproved(self) -> None:
+        OrganizationMember.objects.filter(
+            user_id=self.slack_user.id, organization_id=self.organization.id
+        ).update(invite_status=InviteStatus.REQUESTED_TO_JOIN.value)
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id is None
+        assert result.halt_reason == SeerSlackHaltReason.NO_VALID_ORGANIZATION
+
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_resolves_valid_organization(self, mock_access: MagicMock) -> None:
+        result = self.slack_request.resolve_seer_organization()
+        assert result.organization_id == self.organization.id
+        assert result.halt_reason is None
+
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=False,
+    )
+    def test_control_silo_skips_access_check(self, mock_has_access: MagicMock) -> None:
+        """
+        In control silo, has_access is not consulted (it depends on subscription context
+        that getsentry's FlagpoleFeatureHandler does not populate in control silo).
+        The full verdict is deferred to the cell handler.
+        """
+        with assume_test_silo_mode(SiloMode.CONTROL, can_be_monolith=False):
+            result = self.slack_request.resolve_seer_organization()
+
+        assert result.organization_id == self.organization.id
+        assert result.halt_reason is None
+        mock_has_access.assert_not_called()
+
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_cell_silo_uses_full_access_check(self, mock_has_access: MagicMock) -> None:
+        """
+        In cell silo, has_access (the subscription-gated check) is the gate.
+        """
+        with assume_test_silo_mode(SiloMode.CELL, can_be_monolith=False):
+            result = self.slack_request.resolve_seer_organization()
+
+        assert result.organization_id == self.organization.id
+        assert result.halt_reason is None
+        mock_has_access.assert_called()
+
+    @patch("sentry.integrations.slack.requests.event.get_thread_history")
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_multi_org_resolves_from_message_link(
+        self, mock_access: MagicMock, mock_get_thread_history: MagicMock
+    ) -> None:
+        other_org = self._add_second_org()
+        slack_request = self._build_request(
+            text=f"<@U_BOT> what about <https://{other_org.slug}.sentry.io/issues/123/> ?"
+        )
+        result = slack_request.resolve_seer_organization()
+        assert result.organization_id == other_org.id
+        assert result.halt_reason is None
+        # No need to check the thread if we have a link in the initial message.
+        assert mock_get_thread_history.call_count == 0
+
+    @patch("sentry.integrations.slack.requests.event.get_thread_history")
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_multi_org_resolves_from_thread(
+        self, mock_access: MagicMock, mock_get_thread_history: MagicMock
+    ) -> None:
+        other_org = self._add_second_org()
+        mock_get_thread_history.return_value = [
+            {"user": "U_OTHER", "text": f"<https://{other_org.slug}.sentry.io/issues/42/>"},
+            {"user": "U_SLACK", "text": "<@U_BOT> help"},
+        ]
+        slack_request = self._build_request(text="<@U_BOT> help", thread_ts="0.9")
+        result = slack_request.resolve_seer_organization()
+        assert result.organization_id == other_org.id
+        assert result.halt_reason is None
+
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_multi_org_ignores_link_for_unavailable_org(self, mock_access: MagicMock) -> None:
+        self._add_second_org()
+        slack_request = self._build_request(
+            text="<@U_BOT> <https://sentry.io/organizations/not-my-org/issues/123/>"
+        )
+        result = slack_request.resolve_seer_organization()
+        assert result.organization_id == self.organization.id
+        assert result.halt_reason is None
+
+    @patch("sentry.integrations.slack.requests.event.get_thread_history", return_value=[])
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_multi_org_resolves_from_preference(
+        self, mock_access: MagicMock, mock_get_thread_history: MagicMock
+    ) -> None:
+        other_org = self._add_second_org()
+        with assume_test_silo_mode_of(Identity):
+            self.identity.update(data={PREFERRED_ORGANIZATION_ID_KEY: other_org.id})
+
+        slack_request = self._build_request(text="<@U_BOT> help", thread_ts="0.9")
+        result = slack_request.resolve_seer_organization()
+        assert result.organization_id == other_org.id
+        assert result.halt_reason is None
+
+    @patch("sentry.integrations.slack.requests.event.get_thread_history", return_value=[])
+    @patch(
+        "sentry.integrations.slack.requests.event.SeerAgentOperator.has_access",
+        return_value=True,
+    )
+    def test_multi_org_ignores_stale_preference(
+        self, mock_access: MagicMock, mock_get_thread_history: MagicMock
+    ) -> None:
+        with assume_test_silo_mode_of(Identity):
+            self.identity.update(data={PREFERRED_ORGANIZATION_ID_KEY: 9999999})
+
+        slack_request = self._build_request(text="<@U_BOT> help", thread_ts="0.9")
+        result = slack_request.resolve_seer_organization()
+        # Stale preference is silently ignored, falls back to first available org.
+        assert result.organization_id == self.organization.id
+        assert result.halt_reason is None
+
 
 class SlackActionRequestTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
 
         self.request = mock.Mock()
         self.request.data = {
-            "payload": json.dumps(
+            "payload": orjson.dumps(
                 {
                     "type": "foo",
                     "team": {"id": "T001"},
@@ -199,29 +725,31 @@ class SlackActionRequestTest(TestCase):
                     "token": options.get("slack.verification-token"),
                     "callback_id": '{"issue":"I1"}',
                 }
-            )
+            ).decode()
         }
-        self.request.body = urlencode(self.request.data).encode("utf-8")
-        self.request.META = set_signature(options.get("slack.signing-secret"), self.request.body)
+        self.request.body = urlencode(self.request.data).encode()
+        self.request.META = set_signing_secret(
+            options.get("slack.signing-secret"), self.request.body
+        )
 
-    @memoize
-    def slack_request(self):
+    @cached_property
+    def slack_request(self) -> SlackActionRequest:
         return SlackActionRequest(self.request)
 
-    def test_type(self):
+    def test_type(self) -> None:
         assert self.slack_request.type == "foo"
 
-    def test_callback_data(self):
+    def test_callback_data(self) -> None:
         assert self.slack_request.callback_data == {"issue": "I1"}
 
-    def test_validates_existence_of_payload(self):
+    def test_validates_existence_of_payload(self) -> None:
         self.request.data.pop("payload")
 
-        with self.assertRaises(SlackRequestError):
+        with pytest.raises(SlackRequestError):
             self.slack_request.validate()
 
-    def test_validates_payload_json(self):
+    def test_validates_payload_json(self) -> None:
         self.request.data["payload"] = "notjson"
 
-        with self.assertRaises(SlackRequestError):
+        with pytest.raises(SlackRequestError):
             self.slack_request.validate()

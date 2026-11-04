@@ -1,0 +1,309 @@
+import {Fragment, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {IconSearch} from '@sentry/icons/search';
+import {useQuery} from '@tanstack/react-query';
+
+import {Button} from '@sentry/scraps/button';
+import {useDrawer} from '@sentry/scraps/drawer';
+import {Container, Flex, Grid} from '@sentry/scraps/layout';
+import {Text} from '@sentry/scraps/text';
+
+import {AnalyticsArea} from 'sentry/components/analyticsArea';
+import {EmptyStateWarning} from 'sentry/components/emptyStateWarning';
+import {EventFeatureFlagDrawer} from 'sentry/components/events/featureFlags/eventFeatureFlagDrawer';
+import {FeatureFlagSettingsButton} from 'sentry/components/events/featureFlags/featureFlagSettingsButton';
+import {FeatureFlagSort} from 'sentry/components/events/featureFlags/featureFlagSort';
+import {FlagActionDropdown} from 'sentry/components/events/featureFlags/flagActionDropdown';
+import {
+  FlagControlOptions,
+  ORDER_BY_OPTIONS,
+  OrderBy,
+  sortedFlags,
+} from 'sentry/components/events/featureFlags/utils';
+import {organizationFlagLogOptions} from 'sentry/components/featureFlags/hooks/useOrganizationFlagLog';
+import {FeedbackButton} from 'sentry/components/feedbackButton/feedbackButton';
+import {useLegacyEventSuspectFlags} from 'sentry/components/issues/suspect/useLegacyEventSuspectFlags';
+import {
+  KeyValueColumns,
+  KeyValueTableDataRow,
+} from 'sentry/components/tables/keyValueTable';
+import {t, tn} from 'sentry/locale';
+import type {Event, FeatureFlag} from 'sentry/types/event';
+import {IssueCategory, type Group} from 'sentry/types/group';
+import type {Project} from 'sentry/types/project';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {splitIntoColumns} from 'sentry/utils/array/splitIntoColumns';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+import {FoldSection} from 'sentry/views/issueDetails/foldSection';
+import {GroupIdProvider} from 'sentry/views/issueDetails/groupIdContext';
+import {useIssueDetailsEventView} from 'sentry/views/issueDetails/hooks/useIssueDetailsDiscoverQuery';
+
+export function EventFeatureFlagSection(props: EventFeatureFlagSectionProps) {
+  return (
+    <AnalyticsArea name="event_feature_flag_list">
+      <BaseEventFeatureFlagList {...props} />
+    </AnalyticsArea>
+  );
+}
+
+type EventFeatureFlagSectionProps = {
+  event: Event;
+  group: Group;
+  project: Project;
+};
+
+function BaseEventFeatureFlagList({event, group, project}: EventFeatureFlagSectionProps) {
+  const organization = useOrganization();
+
+  const [orderBy, setOrderBy] = useState(OrderBy.NEWEST);
+  const {closeDrawer, isDrawerOpen, openDrawer} = useDrawer();
+  const viewAllButtonRef = useRef<HTMLButtonElement>(null);
+
+  const eventView = useIssueDetailsEventView({group});
+  const {data: rawFlagData} = useQuery(
+    organizationFlagLogOptions({
+      organization,
+      query: {
+        start: eventView.start,
+        end: eventView.end,
+        statsPeriod: eventView.statsPeriod,
+      },
+    })
+  );
+  const location = useLocation();
+
+  // issue list params we want to preserve in the search
+  const queryParams = useMemo(
+    () => ({
+      start: eventView.start,
+      end: eventView.end,
+      statsPeriod: eventView.statsPeriod,
+      project: eventView.project,
+      environment: eventView.environment,
+      sort: location.query.sort,
+    }),
+    [location.query, eventView]
+  );
+
+  const generateAction = useCallback(
+    ({key, value}: {key: string; value: string}) => {
+      const search = new MutableSearch('');
+      const modifiedQuery = search.setFilterValues(key, [value]);
+
+      return {
+        pathname: `/organizations/${organization.slug}/issues/`,
+        query: {
+          ...queryParams,
+          query: modifiedQuery.formatString(),
+        },
+      };
+    },
+    [organization, queryParams]
+  );
+
+  const {suspectFlags} = useLegacyEventSuspectFlags({
+    enabled: true,
+    organization,
+    firstSeen: group.firstSeen,
+    rawFlagData,
+    event,
+  });
+
+  const suspectFlagNames = useMemo(() => {
+    return new Set(suspectFlags.map(f => f.flag));
+  }, [suspectFlags]);
+
+  const eventFlags = useMemo(() => {
+    // At runtime there's no type guarantees on the event flags. So we have to
+    // explicitly validate against SDK developer error or user-provided contexts.
+    const rawFlags = event.contexts?.flags?.values ?? [];
+    return rawFlags.filter(
+      (f): f is Required<FeatureFlag> =>
+        typeof f?.flag === 'string' && typeof f.result === 'boolean'
+    );
+  }, [event]);
+
+  const hasFlags = eventFlags.length > 0;
+
+  const hydratedFlags = useMemo(() => {
+    // Transform the flags array into something readable by the key-value component.
+    // Reverse the flags to show newest at the top by default.
+    return eventFlags.toReversed().map(f => {
+      return {
+        item: {
+          key: f.flag,
+          subject: f.flag,
+          value: (
+            <Flex align="center" gap="sm" wrap="wrap">
+              <Text as="span" monospace wrap="nowrap">
+                {f.result.toString()}
+              </Text>
+              {suspectFlagNames.has(f.flag) && (
+                <Text as="div" size="sm" variant="secondary" wrap="nowrap">
+                  {t('Suspect')}
+                </Text>
+              )}
+            </Flex>
+          ),
+          actionButton: (
+            <FlagActionDropdown
+              flag={f.flag}
+              result={f.result.toString()}
+              generateAction={generateAction}
+            />
+          ),
+          actionButtonAlwaysVisible: true,
+        },
+        isSuspectFlag: suspectFlagNames.has(f.flag),
+      };
+    });
+  }, [suspectFlagNames, eventFlags, generateAction]);
+
+  const onViewAllFlags = (focusControl?: FlagControlOptions) => {
+    trackAnalytics('flags.view-all-clicked', {
+      organization,
+    });
+    openDrawer(
+      () => (
+        <GroupIdProvider groupId={group.id}>
+          <EventFeatureFlagDrawer
+            group={group}
+            event={event}
+            project={project}
+            hydratedFlags={hydratedFlags}
+            initialOrderBy={orderBy}
+            focusControl={focusControl}
+          />
+        </GroupIdProvider>
+      ),
+      {
+        ariaLabel: t('Feature flags drawer'),
+        drawerKey: 'feature-flags-drawer',
+        // We prevent a click on the 'View All' button from closing the drawer so that
+        // we don't reopen it immediately, and instead let the button handle this itself.
+        shouldCloseOnInteractOutside: element => {
+          const viewAllButton = viewAllButtonRef.current;
+          if (viewAllButton?.contains(element)) {
+            return false;
+          }
+          return true;
+        },
+      }
+    );
+  };
+
+  useEffect(() => {
+    if (hasFlags) {
+      trackAnalytics('flags.table_rendered', {
+        organization,
+        numFlags: hydratedFlags.length,
+        projectSlug: project.slug,
+        orgSlug: organization.slug,
+      });
+    }
+  }, [hasFlags, hydratedFlags.length, organization, project.slug]);
+
+  if (group.issueCategory !== IssueCategory.ERROR) {
+    return null;
+  }
+
+  // If the project has never ingested flags, hide the section entirely.
+  if (!hasFlags && !project.hasFlags) {
+    return null;
+  }
+
+  const actions = (
+    <Grid flow="column" align="center" gap="md">
+      <Container display={{zero: 'none', sm: 'block'}}>
+        <FeedbackButton
+          variant="secondary"
+          aria-label={t('Give feedback on the feature flag section')}
+          size="xs"
+          feedbackOptions={{
+            messagePlaceholder: t('How can we make feature flags work better for you?'),
+            tags: {
+              'feedback.source': 'issue_details_feature_flags',
+              'feedback.owner': 'replay',
+            },
+          }}
+        />
+      </Container>
+      <FeatureFlagSettingsButton orgSlug={organization.slug} />
+      {hasFlags && (
+        <Fragment>
+          <Button
+            aria-label={t('Open Feature Flag Search')}
+            icon={<IconSearch size="xs" />}
+            size="xs"
+            tooltipProps={{title: t('Open Search')}}
+            onClick={() => onViewAllFlags(FlagControlOptions.SEARCH)}
+          />
+          <FeatureFlagSort
+            orderByOptions={ORDER_BY_OPTIONS}
+            orderBy={orderBy}
+            setOrderBy={value => {
+              setOrderBy(value);
+              trackAnalytics('flags.sort_flags', {
+                organization,
+                sortMethod: value as string,
+              });
+            }}
+          />
+        </Fragment>
+      )}
+    </Grid>
+  );
+
+  const NUM_PREVIEW_FLAGS = 20;
+
+  const truncatedItems = sortedFlags({flags: hydratedFlags, sort: orderBy}).slice(
+    0,
+    NUM_PREVIEW_FLAGS
+  );
+
+  const extraFlags = hydratedFlags.length - NUM_PREVIEW_FLAGS;
+  const label = tn('View 1 More Flag', 'View %s More Flags', extraFlags);
+
+  return (
+    <FoldSection
+      sectionKey={SectionKey.FEATURE_FLAGS}
+      title={t('Feature Flags')}
+      actions={actions}
+    >
+      {hasFlags ? (
+        <Container marginBottom="xl">
+          <KeyValueColumns maxKeyWidth="70%">
+            {columnCount =>
+              splitIntoColumns(
+                truncatedItems.map((rowProps, index) => (
+                  <KeyValueTableDataRow key={index} {...rowProps} />
+                )),
+                columnCount
+              )
+            }
+          </KeyValueColumns>
+        </Container>
+      ) : (
+        <Container width="100%" border="primary" radius="md">
+          <EmptyStateWarning small>
+            {t('No feature flags were found for this event')}
+          </EmptyStateWarning>
+        </Container>
+      )}
+      {extraFlags > 0 && (
+        <Button
+          size="sm"
+          // Since we've disabled the button as an 'outside click' for the drawer we can change
+          // the operation based on the drawer state.
+          onClick={() => (isDrawerOpen ? closeDrawer() : onViewAllFlags())}
+          aria-label={label}
+          ref={viewAllButtonRef}
+        >
+          {label}
+        </Button>
+      )}
+    </FoldSection>
+  );
+}

@@ -1,0 +1,288 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {ProjectFixture} from 'sentry-fixture/project';
+import {TeamFixture} from 'sentry-fixture/team';
+import type {DistributedOmit} from 'type-fest';
+
+import {act, render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
+import {selectEvent} from 'sentry-test/selectEvent';
+
+import {openCreateTeamModal} from 'sentry/actionCreators/modal';
+import {addTeamToProject} from 'sentry/actionCreators/projects';
+import {TeamSelector} from 'sentry/components/teamSelector';
+import {OrganizationStore} from 'sentry/stores/organizationStore';
+import {TeamStore} from 'sentry/stores/teamStore';
+import type {Organization} from 'sentry/types/organization';
+
+jest.mock('sentry/actionCreators/projects', () => ({
+  addTeamToProject: jest.fn(),
+}));
+jest.mock('sentry/actionCreators/modal', () => ({
+  openCreateTeamModal: jest.fn(),
+}));
+
+const teamData = [
+  {
+    id: '1',
+    slug: 'team1',
+    name: 'Team 1',
+    isMember: true,
+  },
+  {
+    id: '2',
+    slug: 'team2',
+    name: 'Team 2',
+    isMember: false,
+  },
+  {
+    id: '3',
+    slug: 'team3',
+    name: 'Team 3',
+    isMember: false,
+  },
+];
+const teams = teamData.map(data => TeamFixture(data));
+const project = ProjectFixture({teams: [teams[0]!]});
+const organization = OrganizationFixture({access: ['project:write']});
+act(() => OrganizationStore.onUpdate(organization, {replace: true}));
+
+function createWrapper(
+  props: DistributedOmit<
+    React.ComponentProps<typeof TeamSelector>,
+    'onChange' | 'value'
+  > & {
+    onChange?: React.ComponentProps<typeof TeamSelector>['onChange'];
+    value?: React.ComponentProps<typeof TeamSelector>['value'];
+  } = {},
+  org?: Organization
+) {
+  return render(
+    <TeamSelector
+      name="teamSelector"
+      aria-label="Select a team"
+      onChange={() => {}}
+      {...props}
+      {...(props.multiple
+        ? {multiple: true, value: Array.isArray(props.value) ? props.value : []}
+        : {multiple: false, value: typeof props.value === 'string' ? props.value : null})}
+    />,
+    {organization: org ?? organization}
+  );
+}
+
+describe('Team Selector', () => {
+  beforeEach(() => {
+    TeamStore.reset();
+    TeamStore.loadInitialData(teams);
+  });
+
+  it('renders teams and selects an option', async () => {
+    const onChangeMock = jest.fn();
+    createWrapper({onChange: onChangeMock});
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+    expect(screen.getByText('#team2')).toBeInTheDocument();
+    expect(screen.getByText('#team3')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#team1'));
+    expect(onChangeMock).toHaveBeenCalledWith(expect.objectContaining({value: 'team1'}));
+  });
+
+  it('displays a saved team that is not in the loaded page', async () => {
+    const savedTeam = TeamFixture({id: '4', slug: 'saved-team'});
+    const onChange = jest.fn();
+    TeamStore.setTeams([teams[0]!], true, 'next-page');
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+      match: [MockApiClient.matchQuery({query: `id:${savedTeam.id}`})],
+      body: [savedTeam],
+    });
+
+    createWrapper({
+      useId: true,
+      value: savedTeam.id,
+      onChange,
+      useTeamDefaultIfOnlyOne: true,
+    });
+
+    expect(await screen.findByText('#saved-team')).toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('loads missing saved teams by slug in a multiple selection', async () => {
+    const savedTeam = TeamFixture({id: '4', slug: 'saved-team'});
+    const onChange = jest.fn();
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+      match: [MockApiClient.matchQuery({query: `slug:${savedTeam.slug}`})],
+      body: [savedTeam],
+    });
+
+    createWrapper({multiple: true, value: ['team1', savedTeam.slug], onChange});
+
+    expect(await screen.findByText('#saved-team')).toBeInTheDocument();
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('respects the team filter', async () => {
+    createWrapper({teamFilter: team => team.slug === 'team1'});
+
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+
+    // These options should be filtered out
+    expect(screen.queryByText('#team2')).not.toBeInTheDocument();
+    expect(screen.queryByText('#team3')).not.toBeInTheDocument();
+  });
+
+  it('respects the project filter', async () => {
+    createWrapper({project});
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+
+    // team2 and team3 should have add to project buttons
+    expect(screen.getAllByRole('button')).toHaveLength(2);
+  });
+
+  it('respects the team and project filter', async () => {
+    createWrapper({
+      teamFilter: team => team.slug === 'team1' || team.slug === 'team2',
+      project,
+    });
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+
+    // team3 should be filtered out
+    expect(screen.queryByText('#team3')).not.toBeInTheDocument();
+
+    // team2 should have add to project buttons
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+  });
+
+  it('allows you to add teams outside of project', async () => {
+    createWrapper({project});
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+
+    // team2 and team3 should have add to project buttons
+    const addToProjectButtons = screen.getAllByRole('button');
+
+    await userEvent.click(addToProjectButtons[0]!);
+
+    expect(addTeamToProject).toHaveBeenCalled();
+  });
+
+  it('allows searching by slug with useId', async () => {
+    const onChangeMock = jest.fn();
+    createWrapper({useId: true, onChange: onChangeMock});
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+    });
+
+    await userEvent.type(screen.getByLabelText('Select a team'), 'team2');
+
+    expect(screen.getByText('#team2')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#team2'));
+    expect(onChangeMock).toHaveBeenCalledWith(expect.objectContaining({value: '2'}));
+
+    // Wait for store to be updated from API response
+    await act(tick);
+  });
+
+  it('allows to create a new team if org admin', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+    });
+    const onChangeMock = jest.fn();
+    const orgWithAccess = OrganizationFixture({access: ['project:admin']});
+
+    createWrapper(
+      {
+        allowCreate: true,
+        onChange: onChangeMock,
+      },
+      orgWithAccess
+    );
+
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+    await userEvent.click(screen.getByText('Create team'));
+    // it opens the create team modal
+    expect(openCreateTeamModal).toHaveBeenCalled();
+  });
+
+  it('allows to create a new team if org admin (multiple select)', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+    });
+    const onChangeMock = jest.fn();
+    const orgWithAccess = OrganizationFixture({access: ['project:admin']});
+
+    const {rerender} = createWrapper(
+      {
+        allowCreate: true,
+        multiple: true,
+        onChange: onChangeMock,
+      },
+      orgWithAccess
+    );
+
+    await selectEvent.select(screen.getByText('Select...'), '#team1');
+    // it does no open the create team modal yet
+    expect(openCreateTeamModal).not.toHaveBeenCalled();
+
+    rerender(
+      <TeamSelector allowCreate multiple value={['team1']} onChange={onChangeMock} />
+    );
+
+    await selectEvent.select(screen.getByRole('textbox'), ['#team2', 'Create team']);
+    // it opens the create team modal since the create team option is selected
+    expect(openCreateTeamModal).toHaveBeenCalled();
+  });
+
+  it('does not allow to create a new team if not org owner', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/teams/`,
+    });
+    const onChangeMock = jest.fn();
+    const orgWithoutAccess = OrganizationFixture({access: ['project:write']});
+
+    createWrapper(
+      {
+        allowCreate: true,
+        onChange: onChangeMock,
+      },
+      orgWithoutAccess
+    );
+
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+    await userEvent.click(screen.getByText('Create team'));
+    // it does no open the create team modal
+    expect(openCreateTeamModal).not.toHaveBeenCalled();
+  });
+
+  it('shows all teams to members if filterByUserMembership is false', async () => {
+    createWrapper({filterByUserMembership: false});
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+    expect(screen.getByText('#team2')).toBeInTheDocument();
+    expect(screen.getByText('#team3')).toBeInTheDocument();
+  });
+
+  it('only shows member teams if filterByUserMembership is true', async () => {
+    createWrapper({filterByUserMembership: true});
+    await userEvent.type(screen.getByText('Select...'), '{keyDown}');
+
+    expect(screen.getByText('#team1')).toBeInTheDocument();
+
+    // member can not invite to teams they are not in if the Open Membership setting is off
+    expect(screen.queryByText('#team2')).not.toBeInTheDocument();
+    expect(screen.queryByText('#team3')).not.toBeInTheDocument();
+  });
+});

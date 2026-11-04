@@ -1,0 +1,297 @@
+import {useRef, useState} from 'react';
+import {IconGlobe} from '@sentry/icons/globe';
+import {IconTerminal} from '@sentry/icons/terminal';
+import {useQuery} from '@tanstack/react-query';
+import partition from 'lodash/partition';
+import {PlatformIcon} from 'platformicons';
+
+import {CompactSelect} from '@sentry/scraps/compactSelect';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Text} from '@sentry/scraps/text';
+
+import {CopyMarkdownButton} from 'sentry/components/onboarding/gettingStartedDoc/onboardingCopyMarkdownButton';
+import {simpleHtmlToMarkdown} from 'sentry/components/onboarding/utils/stepsToMarkdown';
+import {t, tct} from 'sentry/locale';
+import type {PlatformKey} from 'sentry/types/platform';
+import type {Project} from 'sentry/types/project';
+import {projectKeysApiOptions} from 'sentry/utils/projectKeys';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import type {QuickStartProps} from 'sentry/views/insights/crons/components/manualCheckInGuides';
+import {
+  CLICronQuickStart,
+  CurlCronQuickStart,
+  DotNetCronQuickStart,
+  DotNetHangfireCronQuickStart,
+  GoCronQuickStart,
+  JavaCronQuickStart,
+  JavaQuartzCronQuickStart,
+  JavaSpringBootCronQuickStart,
+  NodeJSCronQuickStart,
+  PHPCronQuickStart,
+  PHPLaravelCronQuickStart,
+  PythonCeleryCronQuickStart,
+  PythonCronQuickStart,
+  RubyCronQuickStart,
+  RubyRailsCronQuickStart,
+  RubySidekiqCronQuickStart,
+} from 'sentry/views/insights/crons/components/manualCheckInGuides';
+
+interface Props {
+  monitorSlug: string;
+  project: Project;
+}
+
+interface OnboardingGuide {
+  Guide: React.ComponentType<QuickStartProps>;
+  icon: React.ReactNode;
+  label: string;
+  platforms?: Set<PlatformKey>;
+}
+
+const onboardingGuides: Record<string, OnboardingGuide> = {
+  cli: {
+    label: 'Sentry CLI',
+    icon: <IconTerminal size="sm" />,
+    Guide: CLICronQuickStart,
+  },
+  curl: {
+    label: 'cURL',
+    icon: <IconGlobe size="sm" />,
+    Guide: CurlCronQuickStart,
+  },
+  python: {
+    label: 'Python',
+    icon: <PlatformIcon size={16} platform="python" alt="" />,
+    Guide: PythonCronQuickStart,
+    platforms: new Set([
+      'python',
+      'python-django',
+      'python-flask',
+      'python-fastapi',
+      'python-starlette',
+      'python-sanic',
+      'python-bottle',
+      'python-pylons',
+      'python-pyramid',
+      'python-tornado',
+      'python-rq',
+    ]),
+  },
+  pythonCelery: {
+    label: 'Celery',
+    icon: <PlatformIcon size={16} platform="python-celery" alt="" />,
+    Guide: PythonCeleryCronQuickStart,
+    platforms: new Set(['python-celery']),
+  },
+  php: {
+    label: 'PHP',
+    icon: <PlatformIcon size={16} platform="php" alt="" />,
+    Guide: PHPCronQuickStart,
+    platforms: new Set(['php', 'php-monolog', 'php-symfony']),
+  },
+  phpLaravel: {
+    label: 'Laravel',
+    icon: <PlatformIcon size={16} platform="php-laravel" alt="" />,
+    Guide: PHPLaravelCronQuickStart,
+    platforms: new Set(['php-laravel']),
+  },
+  nodeJs: {
+    label: 'Node',
+    icon: <PlatformIcon size={16} platform="node" alt="" />,
+    Guide: NodeJSCronQuickStart,
+    platforms: new Set(['node']),
+  },
+  go: {
+    label: 'Go',
+    icon: <PlatformIcon size={16} platform="go" alt="" />,
+    Guide: GoCronQuickStart,
+    platforms: new Set(['go']),
+  },
+  java: {
+    label: 'Java',
+    icon: <PlatformIcon size={16} platform="java" alt="" />,
+    Guide: JavaCronQuickStart,
+    platforms: new Set(['java', 'java-log4j2', 'java-logback']),
+  },
+  javaSpringBoot: {
+    label: 'Spring',
+    icon: <PlatformIcon size={16} platform="java-spring" alt="" />,
+    Guide: JavaSpringBootCronQuickStart,
+    platforms: new Set(['java-spring-boot', 'java-spring']),
+  },
+  javaQuartz: {
+    label: 'Quartz',
+    Guide: JavaQuartzCronQuickStart,
+    icon: <PlatformIcon size={16} platform="java-spring" alt="" />,
+    platforms: new Set([
+      'java',
+      'java-log4j2',
+      'java-logback',
+      'java-spring-boot',
+      'java-spring',
+    ]),
+  },
+  ruby: {
+    label: 'Ruby',
+    icon: <PlatformIcon size={16} platform="ruby" alt="" />,
+    Guide: RubyCronQuickStart,
+    platforms: new Set(['ruby']),
+  },
+  rubyRails: {
+    label: 'Rails',
+    icon: <PlatformIcon size={16} platform="ruby-rails" alt="" />,
+    Guide: RubyRailsCronQuickStart,
+    platforms: new Set(['ruby', 'ruby-rails']),
+  },
+  rubySidekiq: {
+    label: 'Sidekiq',
+    icon: <PlatformIcon size={16} platform="ruby" alt="" />,
+    Guide: RubySidekiqCronQuickStart,
+    platforms: new Set(['ruby', 'ruby-rails']),
+  },
+  dotnet: {
+    label: '.NET',
+    icon: <PlatformIcon size={16} platform="dotnet" alt="" />,
+    Guide: DotNetCronQuickStart,
+    platforms: new Set([
+      'dotnet',
+      'dotnet-aspnet',
+      'dotnet-aspnetcore',
+      'dotnet-awslambda',
+      'dotnet-gcpfunctions',
+      'dotnet-maui',
+      'dotnet-uwp',
+      'dotnet-winforms',
+      'dotnet-wpf',
+      'dotnet-xamarin',
+    ]),
+  },
+  dotnetHangfire: {
+    label: 'Hangfire',
+    icon: <PlatformIcon size={16} platform="dotnet" alt="" />,
+    Guide: DotNetHangfireCronQuickStart,
+    platforms: new Set([
+      'dotnet',
+      'dotnet-aspnet',
+      'dotnet-aspnetcore',
+      'dotnet-awslambda',
+      'dotnet-gcpfunctions',
+      'dotnet-maui',
+      'dotnet-uwp',
+      'dotnet-winforms',
+      'dotnet-wpf',
+      'dotnet-xamarin',
+    ]),
+  },
+};
+
+/**
+ * The platforms that are well supported for crons
+ */
+export const platformsWithGuides = Array.from(
+  Object.values(onboardingGuides).reduce((combinedPlatforms, guide) => {
+    guide.platforms?.forEach(platform => combinedPlatforms.add(platform));
+    return combinedPlatforms;
+  }, new Set())
+);
+
+const guideToSelectOption = ({key, label, icon}: {key: string} & OnboardingGuide) => ({
+  label,
+  value: key,
+  leadingItems: <div>{icon}</div>,
+});
+
+export function MonitorQuickStartGuide({monitorSlug, project}: Props) {
+  const org = useOrganization();
+  const guideContainerRef = useRef<HTMLDivElement>(null);
+
+  const {data: projectKeys} = useQuery({
+    ...projectKeysApiOptions({orgSlug: org.slug, projSlug: project.slug}),
+    staleTime: Infinity,
+  });
+
+  const guideList = Object.entries(onboardingGuides).map(([key, guide]) => ({
+    ...guide,
+    key,
+  }));
+
+  const [genericGuides, platformGuides] = partition(
+    guideList,
+    guide => guide.platforms === undefined
+  );
+
+  const exampleOptions = [
+    {label: t('Platform Specfiic'), options: platformGuides.map(guideToSelectOption)},
+    {label: t('Generic'), options: genericGuides.map(guideToSelectOption)},
+  ];
+
+  const platformSpecific = platformGuides.filter(guide =>
+    guide.platforms?.has(project.platform ?? 'other')
+  );
+
+  const defaultExample = platformSpecific.length > 0 ? platformSpecific[0]!.key : 'cli';
+
+  const [selectedGuide, setSelectedGuide] = useState(defaultExample);
+  const {Guide} = onboardingGuides[selectedGuide]!;
+
+  const guideProps: QuickStartProps = {
+    slug: monitorSlug,
+    orgSlug: org.slug,
+    orgId: org.id,
+    projectId: project.id,
+    cronsUrl: projectKeys?.[0]?.dsn.crons,
+    dsnKey: projectKeys?.[0]?.dsn.public,
+  };
+
+  // TODO: Migrate crons guides to the content block system so we can use
+  // structured stepsToMarkdown() instead of innerHTML scraping. The innerHTML
+  // approach may include rendered UI chrome and won't substitute auth tokens.
+  const getGuideMarkdown = () => {
+    if (!guideContainerRef.current) {
+      return '';
+    }
+    try {
+      const html = guideContainerRef.current.innerHTML;
+      return simpleHtmlToMarkdown(html);
+    } catch {
+      return '';
+    }
+  };
+
+  return (
+    <Stack gap="xl">
+      <Text>
+        {tct(
+          'Select an integration method for your monitor. For in-depth instructions on integrating Crons, view [docsLink:our complete documentation].',
+          {
+            docsLink: (
+              <ExternalLink href="https://docs.sentry.io/product/crons/getting-started/" />
+            ),
+          }
+        )}
+      </Text>
+      <Flex justify="between" align="center">
+        <CompactSelect
+          trigger={triggerProps => (
+            <OverlayTrigger.Button {...triggerProps} prefix={t('Guide')} />
+          )}
+          search
+          options={exampleOptions}
+          value={selectedGuide}
+          onChange={({value}) => setSelectedGuide(value)}
+          size="sm"
+        />
+        <CopyMarkdownButton
+          borderless
+          getMarkdown={getGuideMarkdown}
+          source="crons_onboarding"
+        />
+      </Flex>
+      <Stack gap="md" ref={guideContainerRef}>
+        <Guide {...guideProps} />
+      </Stack>
+    </Stack>
+  );
+}

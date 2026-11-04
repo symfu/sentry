@@ -1,0 +1,363 @@
+import {useMemo} from 'react';
+import {queryOptions, useQueries} from '@tanstack/react-query';
+
+import {apiFetch, type ApiResponse} from 'sentry/utils/api/apiFetch';
+import {apiOptions, selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {toArray} from 'sentry/utils/array/toArray';
+import {defined} from 'sentry/utils/defined';
+import type {EventsTableData} from 'sentry/utils/discover/discoverQuery';
+import {
+  getEquationAliasIndex,
+  isEquation,
+  isEquationAlias,
+} from 'sentry/utils/discover/fields';
+import type {DiscoverQueryRequestParams} from 'sentry/utils/discover/genericDiscoverQuery';
+import {DiscoverDatasets} from 'sentry/utils/discover/types';
+import {decodeSorts} from 'sentry/utils/queryString';
+import type {
+  HeatmapWidgetQueryParams,
+  WidgetQueryParams,
+} from 'sentry/views/dashboards/datasetConfig/base';
+import {getTimeseriesRequestQuery} from 'sentry/views/dashboards/datasetConfig/utils/getSeriesRequestData';
+import {traceMetricsResponseTransforms} from 'sentry/views/dashboards/datasetConfig/utils/traceMetricsResponseTransforms';
+import {eventViewFromWidget} from 'sentry/views/dashboards/utils';
+import {
+  combineIngestionMeta,
+  type WidgetTimeSeries,
+} from 'sentry/views/dashboards/utils/transformTimeSeriesResponse';
+import {useWidgetQueryQueue} from 'sentry/views/dashboards/utils/widgetQueryQueue';
+import {extractTraceMetricFromColumn} from 'sentry/views/dashboards/widgetBuilder/utils/buildTraceMetricAggregate';
+import {getSelectedAggregate} from 'sentry/views/dashboards/widgetBuilder/utils/getSelectedAggregate';
+import type {HookWidgetQueryResult} from 'sentry/views/dashboards/widgetCard/genericWidgetQueries';
+import {
+  applyDashboardFiltersToWidget,
+  getReferrer,
+} from 'sentry/views/dashboards/widgetCard/genericWidgetQueries';
+import {
+  combineWidgetJsonQueryResults,
+  combineWidgetQueryResults,
+} from 'sentry/views/dashboards/widgetCard/hooks/utils/combineWidgetQueryResults';
+import {getSeriesConfidenceInformation} from 'sentry/views/dashboards/widgetCard/hooks/utils/getSeriesConfidenceInformation';
+import {getWidgetStaleTime} from 'sentry/views/dashboards/widgetCard/hooks/utils/getStaleTime';
+import {getTimeseriesWidgetQueryOptions} from 'sentry/views/dashboards/widgetCard/hooks/utils/getTimeseriesWidgetQueryOptions';
+import {NONE_UNIT} from 'sentry/views/explore/metrics/constants';
+import {useMetricHeatMapData} from 'sentry/views/explore/metrics/hooks/useMetricHeatMapData';
+import {getRetryDelay} from 'sentry/views/insights/common/utils/retryHandlers';
+
+type TraceMetricsTableResponse = EventsTableData;
+
+const EMPTY_ARRAY: any[] = [];
+
+export function useTraceMetricsSeriesQuery(
+  params: WidgetQueryParams & {skipDashboardFilterParens?: boolean}
+): HookWidgetQueryResult {
+  const {
+    widget,
+    organization,
+    pageFilters,
+    enabled,
+    samplingMode,
+    dashboardFilters,
+    skipDashboardFilterParens,
+    widgetInterval,
+  } = params;
+
+  const {queue} = useWidgetQueryQueue();
+
+  const filteredWidget = useMemo(
+    () =>
+      applyDashboardFiltersToWidget(widget, dashboardFilters, skipDashboardFilterParens),
+    [widget, dashboardFilters, skipDashboardFilterParens]
+  );
+
+  const {results: queryResults, data: rawData} = useQueries({
+    queries: filteredWidget.queries.map((_, queryIndex) =>
+      getTimeseriesWidgetQueryOptions({
+        organization,
+        pageFilters,
+        queue,
+        enabled,
+        query: getTimeseriesRequestQuery(
+          filteredWidget,
+          queryIndex,
+          pageFilters,
+          DiscoverDatasets.TRACEMETRICS,
+          {
+            organization,
+            referrer: getReferrer(filteredWidget.displayType),
+            widgetInterval,
+            sampling: samplingMode,
+          }
+        ),
+      })
+    ),
+    combine: combineWidgetQueryResults,
+  });
+
+  const transformedData = (() => {
+    const isFetching = queryResults.some(q => q?.isFetching);
+    const allHaveData = queryResults.every(q => q?.data);
+    const errorMessage = queryResults.find(q => q?.error)?.error?.message;
+
+    if (!allHaveData || isFetching) {
+      const loading = isFetching || !errorMessage;
+      return {
+        loading,
+        errorMessage,
+        rawData: EMPTY_ARRAY,
+      };
+    }
+
+    const timeseriesResults: WidgetTimeSeries[] = [];
+
+    queryResults.forEach((q, requestIndex) => {
+      if (!q?.data) {
+        return;
+      }
+
+      const responseData = q.data;
+
+      const transformedResult = traceMetricsResponseTransforms.transformTimeSeries!(
+        responseData,
+        filteredWidget,
+        requestIndex
+      );
+
+      timeseriesResults.push(...transformedResult);
+    });
+
+    return {
+      loading: false,
+      errorMessage: undefined,
+      timeseriesResults,
+      ingestion: combineIngestionMeta(queryResults.map(q => q?.data)),
+      rawData,
+    };
+  })();
+
+  // When a widget has several queries, the last response's confidence is shown
+  const confidenceInformation = useMemo(() => {
+    const lastResponse = rawData.findLast(defined);
+    return lastResponse
+      ? getSeriesConfidenceInformation(lastResponse, widget.queries[0])
+      : undefined;
+  }, [rawData, widget.queries]);
+
+  return {...transformedData, ...confidenceInformation};
+}
+
+export function useTraceMetricsTableQuery(
+  params: WidgetQueryParams & {skipDashboardFilterParens?: boolean}
+): HookWidgetQueryResult {
+  const {
+    widget,
+    organization,
+    pageFilters,
+    enabled,
+    samplingMode,
+    cursor,
+    limit,
+    dashboardFilters,
+    skipDashboardFilterParens,
+  } = params;
+
+  const {queue} = useWidgetQueryQueue();
+
+  const filteredWidget = useMemo(
+    () =>
+      applyDashboardFiltersToWidget(widget, dashboardFilters, skipDashboardFilterParens),
+    [widget, dashboardFilters, skipDashboardFilterParens]
+  );
+
+  const {results: queryResults, data: rawData} = useQueries({
+    queries: filteredWidget.queries.map(query => {
+      const eventView = eventViewFromWidget('', query, pageFilters);
+
+      const requestParams: DiscoverQueryRequestParams = {
+        per_page: limit,
+        cursor,
+        referrer: getReferrer(filteredWidget.displayType),
+        dataset: DiscoverDatasets.TRACEMETRICS,
+      };
+
+      if (query.orderby) {
+        const baseSort = decodeSorts(query.orderby)[0];
+        if (isEquationAlias(baseSort?.field ?? '')) {
+          const fields = query.fields ?? [...query.columns, ...query.aggregates];
+          const equations = fields.filter(isEquation);
+          const equationIndex = getEquationAliasIndex(baseSort?.field ?? '');
+          const equation = equations[equationIndex];
+          if (equation) {
+            requestParams.sort = toArray(
+              baseSort?.kind === 'desc' ? `-${equation}` : equation
+            );
+          } else {
+            // In case we failed to find an equation by its index, reset the sort
+            requestParams.sort = undefined;
+          }
+        } else {
+          requestParams.sort = toArray(query.orderby);
+        }
+      }
+
+      const queryParams = {
+        ...eventView.generateQueryStringObject(),
+        ...requestParams,
+        ...(samplingMode ? {sampling: samplingMode} : {}),
+      };
+
+      return queryOptions({
+        ...apiOptions.as<TraceMetricsTableResponse>()(
+          '/organizations/$organizationIdOrSlug/events/',
+          {
+            path: {organizationIdOrSlug: organization.slug},
+            method: 'GET' as const,
+            query: queryParams,
+            staleTime: getWidgetStaleTime(pageFilters),
+          }
+        ),
+        queryFn: (context): Promise<ApiResponse<TraceMetricsTableResponse>> => {
+          if (queue) {
+            return new Promise((resolve, reject) => {
+              const fetchFnRef = {
+                current: () =>
+                  apiFetch<TraceMetricsTableResponse>(context).then(resolve, reject),
+              };
+              queue.addItem({fetchDataRef: fetchFnRef});
+            });
+          }
+          return apiFetch<TraceMetricsTableResponse>(context);
+        },
+        enabled,
+        retry: false,
+        retryDelay: getRetryDelay,
+        select: selectJsonWithHeaders,
+      });
+    }),
+    combine: combineWidgetJsonQueryResults,
+  });
+
+  const transformedData = (() => {
+    const isFetching = queryResults.some(q => q?.isFetching);
+    const allHaveData = queryResults.every(q => q?.data?.json);
+    const errorMessage = queryResults.find(q => q?.error)?.error?.message;
+
+    if (!allHaveData || isFetching) {
+      const loading = isFetching || !errorMessage;
+      return {
+        loading,
+        errorMessage,
+        rawData: EMPTY_ARRAY,
+      };
+    }
+
+    const tableResults: any[] = [];
+    let responsePageLinks: string | undefined;
+
+    queryResults.forEach((q, i) => {
+      if (!q?.data?.json) {
+        return;
+      }
+
+      const responseData = q.data.json;
+
+      const transformedDataItem = {
+        ...traceMetricsResponseTransforms.transformTable(
+          responseData,
+          filteredWidget.queries[i]!,
+          organization,
+          pageFilters
+        ),
+        title: filteredWidget.queries[i]?.name ?? '',
+      };
+
+      tableResults.push(transformedDataItem);
+
+      responsePageLinks = q.data.headers.Link;
+    });
+
+    return {
+      loading: false,
+      errorMessage: undefined,
+      tableResults,
+      pageLinks: responsePageLinks,
+      rawData,
+    };
+  })();
+
+  return transformedData;
+}
+
+/**
+ *
+ * The X-axis `widgetInterval` and Y-axis `yBuckets` are derived from the
+ * widget's rendered dimensions and passed in from the chart container, since
+ * the query layer has no access to the rendered size.
+ */
+export function useTraceMetricsHeatmapQuery(
+  params: HeatmapWidgetQueryParams
+): HookWidgetQueryResult {
+  const {
+    widget,
+    organization,
+    pageFilters,
+    enabled,
+    dashboardFilters,
+    skipDashboardFilterParens,
+    samplingMode,
+    widgetInterval = '',
+    yBuckets = 0,
+  } = params;
+
+  const filteredWidget = useMemo(
+    () =>
+      applyDashboardFiltersToWidget(widget, dashboardFilters, skipDashboardFilterParens),
+    [widget, dashboardFilters, skipDashboardFilterParens]
+  );
+
+  const query = filteredWidget.queries[0];
+  const selectedAggregate = getSelectedAggregate(widget);
+  const traceMetric = selectedAggregate
+    ? extractTraceMetricFromColumn(selectedAggregate)
+    : undefined;
+
+  // Don't fetch until the widget's aggregate resolves to a real metric —
+  // otherwise we'd request with an empty `metric.name` filter.
+  const heatMapConditionsAreValid =
+    yBuckets > 0 && Boolean(widgetInterval) && Boolean(traceMetric?.name);
+  const heatmapEnabled = enabled && heatMapConditionsAreValid;
+
+  const {series, error, isPending, isFetching} = useMetricHeatMapData({
+    traceMetric: traceMetric ?? {name: '', type: '', unit: NONE_UNIT},
+    enabled: heatmapEnabled,
+    organization,
+    selection: pageFilters,
+    query: query?.conditions ?? '',
+    interval: widgetInterval,
+    sampling: samplingMode,
+    yBuckets,
+  });
+
+  // `genericWidgetQueries` guards its `onDataFetched` effect by reference
+  // (`rawData === prev`); wrapping the single series in a fresh array each
+  // render would defeat that guard and cause an update loop, so memoize it.
+  const rawData = useMemo(() => (series ? [series] : EMPTY_ARRAY), [series]);
+
+  if (error) {
+    return {
+      loading: false,
+      errorMessage: error.message,
+      rawData: EMPTY_ARRAY,
+    };
+  }
+
+  if (isFetching || isPending) {
+    return {loading: true, rawData: EMPTY_ARRAY};
+  }
+
+  return {
+    loading: false,
+    heatmapResults: series,
+    rawData,
+  };
+}

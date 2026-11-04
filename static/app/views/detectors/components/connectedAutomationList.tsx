@@ -1,0 +1,187 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+import {useQuery} from '@tanstack/react-query';
+
+import {Button} from '@sentry/scraps/button';
+import {Container} from '@sentry/scraps/layout';
+import type {CursorHandler} from '@sentry/scraps/pagination';
+import {Pagination, useGetPaginationCaption} from '@sentry/scraps/pagination';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+
+import {Placeholder} from 'sentry/components/placeholder';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {ActionCell} from 'sentry/components/workflowEngine/gridCell/actionCell';
+import {AutomationTitleCell} from 'sentry/components/workflowEngine/gridCell/automationTitleCell';
+import {TimeAgoCell} from 'sentry/components/workflowEngine/gridCell/timeAgoCell';
+import {t} from 'sentry/locale';
+import type {Automation} from 'sentry/types/workflowEngine/automations';
+import type {Detector} from 'sentry/types/workflowEngine/detectors';
+import {selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {automationsApiOptions} from 'sentry/views/automations/hooks';
+import {getAutomationActions} from 'sentry/views/automations/hooks/utils';
+
+const DEFAULT_AUTOMATIONS_PER_PAGE = 10;
+
+type Props = React.HTMLAttributes<HTMLDivElement> & {
+  /**
+   * If null, all automations will be fetched.
+   */
+  automationIds: Detector['workflowIds'] | null;
+  cursor: string | undefined;
+  onCursor: CursorHandler;
+  connectedAutomationIds?: Set<string>;
+  emptyMessage?: React.ReactNode;
+  limit?: number | null;
+  openInNewTab?: boolean;
+  query?: string;
+  toggleConnected?: (params: {automation: Automation}) => void;
+};
+
+function Skeletons({canEdit, numberOfRows}: {canEdit: boolean; numberOfRows: number}) {
+  return (
+    <Fragment>
+      {Array.from({length: numberOfRows}).map((_, index) => (
+        <SimpleTable.Row key={index}>
+          <SimpleTable.RowCell>
+            <Placeholder height="20px" />
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <Placeholder height="20px" />
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <Placeholder height="20px" />
+          </SimpleTable.RowCell>
+          {canEdit && (
+            <SimpleTable.RowCell>
+              <Placeholder height="20px" />
+            </SimpleTable.RowCell>
+          )}
+        </SimpleTable.Row>
+      ))}
+    </Fragment>
+  );
+}
+
+export function ConnectedAutomationsList({
+  automationIds,
+  connectedAutomationIds,
+  toggleConnected,
+  emptyMessage = t('No alerts connected'),
+  cursor,
+  onCursor,
+  limit = DEFAULT_AUTOMATIONS_PER_PAGE,
+  query,
+  openInNewTab,
+  ...props
+}: Props) {
+  const getPaginationCaption = useGetPaginationCaption();
+  const organization = useOrganization();
+  const canEdit = Boolean(
+    connectedAutomationIds && typeof toggleConnected === 'function'
+  );
+
+  const {data, isLoading, isError, isSuccess} = useQuery({
+    ...automationsApiOptions(organization, {
+      ids: automationIds ?? undefined,
+      limit: limit ?? undefined,
+      cursor,
+      query,
+    }),
+    select: selectJsonWithHeaders,
+    enabled: automationIds === null || automationIds.length > 0,
+  });
+
+  const automations = data?.json;
+  const pageLinks = data?.headers.Link;
+  const totalCountInt = data?.headers['X-Hits'] ?? 0;
+
+  const paginationCaption =
+    isLoading || !automations || limit === null
+      ? undefined
+      : getPaginationCaption({
+          cursor,
+          limit,
+          pageLength: automations.length,
+          total: totalCountInt,
+        });
+
+  const columns: TableColumnConfig[] = [
+    {key: 'name', width: '1fr'},
+    {key: 'last-triggered', visible: {xl: true}, width: '200px'},
+    {key: 'action-filters', visible: {sm: true}, width: '180px'},
+    ...(canEdit ? [{key: 'connected', width: '140px'} satisfies TableColumnConfig] : []),
+  ];
+
+  return (
+    <Container containerType="inline-size" {...props}>
+      <StyledSimpleTable
+        columns={columns}
+        header={
+          <SimpleTable.HeaderRow>
+            <SimpleTable.HeaderCell>{t('Name')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell>{t('Last Triggered')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell>{t('Actions')}</SimpleTable.HeaderCell>
+            {canEdit && <SimpleTable.HeaderCell />}
+          </SimpleTable.HeaderRow>
+        }
+      >
+        {isLoading && (
+          <Skeletons
+            canEdit={canEdit}
+            numberOfRows={
+              automationIds === null
+                ? (limit ?? DEFAULT_AUTOMATIONS_PER_PAGE)
+                : Math.min(automationIds?.length ?? 0, DEFAULT_AUTOMATIONS_PER_PAGE)
+            }
+          />
+        )}
+        {isError && <SimpleTable.Error />}
+        {((isSuccess && automations?.length === 0) ||
+          (automationIds !== null && automationIds.length === 0)) && (
+          <SimpleTable.Empty>{emptyMessage}</SimpleTable.Empty>
+        )}
+        {isSuccess &&
+          automations?.map(automation => (
+            <SimpleTable.Row
+              key={automation.id}
+              variant={automation.enabled ? 'default' : 'faded'}
+            >
+              <SimpleTable.RowCell>
+                <AutomationTitleCell
+                  automation={automation}
+                  openInNewTab={openInNewTab}
+                />
+              </SimpleTable.RowCell>
+              <SimpleTable.RowCell>
+                <TimeAgoCell date={automation.lastTriggered} />
+              </SimpleTable.RowCell>
+              <SimpleTable.RowCell>
+                <ActionCell actions={getAutomationActions(automation)} />
+              </SimpleTable.RowCell>
+              {canEdit && (
+                <SimpleTable.RowCell justify="end">
+                  <Button onClick={() => toggleConnected?.({automation})} size="sm">
+                    {connectedAutomationIds?.has(automation.id)
+                      ? t('Disconnect')
+                      : t('Connect')}
+                  </Button>
+                </SimpleTable.RowCell>
+              )}
+            </SimpleTable.Row>
+          ))}
+      </StyledSimpleTable>
+      {limit && (
+        <Pagination
+          onCursor={onCursor}
+          pageLinks={pageLinks}
+          caption={paginationCaption}
+        />
+      )}
+    </Container>
+  );
+}
+
+const StyledSimpleTable = styled(SimpleTable)`
+  margin-bottom: ${p => p.theme.space.xl};
+`;

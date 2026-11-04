@@ -1,0 +1,127 @@
+import type {Series} from 'sentry/types/echarts';
+import type {EventsStats} from 'sentry/types/organization';
+import {
+  aggregateOutputType,
+  RateUnit,
+  type AggregationOutputType,
+} from 'sentry/utils/discover/fields';
+import {parseGroupBy} from 'sentry/utils/timeSeries/parseGroupBy';
+import type {TimeSeries} from 'sentry/views/dashboards/widgets/common/types';
+import {convertEventsStatsToTimeSeriesData} from 'sentry/views/insights/common/queries/useSortedTimeSeries';
+
+/**
+ * Delimiter used by the backend to separate parts of a series name.
+ * Format: "alias : yAxis : groupValue1,groupValue2"
+ */
+export const SERIES_NAME_PART_DELIMITER = ' : ';
+
+/**
+ * Delimiter used to separate the query alias/prefix from group-by and
+ * aggregate parts in a series name. Distinct from {@link SERIES_NAME_PART_DELIMITER}
+ * so the query prefix can be reliably extracted.
+ * Format: "queryPrefix > groupValue : yAxis"
+ */
+export const SERIES_QUERY_DELIMITER = ' > ';
+
+/** Converts a legacy series whose query and alias prefixes have already been removed. */
+export function transformLegacySeriesToTimeSeries(
+  timeseriesResult: Series | undefined,
+  fields: string[] = [],
+  yAxis = ''
+): TimeSeries | null {
+  if (!timeseriesResult) {
+    return null;
+  }
+
+  const mapped = mapAggregationTypeToValueTypeAndUnit(aggregateOutputType(yAxis), yAxis);
+  const seriesName = timeseriesResult.seriesName ?? yAxis;
+  const valueType = mapped.valueType as AggregationOutputType;
+  const valueUnit = mapped.valueUnit;
+
+  const splitSeriesName = seriesName.split(SERIES_NAME_PART_DELIMITER);
+
+  const isOther = splitSeriesName.includes('Other');
+
+  // The caller removes query prefixes; the remaining name contains groups and yAxis.
+  const groupValuesPart = splitSeriesName.find(name => name !== yAxis);
+
+  const groupBy =
+    fields.length > 0 && groupValuesPart ? parseGroupBy(groupValuesPart, fields) : null;
+
+  const timeSeries = convertEventsStatsToTimeSeriesData(
+    yAxis,
+    createEventsStatsFromSeries(
+      {...timeseriesResult, seriesName: yAxis},
+      valueType,
+      valueUnit
+    )
+  )[1];
+
+  return {
+    ...timeSeries,
+    groupBy,
+    meta: {
+      ...timeSeries.meta,
+      isOther,
+    },
+  };
+}
+
+function createEventsStatsFromSeries(
+  series: Series,
+  valueType: AggregationOutputType,
+  valueUnit: string | null
+): EventsStats {
+  return {
+    data: series.data.map(dataUnit => [
+      typeof dataUnit.name === 'number'
+        ? dataUnit.name / 1000
+        : new Date(dataUnit.name).getTime() / 1000,
+      [{count: dataUnit.value, comparisonCount: undefined}],
+    ]),
+    meta: {
+      fields: {
+        [series.seriesName]: valueType,
+      },
+      units: {
+        [series.seriesName]: valueUnit,
+      },
+      isMetricsData: false,
+      tips: {columns: undefined, query: undefined},
+    },
+  };
+}
+
+function mapAggregationTypeToValueTypeAndUnit(
+  aggregationType: AggregationOutputType,
+  fieldName: string
+): {
+  valueType: TimeSeries['meta']['valueType'];
+  valueUnit: TimeSeries['meta']['valueUnit'];
+} {
+  // Special case, epm/eps come back as numbers but we want to show as reate
+  // Checking eps/epm here is a hack until we migrate to new /timeseries endpoint
+  if (fieldName?.includes('eps()')) {
+    return {valueType: 'rate', valueUnit: RateUnit.PER_SECOND};
+  }
+  if (fieldName?.includes('epm()')) {
+    return {valueType: 'rate', valueUnit: RateUnit.PER_MINUTE};
+  }
+
+  switch (aggregationType) {
+    case 'rate':
+      return {valueType: 'rate', valueUnit: null};
+    case 'size':
+      return {valueType: 'size', valueUnit: null};
+    case 'duration':
+      return {valueType: 'duration', valueUnit: null};
+    case 'score':
+      return {valueType: 'score', valueUnit: null};
+    case 'percentage':
+      return {valueType: 'percentage', valueUnit: null};
+    case 'integer':
+    case 'number':
+    default:
+      return {valueType: 'number', valueUnit: null};
+  }
+}

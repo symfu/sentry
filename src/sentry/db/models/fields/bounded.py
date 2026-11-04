@@ -1,6 +1,8 @@
-from django.conf import settings
+from __future__ import annotations
+
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.db.models.expressions import Combinable
+from django.utils.translation import gettext_lazy as _
 
 __all__ = (
     "BoundedAutoField",
@@ -8,80 +10,117 @@ __all__ = (
     "BoundedIntegerField",
     "BoundedBigIntegerField",
     "BoundedPositiveIntegerField",
+    "BoundedPositiveBigIntegerField",
+    "WrappingU32IntegerField",
 )
 
+I32_MAX = 2_147_483_647  # 2**31 - 1
+U32_MAX = 4_294_967_295  # 2**32 - 1
+I64_MAX = 9_223_372_036_854_775_807  # 2**63 - 1
 
-class BoundedIntegerField(models.IntegerField):
-    MAX_VALUE = 2147483647
 
-    def get_prep_value(self, value):
+class BoundedIntegerField(models.IntegerField):  # type: ignore[type-arg]
+    MAX_VALUE = I32_MAX
+
+    def get_prep_value(self, value: int) -> int:
         if value:
             value = int(value)
             assert value <= self.MAX_VALUE
         return super().get_prep_value(value)
 
 
-class BoundedPositiveIntegerField(models.PositiveIntegerField):
-    MAX_VALUE = 2147483647
+class BoundedPositiveIntegerField(models.PositiveIntegerField):  # type: ignore[type-arg]
+    MAX_VALUE = I32_MAX
 
-    def get_prep_value(self, value):
+    def get_prep_value(self, value: int) -> int:
         if value:
             value = int(value)
             assert value <= self.MAX_VALUE
         return super().get_prep_value(value)
 
 
-class BoundedAutoField(models.AutoField):
-    MAX_VALUE = 2147483647
+class WrappingU32IntegerField(models.IntegerField):  # type: ignore[type-arg]
+    """
+    This type allows storing a full unsigned `u32` value by manually wrapping it around,
+    so it is stored as a signed `i32` value in the database.
+    """
 
-    def get_prep_value(self, value):
+    MIN_VALUE = 0
+    MAX_VALUE = U32_MAX
+
+    def get_prep_value(self, value: int) -> int:
+        if value:
+            value = int(value)
+            assert self.MIN_VALUE <= value <= self.MAX_VALUE
+
+            if value > I32_MAX:
+                value = value - 2**32
+
+        return super().get_prep_value(value)
+
+    def from_db_value(
+        self, value: int | None, expression: object, connection: object
+    ) -> int | None:
+        if value is None:
+            return None
+        if value < 0:
+            return value + 2**32
+        return value
+
+
+class BoundedAutoField(models.AutoField):  # type: ignore[type-arg]
+    MAX_VALUE = I32_MAX
+
+    def get_prep_value(self, value: int) -> int:
         if value:
             value = int(value)
             assert value <= self.MAX_VALUE
         return super().get_prep_value(value)
 
 
-if settings.SENTRY_USE_BIG_INTS:
+class BoundedBigIntegerField(models.BigIntegerField):  # type: ignore[type-arg]
+    description = _("Big Integer")
 
-    class BoundedBigIntegerField(models.BigIntegerField):
-        description = _("Big Integer")
+    MAX_VALUE = I64_MAX
 
-        MAX_VALUE = 9223372036854775807
+    def get_internal_type(self) -> str:
+        return "BigIntegerField"
 
-        def get_internal_type(self):
-            return "BigIntegerField"
-
-        def get_prep_value(self, value):
-            if value:
-                value = int(value)
-                assert value <= self.MAX_VALUE
-            return super().get_prep_value(value)
-
-    class BoundedBigAutoField(models.AutoField):
-        description = _("Big Integer")
-
-        MAX_VALUE = 9223372036854775807
-
-        def db_type(self, connection):
-            return "bigserial"
-
-        def get_related_db_type(self, connection):
-            return BoundedBigIntegerField().db_type(connection)
-
-        def get_internal_type(self):
-            return "BigIntegerField"
-
-        def get_prep_value(self, value):
-            if value:
-                value = int(value)
-                assert value <= self.MAX_VALUE
-            return super().get_prep_value(value)
+    def get_prep_value(self, value: int) -> int:
+        if value:
+            value = int(value)
+            assert value <= self.MAX_VALUE
+        return super().get_prep_value(value)
 
 
-else:
-    # we want full on classes for these
-    class BoundedBigIntegerField(BoundedIntegerField):
-        pass
+class BoundedPositiveBigIntegerField(models.PositiveBigIntegerField):  # type: ignore[type-arg]
+    description = _("Positive big integer")
 
-    class BoundedBigAutoField(BoundedAutoField):
-        pass
+    MAX_VALUE = I64_MAX
+
+    def get_internal_type(self) -> str:
+        return "PositiveBigIntegerField"
+
+    def get_prep_value(self, value: int) -> int:
+        if value:
+            value = int(value)
+            assert value <= self.MAX_VALUE
+        return super().get_prep_value(value)
+
+
+class BoundedBigAutoField(models.BigAutoField):  # type: ignore[type-arg]
+    _pyi_private_set_type: float | int | str | Combinable
+    _pyi_private_get_type: int
+
+    description = _("Big Integer")
+
+    MAX_VALUE = I64_MAX
+
+    def get_internal_type(self) -> str:
+        return "BigAutoField"
+
+    def get_prep_value(self, value: int) -> int:
+        if value:
+            value = int(value)
+            assert value <= self.MAX_VALUE
+        return super().get_prep_value(value)

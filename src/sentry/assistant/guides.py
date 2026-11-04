@@ -1,27 +1,35 @@
-# Guide Schema
-# id (text, required): unique id
-# required_targets (list): An empty list will cause the guide to be shown regardless
-#                          of page/targets presence.
-# steps (list): List of steps
+# Guide definitions
+#
+# The id of each guide should be unique and immutable, as it is stored in the
+# AssistantActivity model to record when the guide was seen / dismissed.
+#
+# Guide UI elements are configured on the frontend in `getGuideContent.tsx`.
 
-# Step Schema
-# title (text, required): Title text. Tone should be active.
-# message (text, optional): Message text. Should help illustrate how to do a task, not
-#                           just literally what the button does.
-# target (text, optional): step is tied to an anchor target. If the anchor doesn't exist,
-#                          the step will not be shown. if the anchor exists but is of type
-#                         "invisible", it will not be pinged but will be scrolled to.
-#                          otherwise the anchor will be pinged and scrolled to. If you'd like
-#                          your step to show always or have a step is not tied to a specific
-#                          element but you'd still like it to be shown, set this as None.
 
 GUIDES = {
-    "issue": {"id": 1, "required_targets": ["issue_title", "exception"]},
-    "issue_stream": {"id": 3, "required_targets": ["issue_stream"]},
-    "inbox_guide": {"id": 8, "required_targets": ["inbox_guide"]},
-    "for_review_guide": {"id": 9, "required_targets": ["for_review_guide_tab"]},
-    "alerts_write_member": {"id": 10, "required_targets": ["alerts_write_member"]},
-    "alerts_write_owner": {"id": 11, "required_targets": ["alerts_write_owner"]},
-    "assigned_or_suggested_guide": {"id": 12, "required_targets": ["assigned_or_suggested_query"]},
-    "release_adoption": {"id": 13, "required_targets": ["release_adoption"]},
+    "issue": 1,
+    "issue_stream": 3,
+    "alerts_write_member": 10,
+    "alerts_write_owner": 11,
+    "trace_view": 16,
+    "span_op_breakdowns_and_tag_explorer": 17,
+    "team_key_transactions": 18,
+    "project_transaction_threshold": 19,
+    "semver": 22,
+    "release_stages": 23,
+    "new_page_filters": 24,
+    "new_page_filters_pin": 25,
+    "releases_widget": 26,
+    "activate_sampling_rule": 27,
+    "create_conditional_rule": 28,
+    "explain_archive_button_issue_details": 29,
+    "explain_archive_tab_issue_stream": 30,
+    "explain_new_default_event_issue_detail": 31,
+    "new_project_filter": 32,
+    "explain_archive_button_issue_stream": 33,
+    "issue_views_page_filters_persistence": 39,
+    "tour.issue_details": 40,
+    "tour.stacked_navigation": 41,
+    "tour.explore.spans": 42,
+    "tour.settings_navigation": 43,
 }

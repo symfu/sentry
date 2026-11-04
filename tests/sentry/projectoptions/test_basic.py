@@ -1,27 +1,26 @@
-import pytest
+from __future__ import annotations
 
-from contextlib import contextmanager
+from unittest import mock
 
-from sentry.projectoptions import defaults, default_manager
+from sentry.models.options.project_option import ProjectOption
+from sentry.models.project import Project
+from sentry.models.team import Team
+from sentry.projectoptions import default_manager, defaults, get_well_known_default
 from sentry.projectoptions.manager import WellKnownProjectOption
-from sentry.models import ProjectOption
+from sentry.testutils.factories import Factories
+from sentry.testutils.pytest.fixtures import django_db_all
 
 
-@contextmanager
-def latest_epoch(value):
-    old = defaults.LATEST_EPOCH
-    try:
-        defaults.LATEST_EPOCH = value
-        yield
-    finally:
-        defaults.LATEST_EPOCH = old
+def latest_epoch(value: int) -> mock._patch[int]:
+    return mock.patch.object(defaults, "LATEST_EPOCH", value)
 
 
-@pytest.mark.django_db
-def test_defaults(default_project):
+@django_db_all
+@latest_epoch(10)
+def test_defaults(default_project: Project) -> None:
     default_manager.register(
         key="__sentry_test:test-option",
-        epoch_defaults={1: "whatever", 10: "new-value", 42: "latest-value"},
+        epoch_defaults={1: "whatever", 20: "new-value", 42: "latest-value"},
     )
 
     assert default_project.get_option("__sentry_test:test-option") == "whatever"
@@ -33,14 +32,14 @@ def test_defaults(default_project):
     assert default_project.get_option("__sentry_test:test-option") == "latest-value"
 
 
-@pytest.mark.django_db
-def freeze_option(factories, default_team):
+@django_db_all
+def freeze_option(factories: Factories, default_team: Team) -> None:
     with latest_epoch(42):
         project = factories.create_project(name="Bar", slug="bar", teams=[default_team])
         assert project.get_option("sentry:option-epoch", defaults.LATEST_EPOCH)
 
 
-def test_epoch_defaults():
+def test_epoch_defaults() -> None:
     option = WellKnownProjectOption(
         key="__sentry_test:test-option",
         epoch_defaults={1: "whatever", 10: "new-value", 42: "latest-value"},
@@ -53,3 +52,41 @@ def test_epoch_defaults():
     assert option.get_default(epoch=20) == "new-value"
     assert option.get_default(epoch=42) == "latest-value"
     assert option.get_default(epoch=100) == "latest-value"
+
+
+def test_loader_version_defaults() -> None:
+    assert get_well_known_default("sentry:default_loader_version", epoch=14) == "9.x"
+    assert get_well_known_default("sentry:default_loader_version", epoch=15) == "10.x"
+    assert get_well_known_default("sentry:default_loader_version", epoch=16) == "10.x"
+    assert (
+        get_well_known_default("sentry:default_loader_version", epoch=defaults.LATEST_EPOCH)
+        == "11.x"
+    )
+    assert "11.x" in get_well_known_default("sentry:loader_available_sdk_versions", epoch=1)
+    assert "11.x" in get_well_known_default(
+        "sentry:loader_available_sdk_versions", epoch=defaults.LATEST_EPOCH
+    )
+
+
+@django_db_all
+def test_isset_simple(default_project: Project) -> None:
+    default_manager.register("best_dogs", default="all dogs")
+
+    assert default_project.get_option("best_dogs") == "all dogs"
+    assert default_manager.isset(default_project, "best_dogs") is False
+
+    default_project.update_option("best_dogs", "Maisey and Charlie")
+    assert default_project.get_option("best_dogs") == "Maisey and Charlie"
+    assert default_manager.isset(default_project, "best_dogs") is True
+
+
+@django_db_all
+def test_isset_differentiates_unset_from_set_to_default(default_project: Project) -> None:
+    default_manager.register("best_dogs", default="all dogs")
+
+    assert default_project.get_option("best_dogs") == "all dogs"
+    assert default_manager.isset(default_project, "best_dogs") is False
+
+    default_project.update_option("best_dogs", "all dogs")
+    assert default_project.get_option("best_dogs") == "all dogs"
+    assert default_manager.isset(default_project, "best_dogs") is True

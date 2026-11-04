@@ -1,0 +1,630 @@
+import {Fragment} from 'react';
+import {expectTypeOf} from 'expect-type';
+
+import {render, screen, within} from 'sentry-test/reactTestingLibrary';
+
+import {Markdown} from '@sentry/scraps/markdown';
+
+describe('Markdown', () => {
+  describe('basic rendering', () => {
+    it('renders paragraphs', () => {
+      render(<Markdown raw="Hello world" />);
+      expect(screen.getByText('Hello world')).toBeInTheDocument();
+    });
+
+    it('renders headings', () => {
+      render(<Markdown raw="## Heading 2" />);
+      expect(screen.getByRole('heading', {level: 2})).toHaveTextContent('Heading 2');
+    });
+
+    it('renders multiple heading levels', () => {
+      render(<Markdown raw={'## H2\n\n### H3\n\n#### H4'} />);
+      expect(screen.getByRole('heading', {level: 2})).toHaveTextContent('H2');
+      expect(screen.getByRole('heading', {level: 3})).toHaveTextContent('H3');
+      expect(screen.getByRole('heading', {level: 4})).toHaveTextContent('H4');
+    });
+
+    it('renders bold and italic', () => {
+      render(<Markdown raw="**bold** *italic*" />);
+      expect(screen.getByText('bold').tagName).toBe('STRONG');
+      expect(screen.getByText('italic').tagName).toBe('EM');
+    });
+
+    it('renders inline code', () => {
+      render(<Markdown raw="Use `foo()` here" />);
+      expect(screen.getByText('foo()')).toBeInTheDocument();
+      expect(screen.getByText('foo()').tagName).toBe('CODE');
+    });
+
+    it('renders code blocks', () => {
+      render(<Markdown raw={'```\nconst x = 1;\n```'} />);
+      expect(screen.getByText('const x = 1;')).toBeInTheDocument();
+    });
+
+    it('renders unordered lists', () => {
+      render(<Markdown raw={'- item 1\n- item 2'} />);
+      expect(screen.getByText('item 1')).toBeInTheDocument();
+      expect(screen.getByText('item 2')).toBeInTheDocument();
+      const list = screen.getByRole('list');
+      expect(list.tagName).toBe('UL');
+    });
+
+    it('renders ordered lists', () => {
+      render(<Markdown raw={'1. first\n2. second'} />);
+      expect(screen.getByText('first')).toBeInTheDocument();
+      const list = screen.getByRole('list');
+      expect(list.tagName).toBe('OL');
+    });
+
+    it('renders blockquotes', () => {
+      render(<Markdown raw="> quoted text" />);
+      expect(screen.getByText('quoted text')).toBeInTheDocument();
+      expect(screen.getByRole('blockquote')).toBeInTheDocument();
+    });
+
+    it('renders horizontal rules', () => {
+      render(<Markdown raw={'above\n\n---\n\nbelow'} />);
+      expect(screen.getByRole('separator')).toBeInTheDocument();
+    });
+
+    it('renders strikethrough', () => {
+      render(<Markdown raw="~~deleted~~" />);
+      expect(screen.getByText('deleted')).toBeInTheDocument();
+    });
+
+    it('renders line breaks', () => {
+      render(<Markdown raw={'line 1  \nline 2'} />);
+      expect(screen.getByText(/line 1/)).toBeInTheDocument();
+      expect(screen.getByText(/line 2/)).toBeInTheDocument();
+    });
+  });
+
+  describe('tables', () => {
+    function getCellTexts(row: HTMLElement) {
+      return within(row)
+        .getAllByRole('cell')
+        .map(cell => cell.textContent);
+    }
+
+    it('renders the header and body rows', () => {
+      render(<Markdown raw={'| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |'} />);
+
+      const table = screen.getByRole('table');
+      const [, firstRow, secondRow] = within(table).getAllByRole('row');
+
+      expect(
+        within(table)
+          .getAllByRole('columnheader')
+          .map(header => header.textContent)
+      ).toEqual(['A', 'B']);
+      expect(getCellTexts(firstRow!)).toEqual(['1', '2']);
+      expect(getCellTexts(secondRow!)).toEqual(['3', '4']);
+    });
+
+    it('renders inline Markdown inside cells', () => {
+      render(
+        <Markdown
+          raw={
+            '| **Name** | Details |\n| --- | --- |\n| `foo()` | *see* [docs](https://example.com) |'
+          }
+        />
+      );
+
+      const [, row] = screen.getAllByRole('row');
+
+      expect(screen.getByRole('columnheader', {name: 'Name'})).toContainHTML(
+        '<strong>Name</strong>'
+      );
+      expect(within(row!).getByText('foo()').tagName).toBe('CODE');
+      expect(within(row!).getByText('see').tagName).toBe('EM');
+      expect(within(row!).getByRole('link', {name: 'docs'})).toHaveAttribute(
+        'href',
+        'https://example.com'
+      );
+    });
+
+    it('renders empty cells in place', () => {
+      render(<Markdown raw={'| A | B | C |\n| --- | --- | --- |\n| 1 |  | 3 |'} />);
+
+      const [, row] = screen.getAllByRole('row');
+
+      expect(getCellTexts(row!)).toEqual(['1', '', '3']);
+    });
+
+    it('renders a table with only a header row', () => {
+      render(<Markdown raw={'| A | B |\n| --- | --- |'} />);
+
+      const table = screen.getByRole('table');
+
+      expect(
+        within(table)
+          .getAllByRole('columnheader')
+          .map(header => header.textContent)
+      ).toEqual(['A', 'B']);
+      expect(within(table).getAllByRole('row')).toHaveLength(1);
+      expect(within(table).queryByRole('cell')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('links', () => {
+    it('renders safe links', () => {
+      render(<Markdown raw="[example](https://example.com)" />);
+      const link = screen.getByRole('link', {name: 'example'});
+      expect(link).toHaveAttribute('href', 'https://example.com');
+    });
+
+    it('renders mailto links', () => {
+      render(<Markdown raw="[email](mailto:foo@example.com)" />);
+      const link = screen.getByRole('link', {name: 'email'});
+      expect(link).toHaveAttribute('href', 'mailto:foo@example.com');
+    });
+
+    it('renders link titles', () => {
+      render(<Markdown raw='[x](https://example.com "Example Title")' />);
+      const link = screen.getByRole('link', {name: 'x'});
+      expect(link).toHaveAttribute('title', 'Example Title');
+    });
+
+    it('rejects javascript: links', () => {
+      render(<Markdown raw="[x](javascript:alert(1))" />);
+      expect(screen.queryByRole('link')).not.toBeInTheDocument();
+      expect(screen.getByText('x')).toBeInTheDocument();
+    });
+
+    it('rejects data: links', () => {
+      render(<Markdown raw="[x](data:text/html,<script>alert(1)</script>)" />);
+      expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    });
+
+    it('rejects vbscript: links', () => {
+      render(<Markdown raw="[x](vbscript:foo)" />);
+      expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('images', () => {
+    it('strips images by default', () => {
+      render(<Markdown raw="![alt](https://example.com/img.png)" />);
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+
+    it('renders images when Image component is provided', () => {
+      render(
+        <Markdown
+          raw="![alt text](https://example.com/img.png)"
+          components={{
+            Image: ({src, alt}) => <img src={src} alt={alt} />,
+          }}
+        />
+      );
+      expect(screen.getByRole('img')).toHaveAttribute('alt', 'alt text');
+    });
+  });
+
+  describe('raw HTML', () => {
+    it('strips script tags', () => {
+      const {container} = render(<Markdown raw="<script>alert(1)</script>hello" />);
+      expect(container.innerHTML).not.toContain('<script');
+      expect(container.innerHTML).toContain('hello');
+    });
+
+    it('strips iframe tags', () => {
+      const {container} = render(
+        <Markdown raw='<iframe src="https://evil.com"></iframe>' />
+      );
+      expect(container.innerHTML).not.toContain('<iframe');
+    });
+
+    it('strips form elements', () => {
+      const {container} = render(
+        <Markdown raw='<form action="/evil"><input><button>click</button></form>' />
+      );
+      expect(container.innerHTML).not.toContain('<form');
+      expect(container.innerHTML).not.toContain('<input');
+      expect(container.innerHTML).not.toContain('<button');
+    });
+
+    it('strips event handler attributes', () => {
+      const {container} = render(<Markdown raw='<div onclick="alert(1)">text</div>' />);
+      expect(container.innerHTML).not.toContain('onclick');
+    });
+
+    it('preserves safe inline HTML like sub and sup', () => {
+      render(<Markdown raw="H<sub>2</sub>O and x<sup>2</sup>" />);
+      // The full text should render with the sub/sup elements
+      expect(screen.getByText(/H.*O and x/)).toBeInTheDocument();
+    });
+  });
+
+  describe('component overrides', () => {
+    it('hands a Table override the parsed columns, header, and rows', () => {
+      render(
+        <Markdown
+          raw={'| Name | Count |\n| --- | ---: |\n| **alpha** | 1 |\n| beta | 2 |'}
+          components={{
+            Table: ({columns, header, rows}) => (
+              <div
+                data-test-id="custom-table"
+                data-aligns={columns.map(column => column.align ?? 'none').join(',')}
+              >
+                <div role="row">
+                  {header.map((cell, index) => (
+                    <span key={index} role="columnheader">
+                      {cell}
+                    </span>
+                  ))}
+                </div>
+                {rows.map((row, rowIndex) => (
+                  <div key={rowIndex} role="row">
+                    {row.map((cell, cellIndex) => (
+                      <span key={cellIndex} role="cell">
+                        {cell}
+                      </span>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            ),
+          }}
+        />
+      );
+
+      expect(screen.getByTestId('custom-table')).toHaveAttribute(
+        'data-aligns',
+        'none,right'
+      );
+      expect(screen.getAllByRole('columnheader').map(cell => cell.textContent)).toEqual([
+        'Name',
+        'Count',
+      ]);
+
+      const [, firstRow, secondRow] = screen.getAllByRole('row');
+      // Cells arrive rendered, inline Markdown included.
+      expect(within(firstRow!).getByText('alpha').tagName).toBe('STRONG');
+      expect(
+        within(secondRow!)
+          .getAllByRole('cell')
+          .map(cell => cell.textContent)
+      ).toEqual(['beta', '2']);
+    });
+
+    it('overrides Paragraph component', () => {
+      render(
+        <Markdown
+          raw="Hello"
+          components={{
+            Paragraph: ({children}) => <div data-test-id="custom-p">{children}</div>,
+          }}
+        />
+      );
+      expect(screen.getByTestId('custom-p')).toHaveTextContent('Hello');
+    });
+
+    it('overrides Heading component', () => {
+      render(
+        <Markdown
+          raw="# Title"
+          components={{
+            Heading: ({children, level}) => (
+              <div data-test-id="custom-heading" data-level={level}>
+                {children}
+              </div>
+            ),
+          }}
+        />
+      );
+      const heading = screen.getByTestId('custom-heading');
+      expect(heading).toHaveTextContent('Title');
+      expect(heading).toHaveAttribute('data-level', '1');
+    });
+
+    it('overrides Link component', () => {
+      render(
+        <Markdown
+          raw="[click](https://example.com)"
+          components={{
+            Link: ({href, children}) => (
+              <span data-test-id="custom-link" data-href={href}>
+                {children}
+              </span>
+            ),
+          }}
+        />
+      );
+      const link = screen.getByTestId('custom-link');
+      expect(link).toHaveAttribute('data-href', 'https://example.com');
+      expect(link).toHaveTextContent('click');
+    });
+
+    it('overrides InlineCode component', () => {
+      render(
+        <Markdown
+          raw="Use `foo()` here"
+          components={{
+            InlineCode: ({children}) => (
+              <span data-test-id="custom-code">{children}</span>
+            ),
+          }}
+        />
+      );
+      expect(screen.getByTestId('custom-code')).toHaveTextContent('foo()');
+    });
+
+    it('overrides CodeBlock component', () => {
+      render(
+        <Markdown
+          raw={'```js\nconst x = 1;\n```'}
+          components={{
+            CodeBlock: ({children, lang}) => (
+              <span data-test-id="custom-code" data-lang={lang}>
+                {children}
+              </span>
+            ),
+          }}
+        />
+      );
+      const code = screen.getByTestId('custom-code');
+      expect(code).toHaveTextContent('const x = 1;');
+      expect(code).toHaveAttribute('data-lang', 'js');
+    });
+
+    it('overrides Text component for text transforms', () => {
+      render(
+        <Markdown
+          raw="Issue PROJ-123 is important"
+          components={{
+            Text: ({children}) => {
+              const parts = children.split(/(PROJ-\d+)/);
+              return (
+                <Fragment>
+                  {parts.map((part, i) =>
+                    /PROJ-\d+/.test(part) ? (
+                      <a key={i} href={`/issues/${part}/`}>
+                        {part}
+                      </a>
+                    ) : (
+                      part
+                    )
+                  )}
+                </Fragment>
+              );
+            },
+          }}
+        />
+      );
+      const link = screen.getByRole('link', {name: 'PROJ-123'});
+      expect(link).toHaveAttribute('href', '/issues/PROJ-123/');
+    });
+
+    it('Text override does not apply inside code spans', () => {
+      let textCallCount = 0;
+      render(
+        <Markdown
+          raw="Normal text and `PROJ-123 in code`"
+          components={{
+            Text: ({children}) => {
+              textCallCount++;
+              return <span>{children}</span>;
+            },
+          }}
+        />
+      );
+      // text component should NOT be called for content inside code spans
+      // Code span content goes through the code component, not text
+      expect(screen.getByText('PROJ-123 in code').tagName).toBe('CODE');
+      expect(textCallCount).toBeGreaterThan(0);
+    });
+  });
+
+  describe('safety is non-overridable', () => {
+    it('custom Link never receives unsafe hrefs', () => {
+      const linkFn = jest.fn(({href, children}: any) => (
+        <span data-href={href}>{children}</span>
+      ));
+      render(<Markdown raw="[click](javascript:alert(1))" components={{Link: linkFn}} />);
+      expect(linkFn).not.toHaveBeenCalled();
+      expect(screen.getByText('click')).toBeInTheDocument();
+    });
+
+    it('custom Link receives safe hrefs normally', () => {
+      const linkFn = jest.fn(({href, children}: any) => (
+        <a data-test-id="safe-link" href={href}>
+          {children}
+        </a>
+      ));
+      render(<Markdown raw="[click](https://example.com)" components={{Link: linkFn}} />);
+      expect(linkFn).toHaveBeenCalled();
+      expect(screen.getByTestId('safe-link')).toHaveAttribute(
+        'href',
+        'https://example.com'
+      );
+    });
+
+    it('custom Html receives sanitized content', () => {
+      let receivedHtml: TrustedHTML | undefined;
+      render(
+        <Markdown
+          raw="<script>alert(1)</script>"
+          components={{
+            Html: ({html}) => {
+              receivedHtml = html;
+              return <span data-test-id="custom-html" />;
+            },
+          }}
+        />
+      );
+      expectTypeOf(receivedHtml).toEqualTypeOf<TrustedHTML | undefined>();
+      expect(receivedHtml).not.toContain('<script');
+    });
+
+    it('images are stripped without an explicit Image component', () => {
+      render(<Markdown raw="![alt](https://example.com/img.png)" />);
+      expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('tags', () => {
+    it('echoes the original tag source by default', () => {
+      const raw = '{% ref type="issue" id="PROJ-123" /%}';
+      const {container} = render(<Markdown raw={raw} />);
+      expect(container).toHaveTextContent(raw);
+    });
+
+    it('echoes block tag source including the body by default', () => {
+      const raw =
+        '{% artifact type="root-cause" %}{"description":"Race condition"}{% /artifact %}';
+      const {container} = render(<Markdown raw={raw} />);
+      expect(container).toHaveTextContent(raw);
+    });
+
+    it('renders custom Tag component with attrs', () => {
+      render(
+        <Markdown
+          raw='{% ref type="issue" id="PROJ-123" /%}'
+          components={{
+            Tag: ({attrs}) => <output role="log">{JSON.stringify(attrs)}</output>,
+          }}
+        />
+      );
+      expect(screen.getByRole('log')).toHaveTextContent(
+        '{"type":"issue","id":"PROJ-123"}'
+      );
+    });
+
+    it('passes separate attrs and data for block tags', () => {
+      render(
+        <Markdown
+          raw='{% artifact type="root-cause" %}{"description":"Race condition"}{% /artifact %}'
+          components={{
+            Tag: ({attrs, data}) => (
+              <output role="log">{JSON.stringify({attrs, data})}</output>
+            ),
+          }}
+        />
+      );
+      expect(screen.getByRole('log')).toHaveTextContent(
+        '{"attrs":{"type":"root-cause"},"data":{"description":"Race condition"}}'
+      );
+    });
+
+    it('suppresses partial tag syntax in text while streaming', () => {
+      const {container} = render(
+        <Markdown raw='Some text {% ref type="issue"' variant="streaming" />
+      );
+      expect(container).toHaveTextContent(/Some text/);
+      expect(container).not.toHaveTextContent(/\{%/);
+    });
+
+    it('renders unclosed tag syntax literally in static content', () => {
+      render(<Markdown raw="Seer chat emits {% autofix %} embeds." />);
+      expect(
+        screen.getByText('Seer chat emits {% autofix %} embeds.')
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe('tag index', () => {
+    function IndexProbe({name, index}: {name: string; index?: number}) {
+      return <output role="log">{`${name}=${index}`}</output>;
+    }
+
+    const indexes = () => screen.getAllByRole('log').map(el => el.textContent);
+
+    it('numbers tags in document order across blocks', () => {
+      render(
+        <Markdown
+          raw={'{% a /%}\n\n## Heading\n\n{% b /%}\n\n{% c /%}'}
+          components={{Tag: IndexProbe}}
+        />
+      );
+      expect(indexes()).toEqual(['a=0', 'b=1', 'c=2']);
+    });
+
+    it('numbers two inline tags in the same paragraph separately', () => {
+      render(
+        <Markdown
+          raw="See {% a /%} and also {% b /%} here"
+          components={{Tag: IndexProbe}}
+        />
+      );
+      expect(indexes()).toEqual(['a=0', 'b=1']);
+    });
+
+    it('numbers identical tags separately', () => {
+      render(
+        <Markdown
+          raw={'{% a %}{"id":"1"}{% /a %}\n\n{% a %}{"id":"1"}{% /a %}'}
+          components={{Tag: IndexProbe}}
+        />
+      );
+      expect(indexes()).toEqual(['a=0', 'a=1']);
+    });
+
+    it('numbers tags nested in lists', () => {
+      render(
+        <Markdown
+          raw={'- first {% a /%}\n- second {% b /%}'}
+          components={{Tag: IndexProbe}}
+        />
+      );
+      expect(indexes()).toEqual(['a=0', 'b=1']);
+    });
+
+    it('numbers tags in table headers before table rows', () => {
+      render(
+        <Markdown
+          raw={'| {% a /%} |\n| --- |\n| {% b /%} |'}
+          components={{Tag: IndexProbe}}
+        />
+      );
+      expect(indexes()).toEqual(['a=0', 'b=1']);
+    });
+
+    it('keeps existing indexes when content is appended', () => {
+      const {rerender} = render(
+        <Markdown raw="Start {% a /%}" components={{Tag: IndexProbe}} />
+      );
+      expect(indexes()).toEqual(['a=0']);
+
+      rerender(
+        <Markdown raw="Start {% a /%} then {% b /%}" components={{Tag: IndexProbe}} />
+      );
+      expect(indexes()).toEqual(['a=0', 'b=1']);
+    });
+
+    it('does not count a tag whose closing marker has not arrived', () => {
+      const {rerender} = render(
+        <Markdown raw='{% a /%} then {% b %}{"id"' components={{Tag: IndexProbe}} />
+      );
+      expect(indexes()).toEqual(['a=0']);
+
+      rerender(
+        <Markdown
+          raw='{% a /%} then {% b %}{"id":"1"}{% /b %}'
+          components={{Tag: IndexProbe}}
+        />
+      );
+      expect(indexes()).toEqual(['a=0', 'b=1']);
+    });
+  });
+
+  describe('token caching', () => {
+    it('renders correctly when raw prop changes', () => {
+      const {rerender} = render(<Markdown raw="First" />);
+      expect(screen.getByText('First')).toBeInTheDocument();
+
+      rerender(<Markdown raw="Second" />);
+      expect(screen.getByText('Second')).toBeInTheDocument();
+      expect(screen.queryByText('First')).not.toBeInTheDocument();
+    });
+
+    it('renders correctly when content is appended', () => {
+      const {rerender} = render(<Markdown raw="Paragraph one" />);
+      expect(screen.getByText('Paragraph one')).toBeInTheDocument();
+
+      rerender(<Markdown raw={'Paragraph one\n\nParagraph two'} />);
+      expect(screen.getByText('Paragraph one')).toBeInTheDocument();
+      expect(screen.getByText('Paragraph two')).toBeInTheDocument();
+    });
+  });
+});

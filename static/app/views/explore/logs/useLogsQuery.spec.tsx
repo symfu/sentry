@@ -1,0 +1,1468 @@
+import {QueryClientProvider, type InfiniteData} from '@tanstack/react-query';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {PageFiltersFixture} from 'sentry-fixture/pageFilters';
+
+import {makeTestQueryClient} from 'sentry-test/queryClient';
+import {act, renderHookWithProviders, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import type {Organization} from 'sentry/types/organization';
+import {LogsAnalyticsPageSource} from 'sentry/utils/analytics/logsAnalyticsEvent';
+import type {ApiResponse} from 'sentry/utils/api/apiFetch';
+import {safeParseQueryKey} from 'sentry/utils/api/apiQueryKey';
+import {
+  LOGS_AUTO_REFRESH_KEY,
+  LOGS_REFRESH_INTERVAL_KEY,
+} from 'sentry/views/explore/contexts/logs/logsAutoRefreshContext';
+import {LOGS_SORT_BYS_KEY} from 'sentry/views/explore/contexts/logs/sortBys';
+import {SAMPLING_MODE} from 'sentry/views/explore/hooks/useProgressiveQuery';
+import type {LogsFrozenContextProviderProps} from 'sentry/views/explore/logs/logsFrozenContext';
+import type {LogPageParam} from 'sentry/views/explore/logs/logsInfinitePageParams';
+import {LogsQueryParamsProvider} from 'sentry/views/explore/logs/logsQueryParamsProvider';
+import type {
+  EventsLogsResult,
+  OurLogsResponseItem,
+} from 'sentry/views/explore/logs/types';
+import {OurLogKnownFieldKey} from 'sentry/views/explore/logs/types';
+import {useInfiniteLogsQuery} from 'sentry/views/explore/logs/useLogsQuery';
+
+type CachedQueryData = InfiniteData<ApiResponse<EventsLogsResult>, LogPageParam>;
+
+const linkHeaders = {
+  Link: '<http://127.0.0.1:8000/api/0/organizations/org-slug/teams/?cursor=0:0:1>; rel="previous"; results="false"; cursor="0:0:1", <http://127.0.0.1:8000/api/0/organizations/org-slug/teams/?cursor=0:100:0>; rel="next"; results="true"; cursor="0:100:0"',
+};
+
+describe('useInfiniteLogsQuery', () => {
+  const organization = OrganizationFixture();
+  const queryClient = makeTestQueryClient();
+
+  function createWrapper() {
+    return function ({children}: {children?: React.ReactNode}) {
+      return (
+        <QueryClientProvider client={queryClient}>
+          <LogsQueryParamsProvider
+            analyticsPageSource={LogsAnalyticsPageSource.EXPLORE_LOGS}
+            source="location"
+          >
+            {children}
+          </LogsQueryParamsProvider>
+        </QueryClientProvider>
+      );
+    };
+  }
+
+  let mockNow: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    mockNow = jest.spyOn(Date, 'now');
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(PageFiltersFixture());
+    queryClient.clear();
+  });
+
+  afterEach(() => {
+    mockNow.mockRestore();
+    PageFiltersStore.reset();
+  });
+
+  it('should not fetch logs when disabled', () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: createMockLogsData([{id: '1', timestamp_precise: '100', timestamp: '100'}]),
+      headers: linkHeaders,
+    });
+
+    const {result} = renderHookWithProviders(
+      ({disabled}) => useInfiniteLogsQuery({disabled}),
+      {
+        additionalWrapper: createWrapper(),
+        initialProps: {disabled: true},
+        organization,
+      }
+    );
+
+    expect(result.current.isPending).toBe(true);
+    expect(result.current.data).toHaveLength(0);
+  });
+
+  it('keeps the surviving row paired with its page hint across pagination and refresh', async () => {
+    const first = createMockLogsData([
+      {id: '3', timestamp_precise: '300', timestamp: '300'},
+      {id: '2', timestamp_precise: '200', timestamp: '200'},
+    ]);
+    const second = createMockLogsData([
+      {id: '2', timestamp_precise: '200', timestamp: '200'},
+      {id: '1', timestamp_precise: '100', timestamp: '100'},
+    ]);
+    first.meta!.routingHint = 'first-page';
+    second.meta!.routingHint = 'second-page';
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: first,
+      headers: linkHeaders,
+    });
+    const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      organization,
+      additionalWrapper: createWrapper(),
+    });
+    await waitFor(() => expect(result.current.data).toHaveLength(2));
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: second,
+      headers: linkHeaders,
+    });
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.data).toHaveLength(3));
+    const hints = () =>
+      result.current.data.map(row => [row.id, result.current.routingHintsByRow.get(row)]);
+    expect(hints()).toEqual([
+      ['3', 'first-page'],
+      ['2', 'first-page'],
+      ['1', 'second-page'],
+    ]);
+
+    // Replace responses without changing row values or the number of pages.
+    act(() => {
+      queryClient.setQueryData(result.current.queryKey, previous => {
+        if (!previous) {
+          throw new Error('Expected cached log pages');
+        }
+        return {
+          ...previous,
+          pages: previous.pages.map((page, index) => ({
+            ...page,
+            json: {
+              ...page.json,
+              meta: {
+                ...page.json.meta!,
+                routingHint: index === 0 ? 'refreshed-page' : undefined,
+              },
+            },
+          })),
+        };
+      });
+    });
+    await waitFor(() =>
+      expect(hints()).toEqual([
+        ['3', 'refreshed-page'],
+        ['2', 'refreshed-page'],
+        ['1', undefined],
+      ])
+    );
+    expect(result.current.data.every(row => !('routingHint' in row))).toBe(true);
+  });
+
+  it('reads the routing hint from trace log responses', async () => {
+    const body = createMockLogsData([
+      {id: '1', timestamp_precise: '100', timestamp: '100'},
+    ]);
+    body.meta!.routingHint = 'trace-log-hint';
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/trace-logs/`,
+      body,
+    });
+    const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      organization,
+      additionalWrapper: ({children}) => (
+        <LogsQueryParamsProvider
+          analyticsPageSource={LogsAnalyticsPageSource.TRACE_DETAILS}
+          source="state"
+          freeze={{traceId: '00000000000000000000000000000000'}}
+        >
+          {children}
+        </LogsQueryParamsProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.data).toHaveLength(1));
+    expect(result.current.routingHintsByRow.get(result.current.data[0]!)).toBe(
+      'trace-log-hint'
+    );
+  });
+
+  test.each([
+    ['DESC', ['9', '8', '7', '6', '5', '4', '4.1', '3', '2']],
+    ['ASC', ['1', '2', '3', '4', '5', '6', '6.1', '7', '8']],
+  ])('should fetch pages correctly in %s sort order', async (sort, expectedData) => {
+    const mocks =
+      sort === 'DESC'
+        ? createDescendingMocks(organization)
+        : createAscendingMocks(organization);
+
+    const {result, rerender} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      initialRouterConfig: {
+        location: {
+          pathname: '/mock-pathname/',
+          query: sort === 'ASC' ? {[LOGS_SORT_BYS_KEY]: 'timestamp'} : {},
+        },
+      },
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    // Initial page.
+    expect(result.current.data).toHaveLength(3);
+
+    expect(mocks.initialMock).toHaveBeenCalled();
+    expect(mocks.previousPageMock).not.toHaveBeenCalled();
+    expect(mocks.nextPageMock).not.toHaveBeenCalled();
+
+    expect(result.current.hasPreviousPage).toBe(true);
+    expect(result.current.hasNextPage).toBe(true);
+
+    await result.current.fetchNextPage();
+
+    expect(mocks.previousPageMock).not.toHaveBeenCalled();
+    expect(mocks.nextPageMock).toHaveBeenCalled();
+
+    const queryCache = queryClient.getQueryCache();
+    const queryKeys = queryCache.getAll().map(query => query.queryKey);
+    const infiniteQueryKey = queryKeys.find(key => safeParseQueryKey(key)?.isInfinite)!;
+
+    // https://github.com/typescript-eslint/typescript-eslint/issues/10722
+    // eslint-disable-next-line @typescript-eslint/non-nullable-type-assertion-style
+    let cachedData = queryClient.getQueryData(infiniteQueryKey) as CachedQueryData;
+
+    expect(cachedData.pageParams).toHaveLength(2);
+
+    await result.current.fetchPreviousPage();
+
+    expect(mocks.previousPageMock).toHaveBeenCalled();
+
+    cachedData = queryClient.getQueryData(infiniteQueryKey)!;
+
+    expect(cachedData.pageParams).toHaveLength(3);
+
+    // Update hook to show more data.
+    rerender();
+
+    expect(result.current.data).toHaveLength(9);
+    expect(result.current.data.map(datum => datum[OurLogKnownFieldKey.ID])).toEqual(
+      expectedData
+    );
+  });
+
+  it('keeps the first row first when fetching the previous page in ascending sort order', async () => {
+    const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+
+    MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: createMockLogsData([
+        {id: '1', timestamp_precise: '100', timestamp: '100'},
+        {id: '2', timestamp_precise: '200', timestamp: '200'},
+        {id: '3', timestamp_precise: '300', timestamp: '300'},
+      ]),
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.length === 0;
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    const olderRowsMock = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: createMockLogsData([]),
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=100 !${OurLogKnownFieldKey.ID}:1`
+          );
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    const newerRowsMock = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: createMockLogsData([
+        {id: '3', timestamp_precise: '300', timestamp: '300'},
+        {id: '2', timestamp_precise: '200', timestamp: '200'},
+      ]),
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=100 !${OurLogKnownFieldKey.ID}:1`
+          );
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    const {result, rerender} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      initialRouterConfig: {
+        location: {
+          pathname: '/mock-pathname/',
+          query: {[LOGS_SORT_BYS_KEY]: 'timestamp'},
+        },
+      },
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    await result.current.fetchPreviousPage();
+    rerender();
+
+    expect(olderRowsMock).toHaveBeenCalled();
+    expect(newerRowsMock).not.toHaveBeenCalled();
+    expect(result.current.data.map(datum => datum[OurLogKnownFieldKey.ID])).toEqual([
+      '1',
+      '2',
+      '3',
+    ]);
+  });
+
+  it('should remove empty pages but maintain hasNextPage', async () => {
+    const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+
+    const initialResponse = createMockLogsData([
+      {id: '6', timestamp_precise: '600', timestamp: '600'},
+      {id: '5', timestamp_precise: '500', timestamp: '500'},
+      {id: '4', timestamp_precise: '400', timestamp: '400'},
+    ]);
+
+    const initialMock = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: initialResponse,
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.length === 0;
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    const emptyNextPageResponse = createMockLogsData([]);
+
+    const nextPageMock = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return (
+            query.query.startsWith(
+              `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=400 !${OurLogKnownFieldKey.ID}:4`
+            ) && query.sort === '-timestamp'
+          );
+        },
+      ],
+      body: emptyNextPageResponse,
+      headers: linkHeaders,
+    });
+
+    const {result, rerender} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    expect(result.current.data).toHaveLength(3);
+    expect(initialMock).toHaveBeenCalled();
+    expect(nextPageMock).not.toHaveBeenCalled();
+    expect(result.current.hasNextPage).toBe(true);
+
+    await result.current.fetchNextPage();
+    expect(nextPageMock).toHaveBeenCalledTimes(1);
+
+    const queryCache = queryClient.getQueryCache();
+    const queryKeys = queryCache.getAll().map(query => query.queryKey);
+    const infiniteQueryKey = queryKeys.find(key => safeParseQueryKey(key)?.isInfinite)!;
+
+    // https://github.com/typescript-eslint/typescript-eslint/issues/10722
+    // eslint-disable-next-line @typescript-eslint/non-nullable-type-assertion-style
+    let cachedData = queryClient.getQueryData(infiniteQueryKey) as CachedQueryData;
+    expect(cachedData.pages).toHaveLength(2);
+    expect(cachedData.pageParams).toHaveLength(2);
+
+    rerender();
+
+    cachedData = queryClient.getQueryData(infiniteQueryKey)!;
+    expect(cachedData.pages).toHaveLength(1); // Only the initial page should remain
+    expect(cachedData.pageParams).toHaveLength(1);
+
+    expect(result.current.hasNextPage).toBe(true);
+
+    await result.current.fetchNextPage();
+
+    expect(nextPageMock).toHaveBeenCalledTimes(2);
+
+    rerender();
+
+    cachedData = queryClient.getQueryData(infiniteQueryKey)!;
+    expect(cachedData.pages).toHaveLength(1);
+    expect(cachedData.pageParams).toHaveLength(1);
+
+    expect(result.current.hasNextPage).toBe(true);
+  });
+
+  it('triggers the high accuracy request when there is no data and a partial scan', async () => {
+    const mockNormalRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [],
+        meta: {
+          dataScanned: 'partial',
+          fields: {},
+        },
+      },
+      method: 'GET',
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          return options.query.sampling === SAMPLING_MODE.NORMAL;
+        },
+      ],
+    });
+
+    const mockHighAccuracyRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [],
+        meta: {
+          dataScanned: 'full',
+          fields: {},
+        },
+      },
+      method: 'GET',
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          return options.query.sampling === SAMPLING_MODE.HIGH_ACCURACY;
+        },
+      ],
+    });
+
+    renderHookWithProviders(() => useInfiniteLogsQuery({}), {
+      additionalWrapper: createWrapper(),
+    });
+
+    expect(mockNormalRequest).toHaveBeenCalledTimes(1);
+    expect(mockNormalRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events/',
+      expect.objectContaining({
+        query: expect.objectContaining({
+          dataset: 'ourlogs',
+          sampling: SAMPLING_MODE.NORMAL,
+        }),
+      })
+    );
+
+    await waitFor(() => expect(mockHighAccuracyRequest).toHaveBeenCalledTimes(1));
+    expect(mockHighAccuracyRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events/',
+      expect.objectContaining({
+        query: expect.objectContaining({
+          dataset: 'ourlogs',
+          sampling: SAMPLING_MODE.HIGH_ACCURACY,
+        }),
+      })
+    );
+  });
+
+  it('passes highFidelity in the request data so the cache key reflects the mode', async () => {
+    const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+    const mockRequest = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: createMockLogsData([{id: '1', timestamp_precise: '100', timestamp: '100'}]),
+      headers: linkHeaders,
+    });
+
+    renderHookWithProviders(() => useInfiniteLogsQuery({highFidelity: true}), {
+      additionalWrapper: createWrapper(),
+      organization,
+    });
+
+    await waitFor(() => expect(mockRequest).toHaveBeenCalled());
+    expect(mockRequest).toHaveBeenCalledWith(
+      eventsEndpoint,
+      expect.objectContaining({data: {highFidelity: true}})
+    );
+  });
+
+  describe('anchoring', () => {
+    const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+    const anchorRow = {id: '5', timestamp_precise: '5000', timestamp: '5000'};
+
+    function mockBaseRows() {
+      return MockApiClient.addMockResponse({
+        url: eventsEndpoint,
+        body: createMockLogsData([
+          {id: '9', timestamp_precise: '9000', timestamp: '9000'},
+          {id: '8', timestamp_precise: '8000', timestamp: '8000'},
+        ]),
+        match: [
+          (_, options) =>
+            options?.query?.sampling === SAMPLING_MODE.NORMAL &&
+            options.query.query.length === 0,
+        ],
+        headers: linkHeaders,
+      });
+    }
+
+    function mockAnchoredRows(
+      filter: string,
+      rows: Parameters<typeof createMockLogsData>[0]
+    ) {
+      return MockApiClient.addMockResponse({
+        url: eventsEndpoint,
+        body: createMockLogsData(rows),
+        match: [
+          (_, options) =>
+            options?.query?.sampling === SAMPLING_MODE.HIGH_ACCURACY &&
+            options.query.query === filter,
+        ],
+        headers: linkHeaders,
+      });
+    }
+
+    it('loads rows on both sides of the anchored log when anchoring in descending order', async () => {
+      mockBaseRows();
+      const beforeMock = mockAnchoredRows(
+        `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=5256`,
+        [
+          {id: '6', timestamp_precise: '6000', timestamp: '6000'},
+          {id: '7', timestamp_precise: '7000', timestamp: '7000'},
+        ]
+      );
+      const afterMock = mockAnchoredRows(
+        `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=5256`,
+        [anchorRow, {id: '4', timestamp_precise: '4000', timestamp: '4000'}]
+      );
+
+      const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createWrapper(),
+        organization,
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(2));
+
+      act(() => {
+        result.current.anchorToLog(createMockLogsData([anchorRow]).data[0]!);
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(4));
+
+      expect(beforeMock).toHaveBeenCalledTimes(1);
+      expect(afterMock).toHaveBeenCalledTimes(1);
+      expect(result.current.anchor?.id).toBe('5');
+      expect(result.current.data.map(row => row[OurLogKnownFieldKey.ID])).toEqual([
+        '7',
+        '6',
+        '5',
+        '4',
+      ]);
+    });
+
+    it('loads rows on both sides of the anchored log when anchoring in ascending order', async () => {
+      mockBaseRows();
+      const beforeMock = mockAnchoredRows(
+        `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=4744`,
+        [
+          {id: '4', timestamp_precise: '4000', timestamp: '4000'},
+          {id: '3', timestamp_precise: '3000', timestamp: '3000'},
+        ]
+      );
+      const afterMock = mockAnchoredRows(
+        `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=4744`,
+        [anchorRow, {id: '6', timestamp_precise: '6000', timestamp: '6000'}]
+      );
+
+      const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createWrapper(),
+        initialRouterConfig: {
+          location: {
+            pathname: '/mock-pathname/',
+            query: {[LOGS_SORT_BYS_KEY]: 'timestamp'},
+          },
+        },
+        organization,
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(2));
+
+      act(() => {
+        result.current.anchorToLog(createMockLogsData([anchorRow]).data[0]!);
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(4));
+
+      expect(beforeMock).toHaveBeenCalledTimes(1);
+      expect(afterMock).toHaveBeenCalledTimes(1);
+      expect(result.current.data.map(row => row[OurLogKnownFieldKey.ID])).toEqual([
+        '3',
+        '4',
+        '5',
+        '6',
+      ]);
+    });
+
+    it('returns to the unanchored rows when the anchor is cleared', async () => {
+      mockBaseRows();
+      mockAnchoredRows(`${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=5256`, []);
+      mockAnchoredRows(`${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=5256`, [anchorRow]);
+
+      const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createWrapper(),
+        organization,
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(2));
+      act(() => {
+        result.current.anchorToLog(createMockLogsData([anchorRow]).data[0]!);
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(1));
+
+      act(() => {
+        result.current.clearAnchor();
+      });
+
+      expect(result.current.anchor).toBeUndefined();
+      expect(result.current.data.map(row => row[OurLogKnownFieldKey.ID])).toEqual([
+        '9',
+        '8',
+      ]);
+    });
+
+    it('keeps the anchor dropped after auto-refresh is enabled and then turned off', async () => {
+      MockApiClient.addMockResponse({
+        url: eventsEndpoint,
+        body: createMockLogsData([]),
+        headers: linkHeaders,
+      });
+      mockBaseRows();
+      mockAnchoredRows(`${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=5256`, []);
+      mockAnchoredRows(`${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=5256`, [anchorRow]);
+
+      const {result, router} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createWrapper(),
+        initialRouterConfig: {location: {pathname: '/mock-pathname/', query: {}}},
+        organization,
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(2));
+      act(() => {
+        result.current.anchorToLog(createMockLogsData([anchorRow]).data[0]!);
+      });
+      await waitFor(() => expect(result.current.anchor?.id).toBe('5'));
+
+      act(() => {
+        router.navigate(`/mock-pathname/?${LOGS_AUTO_REFRESH_KEY}=enabled`);
+      });
+      await waitFor(() => expect(result.current.anchor).toBeUndefined());
+      act(() => {
+        router.navigate(`/mock-pathname/?${LOGS_AUTO_REFRESH_KEY}=paused`);
+      });
+
+      await waitFor(() => expect(result.current.isPending).toBe(false));
+      expect(result.current.anchor).toBeUndefined();
+    });
+  });
+
+  describe('frozen to a trace', () => {
+    const traceId = 'a'.repeat(32);
+    const traceLogsEndpoint = `/organizations/${organization.slug}/trace-logs/`;
+
+    function mockTraceLogsRequest() {
+      return MockApiClient.addMockResponse({
+        url: traceLogsEndpoint,
+        body: createMockLogsData([{id: '1', timestamp_precise: '100', timestamp: '100'}]),
+        headers: linkHeaders,
+      });
+    }
+
+    function createTraceWrapper(freeze: LogsFrozenContextProviderProps) {
+      return function ({children}: {children?: React.ReactNode}) {
+        return (
+          <QueryClientProvider client={queryClient}>
+            <LogsQueryParamsProvider
+              analyticsPageSource={LogsAnalyticsPageSource.TRACE_DETAILS}
+              source="location"
+              freeze={freeze}
+            >
+              {children}
+            </LogsQueryParamsProvider>
+          </QueryClientProvider>
+        );
+      };
+    }
+
+    beforeEach(() => {
+      PageFiltersStore.onInitializeUrlState(
+        PageFiltersFixture({
+          datetime: {
+            start: '2025-04-03T00:00:00',
+            end: '2025-04-03T00:10:00',
+            period: null,
+            utc: null,
+          },
+        })
+      );
+    });
+
+    it('queries as far back as logs go, narrowed by the trace timestamp', async () => {
+      const mockRequest = mockTraceLogsRequest();
+
+      renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createTraceWrapper({traceId, traceTimestamp: 1743695410}),
+        organization,
+      });
+
+      await waitFor(() => expect(mockRequest).toHaveBeenCalled());
+      expect(mockRequest).toHaveBeenCalledWith(
+        traceLogsEndpoint,
+        expect.objectContaining({
+          query: expect.objectContaining({
+            statsPeriod: '30d',
+            timestamp: 1743695410,
+            traceId: [traceId],
+          }),
+        })
+      );
+    });
+
+    it('keeps the selected range when there is no trace timestamp to narrow by', async () => {
+      const mockRequest = mockTraceLogsRequest();
+
+      renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createTraceWrapper({traceId}),
+        organization,
+      });
+
+      await waitFor(() => expect(mockRequest).toHaveBeenCalled());
+      expect(mockRequest).toHaveBeenCalledWith(
+        traceLogsEndpoint,
+        expect.objectContaining({
+          query: expect.objectContaining({
+            start: '2025-04-03T00:00:00.000',
+            end: '2025-04-03T00:10:00.000',
+          }),
+        })
+      );
+    });
+
+    it('matches both span id attributes when frozen to a span', async () => {
+      const mockRequest = mockTraceLogsRequest();
+      const spanId = 'b'.repeat(16);
+
+      renderHookWithProviders(() => useInfiniteLogsQuery(), {
+        additionalWrapper: createTraceWrapper({span: {traceId, spanId}}),
+        organization,
+      });
+
+      await waitFor(() => expect(mockRequest).toHaveBeenCalled());
+      expect(mockRequest).toHaveBeenCalledWith(
+        traceLogsEndpoint,
+        expect.objectContaining({
+          query: expect.objectContaining({
+            query: `trace:${traceId} ( span_id:${spanId} OR trace.parent_span_id:${spanId} )`,
+          }),
+        })
+      );
+    });
+  });
+
+  describe('high fidelity', () => {
+    function makeLinkHeader(cursor: string, hasNext = true) {
+      const url =
+        'https://sentry.io/api/0/organizations/org-slug/events/?caseInsensitive=&dataset=ourlogs&field=id&field=project.id&field=trace&field=severity_number&field=severity&field=timestamp&field=timestamp_precise&field=message.template&field=message&orderby=-timestamp&per_page=1000&query=&referrer=api.explore.logs-table&sampling=HIGHEST_ACCURACY_FLEX_TIME&sort=-timestamp&statsPeriod=1h&highFidelity=true';
+      return [
+        [
+          `<${url}&cursor=:0:1>`,
+          'rel="previous"',
+          'results="false"',
+          'cursor=":0:1"',
+        ].join('; '),
+        [
+          `<${url}&cursor=${cursor}:0:0>`,
+          'rel="next"',
+          `results="${hasNext ? 'true' : 'false'}"`,
+          `cursor="${cursor}:0:1"`,
+        ].join('; '),
+      ].join(', ');
+    }
+
+    function makeMockEventsResponse({
+      cursor,
+      nextCursor,
+      data = [],
+      hasNext,
+    }: {
+      cursor: string;
+      nextCursor: string;
+      data?: any[];
+      hasNext?: boolean;
+    }) {
+      return {
+        url: '/organizations/org-slug/events/',
+        headers: {
+          Link: makeLinkHeader(nextCursor, hasNext),
+        },
+        body: {
+          data,
+          meta: {
+            dataScanned: 'full',
+            fields: {},
+          },
+        },
+        match: [
+          function (_url: string, options: Record<string, any>) {
+            return (
+              options.query.sampling === SAMPLING_MODE.FLEX_TIME &&
+              (options.query.cursor || '') === (cursor ? `${cursor}:0:1` : '')
+            );
+          },
+        ],
+      };
+    }
+
+    it('auto fetches empty pages while within the budget and stops when the server has no more', async () => {
+      const mockFlextTimeRequests = [
+        makeMockEventsResponse({cursor: '', nextCursor: 'page2'}),
+        makeMockEventsResponse({cursor: 'page2', nextCursor: 'page3'}),
+        makeMockEventsResponse({cursor: 'page3', nextCursor: 'page4', hasNext: false}),
+        makeMockEventsResponse({cursor: 'page4', nextCursor: 'page5', hasNext: false}),
+      ].map(response => MockApiClient.addMockResponse(response));
+
+      const {result} = renderHookWithProviders(
+        () => useInfiniteLogsQuery({highFidelity: true}),
+        {
+          additionalWrapper: createWrapper(),
+        }
+      );
+
+      // Within the default 15s budget the loop drains through all pages that
+      // advertise a next link, including the one whose response flips
+      // hasNext=false.
+      await waitFor(() => expect(mockFlextTimeRequests[0]).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(mockFlextTimeRequests[1]).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(mockFlextTimeRequests[2]).toHaveBeenCalledTimes(1));
+
+      // The next link on mock[2] reports results=false, so auto-fetch stops.
+      expect(result.current.canResumeAutoFetch).toBe(false);
+      await waitFor(() => expect(mockFlextTimeRequests[3]).not.toHaveBeenCalled());
+    });
+
+    function mockNowAdvancingBy(ms: number) {
+      let now = 0;
+      mockNow.mockImplementation(() => {
+        const current = now;
+        now += ms;
+        return current;
+      });
+    }
+
+    function mockEmptyFlexTimePages() {
+      return [
+        makeMockEventsResponse({cursor: '', nextCursor: 'page2'}),
+        makeMockEventsResponse({cursor: 'page2', nextCursor: 'page3'}),
+        makeMockEventsResponse({cursor: 'page3', nextCursor: 'page4', hasNext: false}),
+      ].map(response => MockApiClient.addMockResponse(response));
+    }
+
+    async function waitForRequestToSettle(result: {
+      current: ReturnType<typeof useInfiniteLogsQuery>;
+    }) {
+      await waitFor(() => {
+        if (result.current.isPending) {
+          throw new Error('Waiting for request to settle');
+        }
+      });
+    }
+
+    it('stops auto-fetching once the initial wall-clock budget expires at 15000ms', async () => {
+      mockNowAdvancingBy(15_000);
+      const mockFlextTimeRequests = [
+        makeMockEventsResponse({cursor: '', nextCursor: 'page2'}),
+        makeMockEventsResponse({cursor: 'page2', nextCursor: 'page3'}),
+        makeMockEventsResponse({cursor: 'page3', nextCursor: 'page4', hasNext: false}),
+      ].map(response => MockApiClient.addMockResponse(response));
+
+      const {result} = renderHookWithProviders(
+        () => useInfiniteLogsQuery({highFidelity: true}),
+        {
+          additionalWrapper: createWrapper(),
+        }
+      );
+
+      await waitForRequestToSettle(result);
+
+      expect(mockFlextTimeRequests[1]).not.toHaveBeenCalled();
+
+      // allowed to resume autofetching because the row limit has not been reached
+      expect(result.current.canResumeAutoFetch).toBe(true);
+    });
+
+    it('stops auto-fetching once the one-click resumed wall-clock budget expires at 30000ms', async () => {
+      mockNowAdvancingBy(15_000);
+      const mockFlextTimeRequests = mockEmptyFlexTimePages();
+
+      const {result} = renderHookWithProviders(
+        () => useInfiniteLogsQuery({highFidelity: true}),
+        {
+          additionalWrapper: createWrapper(),
+        }
+      );
+
+      await waitForRequestToSettle(result);
+
+      mockNowAdvancingBy(30_000);
+      act(() => result.current.resumeAutoFetch());
+
+      await waitForRequestToSettle(result);
+      expect(mockFlextTimeRequests[1]).not.toHaveBeenCalled();
+      expect(result.current.canResumeAutoFetch).toBe(true);
+    });
+
+    it('stops auto-fetching once the two-click resumed wall-clock budget expires at 60000ms', async () => {
+      mockNowAdvancingBy(15_000);
+      const mockFlextTimeRequests = mockEmptyFlexTimePages();
+
+      const {result} = renderHookWithProviders(
+        () => useInfiniteLogsQuery({highFidelity: true}),
+        {
+          additionalWrapper: createWrapper(),
+        }
+      );
+
+      await waitForRequestToSettle(result);
+
+      mockNowAdvancingBy(30_000);
+      act(() => result.current.resumeAutoFetch());
+
+      await waitForRequestToSettle(result);
+
+      mockNowAdvancingBy(60_000);
+      act(() => result.current.resumeAutoFetch());
+
+      await waitForRequestToSettle(result);
+      expect(mockFlextTimeRequests[1]).not.toHaveBeenCalled();
+      expect(result.current.canResumeAutoFetch).toBe(true);
+    });
+
+    it('stops auto-fetching once the three-click resumed wall-clock budget expires at 90000ms', async () => {
+      mockNowAdvancingBy(15_000);
+      const mockFlextTimeRequests = mockEmptyFlexTimePages();
+
+      const {result} = renderHookWithProviders(
+        () => useInfiniteLogsQuery({highFidelity: true}),
+        {
+          additionalWrapper: createWrapper(),
+        }
+      );
+
+      await waitForRequestToSettle(result);
+
+      mockNowAdvancingBy(30_000);
+      act(() => result.current.resumeAutoFetch());
+
+      await waitForRequestToSettle(result);
+
+      mockNowAdvancingBy(60_000);
+      act(() => result.current.resumeAutoFetch());
+
+      await waitForRequestToSettle(result);
+
+      mockNowAdvancingBy(90_000);
+      act(() => result.current.resumeAutoFetch());
+
+      await waitForRequestToSettle(result);
+      expect(mockFlextTimeRequests[1]).not.toHaveBeenCalled();
+      expect(result.current.canResumeAutoFetch).toBe(true);
+    });
+
+    it('auto fetches until limit', async () => {
+      function fakeRow(index: number) {
+        return {
+          [OurLogKnownFieldKey.ID]: String(index),
+          [OurLogKnownFieldKey.TIMESTAMP_PRECISE]: String(index * 100),
+          [OurLogKnownFieldKey.TIMESTAMP]: String(index * 100),
+        };
+      }
+      const mockFlextTimeRequests = [
+        makeMockEventsResponse({
+          cursor: '',
+          nextCursor: 'page2',
+          data: Array.from({length: 500})
+            .fill(0)
+            .map((_, i) => fakeRow(i)),
+        }),
+        makeMockEventsResponse({
+          cursor: 'page2',
+          nextCursor: 'page3',
+          data: Array.from({length: 500})
+            .fill(0)
+            .map((_, i) => fakeRow(i + 500)),
+        }),
+        makeMockEventsResponse({
+          cursor: 'page3',
+          nextCursor: 'page4',
+          data: Array.from({length: 500})
+            .fill(0)
+            .map((_, i) => fakeRow(i + 1000)),
+        }),
+      ].map(response => MockApiClient.addMockResponse(response));
+
+      const {result} = renderHookWithProviders(
+        () => useInfiniteLogsQuery({highFidelity: true}),
+        {
+          additionalWrapper: createWrapper(),
+        }
+      );
+
+      // the first 2 requests should have been called and stop because it totals 1000 results
+      await waitFor(() => expect(mockFlextTimeRequests[0]).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(mockFlextTimeRequests[1]).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(mockFlextTimeRequests[2]).not.toHaveBeenCalled());
+
+      // should not be allowed to resume autofetching because the row limit is reached
+      expect(result.current.canResumeAutoFetch).toBe(false);
+
+      await result.current.fetchNextPage();
+      await waitFor(() => expect(mockFlextTimeRequests[2]).toHaveBeenCalledTimes(1));
+    });
+  });
+});
+
+function createMockLogsData(
+  rows: Array<{
+    id: string;
+    timestamp: string;
+    timestamp_precise: string;
+  }>
+): EventsLogsResult {
+  return {
+    data: rows.map(row => ({
+      [OurLogKnownFieldKey.ID]: row.id,
+      [OurLogKnownFieldKey.TIMESTAMP_PRECISE]: row.timestamp_precise,
+      [OurLogKnownFieldKey.TIMESTAMP]: row.timestamp,
+    })) as OurLogsResponseItem[],
+    meta: {
+      fields: {
+        [OurLogKnownFieldKey.ID]: {type: 'string'},
+        [OurLogKnownFieldKey.TIMESTAMP_PRECISE]: {type: 'string'},
+        [OurLogKnownFieldKey.TIMESTAMP]: {type: 'date'},
+      } as any,
+      units: {},
+    },
+  };
+}
+
+function createDescendingMocks(organization: Organization) {
+  const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+
+  const initialResponse = createMockLogsData([
+    {id: '6', timestamp_precise: '600', timestamp: '600'},
+    {id: '5', timestamp_precise: '500', timestamp: '500'},
+    {id: '4', timestamp_precise: '400', timestamp: '400'},
+  ]);
+
+  const initialMock = MockApiClient.addMockResponse({
+    url: eventsEndpoint,
+    body: initialResponse,
+    match: [
+      (_, options) => {
+        const query = options?.query || {};
+        return query.query.length === 0;
+      },
+    ],
+    headers: linkHeaders,
+  });
+
+  // Reversed because it's the previous page.
+  const previousPageResponse = createMockLogsData([
+    {id: '7', timestamp_precise: '700', timestamp: '700'},
+    {id: '8', timestamp_precise: '800', timestamp: '800'},
+    {id: '9', timestamp_precise: '900', timestamp: '900'},
+  ]);
+
+  const previousPageMock = MockApiClient.addMockResponse({
+    url: eventsEndpoint,
+    match: [
+      (_, options) => {
+        const query = options?.query || {};
+        return (
+          query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=600 !${OurLogKnownFieldKey.ID}:6`
+          ) && query.sort === 'timestamp' // ASC. Timestamp is aliased to sort both timestamp_precise and timestamp
+        );
+      },
+    ],
+    body: previousPageResponse,
+    headers: linkHeaders,
+  });
+
+  const nextPageResponse = createMockLogsData([
+    {id: '4.1', timestamp_precise: '400', timestamp: '400'},
+    {id: '3', timestamp_precise: '300', timestamp: '300'},
+    {id: '2', timestamp_precise: '200', timestamp: '200'},
+  ]);
+
+  const nextPageMock = MockApiClient.addMockResponse({
+    url: eventsEndpoint,
+    match: [
+      (_, options) => {
+        const query = options?.query || {};
+        return (
+          query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=400 !${OurLogKnownFieldKey.ID}:4`
+          ) && query.sort === '-timestamp' // DESC. Timestamp is aliased to sort both timestamp_precise and timestamp
+        );
+      },
+    ],
+    body: nextPageResponse,
+    headers: linkHeaders,
+  });
+
+  return {
+    initialMock,
+    previousPageMock,
+    nextPageMock,
+  };
+}
+
+function createAscendingMocks(organization: Organization) {
+  const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+
+  const initialResponse = createMockLogsData([
+    {id: '4', timestamp_precise: '400', timestamp: '400'},
+    {id: '5', timestamp_precise: '500', timestamp: '500'},
+    {id: '6', timestamp_precise: '600', timestamp: '600'},
+  ]);
+
+  const initialMock = MockApiClient.addMockResponse({
+    url: eventsEndpoint,
+    body: initialResponse,
+    match: [
+      (_, options) => {
+        const query = options?.query || {};
+        return query.query.length === 0;
+      },
+    ],
+    headers: linkHeaders,
+  });
+
+  // Reversed because it's the previous page.
+  const previousPageResponse = createMockLogsData([
+    {id: '3', timestamp_precise: '300', timestamp: '300'},
+    {id: '2', timestamp_precise: '200', timestamp: '200'},
+    {id: '1', timestamp_precise: '100', timestamp: '100'},
+  ]);
+
+  const previousPageMock = MockApiClient.addMockResponse({
+    url: eventsEndpoint,
+    match: [
+      (_, options) => {
+        const query = options?.query || {};
+        return (
+          query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:<=400 !${OurLogKnownFieldKey.ID}:4`
+          ) && query.sort === '-timestamp' // DESC. Timestamp is aliased to sort both timestamp_precise and timestamp
+        );
+      },
+    ],
+    body: previousPageResponse,
+    headers: linkHeaders,
+  });
+
+  const nextPageResponse = createMockLogsData([
+    {id: '6.1', timestamp_precise: '600', timestamp: '600'},
+    {id: '7', timestamp_precise: '700', timestamp: '700'},
+    {id: '8', timestamp_precise: '800', timestamp: '800'},
+  ]);
+
+  const nextPageMock = MockApiClient.addMockResponse({
+    url: eventsEndpoint,
+    match: [
+      (_, options) => {
+        const query = options?.query || {};
+        return (
+          query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=600 !${OurLogKnownFieldKey.ID}:6`
+          ) && query.sort === 'timestamp' // ASC. Timestamp is aliased to sort both timestamp_precise and timestamp
+        );
+      },
+    ],
+    body: nextPageResponse,
+    headers: linkHeaders,
+  });
+
+  return {
+    initialMock,
+    previousPageMock,
+    nextPageMock,
+  };
+}
+
+// Virtual Streaming Tests
+describe('Virtual Streaming Integration (Auto Refresh Behaviour)', () => {
+  const organization = OrganizationFixture();
+  const queryClient = makeTestQueryClient();
+
+  function createWrapper() {
+    return function ({children}: {children?: React.ReactNode}) {
+      return (
+        <QueryClientProvider client={queryClient}>
+          <LogsQueryParamsProvider
+            analyticsPageSource={LogsAnalyticsPageSource.EXPLORE_LOGS}
+            source="location"
+          >
+            {children}
+          </LogsQueryParamsProvider>
+        </QueryClientProvider>
+      );
+    };
+  }
+
+  let mockNowInner: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+    // jest.resetAllMocks() clears any outer Date.now spy, so we need to re-mock it here
+    // with a realistic timestamp so that initializeVirtualTimestamp computes a sane
+    // targetTimestamp and correctly filters far-future log rows.
+    mockNowInner = jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    MockApiClient.clearMockResponses();
+    queryClient.clear();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(PageFiltersFixture());
+  });
+
+  afterEach(() => {
+    mockNowInner.mockRestore();
+    PageFiltersStore.reset();
+  });
+
+  it('should integrate with virtual streaming when auto refresh is enabled', async () => {
+    const initialResponse = createMockLogsData([
+      {id: '4', timestamp_precise: '2000000000000000000', timestamp: '2000000000000'}, // far future
+      {id: '3', timestamp_precise: '3000000000', timestamp: '3000'}, // newest
+      {id: '2', timestamp_precise: '2000000000', timestamp: '2000'},
+      {id: '1', timestamp_precise: '1000000000', timestamp: '1000'}, // oldest
+    ]);
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: initialResponse,
+      headers: linkHeaders,
+    });
+
+    const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      initialRouterConfig: {
+        location: {
+          pathname: '/mock-pathname/',
+          query: {
+            [LOGS_AUTO_REFRESH_KEY]: 'enabled',
+            [LOGS_REFRESH_INTERVAL_KEY]: '5', // Fast refresh for testing
+          },
+        },
+      },
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    // With auto refresh enabled, virtual streaming should be active
+    // All data should be visible initially since all the mocked timestamps are well behind `now()`
+    await waitFor(() => {
+      expect(result.current.data).toHaveLength(3);
+    });
+  });
+
+  it('should not apply virtual streaming when auto refresh is disabled', async () => {
+    const initialResponse = createMockLogsData([
+      {id: '4', timestamp_precise: '2000000000000000000', timestamp: '2000000000000'}, // far future
+      {id: '3', timestamp_precise: '3000000000', timestamp: '3000'}, // newest
+      {id: '2', timestamp_precise: '2000000000', timestamp: '2000'},
+      {id: '1', timestamp_precise: '1000000000', timestamp: '1000'}, // oldest
+    ]);
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: initialResponse,
+      headers: linkHeaders,
+    });
+
+    const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      initialRouterConfig: {
+        location: {
+          pathname: '/mock-pathname/',
+          query: {
+            [LOGS_AUTO_REFRESH_KEY]: 'idle',
+            [LOGS_REFRESH_INTERVAL_KEY]: '5', // Fast refresh for testing
+          },
+        },
+      },
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    // Without auto refresh, all data should always be visible
+    expect(result.current.data).toHaveLength(4);
+  });
+
+  it('should handle multiple pages with virtual streaming', async () => {
+    const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+
+    // Initial page - newer timestamps (descending order)
+    const initialResponse = createMockLogsData([
+      {id: '6', timestamp_precise: '6000000000', timestamp: '6000'},
+      {id: '5', timestamp_precise: '5000000000', timestamp: '5000'},
+      {id: '4', timestamp_precise: '4000000000', timestamp: '4000'},
+    ]);
+
+    const initialMock = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: initialResponse,
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          // TODO: Fix space in query
+          return query.query === ' timestamp_precise:<=1699999960000000000';
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    // Next page - older timestamps
+    const previousPageResponse = createMockLogsData([
+      {id: '3', timestamp_precise: '3000000000', timestamp: '3000'},
+      {id: '2', timestamp_precise: '2000000000', timestamp: '2000'},
+      {id: '1', timestamp_precise: '1000000000', timestamp: '1000'},
+    ]);
+
+    const previousPageMock = MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.startsWith(
+            `${OurLogKnownFieldKey.TIMESTAMP_PRECISE}:>=6000000000 !${OurLogKnownFieldKey.ID}:6`
+          );
+        },
+      ],
+      body: previousPageResponse,
+      headers: linkHeaders,
+    });
+
+    const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      initialRouterConfig: {
+        location: {
+          pathname: '/mock-pathname/',
+          query: {
+            [LOGS_AUTO_REFRESH_KEY]: 'enabled',
+            [LOGS_REFRESH_INTERVAL_KEY]: '5', // Fast refresh for testing
+          },
+        },
+      },
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    await waitFor(() => {
+      expect(result.current.data).toHaveLength(3);
+    });
+    expect(initialMock).toHaveBeenCalled();
+
+    // Fetch next page
+    await result.current.fetchPreviousPage();
+
+    await waitFor(() => {
+      expect(previousPageMock).toHaveBeenCalled();
+    });
+
+    // Should now have 6 total rows (virtual streaming will filter based on its internal state)
+    expect(result.current.data.length).toBeGreaterThan(0);
+    expect(result.current.data.length).toBeLessThanOrEqual(6);
+  });
+
+  it('should remove duplicate rows based on unique row ID', async () => {
+    const eventsEndpoint = `/organizations/${organization.slug}/events/`;
+
+    // Create pages with overlapping data (same ID)
+    const initialResponse = createMockLogsData([
+      {id: '2', timestamp_precise: '2000000000', timestamp: '2000'},
+      {id: '1', timestamp_precise: '1000000000', timestamp: '1000'},
+    ]);
+
+    const nextPageResponse = createMockLogsData([
+      {id: '3', timestamp_precise: '3000000000', timestamp: '3000'},
+      {id: '2', timestamp_precise: '2000000000', timestamp: '2000'}, // Duplicate
+    ]);
+
+    MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: initialResponse,
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.length === 0;
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    MockApiClient.addMockResponse({
+      url: eventsEndpoint,
+      body: nextPageResponse,
+      match: [
+        (_, options) => {
+          const query = options?.query || {};
+          return query.query.includes('timestamp_precise:<=1000');
+        },
+      ],
+      headers: linkHeaders,
+    });
+
+    const {result} = renderHookWithProviders(() => useInfiniteLogsQuery(), {
+      additionalWrapper: createWrapper(),
+      initialRouterConfig: {
+        location: {
+          pathname: '/mock-pathname/',
+          query: {
+            [LOGS_AUTO_REFRESH_KEY]: 'idle', // Disable auto refresh to avoid virtual streaming filtering
+            [LOGS_REFRESH_INTERVAL_KEY]: '5',
+          },
+        },
+      },
+      organization,
+    });
+
+    await waitFor(() => {
+      expect(result.current.isPending).toBe(false);
+    });
+
+    expect(result.current.data).toHaveLength(2);
+
+    await result.current.fetchNextPage();
+
+    await waitFor(() => {
+      // Should have 3 unique rows, not 4 (duplicate ID '2' should be filtered out)
+      expect(result.current.data).toHaveLength(3);
+    });
+
+    const ids = result.current.data.map(row => row[OurLogKnownFieldKey.ID]);
+    expect(ids).toEqual(['2', '1', '3']);
+  });
+});

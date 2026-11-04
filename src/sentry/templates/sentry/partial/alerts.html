@@ -1,27 +1,5 @@
 {% load sentry_helpers %}
-{% load sentry_assets %}
 
-<div id="blk_alerts" class="messages-container"></div>
-{% script %}
-<script>
-$(function(){
-  ReactDOM.render(React.createFactory(SentryApp.SystemAlerts)({
-     className: "alert-list"
-  }), document.getElementById('blk_alerts'));
-});
-</script>
-{% endscript %}
-
-<div id="blk_indicators"></div>
-{% script %}
-<script>
-$(function(){
-  ReactDOM.render(React.createFactory(SentryApp.Indicators)({
-     className: "indicators-container"
-  }), document.getElementById('blk_indicators'));
-});
-</script>
-{% endscript %}
 {% if messages %}
   <div id="messages" class="messages-container">
     {% for message in messages %}

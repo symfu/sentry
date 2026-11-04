@@ -1,0 +1,328 @@
+import {matchRoutes, type RouteObject} from 'react-router';
+
+import * as constants from 'sentry/constants';
+import {buildRoutes} from 'sentry/router/routes';
+import {replaceRouterParams} from 'sentry/utils/replaceRouterParams';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import {AuthenticatedApiErrorHandler} from 'sentry/views/app/authenticatedApiErrorHandler';
+import type {SettingsBreadcrumb} from 'sentry/views/settings/components/settingsBreadcrumb/types';
+
+// Setup a module mock so that we can replace
+// USING_CUSTOMER_DOMAIN with a getter.
+jest.mock('sentry/constants', () => {
+  const originalModule = jest.requireActual('sentry/constants');
+
+  return {
+    __esModule: true,
+    ...originalModule,
+    get USING_CUSTOMER_DOMAIN() {
+      return false;
+    },
+  };
+});
+
+type RouteMetadata = {
+  leadingPath: string;
+  route: RouteObject;
+};
+
+function extractRoutes(rootRoute: RouteObject[]): Set<string> {
+  const routes = new Set<string>();
+
+  // A queue of routes we need to visit
+  const visitQueue: RouteMetadata[] = [{leadingPath: '', route: rootRoute[0]!}];
+  while (visitQueue.length > 0) {
+    const current = visitQueue.pop();
+    if (!current) {
+      break;
+    }
+    const leading = current.leadingPath;
+
+    const currentPath = `${leading}${current.route.path ?? ''}`.replace('//', '/');
+    if (current.route.children) {
+      for (const childRoute of current.route.children ?? []) {
+        visitQueue.push({
+          leadingPath: currentPath,
+          route: childRoute,
+        });
+      }
+    }
+
+    if (
+      current.route.element &&
+      (
+        current.route.element as React.ReactElement<any, React.NamedExoticComponent>
+      ).type.displayName?.endsWith('Redirect')
+    ) {
+      // Redirect routes are not relevant to us.
+      continue;
+    }
+
+    // We are on a terminal route in the tree. Add to the map of route components.
+    // We are less interested in container route components.
+    if (current.route.element) {
+      routes.add(currentPath);
+    }
+  }
+
+  return routes;
+}
+
+/**
+ * Returns the paths of all matched route segments for a given URL.
+ */
+function getMatchedPaths(routes: RouteObject[], url: string): string[] {
+  const matches = matchRoutes(routes, url);
+  if (!matches) {
+    return [];
+  }
+  return matches.map(m => m.route.path ?? '(layout)');
+}
+
+/**
+ * Resolves the URL a redirect route sends the user to, the same way the
+ * `Redirect` element does at runtime.
+ */
+function getRedirectTarget(routes: RouteObject[], url: string): string | undefined {
+  const matches = matchRoutes(routes, url);
+  const match = matches?.at(-1);
+  const to = (match?.route.element as React.ReactElement<{to?: string}> | undefined)
+    ?.props.to;
+
+  return to === undefined ? undefined : replaceRouterParams(to, match!.params);
+}
+
+describe('buildRoutes()', () => {
+  it.each([false, true])(
+    'composes settings breadcrumbs from matched routes (customer domain: %s)',
+    customerDomain => {
+      jest
+        .spyOn(constants, 'USING_CUSTOMER_DOMAIN', 'get')
+        .mockReturnValue(customerDomain);
+      const routeTree = buildRoutes();
+      const prefix = customerDomain ? '/settings/' : '/settings/org-slug/';
+      const cases: Array<[string, SettingsBreadcrumb[]]> = [
+        [
+          'members/member-1/',
+          [
+            {type: 'link', label: 'Settings', to: '/settings/'},
+            {type: 'link', label: 'Members', to: '/settings/:orgId/members/'},
+          ],
+        ],
+        [
+          'projects/javascript/keys/key-1/',
+          [
+            {type: 'link', label: 'Settings', to: '/settings/'},
+            {
+              type: 'project',
+              to: '/settings/:orgId/projects/:projectId/',
+            },
+            {
+              type: 'link',
+              label: 'Client Keys',
+              to: '/settings/:orgId/projects/:projectId/keys/',
+            },
+          ],
+        ],
+        [
+          'teams/frontend/notifications/',
+          [
+            {type: 'link', label: 'Settings', to: '/settings/'},
+            {type: 'link', label: 'Teams', to: '/settings/:orgId/teams/'},
+            {
+              type: 'team',
+              to: '/settings/:orgId/teams/:teamId/',
+              switchTo: '/settings/:orgId/teams/:teamId/notifications/',
+            },
+          ],
+        ],
+        [
+          'integrations/github/1/',
+          [
+            {type: 'link', label: 'Settings', to: '/settings/'},
+            {type: 'link', label: 'Integrations', to: '/settings/:orgId/integrations/'},
+            {
+              type: 'integration',
+              to: '/settings/:orgId/integrations/:providerKey/',
+              switchTo: '/settings/:orgId/integrations/:providerKey/',
+            },
+          ],
+        ],
+        [
+          'document-integrations/docs-app/',
+          [
+            {type: 'link', label: 'Settings', to: '/settings/'},
+            {
+              type: 'link',
+              label: 'Integrations',
+              to: '/settings/:orgId/document-integrations/',
+            },
+          ],
+        ],
+      ];
+      for (const [path, expected] of cases) {
+        const matches = matchRoutes(routeTree, prefix + path);
+        const parents = matches?.flatMap(
+          match => match.route.handle?.settingsBreadcrumb ?? []
+        );
+        expect({path, parents}).toEqual({
+          path,
+          parents: expected,
+        });
+      }
+    }
+  );
+
+  it.each([
+    ['/manage/settings/', ['Settings', 'Settings']],
+    ['/manage/status/mail/', ['Settings', 'Mail']],
+    ['/manage/users/', ['Settings', 'Users']],
+  ])('shows the admin breadcrumb for %s', (url, names) => {
+    const matches = matchRoutes(buildRoutes(), url);
+    expect(
+      matches?.flatMap(match => (match.route.handle as {name?: string})?.name ?? [])
+    ).toEqual(names);
+  });
+
+  // Until customer-domains is enabled for single-tenant, self-hosted and path
+  // based slug routes are removed we need to ensure
+  // that each orgId route also has slugless path.
+  test('orgId routes also have domain routes', () => {
+    const spy = jest.spyOn(constants, 'USING_CUSTOMER_DOMAIN', 'get');
+
+    // Get routes for with customer domains off.
+    spy.mockReturnValue(false);
+    const routes = extractRoutes(buildRoutes());
+
+    // Get routes with customer domains on.
+    spy.mockReturnValue(true);
+    const domainRoutes = extractRoutes(buildRoutes());
+
+    // All routes that exist under orgId path slugs should
+    // have a sibling under customer-domains.
+    const mismatch: Array<{domain: string; slug: string}> = [];
+    for (const path of routes) {
+      // Normalize the URLs so that we know the path we're looking for.
+      const domainPath = normalizeUrl(path, {forceCustomerDomain: true});
+
+      // Path is not different under customer domains.
+      if (domainPath === path) {
+        continue;
+      }
+
+      if (!domainRoutes.has(domainPath)) {
+        mismatch.push({slug: path, domain: domainPath});
+      }
+    }
+
+    if (mismatch.length > 0) {
+      const routelist = mismatch
+        .map(item => `- slug: ${item.slug}\n  domain: ${item.domain}`)
+        .join('\n');
+      throw new Error(
+        `Unable to find matching URLs for the following ${mismatch.length} routes:\n\n` +
+          routelist +
+          '\n\nEach route with the :orgId parameter is expected to have corresponding domain based route as well. ' +
+          'If you need help with this drop by #proj-hybrid-cloud.'
+      );
+    }
+  });
+
+  describe('explore route catch-all', () => {
+    it('catches unknown subpaths under /explore/', () => {
+      const spy = jest.spyOn(constants, 'USING_CUSTOMER_DOMAIN', 'get');
+
+      spy.mockReturnValue(true);
+      let routes = buildRoutes();
+      let matchedPaths = getMatchedPaths(routes, '/explore/nonexistent-page/');
+      expect(matchedPaths).toContain(':catchAll/');
+
+      spy.mockReturnValue(false);
+      routes = buildRoutes();
+      matchedPaths = getMatchedPaths(
+        routes,
+        '/organizations/test-org/explore/nonexistent-page/also-nonexistent-page/'
+      );
+      expect(matchedPaths).toContain('*');
+    });
+  });
+
+  describe('seer routes', () => {
+    it.each([
+      ['/seer/automations/', 'automations/', true],
+      ['/organizations/test-org/seer/automations/', 'automations/', false],
+      ['/seer/automations/runs/', 'runs/', true],
+      ['/organizations/test-org/seer/automations/runs/', 'runs/', false],
+      ['/seer/investigations/', 'investigations/', true],
+      ['/seer/investigations/investigation-1/', 'investigations/:investigationId/', true],
+      ['/organizations/test-org/seer/investigations/', 'investigations/', false],
+      [
+        '/organizations/test-org/seer/investigations/investigation-1/',
+        'investigations/:investigationId/',
+        false,
+      ],
+    ])('matches %s', (url, routePath, customerDomain) => {
+      jest
+        .spyOn(constants, 'USING_CUSTOMER_DOMAIN', 'get')
+        .mockReturnValue(customerDomain);
+
+      expect(getMatchedPaths(buildRoutes(), url)).toContain(routePath);
+    });
+
+    it('redirects the index to automations', () => {
+      jest.spyOn(constants, 'USING_CUSTOMER_DOMAIN', 'get').mockReturnValue(false);
+
+      expect(getRedirectTarget(buildRoutes(), '/organizations/test-org/seer/')).toBe(
+        'automations/'
+      );
+    });
+  });
+
+  describe('legacy insights module redirects', () => {
+    // Sub-paths collapse onto the module landing page rather than carrying
+    // over, since a `redirectTo` string cannot interpolate a wildcard match.
+    it.each([
+      ['/organizations/test-org/performance/database/', '/insights/backend/database/'],
+      [
+        '/organizations/test-org/performance/database/spans/span/abc123/',
+        '/insights/backend/database/',
+      ],
+      ['/organizations/test-org/performance/http/domains/', '/insights/backend/http/'],
+      ['/organizations/test-org/performance/pageloads/', '/insights/frontend/pageloads/'],
+    ])('redirects %s to %s', (from, to) => {
+      expect(getRedirectTarget(buildRoutes(), from)).toBe(to);
+    });
+  });
+
+  it.each([
+    ['/share/issue/abc/', '/share/issue/:shareId/'],
+    [
+      '/organizations/test-org/share/issue/abc/',
+      '/organizations/:orgId/share/issue/:shareId/',
+    ],
+  ])('serves %s outside the authenticated error handler', (url, routePath) => {
+    const matches = matchRoutes(buildRoutes(), url);
+    const components = matches?.map(
+      match => (match.route.element as React.ReactElement | undefined)?.type
+    );
+
+    expect(matches?.at(-1)?.route.path).toBe(routePath);
+    expect(components).not.toContain(AuthenticatedApiErrorHandler);
+  });
+
+  it('matches legacy project event redirects under the organization layout', () => {
+    const matchedPaths = getMatchedPaths(
+      buildRoutes(),
+      '/test-org/test-project/events/test-event/'
+    );
+
+    expect(matchedPaths).toEqual([
+      '(layout)',
+      '/',
+      '(layout)',
+      '(layout)',
+      '/:orgId/:projectId/',
+      'events/:eventId/',
+    ]);
+  });
+});

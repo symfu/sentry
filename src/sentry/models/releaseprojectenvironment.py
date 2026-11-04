@@ -1,14 +1,41 @@
-from datetime import timedelta
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import TYPE_CHECKING, TypedDict
+
 from django.db import models
 from django.utils import timezone
 
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import (
+    BoundedPositiveIntegerField,
+    FlexibleForeignKey,
+    Model,
+    cell_silo_model,
+    sane_repr,
+)
+from sentry.metrics.base import MutableTags
+from sentry.models.metric_tags import DATA_ACCESS_TAG, DataAccessTagValues
 from sentry.utils import metrics
 from sentry.utils.cache import cache
-from sentry.db.models import BoundedPositiveIntegerField, FlexibleForeignKey, Model, sane_repr
+from sentry.utils.last_seen import BumpResult, try_bump_last_seen
+
+if TYPE_CHECKING:
+    from sentry.models.environment import Environment
+    from sentry.models.project import Project
+    from sentry.models.release import Release
 
 
+class ReleaseStages(str, Enum):
+    ADOPTED = "adopted"
+    LOW_ADOPTION = "low_adoption"
+    REPLACED = "replaced"
+
+
+@cell_silo_model
 class ReleaseProjectEnvironment(Model):
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Excluded
 
     release = FlexibleForeignKey("sentry.Release")
     project = FlexibleForeignKey("sentry.Project")
@@ -18,29 +45,56 @@ class ReleaseProjectEnvironment(Model):
     last_seen = models.DateTimeField(default=timezone.now, db_index=True)
     last_deploy_id = BoundedPositiveIntegerField(null=True, db_index=True)
 
+    adopted = models.DateTimeField(null=True, blank=True)
+    unadopted = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         app_label = "sentry"
         db_table = "sentry_releaseprojectenvironment"
+        indexes = (
+            models.Index(fields=("project", "adopted", "environment")),
+            models.Index(fields=("project", "unadopted", "environment")),
+        )
         unique_together = (("project", "release", "environment"),)
 
     __repr__ = sane_repr("project", "release", "environment")
 
     @classmethod
-    def get_cache_key(cls, release_id, project_id, environment_id):
+    def get_cache_key(cls, release_id: int, project_id: int, environment_id: int) -> str:
         return f"releaseprojectenv:{release_id}:{project_id}:{environment_id}"
 
     @classmethod
-    def get_or_create(cls, release, project, environment, datetime, **kwargs):
-        with metrics.timer("models.releaseprojectenvironment.get_or_create") as metrics_tags:
-            return cls._get_or_create_impl(
-                release, project, environment, datetime, metrics_tags, **kwargs
+    def get_or_create(
+        cls,
+        release: Release,
+        project: Project,
+        environment: Environment,
+        datetime: datetime,
+        metrics_tags: MutableTags | None = None,
+        **kwargs: object,
+    ) -> ReleaseProjectEnvironment:
+        with metrics.timer("models.releaseprojectenvironment.get_or_create") as timer_tags:
+            instance = cls._get_or_create_impl(
+                release, project, environment, datetime, timer_tags, **kwargs
             )
+            if metrics_tags is not None:
+                metrics_tags.update(timer_tags)
+            return instance
 
     @classmethod
-    def _get_or_create_impl(cls, release, project, environment, datetime, metrics_tags, **kwargs):
+    def _get_or_create_impl(
+        cls,
+        release: Release,
+        project: Project,
+        environment: Environment,
+        datetime: datetime,
+        metrics_tags: MutableTags,
+        **kwargs: object,
+    ) -> ReleaseProjectEnvironment:
         cache_key = cls.get_cache_key(project.id, release.id, environment.id)
 
         instance = cache.get(cache_key)
+        cache_hit = instance is not None
         if instance is None:
             metrics_tags["cache_hit"] = "false"
             instance, created = cls.objects.get_or_create(
@@ -50,21 +104,53 @@ class ReleaseProjectEnvironment(Model):
                 defaults={"first_seen": datetime, "last_seen": datetime},
             )
             cache.set(cache_key, instance, 3600)
-            metrics_tags["cache_hit"] = "true"
         else:
+            metrics_tags["cache_hit"] = "true"
             created = False
 
         metrics_tags["created"] = "true" if created else "false"
 
-        # Same as releaseenvironment model. Minimizes last_seen updates to once a minute
-        if not created and instance.last_seen < datetime - timedelta(seconds=60):
-            cls.objects.filter(
-                id=instance.id, last_seen__lt=datetime - timedelta(seconds=60)
-            ).update(last_seen=datetime)
-            instance.last_seen = datetime
-            cache.set(cache_key, instance, 3600)
-            metrics_tags["bumped"] = "true"
+        bump = BumpResult.THROTTLED
+        if not created:
+            bump = try_bump_last_seen(
+                model_class=cls,
+                instance=instance,
+                datetime=datetime,
+                bump_key=f"releaseprojectenv_bump:{instance.id}",
+                cache_key=cache_key,
+                metrics_tags=metrics_tags,
+            )
         else:
             metrics_tags["bumped"] = "false"
 
+        if bump in (BumpResult.BUMPED, BumpResult.ERROR):
+            metrics_tags[DATA_ACCESS_TAG] = DataAccessTagValues.DB_UPDATE.value
+        elif created:
+            metrics_tags[DATA_ACCESS_TAG] = DataAccessTagValues.DB_CREATE.value
+        elif cache_hit:
+            metrics_tags[DATA_ACCESS_TAG] = DataAccessTagValues.CACHE_HIT.value
+        else:
+            metrics_tags[DATA_ACCESS_TAG] = DataAccessTagValues.DB_READ.value
+
         return instance
+
+    @property
+    def adoption_stages(self) -> AdoptionStage:
+        return adoption_stage(self.adopted, self.unadopted)
+
+
+class AdoptionStage(TypedDict):
+    stage: ReleaseStages
+    adopted: datetime | None
+    unadopted: datetime | None
+
+
+def adoption_stage(adopted: datetime | None, unadopted: datetime | None) -> AdoptionStage:
+    if adopted is not None and unadopted is None:
+        stage = ReleaseStages.ADOPTED
+    elif adopted is not None and unadopted is not None:
+        stage = ReleaseStages.REPLACED
+    else:
+        stage = ReleaseStages.LOW_ADOPTION
+
+    return {"stage": stage, "adopted": adopted, "unadopted": unadopted}

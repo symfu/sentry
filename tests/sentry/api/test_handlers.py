@@ -1,37 +1,61 @@
-import math
-
-from django.conf.urls import url
 from django.test import override_settings
+from django.urls import re_path
 from rest_framework.permissions import AllowAny
+from rest_framework.request import Request
 
 from sentry.api.base import Endpoint
+from sentry.api.utils import handle_query_errors
+from sentry.search.events.constants import RATE_LIMIT_ERROR_MESSAGE
+from sentry.testutils.cases import APITestCase
+from sentry.testutils.silo import control_silo_test
 from sentry.utils.snuba import RateLimitExceeded
-from sentry.testutils import APITestCase
+from sentry.utils.snuba_rpc import SnubaRPCRateLimitExceeded, SnubaRPCUnavailable
 
 
 class RateLimitedEndpoint(Endpoint):
     permission_classes = (AllowAny,)
 
-    def get(self, request):
-        raise RateLimitExceeded()
+    def get(self, request: Request) -> None:
+        raise RateLimitExceeded(
+            "Rate limit exceeded. Please try your query with a smaller date range or fewer projects."
+        )
+
+    def post(self, request: Request) -> None:
+        raise SnubaRPCRateLimitExceeded("Snuba is tired")
+
+    def put(self, request: Request) -> None:
+        with handle_query_errors():
+            raise SnubaRPCUnavailable("Snuba is unavailable")
 
 
-urlpatterns = [url(r"^/$", RateLimitedEndpoint.as_view(), name="sentry-test")]
+urlpatterns = [re_path(r"^/$", RateLimitedEndpoint.as_view(), name="sentry-test")]
 
 
-@override_settings(ROOT_URLCONF="tests.sentry.api.test_handlers")
+@control_silo_test
+@override_settings(ROOT_URLCONF=__name__)
 class TestRateLimited(APITestCase):
-    endpoint = "sentry-test"
+    @property
+    def endpoint(self) -> str:
+        return "sentry-test"
 
-    def test_simple(self):
+    def test_simple(self) -> None:
         self.login_as(self.user)
-        resp = self.get_response()
+        resp = self.get_response(method="get")
         assert resp.status_code == 429
 
-        # DRF ceils our configured wait time, this produces a different number
-        # type between 2 and 3. In 2 this produces a float, in 3 this produces
-        # an integer.
-        assert (
-            resp.data["detail"]
-            == f"Request was throttled. Expected available in {math.ceil(1)} second."
-        )
+        assert resp.data["detail"] == RATE_LIMIT_ERROR_MESSAGE
+
+    def test_snuba_rpc(self) -> None:
+        self.login_as(self.user)
+        resp = self.get_response(method="post")
+        assert resp.status_code == 429
+
+        assert resp.data["detail"] == RATE_LIMIT_ERROR_MESSAGE
+
+    def test_snuba_rpc_unavailable(self) -> None:
+        self.login_as(self.user)
+        resp = self.get_response(method="put")
+
+        assert resp.status_code == 503
+        assert resp.data["detail"] == "Service temporarily unavailable. Please try again."
+        assert resp["Retry-After"] == "5"

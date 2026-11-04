@@ -1,141 +1,115 @@
 import click
-
-from django.db import connections, ProgrammingError
 from django.conf import settings
+from django.db import connections
+from django.db.utils import ProgrammingError
+
+from sentry.new_migrations.monkey.executor import SentryMigrationExecutor
 from sentry.runner.decorators import configuration
-
-# List of migrations which we'll fake if we're coming from South
-DJANGO_MIGRATIONS = (
-    ("contenttypes", "0001_initial"),
-    # Note that we need to have ops make the `django_content_type.name` column nullable.
-    # This migration removes the column in the same migration, which will likely take
-    # sentry down.
-    ("contenttypes", "0002_remove_content_type_name"),
-    ("auth", "0001_initial"),
-    ("auth", "0002_alter_permission_name_max_length"),
-    ("auth", "0003_alter_user_email_max_length"),
-    ("auth", "0004_alter_user_username_opts"),
-    ("auth", "0005_alter_user_last_login_null"),
-    ("auth", "0006_require_contenttypes_0002"),
-    ("sites", "0001_initial"),
-    ("admin", "0001_initial"),
-    ("sessions", "0001_initial"),
-)
+from sentry.signals import post_upgrade
+from sentry.silo.base import SiloMode
 
 
-def _has_applied_django_migration(connection, app_name, migration):
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "SELECT 1 FROM django_migrations WHERE app = %s AND name = %s LIMIT 1",
-            [app_name, migration],
+def _check_big_ints() -> None:
+    if not getattr(settings, "SENTRY_USE_BIG_INTS", True):
+        raise click.ClickException(
+            "It looks like you have `SENTRY_USE_BIG_INTS = False` configured.  "
+            "sentry now only supports `bigint`.  "
+            "you will want to alter your integer types in your tables and then remove the setting from your configuration"
         )
-    except ProgrammingError as exc:
-        if 'relation "django_migrations" does not exist' in str(exc):
-            return False
-        raise
-    else:
-        return bool(cursor.fetchall())
-    finally:
-        cursor.close()
 
 
-def _has_applied_south_migration(connection, app_name, migration):
-    if migration is None:
-        return True
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "SELECT 1 FROM south_migrationhistory WHERE app_name = %s AND migration = %s LIMIT 1",
-            [app_name, migration],
-        )
-        return bool(cursor.fetchall())
-    finally:
-        cursor.close()
-
-
-def _fake_django_migration(connection, app_name, migration, verbosity=0):
-    if _has_applied_django_migration(connection, app_name, migration):
-        return False
-
-    if verbosity:
-        click.echo(f"Faking migration for {app_name}.{migration}")
-
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO django_migrations (app, name, applied) VALUES (%s, %s, NOW())",
-            [app_name, migration],
-        )
-    finally:
-        cursor.close()
-
-
-def _has_south_history(connection):
-    cursor = connection.cursor()
-    try:
-        cursor.execute("SELECT 1 FROM south_migrationhistory LIMIT 1")
-    except ProgrammingError as exc:
-        if 'relation "south_migrationhistory" does not exist' in str(exc):
-            return False
-        raise
-    return True
-
-
-def _migrate_from_south(verbosity):
-    from django.db.migrations.recorder import MigrationRecorder
-
+def _check_history() -> None:
     connection = connections["default"]
+    cursor = connection.cursor()
+    try:
+        # If this query fails because there are no tables we're good to go.
+        cursor.execute("SELECT COUNT(*) FROM django_migrations")
+        row = cursor.fetchone()
+        if not row or row[0] == 0:
+            return
+    except ProgrammingError as e:
+        # Having no migrations table is ok, as we're likely operating on a new install.
+        if 'relation "django_migrations" does not exist' in str(e):
+            return
+        click.echo(f"Checking migration state failed with: {e}")
+        raise click.ClickException("Could not determine migration state. Aborting")
 
-    if not _has_south_history(connection):
-        return
+    # Either of these migrations need to have been run for us to proceed.
+    migration_heads = (
+        "0904_onboarding_task_project_id_idx",  # pre-squash
+        "0001_squashed_0904_onboarding_task_project_id_idx",  # post-squash
+    )
 
-    # ensure the django_migrations relation exists
-    recorder = MigrationRecorder(connection)
-    recorder.ensure_schema()
-
-    for django_app_name, django_migration in DJANGO_MIGRATIONS:
-        _fake_django_migration(connection, django_app_name, django_migration, verbosity)
-
-    for (
-        south_app_name,
-        south_migration,
-        django_app_name,
-        django_migration,
-        south_migration_required,
-        south_migration_required_error,
-    ) in settings.SOUTH_MIGRATION_CONVERSIONS:
-        if _has_applied_south_migration(connection, south_app_name, south_migration):
-            _fake_django_migration(connection, django_app_name, django_migration)
-        elif south_migration_required:
-            raise Exception(south_migration_required_error)
+    # If we haven't run all the migration up to the latest squash abort.
+    # As we squash more history this should be updated.
+    cursor.execute("SELECT 1 FROM django_migrations WHERE name in %s", [migration_heads])
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        raise click.ClickException(
+            "It looks like you've skipped a hard stop in our upgrade process. "
+            "Please follow the upgrade process here: https://develop.sentry.dev/self-hosted/releases/#hard-stops"
+        )
 
 
-def _upgrade(interactive, traceback, verbosity, repair, with_nodestore):
+def _upgrade(
+    interactive: bool,
+    traceback: bool,
+    verbosity: int,
+    repair: bool,
+    run_post_upgrade: bool,
+    with_nodestore: bool,
+    create_kafka_topics: bool,
+) -> None:
     from django.core.management import call_command as dj_call_command
 
-    # migrate legacy south history into new django migrations automatically
-    _migrate_from_south(verbosity)
+    _check_big_ints()
+    _check_history()
 
-    dj_call_command(
-        "migrate",
-        interactive=interactive,
-        traceback=traceback,
-        verbosity=verbosity,
-        migrate=True,
-        merge=True,
-        ignore_ghost_migrations=True,
-    )
+    for db_conn in settings.DATABASES.keys():
+        # Run migrations on all non-read replica connections.
+        # This is used for sentry.io as our production database runs on multiple hosts.
+        if not settings.DATABASES[db_conn].get("REPLICA_OF", False):
+            # We want the noop case to be quickly skipped.
+            click.echo(f"Checking for migrations to run for {db_conn}")
+            conn = connections[db_conn]
+            executor = SentryMigrationExecutor(conn)
+            targets = executor.loader.graph.leaf_nodes()
+            plan = executor.migration_plan(targets)
+            if not plan:
+                click.echo(f"No migrations to run for {db_conn}")
+                continue
+
+            click.echo(f"Running migrations for {db_conn}")
+            dj_call_command(
+                "migrate",
+                database=db_conn,
+                interactive=interactive,
+                traceback=traceback,
+                verbosity=verbosity,
+            )
 
     if with_nodestore:
         from sentry import nodestore
 
-        nodestore.bootstrap()
+        nodestore.backend.bootstrap()
+
+    if create_kafka_topics:
+        from sentry_kafka_schemas import list_topics
+
+        from sentry.utils.batching_kafka_consumer import create_topics
+        from sentry.utils.kafka_config import get_topic_definition
+
+        for topic in list_topics():
+            topic_defn = get_topic_definition(topic)
+            create_topics(topic_defn["cluster"], [topic_defn["real_topic_name"]])
 
     if repair:
         from sentry.runner import call_command
 
         call_command("sentry.runner.commands.repair.repair")
+
+    if run_post_upgrade:
+        post_upgrade.send(sender=SiloMode.get_current_mode(), interactive=interactive)
 
 
 @click.command()
@@ -151,21 +125,52 @@ def _upgrade(interactive, traceback, verbosity, repair, with_nodestore):
     help="Hold a global lock and limit upgrade to one concurrent.",
 )
 @click.option("--no-repair", default=False, is_flag=True, help="Skip repair step.")
+@click.option(
+    "--no-post-upgrade",
+    default=False,
+    is_flag=True,
+    help="Skip post migration database initialization.",
+)
 @click.option("--with-nodestore", default=False, is_flag=True, help="Bootstrap nodestore.")
+@click.option("--create-kafka-topics", default=False, is_flag=True, help="Create kafka topics.")
 @configuration
-@click.pass_context
-def upgrade(ctx, verbosity, traceback, noinput, lock, no_repair, with_nodestore):
+def upgrade(
+    verbosity: int,
+    traceback: bool,
+    noinput: bool,
+    lock: bool,
+    no_repair: bool,
+    no_post_upgrade: bool,
+    with_nodestore: bool,
+    create_kafka_topics: bool,
+) -> None:
     "Perform any pending database migrations and upgrades."
 
     if lock:
-        from sentry.app import locks
+        from sentry.locks import locks
         from sentry.utils.locking import UnableToAcquireLock
 
-        lock = locks.get("upgrade", duration=0)
+        lock_inst = locks.get("upgrade", duration=0, name="command_upgrade")
         try:
-            with lock.acquire():
-                _upgrade(not noinput, traceback, verbosity, not no_repair, with_nodestore)
+            with lock_inst.acquire():
+                _upgrade(
+                    not noinput,
+                    traceback,
+                    verbosity,
+                    not no_repair,
+                    not no_post_upgrade,
+                    with_nodestore,
+                    create_kafka_topics,
+                )
         except UnableToAcquireLock:
             raise click.ClickException("Unable to acquire `upgrade` lock.")
     else:
-        _upgrade(not noinput, traceback, verbosity, not no_repair, with_nodestore)
+        _upgrade(
+            not noinput,
+            traceback,
+            verbosity,
+            not no_repair,
+            not no_post_upgrade,
+            with_nodestore,
+            create_kafka_topics,
+        )

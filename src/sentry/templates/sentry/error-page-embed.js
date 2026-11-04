@@ -1,5 +1,5 @@
-/*eslint no-var:0,strict:0,block-scoped-var:0*/
-/*global sentryEmbedCallback:false*/
+/* eslint strict:0,block-scoped-var:0 */
+/* global sentryEmbedCallback:false */
 (function (window, document, JSON) {
   'use strict';
   // TODO(dcramer): expose API for building a new error embed so things like
@@ -13,9 +13,11 @@
     };
    */
 
+  /* eslint-disable eslint-js/spaced-comment */
   var strings = /*{{ strings }}*/ '';
   var template = /*{{ template }}*/ '';
   var endpoint = /*{{ endpoint }}*/ '';
+  /* eslint-enable */
 
   var setChild = function (target, child) {
     target.innerHTML = '';
@@ -66,7 +68,9 @@
     this.element.className = 'sentry-error-embed-wrapper';
     this.element.innerHTML = template;
     self.element.onclick = function (e) {
-      if (e.target !== self.element) return;
+      if (e.target !== self.element) {
+        return;
+      }
       self.close();
     };
 
@@ -146,11 +150,16 @@
       document.removeEventListener('keydown', handleFocus);
     }
     this.element.parentNode.removeChild(this.element);
+    if (window.parent) {
+      window.parent.postMessage('__sentry_reportdialog_closed__', '*');
+    }
   };
 
   SentryErrorEmbed.prototype.submit = function (body) {
     var self = this;
-    if (this._submitInProgress) return;
+    if (this._submitInProgress) {
+      return;
+    }
     this._submitInProgress = true;
 
     var xhr = new XMLHttpRequest();

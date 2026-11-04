@@ -1,0 +1,123 @@
+from collections.abc import Sequence
+from typing import Any, cast
+
+from rest_framework.request import Request
+from rest_framework.response import Response
+from sentry_sdk import traces
+
+from sentry import search
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import DEFAULT_DURATION_BUDGET, cell_silo_endpoint
+from sentry.api.bases.organization import OrganizationEndpoint
+from sentry.api.helpers.group_index import validate_search_filter_permissions
+from sentry.api.helpers.group_index.validators import ValidationError
+from sentry.api.utils import get_date_range_from_params
+from sentry.issues.issue_search import convert_query_values, parse_search_query
+from sentry.models.environment import Environment
+from sentry.models.organization import Organization
+from sentry.models.project import Project
+from sentry.organizations.services.organization.model import RpcOrganization
+from sentry.ratelimits.config import RateLimitConfig
+from sentry.snuba import discover
+from sentry.snuba.referrer import Referrer
+from sentry.types.ratelimit import RateLimit, RateLimitCategory
+
+ERR_INVALID_STATS_PERIOD = "Invalid stats_period. Valid choices are '', '24h', and '14d'"
+
+
+ISSUES_COUNT_MAX_HITS_LIMIT = 100
+
+
+@cell_silo_endpoint
+class OrganizationIssuesCountEndpoint(OrganizationEndpoint):
+    publish_status = {
+        "GET": ApiPublishStatus.PRIVATE,
+    }
+    owner = ApiOwner.ISSUES
+    max_acceptable_duration = DEFAULT_DURATION_BUDGET
+    enforce_rate_limit = True
+    rate_limits = RateLimitConfig(
+        limit_overrides={
+            "GET": {
+                RateLimitCategory.IP: RateLimit(limit=10, window=1),
+                RateLimitCategory.USER: RateLimit(limit=10, window=1),
+                RateLimitCategory.ORGANIZATION: RateLimit(limit=10, window=1),
+            }
+        }
+    )
+
+    def _count(
+        self,
+        request: Request,
+        query: str,
+        organization: Organization | RpcOrganization,
+        projects: Sequence[Project],
+        environments: Sequence[Environment] | None,
+        extra_query_kwargs: dict[str, Any] | None = None,
+    ) -> int:
+        with traces.start_span(name="_count", attributes={"sentry.op": "_count"}):
+            query_kwargs: dict[str, Any] = {
+                "projects": projects,
+                "referrer": Referrer.API_ORGANIZATION_ISSUES_COUNT,
+            }
+
+            query = query.strip()
+            if query:
+                search_filters = convert_query_values(
+                    parse_search_query(query), projects, request.user, environments
+                )
+                validate_search_filter_permissions(
+                    cast("Organization", organization), search_filters, request.user
+                )
+                query_kwargs["search_filters"] = search_filters
+
+            if extra_query_kwargs is not None:
+                assert "environment" not in extra_query_kwargs
+                query_kwargs.update(extra_query_kwargs)
+
+            query_kwargs["environments"] = environments if environments else None
+
+            query_kwargs["max_hits"] = ISSUES_COUNT_MAX_HITS_LIMIT
+
+            query_kwargs["actor"] = request.user
+        with traces.start_span(
+            name="start_search",
+            attributes={
+                "sentry.op": "start_search",
+                "query_kwargs": repr(query_kwargs),
+            },
+        ):
+            result = search.backend.query(**query_kwargs)
+            return cast("int", result.hits)
+
+    def get(self, request: Request, organization: Organization | RpcOrganization) -> Response:
+        stats_period = request.GET.get("groupStatsPeriod")
+        start, end = get_date_range_from_params(request.GET, optional=True)
+
+        if stats_period not in (None, "", "24h", "14d", "auto"):
+            return Response({"detail": ERR_INVALID_STATS_PERIOD}, status=400)
+        environments = self.get_environments(request, organization)
+
+        projects = self.get_projects(request, organization)
+
+        if not projects:
+            return Response([])
+
+        queries = request.GET.getlist("query")
+        response: dict[str, int] = {}
+        for query in queries:
+            try:
+                count = self._count(
+                    request,
+                    query,
+                    organization,
+                    projects,
+                    environments,
+                    {"count_hits": True, "date_to": end, "date_from": start},
+                )
+                response[query] = count
+            except (ValidationError, discover.InvalidSearchQuery) as exc:
+                return Response({"detail": str(exc)}, status=400)
+
+        return Response(response)

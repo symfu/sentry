@@ -1,0 +1,722 @@
+import * as Sentry from '@sentry/react';
+import Cookies from 'js-cookie';
+import * as qs from 'query-string';
+
+import {redirectToProject} from 'sentry/actionCreators/redirectToProject';
+import {openSudo} from 'sentry/actionCreators/sudoModal';
+import {EXPERIMENTAL_SPA} from 'sentry/constants';
+import {
+  PROJECT_MOVED,
+  STAFF_REQUIRED,
+  SUDO_REQUIRED,
+  SUPERUSER_REQUIRED,
+} from 'sentry/constants/apiErrorCodes';
+import type {ApiResult, ResponseMeta} from 'sentry/types/api';
+import {isSimilarOrigin} from 'sentry/utils/api/isSimilarOrigin';
+import {resolveHostname} from 'sentry/utils/api/resolveHostname';
+import {isDemoModeActive} from 'sentry/utils/demoMode';
+import {getCsrfToken} from 'sentry/utils/getCsrfToken';
+import {uniqueId} from 'sentry/utils/guid';
+import {RequestError} from 'sentry/utils/requestError/requestError';
+import {sanitizePath} from 'sentry/utils/requestError/sanitizePath';
+import {testableWindowLocation} from 'sentry/utils/testableWindowLocation';
+import type {ReactRouter3Navigate} from 'sentry/utils/useNavigate';
+
+/**
+ * `api.tsx` is consumed outside React, so it can't use the `useNavigate` hook.
+ * The app's bootstrap calls `setApiNavigate` once to install a navigate
+ * function the auth-error handler can use.
+ */
+let apiNavigate: ReactRouter3Navigate | null = null;
+
+export function setApiNavigate(navigate: ReactRouter3Navigate) {
+  apiNavigate = navigate;
+}
+
+export class Request {
+  /**
+   * Is the request still in flight
+   */
+  alive: boolean;
+  /**
+   * Promise which will be resolved when the request has completed
+   */
+  requestPromise: Promise<Response>;
+  /**
+   * AbortController to cancel the in-flight request. This will not be set in
+   * unsupported browsers.
+   */
+  aborter?: AbortController;
+
+  constructor(requestPromise: Promise<Response>, aborter?: AbortController) {
+    this.requestPromise = requestPromise;
+    this.aborter = aborter;
+    this.alive = true;
+  }
+
+  cancel() {
+    // Cancelled requests stay in `activeRequests`, so `Client.clear()` can
+    // cancel the same request more than once. Only count the first abort.
+    if (this.alive) {
+      Sentry.metrics.count('ui.api-request.abort', 1);
+    }
+    this.alive = false;
+    this.aborter?.abort();
+  }
+}
+
+/**
+ * Check if the requested method does not require CSRF tokens
+ */
+function csrfSafeMethod(method?: string): boolean {
+  // these HTTP methods do not require CSRF protection
+  return /^(GET|HEAD|OPTIONS|TRACE)$/.test(method ?? '');
+}
+
+/**
+ * The server derives `next` on the SSO login URL from the Referer header. API
+ * requests usually go to a different (region) origin than the page, so
+ * browsers strip the Referer down to the origin and `next` ends up pointing at
+ * `/`. Replace it with the page the user is actually on. The login view still
+ * validates `next` before redirecting. A missing or unparseable login URL is
+ * returned unchanged.
+ */
+export function withCurrentPageAsNext(loginUrl: string): string {
+  if (!loginUrl) {
+    return loginUrl;
+  }
+  try {
+    const url = new URL(loginUrl, window.location.origin);
+    url.searchParams.set('next', window.location.href);
+    return url.toString();
+  } catch {
+    return loginUrl;
+  }
+}
+
+/**
+ * Return true if we should skip calling the normal error handler
+ */
+export type ApiErrorHandler = (
+  response: ResponseMeta,
+  options: Readonly<RequestOptions>
+) => boolean;
+
+const globalErrorHandlers = new Set<ApiErrorHandler>();
+
+export function registerApiErrorHandler(handler: ApiErrorHandler) {
+  globalErrorHandlers.add(handler);
+
+  return () => {
+    globalErrorHandlers.delete(handler);
+  };
+}
+
+export const initApiClientErrorHandling = () =>
+  registerApiErrorHandler((resp: ResponseMeta, options: RequestOptions) => {
+    // Ignore error unless it is a 401
+    if (resp?.status !== 401) {
+      return false;
+    }
+    if (resp && options.allowAuthError && resp.status === 401) {
+      return false;
+    }
+
+    const code = resp?.responseJSON?.detail?.code;
+    const extra = resp?.responseJSON?.detail?.extra;
+
+    // 401s can also mean sudo is required or it's a request that is allowed to fail
+    // Ignore if these are the cases
+    if (
+      [
+        'sudo-required',
+        'ignore',
+        '2fa-required',
+        'app-connect-authentication-error',
+      ].includes(code)
+    ) {
+      return false;
+    }
+
+    // If user must login via SSO, redirect to org login page
+    if (code === 'sso-required') {
+      testableWindowLocation.assign(withCurrentPageAsNext(extra.loginUrl));
+      return true;
+    }
+
+    if (code === 'member-disabled-over-limit') {
+      apiNavigate?.(extra.next, {replace: true});
+      return true;
+    }
+
+    if (!isDemoModeActive()) {
+      // Demo user can occasionally get 401s back. Otherwise, the user has become unauthenticated. Send them to auth
+      Cookies.set('session_expired', '1');
+    }
+
+    if (EXPERIMENTAL_SPA) {
+      apiNavigate?.('/auth/login/', {replace: true});
+    } else {
+      window.location.reload();
+    }
+    return true;
+  });
+
+/**
+ * Construct a full request URL
+ */
+function buildRequestUrl(baseUrl: string, path: string, options: RequestOptions) {
+  let params: string;
+  try {
+    params = qs.stringify(options.query ?? []);
+  } catch (err) {
+    Sentry.withScope(scope => {
+      scope.setExtra('path', path);
+      scope.setExtra('query', options.query);
+      Sentry.captureException(err);
+    });
+    throw err;
+  }
+
+  // Append the baseUrl if required
+  let fullUrl = path.includes(baseUrl) ? path : baseUrl + path;
+
+  // Apply path and domain transforms for hybrid-cloud
+  fullUrl = resolveHostname(fullUrl, options.host);
+
+  // Append query parameters
+  if (params) {
+    fullUrl += fullUrl.includes('?') ? `&${params}` : `?${params}`;
+  }
+
+  return fullUrl;
+}
+
+/**
+ * Check if the API response says project has been renamed.  If so, redirect
+ * user to new project slug
+ * @public used in __mocks__/api.tsx with jest.requireActual
+ */
+// TODO(ts): refine this type later
+export function hasProjectBeenRenamed(response: ResponseMeta) {
+  const code = response?.responseJSON?.detail?.code;
+
+  // XXX(billy): This actually will never happen because we can't intercept the 302
+  // jQuery ajax will follow the redirect by default...
+  //
+  // TODO(epurkhiser): We use fetch now, is the above comment still true?
+  if (code !== PROJECT_MOVED) {
+    return false;
+  }
+
+  const slug = response?.responseJSON?.detail?.extra?.slug;
+
+  redirectToProject(slug);
+  return true;
+}
+
+type FunctionCallback<Args extends any[] = any[]> = (...args: Args) => void;
+
+type RequestCallbacks = {
+  /**
+   * Callback for the request completing (success or error)
+   */
+  complete?: (resp: ResponseMeta, textStatus: string) => void;
+  /**
+   * Callback for the request failing with an error
+   */
+  // TODO(ts): Update this when sentry is mostly migrated to TS
+  error?: FunctionCallback;
+  /**
+   * Callback for the request completing successfully
+   */
+  success?: (data: any, textStatus?: string, resp?: ResponseMeta) => void;
+};
+
+export type RequestOptions = RequestCallbacks & {
+  /**
+   * Set true, if an authentication required error is allowed for
+   * a request.
+   */
+  allowAuthError?: boolean;
+  /**
+   * Values to attach to the body of the request.
+   */
+  data?: any;
+  /**
+   * Headers add to the request.
+   */
+  headers?: Record<string, string>;
+  /**
+   * The host the request should be made to.
+   */
+  host?: string;
+  /**
+   * The HTTP method to use when making the API request
+   */
+  method?: 'DELETE' | 'GET' | 'PATCH' | 'POST' | 'PUT';
+  /**
+   * Because of the async nature of API requests, errors will happen outside of
+   * the stack that initated the request. a preservedError can be passed to
+   * coalesce the stacks together.
+   */
+  preservedError?: Error;
+  /**
+   * Query parameters to add to the requested URL.
+   */
+  query?: Record<string, any>;
+  /**
+   * By default, requests will be aborted anytime api.clear() is called,
+   * which is commonly used on unmounts. When skipAbort is true, the
+   * request is opted out of this behavior. Useful for when you still
+   * want to cache a request on unmount.
+   */
+  skipAbort?: boolean;
+};
+
+type ClientOptions = {
+  /**
+   * The base URL path to prepend to API request URIs.
+   */
+  baseUrl?: string;
+  /**
+   * Credentials policy to apply to each request
+   */
+  credentials?: RequestCredentials;
+  /**
+   * Base set of headers to apply to each request
+   */
+  headers?: HeadersInit;
+};
+
+type HandleRequestErrorOptions = {
+  id: string;
+  path: string;
+  requestOptions: Readonly<RequestOptions>;
+};
+
+/**
+ * The API client is used to make HTTP requests to Sentry's backend.
+ *
+ * This is they preferred way to talk to the backend.
+ */
+export class Client {
+  baseUrl: string;
+  activeRequests: Record<string, Request>;
+  headers: HeadersInit;
+  credentials?: RequestCredentials;
+
+  static JSON_HEADERS = {
+    Accept: 'application/json; charset=utf-8',
+    'Content-Type': 'application/json',
+  };
+
+  constructor(options: ClientOptions = {}) {
+    this.baseUrl = options.baseUrl ?? '/api/0';
+    this.headers = options.headers ?? Client.JSON_HEADERS;
+    this.activeRequests = {};
+    this.credentials = options.credentials ?? 'include';
+  }
+
+  wrapCallback<T extends any[]>(
+    id: string,
+    func: FunctionCallback<T> | undefined,
+    cleanup = false
+  ) {
+    return (...args: T) => {
+      const req = this.activeRequests[id];
+
+      if (cleanup) {
+        delete this.activeRequests[id];
+      }
+
+      if (!req?.alive) {
+        return;
+      }
+
+      // Check if API response is a 302 -- means project slug was renamed and user
+      // needs to be redirected
+      // @ts-expect-error TS(2556): A spread argument must either have a tuple type or... Remove this comment to see the full error message
+      if (hasProjectBeenRenamed(...args)) {
+        return;
+      }
+
+      // Call success callback
+      return func?.apply(req, args);
+    };
+  }
+
+  /**
+   * Attempt to cancel all active fetch requests
+   */
+  clear() {
+    Object.values(this.activeRequests).forEach(r => r.cancel());
+  }
+
+  handleRequestError(
+    {id, path, requestOptions}: HandleRequestErrorOptions,
+    response: ResponseMeta,
+    textStatus: string,
+    errorThrown: string
+  ) {
+    const code = response?.responseJSON?.detail?.code;
+    const accessModes: Partial<Record<string, 'sudo' | 'staff' | 'superuser'>> = {
+      [SUDO_REQUIRED]: 'sudo',
+      [STAFF_REQUIRED]: 'staff',
+      [SUPERUSER_REQUIRED]: 'superuser',
+    };
+    const accessMode =
+      code && Object.hasOwn(accessModes, code) ? accessModes[code] : undefined;
+
+    let didSuccessfullyRetry = false;
+
+    if (accessMode) {
+      const extra = response?.responseJSON?.detail?.extra;
+      openSudo({
+        accessMode,
+        orgSlug: extra?.orgSlug,
+        retryRequest: async () => {
+          try {
+            // Forward the retry's own response rather than just its body, so
+            // callers still see the real status code and headers after a sudo
+            // prompt interrupts the original request.
+            const [retryData, retryTextStatus, retryResponse] = await this.requestPromise(
+              path,
+              {
+                ...requestOptions,
+                includeAllArgs: true,
+              }
+            );
+            requestOptions.success?.(retryData, retryTextStatus, retryResponse);
+            didSuccessfullyRetry = true;
+          } catch (err) {
+            requestOptions.error?.(err);
+          }
+        },
+        onClose: () =>
+          // If modal was closed, then forward the original response
+          !didSuccessfullyRetry && requestOptions.error?.(response),
+      });
+      return;
+    }
+
+    // Call normal error callback
+    const errorCb = this.wrapCallback<[ResponseMeta, string, string]>(
+      id,
+      requestOptions.error
+    );
+    errorCb?.(response, textStatus, errorThrown);
+  }
+
+  /**
+   * Initiate a request to the backend API.
+   *
+   * @deprecated Use `useApiQuery` or `useMutation` with `fetchDataQuery` and `fetchMutation` instead.
+   * See https://develop.sentry.dev/frontend/network-requests/ for more.
+   */
+  request(path: string, options: Readonly<RequestOptions> = {}): Request {
+    const method = options.method || (options.data ? 'POST' : 'GET');
+
+    let fullUrl = buildRequestUrl(this.baseUrl, path, options);
+
+    let data = options.data;
+
+    if (data !== undefined && method !== 'GET' && !(data instanceof FormData)) {
+      data = JSON.stringify(data);
+    }
+
+    // TODO(epurkhiser): Mimicking the old jQuery API, data could be a string /
+    // object for GET requests. jQuery just sticks it onto the URL as query
+    // parameters
+    if (method === 'GET' && data) {
+      const queryString = typeof data === 'string' ? data : qs.stringify(data);
+
+      if (queryString.length > 0) {
+        fullUrl = fullUrl + (fullUrl.includes('?') ? '&' : '?') + queryString;
+      }
+    }
+
+    const id = uniqueId();
+    const startTime = performance.now();
+    const url = sanitizePath(path);
+
+    const recordRequestMetric = (outcome: 'success' | 'error', status?: number) => {
+      // Skip requests cancelled while in flight (e.g. with `skipAbort`), which
+      // are already counted as aborts
+      if (!this.activeRequests[id]?.alive) {
+        return;
+      }
+      Sentry.metrics.distribution('ui.api-request', performance.now() - startTime, {
+        unit: 'millisecond',
+        attributes: {status, outcome, url, method},
+      });
+    };
+
+    /**
+     * Called when the request completes with a 2xx status
+     */
+    const successHandler = (
+      resp: ResponseMeta,
+      textStatus: string,
+      responseData: any
+    ) => {
+      recordRequestMetric('success', resp?.status);
+      if (options.success !== undefined) {
+        this.wrapCallback<[any, string, ResponseMeta]>(id, options.success)(
+          responseData,
+          textStatus,
+          resp
+        );
+      }
+    };
+
+    /**
+     * Called when the request is non-2xx
+     */
+    const errorHandler = (
+      resp: ResponseMeta,
+      textStatus: string,
+      errorThrown: string
+    ) => {
+      this.handleRequestError(
+        {id, path, requestOptions: options},
+        resp,
+        textStatus,
+        errorThrown
+      );
+    };
+
+    /**
+     * Called when the request completes
+     */
+    const completeHandler = (resp: ResponseMeta, textStatus: string) =>
+      this.wrapCallback<[ResponseMeta, string]>(
+        id,
+        options.complete,
+        true
+      )(resp, textStatus);
+
+    // AbortController is optional, though most browser should support it.
+    const aborter =
+      typeof AbortController !== 'undefined' && !options.skipAbort
+        ? new AbortController()
+        : undefined;
+
+    // GET requests may not have a body
+    const body = method === 'GET' ? undefined : data;
+
+    const requestHeaders = new Headers({...this.headers, ...options.headers});
+
+    // Do not set the X-CSRFToken header when making a request outside of the
+    // current domain. Because we use subdomains we loosely compare origins
+    if (!csrfSafeMethod(method) && isSimilarOrigin(fullUrl, window.location.origin)) {
+      requestHeaders.set('X-CSRFToken', getCsrfToken());
+    }
+
+    const fetchRequest = fetch(fullUrl, {
+      method,
+      body,
+      headers: requestHeaders,
+      credentials: this.credentials,
+      signal: aborter?.signal,
+    });
+
+    // XXX(epurkhiser): We migrated off of jquery, so for now we have a
+    // compatibility layer which mimics that of the jquery response objects.
+    fetchRequest
+      .then(
+        async response => {
+          if (response === undefined) {
+            // For some reason, response is undefined? Throw to the error path.
+            throw new Error('Response is undefined');
+          }
+
+          // The Response's body can only be resolved/used at most once.
+          // So we clone the response so we can resolve the body content as text content.
+          // Response objects need to be cloned before its body can be used.
+          let responseJSON: any;
+          let responseText: any;
+
+          const {status, statusText} = response;
+          let {ok} = response;
+          let errorReason = 'Request not OK'; // the default error reason
+          let twoHundredErrorReason: string | undefined;
+
+          // Try to get text out of the response no matter the status
+          try {
+            responseText = await response.text();
+          } catch (error: any) {
+            twoHundredErrorReason = 'Failed awaiting response.text()';
+            ok = false;
+            if (error.name === 'AbortError') {
+              errorReason = 'Request was aborted';
+            } else {
+              errorReason = error.toString();
+            }
+          }
+
+          const responseContentType = response.headers.get('content-type');
+          const isResponseJSON = responseContentType?.includes('json');
+          const wasExpectingJson =
+            requestHeaders.get('Accept') === Client.JSON_HEADERS.Accept;
+
+          const isStatus3XX = status >= 300 && status < 400;
+          if (status !== 204 && !isStatus3XX) {
+            try {
+              responseJSON = JSON.parse(responseText);
+            } catch (error: any) {
+              twoHundredErrorReason = 'Failed trying to parse responseText';
+              if (error.name === 'AbortError') {
+                ok = false;
+                errorReason = 'Request was aborted';
+              } else if (isResponseJSON && error instanceof SyntaxError) {
+                // If the MIME type is `application/json` but decoding failed,
+                // this should be an error.
+                ok = false;
+                errorReason = 'JSON parse error';
+              } else if (
+                // Empty responses from POST 201 requests are valid
+                responseText?.length > 0 &&
+                wasExpectingJson &&
+                error instanceof SyntaxError
+              ) {
+                // Was expecting json but was returned something else. Possibly HTML.
+                // Ideally this would not be a 200, but we should reject the promise
+                ok = false;
+                errorReason = 'JSON parse error. Possibly returned HTML';
+              }
+            }
+          }
+
+          const responseMeta: ResponseMeta = {
+            status,
+            statusText,
+            responseJSON,
+            responseText,
+            getResponseHeader: (header: string) => response.headers.get(header),
+          };
+
+          // Respect the response content-type header
+          const responseData = isResponseJSON ? responseJSON : responseText;
+
+          if (ok) {
+            successHandler(responseMeta, statusText, responseData);
+          } else {
+            // There's no reason we should be here with a 200 response, but we get
+            // tons of events from this codepath with a 200 status nonetheless.
+            // Until we know why, let's do what is essentially some very fancy print debugging.
+            if (status === 200 && responseText) {
+              const parameterizedPath = sanitizePath(path);
+              const message = '200 treated as error';
+
+              Sentry.withScope(scope => {
+                scope.setTags({endpoint: `${method} ${parameterizedPath}`, errorReason});
+                scope.setExtras({
+                  twoHundredErrorReason,
+                  responseJSON,
+                  responseText,
+                  responseContentType,
+                  errorReason,
+                });
+                // Make sure all of these errors group, so we don't produce a bunch of noise
+                scope.setFingerprint([message]);
+
+                Sentry.captureException(
+                  new Error(`${message}: ${method} ${parameterizedPath}`)
+                );
+              });
+            }
+
+            // Record before the global handlers, which may skip `errorHandler`
+            // (e.g. 401 redirects)
+            recordRequestMetric('error', status);
+
+            const shouldSkipErrorHandler = Array.from(globalErrorHandlers, handler =>
+              handler(responseMeta, options)
+            ).some(Boolean);
+
+            if (!shouldSkipErrorHandler) {
+              errorHandler(responseMeta, statusText, errorReason);
+            }
+          }
+
+          completeHandler(responseMeta, statusText);
+        },
+        () => {
+          // Ignore failed fetch calls or errors in the fetch request itself (e.g. cancelled requests)
+          // Not related to errors in responses
+        }
+      )
+      .catch((error: Error) => {
+        // eslint-disable-next-line no-console
+        console.error(error);
+
+        if (error?.name !== 'AbortError' && error?.message !== 'Response is undefined') {
+          Sentry.captureException(error);
+        }
+      });
+
+    const request = new Request(fetchRequest, aborter);
+    this.activeRequests[id] = request;
+
+    return request;
+  }
+
+  /**
+   * Initiate a request to the backend API.
+   *
+   * @deprecated Use `useApiQuery` or `useMutation` with `fetchDataQuery` and `fetchMutation` instead.
+   * See https://develop.sentry.dev/frontend/network-requests/ for more.
+   */
+  requestPromise<IncludeAllArgsType extends boolean>(
+    path: string,
+    {
+      includeAllArgs,
+      ...options
+    }: {includeAllArgs?: IncludeAllArgsType} & Readonly<RequestOptions> = {}
+  ): Promise<IncludeAllArgsType extends true ? ApiResult : any> {
+    // Create an error object here before we make any async calls so that we
+    // have a helpful stack trace if it errors
+    //
+    // This *should* get logged to Sentry only if the promise rejection is not handled
+    // (since SDK captures unhandled rejections). Ideally we explicitly ignore rejection
+    // or handle with a user friendly error message
+    const preservedError = new Error('API Request Error');
+
+    return new Promise((resolve, reject) => {
+      const request = this.request(path, {
+        ...options,
+        preservedError,
+        success: (data, textStatus, resp) => {
+          if (includeAllArgs) {
+            resolve([data, textStatus, resp] as any);
+          } else {
+            resolve(data);
+          }
+        },
+        error: (resp: ResponseMeta) => {
+          const errorObjectToUse = new RequestError(
+            options.method,
+            path,
+            preservedError,
+            resp
+          );
+
+          // Although `this.request` logs all error responses, this error object can
+          // potentially be logged by Sentry's unhandled rejection handler
+          reject(errorObjectToUse);
+        },
+      });
+
+      // `request` runs neither callback when the fetch itself rejects (a blocked
+      // request, a network failure), which would leave this promise pending
+      // forever. A cancelled request rejects the same way, but it was abandoned
+      // on purpose, so it stays unsettled rather than surfacing as an error.
+      request.requestPromise.catch(() => {
+        if (request.alive) {
+          reject(new RequestError(options.method, path, preservedError));
+        }
+      });
+    });
+  }
+}

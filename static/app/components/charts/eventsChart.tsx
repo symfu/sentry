@@ -1,0 +1,636 @@
+import {isValidElement, memo, useRef, useState} from 'react';
+import type {Theme} from '@emotion/react';
+import {withTheme} from '@emotion/react';
+import {IconWarning} from '@sentry/icons/warning';
+import type {
+  EChartsOption,
+  LegendComponentOption,
+  LineSeriesOption,
+  XAXisComponentOption,
+  YAXisComponentOption,
+} from 'echarts';
+import type {Location, Query} from 'history';
+import isEqual from 'lodash/isEqual';
+
+import type {Client} from 'sentry/api';
+import type {AreaChartProps} from 'sentry/components/charts/areaChart';
+import {AreaChart} from 'sentry/components/charts/areaChart';
+import type {BarChartProps} from 'sentry/components/charts/barChart';
+import {BarChart} from 'sentry/components/charts/barChart';
+import type {ZoomRenderProps} from 'sentry/components/charts/chartZoom';
+import ChartZoom from 'sentry/components/charts/chartZoom';
+import {ErrorPanel} from 'sentry/components/charts/errorPanel';
+import type {LineChartProps} from 'sentry/components/charts/lineChart';
+import {LineChart} from 'sentry/components/charts/lineChart';
+import {useReleaseSeries} from 'sentry/components/charts/releaseSeries';
+import {TransitionChart} from 'sentry/components/charts/transitionChart';
+import {TransparentLoadingMask} from 'sentry/components/charts/transparentLoadingMask';
+import {getInterval, RELEASE_LINES_THRESHOLD} from 'sentry/components/charts/utils';
+import {mergeDroppedDataBand} from 'sentry/components/droppedData/band/mergeDroppedDataBand';
+import {useDroppedDataBand} from 'sentry/components/droppedData/band/useDroppedDataBand';
+import type {DroppedDataProps} from 'sentry/components/droppedData/types';
+import {t} from 'sentry/locale';
+import type {DateString} from 'sentry/types/core';
+import type {ReactEchartsRef, Series} from 'sentry/types/echarts';
+import type {OrganizationSummary} from 'sentry/types/organization';
+import {defined} from 'sentry/utils/defined';
+import {
+  axisLabelFormatter,
+  axisLabelFormatterUsingAggregateOutputType,
+  tooltipFormatter,
+} from 'sentry/utils/discover/charts';
+import type {AggregationOutputType} from 'sentry/utils/discover/fields';
+import {
+  aggregateMultiPlotType,
+  aggregateOutputType,
+  getEquation,
+  isEquation,
+} from 'sentry/utils/discover/fields';
+import type {DiscoverDatasets} from 'sentry/utils/discover/types';
+import {decodeList, decodeScalar} from 'sentry/utils/queryString';
+import {ellipsize} from 'sentry/utils/string/ellipsize';
+
+import {EventsRequest} from './eventsRequest';
+
+type ChartComponent =
+  | React.ComponentType<BarChartProps>
+  | React.ComponentType<AreaChartProps>
+  | React.ComponentType<LineChartProps>;
+
+type ChartProps = {
+  currentSeriesNames: string[];
+  loading: boolean;
+  previousSeriesNames: string[];
+  reloading: boolean;
+  stacked: boolean;
+  theme: Theme;
+  timeseriesData: Series[];
+  yAxis: string;
+  zoomRenderProps: ZoomRenderProps;
+  additionalSeries?: LineSeriesOption[];
+  chartComponent?: ChartComponent;
+  chartOptions?: Omit<EChartsOption, 'xAxis' | 'yAxis'> & {
+    xAxis?: XAXisComponentOption;
+    yAxis?: YAXisComponentOption;
+  };
+  colors?: string[];
+  /**
+   * By default, only the release series is disableable. This adds
+   * a list of series names that are also disableable.
+   */
+  disableableSeries?: string[];
+  droppedData?: DroppedDataProps;
+  forceChartType?: string;
+  fromDiscover?: boolean;
+  height?: number;
+  interval?: string;
+  legendOptions?: LegendComponentOption;
+  minutesThresholdToDisplaySeconds?: number;
+  previousSeriesTransformer?: (series?: Series | null) => Series | null | undefined;
+  previousTimeseriesData?: Series[] | null;
+  referrer?: string;
+  releaseSeries?: Series[];
+  /**
+   * A callback to allow for post-processing of the series data.
+   * Can be used to rename series or even insert a new series.
+   */
+  seriesTransformer?: (series: Series[]) => Series[];
+  showDaily?: boolean;
+  showLegend?: boolean;
+  timeframe?: {end: number; start: number};
+  timeseriesResultsTypes?: Record<string, AggregationOutputType>;
+  topEvents?: number;
+};
+
+function Chart({
+  theme,
+  loading: _loading,
+  reloading: _reloading,
+  yAxis,
+  releaseSeries,
+  zoomRenderProps,
+  timeseriesData,
+  previousTimeseriesData,
+  showLegend,
+  legendOptions,
+  chartOptions: chartOptionsProp,
+  currentSeriesNames,
+  previousSeriesNames,
+  seriesTransformer,
+  previousSeriesTransformer,
+  colors,
+  height,
+  timeframe,
+  topEvents,
+  timeseriesResultsTypes,
+  additionalSeries,
+  showDaily,
+  chartComponent,
+  forceChartType,
+  disableableSeries = [],
+  droppedData,
+  ...props
+}: ChartProps) {
+  const [seriesSelection, setSeriesSelection] = useState<Record<string, boolean>>({});
+  const chartRef = useRef<ReactEchartsRef>(null);
+  const droppedDataBand = useDroppedDataBand({
+    chartRef,
+    droppedData,
+    utc: zoomRenderProps.utc,
+  });
+
+  function handleLegendSelectChanged(legendChange: any) {
+    const {selected} = legendChange;
+    const newSeriesSelection = Object.keys(selected).reduce<Record<string, boolean>>(
+      (state, key) => {
+        // we only want them to be able to disable the Releases&Other series,
+        // and not any of the other possible series here
+        const disableable =
+          ['Releases', 'Other'].includes(key) || disableableSeries.includes(key);
+        state[key] = disableable ? selected[key] : true;
+        return state;
+      },
+      {}
+    );
+
+    setSeriesSelection(newSeriesSelection);
+  }
+
+  const multiPlotType =
+    !defined(chartComponent) && !showDaily && timeseriesData.length > 1
+      ? forceChartType || aggregateMultiPlotType(yAxis)
+      : null;
+  if (multiPlotType !== null && multiPlotType !== 'line' && multiPlotType !== 'area') {
+    throw new Error(`Unknown multi plot type for ${yAxis}`);
+  }
+  const ChartComponent =
+    chartComponent ??
+    (showDaily ? BarChart : multiPlotType === 'line' ? LineChart : AreaChart);
+
+  const data = [
+    ...(currentSeriesNames.length > 0 ? currentSeriesNames : [t('Current')]),
+    ...(additionalSeries ? additionalSeries.map(series => series.name as string) : []),
+  ];
+
+  if (defined(previousTimeseriesData)) {
+    data.push(
+      ...(previousSeriesNames.length > 0 ? previousSeriesNames : [t('Previous')])
+    );
+  }
+
+  const releasesLegend = t('Releases');
+
+  const hasOther = topEvents && topEvents + 1 === timeseriesData.length;
+  if (hasOther) {
+    data.push('Other');
+  }
+
+  if (Array.isArray(releaseSeries) && releaseSeries.length > 0) {
+    data.push(releasesLegend);
+  }
+
+  // Temporary fix to improve performance on pages with a high number of releases.
+  const releases = releaseSeries?.[0];
+  const hideReleasesByDefault =
+    Array.isArray(releaseSeries) &&
+    (releases as any)?.markLine?.data &&
+    (releases as any).markLine.data.length >= RELEASE_LINES_THRESHOLD;
+
+  const selected = Array.isArray(releaseSeries)
+    ? Object.keys(seriesSelection).length === 0 && hideReleasesByDefault
+      ? {[releasesLegend]: false}
+      : seriesSelection
+    : seriesSelection;
+
+  const legend = showLegend
+    ? {
+        right: 16,
+        top: 12,
+        data,
+        selected,
+        ...legendOptions,
+      }
+    : undefined;
+
+  let series = Array.isArray(releaseSeries)
+    ? [...timeseriesData, ...releaseSeries]
+    : timeseriesData;
+  let previousSeries = previousTimeseriesData;
+
+  if (seriesTransformer) {
+    series = seriesTransformer(series);
+  }
+
+  if (previousSeriesTransformer) {
+    previousSeries = previousSeries?.map(prev => previousSeriesTransformer(prev)!);
+  }
+  const chartColors = timeseriesData.length
+    ? (colors?.slice(0, series.length) ??
+      theme.chart.getColorPalette(timeseriesData.length - 1 - (hasOther ? 1 : 0)).slice())
+    : undefined;
+  if (chartColors?.length && hasOther) {
+    chartColors.push(theme.tokens.content.secondary);
+  }
+  const timeframeXAxis = timeframe
+    ? {min: timeframe.start, max: timeframe.end}
+    : undefined;
+  const defaultYAxis = {
+    axisLabel: {
+      color: theme.tokens.content.secondary,
+      formatter: (value: number) => {
+        if (timeseriesResultsTypes) {
+          const outputType =
+            new Set(Object.values(timeseriesResultsTypes)).size === 1
+              ? timeseriesResultsTypes[yAxis]!
+              : 'number';
+          return axisLabelFormatterUsingAggregateOutputType(value, outputType);
+        }
+        return axisLabelFormatter(value, aggregateOutputType(yAxis));
+      },
+    },
+  };
+
+  const band = mergeDroppedDataBand(
+    {
+      grid: {left: '24px', right: '24px', top: '32px', bottom: 12},
+      xAxis: timeframeXAxis,
+      yAxes: [chartOptionsProp?.yAxis ?? defaultYAxis],
+      series: additionalSeries,
+    },
+    droppedDataBand,
+    droppedData?.onClick
+  );
+
+  const chartOptions = {
+    colors: chartColors,
+    grid: band.grid,
+    seriesOptions: {
+      showSymbol: false,
+    },
+    tooltip: {
+      trigger: 'axis' as const,
+      truncate: 80,
+      valueFormatter: (value: number, label?: string) => {
+        const aggregateName = label
+          ?.replace(/^previous /, '')
+          .split(':')
+          .pop()
+          ?.trim();
+        if (aggregateName) {
+          return timeseriesResultsTypes
+            ? tooltipFormatter(value, timeseriesResultsTypes[aggregateName])
+            : tooltipFormatter(value, aggregateOutputType(aggregateName));
+        }
+        return tooltipFormatter(value);
+      },
+    },
+    xAxis: band.xAxis,
+    yAxis: defaultYAxis,
+    ...chartOptionsProp,
+    yAxes: band.yAxes.length > 1 ? band.yAxes : undefined,
+    animation: typeof ChartComponent === typeof BarChart ? false : undefined,
+  };
+
+  return (
+    <ChartComponent
+      {...props}
+      {...zoomRenderProps}
+      {...chartOptions}
+      ref={chartRef}
+      legend={legend}
+      onLegendSelectChanged={handleLegendSelectChanged}
+      onClick={band.onClick}
+      series={series}
+      previousPeriod={previousSeries ? previousSeries : undefined}
+      height={height}
+      additionalSeries={band.series}
+    />
+  );
+}
+
+const ThemedChart = memo(withTheme(Chart), (prevProps, nextProps) => {
+  if (nextProps.reloading || !nextProps.timeseriesData) {
+    return true;
+  }
+
+  if (
+    isEqual(prevProps.timeseriesData, nextProps.timeseriesData) &&
+    isEqual(prevProps.releaseSeries, nextProps.releaseSeries) &&
+    isEqual(prevProps.previousTimeseriesData, nextProps.previousTimeseriesData) &&
+    isEqual(prevProps.additionalSeries, nextProps.additionalSeries) &&
+    isEqual(prevProps.droppedData, nextProps.droppedData)
+  ) {
+    return true;
+  }
+
+  return false;
+});
+
+export type EventsChartProps = {
+  api: Client;
+  /**
+   * Absolute end date.
+   */
+  end: DateString;
+  /**
+   * Environment condition.
+   */
+  environments: string[];
+  location: Location;
+  organization: OrganizationSummary;
+  /**
+   * Project ids
+   */
+  projects: number[];
+  /**
+   * The discover query string to find events with.
+   */
+  query: string;
+  /**
+   * Absolute start date.
+   */
+  start: DateString;
+  /**
+   * The aggregate/metric to plot.
+   */
+  yAxis: string | string[];
+  additionalSeries?: LineSeriesOption[];
+  /**
+   * Markup for optional chart header
+   */
+  chartHeader?: React.ReactNode;
+  /**
+   * Override the default color palette.
+   */
+  colors?: string[];
+  confirmedQuery?: boolean;
+  /**
+   * Name of the series
+   */
+  currentSeriesName?: string;
+  /**
+   * Specifies the dataset to query from. Defaults to discover.
+   */
+  dataset?: DiscoverDatasets;
+  /**
+   * Don't show the previous period's data. Will automatically disable
+   * when start/end are used.
+   */
+  disablePrevious?: boolean;
+  /**
+   * Don't show the release marklines.
+   */
+  disableReleases?: boolean;
+  /**
+   * A list of release names to visually emphasize. Can only be used when `disableReleases` is false.
+   */
+  emphasizeReleases?: string[];
+  /**
+   * The fields that act as grouping conditions when generating a topEvents chart.
+   */
+  field?: string[];
+  /**
+   * The interval resolution for a chart e.g. 1m, 5m, 1d
+   */
+  interval?: string;
+  /**
+   * Whether or not the request for processed baseline data has been resolved/terminated
+   */
+  loadingAdditionalSeries?: boolean;
+  /**
+   * Order condition when showing topEvents
+   */
+  orderby?: string;
+  /**
+   * Relative datetime expression. eg. 14d
+   */
+  period?: string | null;
+  preserveReleaseQueryParams?: boolean;
+  /**
+   * Name of the previous series
+   */
+  previousSeriesName?: string;
+  /**
+   * A unique name for what's triggering this request, see organization_events_stats for an allowlist
+   */
+  referrer?: string;
+  releaseQueryExtra?: Query;
+  reloadingAdditionalSeries?: boolean;
+  /**
+   * Override the interval calculation and show daily results.
+   */
+  showDaily?: boolean;
+  /**
+   * Fetch n top events as dictated by the field and orderby props.
+   */
+  topEvents?: number;
+  /**
+   * Chart zoom will change 'pageStart' instead of 'start'
+   */
+  usePageZoom?: boolean;
+  /**
+   * Should datetimes be formatted in UTC?
+   */
+  utc?: boolean | null;
+} & Pick<
+  ChartProps,
+  | 'seriesTransformer'
+  | 'previousSeriesTransformer'
+  | 'showLegend'
+  | 'minutesThresholdToDisplaySeconds'
+  | 'disableableSeries'
+  | 'droppedData'
+  | 'legendOptions'
+  | 'chartOptions'
+  | 'chartComponent'
+  | 'height'
+  | 'fromDiscover'
+>;
+
+export function EventsChart(props: EventsChartProps) {
+  const {
+    api,
+    organization,
+    period,
+    utc,
+    query,
+    location,
+    start,
+    end,
+    projects,
+    environments,
+    showLegend,
+    minutesThresholdToDisplaySeconds,
+    yAxis,
+    disablePrevious,
+    disableReleases,
+    emphasizeReleases,
+    currentSeriesName: currentName,
+    previousSeriesName: previousName,
+    seriesTransformer,
+    previousSeriesTransformer,
+    field,
+    interval,
+    showDaily,
+    topEvents,
+    orderby,
+    confirmedQuery,
+    colors,
+    chartHeader,
+    legendOptions,
+    chartOptions,
+    preserveReleaseQueryParams,
+    releaseQueryExtra,
+    disableableSeries,
+    droppedData,
+    chartComponent,
+    usePageZoom,
+    height,
+    fromDiscover,
+    additionalSeries,
+    loadingAdditionalSeries,
+    reloadingAdditionalSeries,
+    dataset,
+    ...restProps
+  } = props;
+
+  const isStacked =
+    (typeof topEvents === 'number' && topEvents > 0) ||
+    (Array.isArray(yAxis) && yAxis.length > 1);
+
+  // Include previous only on relative dates (defaults to relative if no start and end)
+  const includePrevious = !disablePrevious && !start && !end;
+
+  const forceChartType = decodeScalar(location.query.forceChartType);
+  const yAxisArray = decodeList(yAxis);
+  const yAxisSeriesNames = yAxisArray.map(name => {
+    const yAxisLabel = name && isEquation(name) ? getEquation(name) : name;
+    return ellipsize(yAxisLabel, 60);
+  });
+
+  const previousSeriesNames = previousName
+    ? [previousName]
+    : yAxisSeriesNames.map(name => t('previous %s', name));
+  const currentSeriesNames = currentName ? [currentName] : yAxisSeriesNames;
+
+  const intervalVal = showDaily ? '1d' : interval || getInterval(props, 'high');
+
+  const {releaseSeries} = useReleaseSeries({
+    utc,
+    period,
+    start,
+    end,
+    projects,
+    environments,
+    emphasizeReleases,
+    preserveQueryParams: preserveReleaseQueryParams,
+    queryExtra: releaseQueryExtra,
+    enabled: !disableReleases,
+  });
+
+  return (
+    <ChartZoom
+      period={period}
+      start={start}
+      end={end}
+      utc={utc}
+      usePageDate={usePageZoom}
+      {...restProps}
+    >
+      {zoomRenderProps => {
+        return (
+          <EventsRequest
+            {...restProps}
+            api={api}
+            organization={organization}
+            period={period}
+            project={projects}
+            environment={environments}
+            start={start}
+            end={end}
+            interval={intervalVal}
+            query={query}
+            includePrevious={includePrevious}
+            currentSeriesNames={currentSeriesNames}
+            previousSeriesNames={previousSeriesNames}
+            yAxis={yAxis}
+            field={field}
+            orderby={orderby}
+            topEvents={topEvents}
+            confirmedQuery={confirmedQuery}
+            partial
+            dataset={dataset}
+          >
+            {eventData => {
+              const {
+                errored,
+                loading,
+                reloading,
+                results,
+                timeseriesData,
+                previousTimeseriesData,
+                timeframe,
+                timeseriesResultsTypes,
+              } = eventData;
+
+              if (errored) {
+                return (
+                  <ErrorPanel>
+                    <IconWarning variant="muted" size="lg" />
+                  </ErrorPanel>
+                );
+              }
+
+              const seriesData = results ?? timeseriesData;
+
+              return (
+                <TransitionChart
+                  loading={loading}
+                  reloading={reloading || !!reloadingAdditionalSeries}
+                  height={height ? `${height}px` : undefined}
+                >
+                  <TransparentLoadingMask
+                    visible={reloading || !!reloadingAdditionalSeries}
+                  />
+
+                  {isValidElement(chartHeader) && chartHeader}
+
+                  <ThemedChart
+                    forceChartType={forceChartType}
+                    zoomRenderProps={zoomRenderProps}
+                    loading={loading || !!loadingAdditionalSeries}
+                    reloading={reloading || !!reloadingAdditionalSeries}
+                    showLegend={showLegend}
+                    minutesThresholdToDisplaySeconds={minutesThresholdToDisplaySeconds}
+                    releaseSeries={releaseSeries}
+                    timeseriesData={seriesData ?? []}
+                    previousTimeseriesData={previousTimeseriesData}
+                    currentSeriesNames={currentSeriesNames}
+                    previousSeriesNames={previousSeriesNames}
+                    seriesTransformer={seriesTransformer}
+                    additionalSeries={additionalSeries}
+                    previousSeriesTransformer={previousSeriesTransformer}
+                    stacked={isStacked}
+                    yAxis={yAxisArray[0]!}
+                    showDaily={showDaily}
+                    colors={colors}
+                    legendOptions={legendOptions}
+                    chartOptions={chartOptions}
+                    disableableSeries={disableableSeries}
+                    droppedData={droppedData}
+                    chartComponent={chartComponent}
+                    height={height}
+                    timeframe={timeframe}
+                    topEvents={topEvents}
+                    fromDiscover={fromDiscover}
+                    timeseriesResultsTypes={timeseriesResultsTypes}
+                  />
+                </TransitionChart>
+              );
+            }}
+          </EventsRequest>
+        );
+      }}
+    </ChartZoom>
+  );
+}

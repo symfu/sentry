@@ -1,41 +1,95 @@
-import logging
-import math
-import re
-import warnings
-from collections import namedtuple
-from enum import Enum
-from datetime import timedelta
+from __future__ import annotations
 
+import logging
+import re
+import uuid
+from collections import defaultdict, namedtuple
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from datetime import datetime, timedelta
+from enum import Enum
+from functools import reduce
+from operator import or_
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+
+from django.core.cache import cache
 from django.db import models
+from django.db.models import Q, QuerySet
+from django.db.models.base import ModelBase
+from django.db.models.signals import pre_save
+from django.dispatch import receiver
 from django.utils import timezone
-from django.utils.http import urlencode, urlquote
-from django.utils.translation import ugettext_lazy as _
+from django.utils.http import urlencode
+from django.utils.translation import gettext_lazy as _
+from sentry_protos.snuba.v1.trace_item_attribute_pb2 import AttributeKey
+from sentry_protos.snuba.v1.trace_item_filter_pb2 import ExistsFilter, TraceItemFilter
+from snuba_sdk import Column, Condition, Entity, Function, Limit, Op, Query, Request
 
 from sentry import eventstore, eventtypes, tagstore
-from sentry.constants import DEFAULT_LOGGER_NAME, LOG_LEVELS, MAX_CULPRIT_LENGTH
+from sentry.backup.scopes import RelocationScope
+from sentry.constants import (
+    ALLOWED_FUTURE_DELTA,
+    DEFAULT_LOGGER_NAME,
+    LOG_LEVELS,
+    MAX_CULPRIT_LENGTH,
+)
 from sentry.db.models import (
-    BaseManager,
     BoundedBigIntegerField,
     BoundedIntegerField,
     BoundedPositiveIntegerField,
     FlexibleForeignKey,
-    GzippedDictField,
     Model,
+    cell_silo_model,
     sane_repr,
 )
-from sentry.utils.http import absolute_uri
+from sentry.db.models.fields.jsonfield import LegacyTextJSONField
+from sentry.db.models.manager.base import BaseManager
+from sentry.db.models.manager.base_query_set import BaseQuerySet
+from sentry.issues.grouptype import GroupCategory, GroupType, get_group_type_by_type_id
+from sentry.issues.priority import (
+    PRIORITY_TO_GROUP_HISTORY_STATUS,
+    PriorityChangeReason,
+    get_priority_for_ongoing_group,
+)
+from sentry.models.commit import Commit
+from sentry.models.grouphistory import record_group_history, record_group_history_from_activity_type
+from sentry.models.organization import Organization
+from sentry.search.eap.occurrences.query_utils import build_event_id_in_filter
+from sentry.search.eap.rpc_utils import and_trace_item_filters
+from sentry.services.eventstore.models import Event, GroupEvent
+from sentry.snuba.dataset import Dataset
+from sentry.snuba.referrer import Referrer
+from sentry.types.activity import ActivityType
+from sentry.types.actor import Actor
+from sentry.types.group import (
+    IGNORED_SUBSTATUS_CHOICES,
+    UNRESOLVED_SUBSTATUS_CHOICES,
+    GroupSubStatus,
+)
+from sentry.utils import metrics
+from sentry.utils.dates import outside_retention_with_modified_start
 from sentry.utils.numbers import base32_decode, base32_encode
+from sentry.utils.safe import get_path
 from sentry.utils.strings import strip, truncatechars
+
+if TYPE_CHECKING:
+    from sentry.integrations.models.integration import Integration
+    from sentry.integrations.services.integration import RpcIntegration
+    from sentry.models.environment import Environment
+    from sentry.models.project import Project
+    from sentry.models.team import Team
+    from sentry.search.events.types import SnubaParams
+    from sentry.users.services.user import RpcUser
 
 logger = logging.getLogger(__name__)
 
-_short_id_re = re.compile(r"^(.*?)(?:[\s_-])([A-Za-z0-9]+)$")
-
+_short_id_re = re.compile(r"^(?:issue+:)?(.*?)(?:[\s_-])([A-Za-z0-9]+)$")
 ShortId = namedtuple("ShortId", ["project_slug", "short_id"])
 
+DEFAULT_TYPE_ID = 1
 
-def parse_short_id(short_id):
-    match = _short_id_re.match(short_id.strip())
+
+def parse_short_id(short_id_s: str) -> ShortId | None:
+    match = _short_id_re.match(short_id_s.strip())
     if match is None:
         return None
     slug, id = match.groups()
@@ -52,31 +106,36 @@ def parse_short_id(short_id):
     return ShortId(slug, short_id)
 
 
-def looks_like_short_id(value):
+def looks_like_short_id(value: str | None) -> bool:
     return _short_id_re.match((value or "").strip()) is not None
 
 
-def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organization=None):
+def get_group_with_redirect(
+    id_or_qualified_short_id: int | str,
+    queryset: BaseQuerySet[Group, Group] | None = None,
+    organization: Organization | None = None,
+) -> tuple[Group, bool]:
     """
     Retrieve a group by ID, checking the redirect table if the requested group
     does not exist. Returns a two-tuple of ``(object, redirected)``.
     """
     if queryset is None:
         if organization:
-            queryset = Group.objects.filter(project__organization=organization)
-            getter = queryset.get
+            updated_qs = Group.objects.filter(project__organization=organization)
+            getter = updated_qs.get
         else:
-            queryset = Group.objects.all()
+            updated_qs = Group.objects.all()
             # When not passing a queryset, we want to read from cache
             getter = Group.objects.get_from_cache
     else:
         if organization:
-            queryset = queryset.filter(project__organization=organization)
-        getter = queryset.get
+            updated_qs = queryset.filter(project__organization=organization)
+        else:
+            # No updates!
+            updated_qs = queryset
+        getter = updated_qs.get
 
-    if not (
-        isinstance(id_or_qualified_short_id, int) or id_or_qualified_short_id.isdigit()  # noqa
-    ):  # NOQA
+    if not (isinstance(id_or_qualified_short_id, int) or id_or_qualified_short_id.isdigit()):
         short_id = parse_short_id(id_or_qualified_short_id)
         if not short_id or not organization:
             raise Group.DoesNotExist()
@@ -87,32 +146,49 @@ def get_group_with_redirect(id_or_qualified_short_id, queryset=None, organizatio
         }
     else:
         short_id = None
+        # Validate that the numeric ID doesn't exceed the max value for the
+        # bounded field, otherwise the ORM will raise an AssertionError.
+        max_id = Group._meta.get_field("id").MAX_VALUE
+        try:
+            numeric_id = int(id_or_qualified_short_id)
+        except ValueError:
+            raise Group.DoesNotExist() from None
+        if numeric_id > max_id:
+            raise Group.DoesNotExist()
         params = {"id": id_or_qualified_short_id}
 
     try:
         return getter(**params), False
     except Group.DoesNotExist as error:
-        from sentry.models import GroupRedirect
+        from sentry.models.groupredirect import GroupRedirect
 
         if short_id:
+            # Known because we only set short_id in a path that raises if org is None
+            assert organization is not None
             params = {
-                "id": GroupRedirect.objects.filter(
+                "id__in": GroupRedirect.objects.filter(
                     organization_id=organization.id,
                     previous_short_id=short_id.short_id,
                     previous_project_slug=short_id.project_slug,
-                ).values_list("group_id", flat=True)
+                ).values_list("group_id", flat=True)[:1]
             }
         else:
-            params["id"] = GroupRedirect.objects.filter(previous_group_id=params["id"]).values_list(
-                "group_id", flat=True
-            )
+            params = {
+                "id__in": GroupRedirect.objects.filter(
+                    previous_group_id=id_or_qualified_short_id,
+                ).values_list("group_id", flat=True)[:1]
+            }
+
         try:
-            return queryset.get(**params), True
+            return updated_qs.get(**params), True
         except Group.DoesNotExist:
             raise error  # raise original `DoesNotExist`
 
 
 # TODO(dcramer): pull in enum library
+GroupTypeClass = type[GroupType]
+
+
 class GroupStatus:
     UNRESOLVED = 0
     RESOLVED = 1
@@ -129,14 +205,36 @@ class GroupStatus:
     MUTED = IGNORED
 
 
+STATUS_WITHOUT_SUBSTATUS = {
+    GroupStatus.RESOLVED,
+    GroupStatus.PENDING_DELETION,
+    GroupStatus.DELETION_IN_PROGRESS,
+    GroupStatus.PENDING_MERGE,
+    GroupStatus.REPROCESSING,
+}
+
 # Statuses that can be queried/searched for
-STATUS_QUERY_CHOICES = {
+STATUS_QUERY_CHOICES: dict[str, int] = {
     "resolved": GroupStatus.RESOLVED,
     "unresolved": GroupStatus.UNRESOLVED,
     "ignored": GroupStatus.IGNORED,
+    "archived": GroupStatus.IGNORED,
     # TODO(dcramer): remove in 9.0
     "muted": GroupStatus.IGNORED,
     "reprocessing": GroupStatus.REPROCESSING,
+}
+QUERY_STATUS_LOOKUP = {
+    status: query for query, status in STATUS_QUERY_CHOICES.items() if query != "muted"
+}
+
+GROUP_SUBSTATUS_TO_STATUS_MAP = {
+    GroupSubStatus.ESCALATING: GroupStatus.UNRESOLVED,
+    GroupSubStatus.REGRESSED: GroupStatus.UNRESOLVED,
+    GroupSubStatus.ONGOING: GroupStatus.UNRESOLVED,
+    GroupSubStatus.NEW: GroupStatus.UNRESOLVED,
+    GroupSubStatus.UNTIL_ESCALATING: GroupStatus.IGNORED,
+    GroupSubStatus.FOREVER: GroupStatus.IGNORED,
+    GroupSubStatus.UNTIL_CONDITION_MET: GroupStatus.IGNORED,
 }
 
 # Statuses that can be updated from the regular "update group" API
@@ -157,72 +255,394 @@ STATUS_UPDATE_CHOICES = {
 
 
 class EventOrdering(Enum):
-    LATEST = ["-timestamp", "-event_id"]
-    OLDEST = ["timestamp", "event_id"]
+    LATEST = ["project_id", "-timestamp", "-id"]
+    OLDEST = ["project_id", "timestamp", "id"]
+    RECOMMENDED = [
+        "-replay.id",
+        "-trace.sampled",
+        "num_processing_errors",
+        "-profile.id",
+        "-timestamp",
+        "-id",
+    ]
 
 
-def get_oldest_or_latest_event_for_environments(
-    ordering, environments=(), issue_id=None, project_id=None
-):
-    conditions = []
+def bulk_get_latest_event_ids(groups: Sequence[Group]) -> dict[int, tuple[int, str]]:
+    """Return the project and latest event IDs for a collection of groups."""
+    # Imported here because sentry.utils.snuba imports Group.
+    from sentry.utils.snuba import bulk_snuba_queries
 
-    if len(environments) > 0:
-        conditions.append(["environment", "IN", environments])
+    partitions: dict[tuple[int, Dataset], list[Group]] = defaultdict(list)
+    for group in groups:
+        dataset = (
+            Dataset.Events if group.issue_category == GroupCategory.ERROR else Dataset.IssuePlatform
+        )
+        partitions[(group.project.organization_id, dataset)].append(group)
 
-    events = eventstore.get_events(
-        filter=eventstore.Filter(
-            conditions=conditions, project_ids=[project_id], group_ids=[issue_id]
-        ),
+    request_contexts: list[tuple[Request, dict[int, int]]] = []
+    end = timezone.now() + ALLOWED_FUTURE_DELTA + timedelta(seconds=1)
+    for (organization_id, dataset), partition in partitions.items():
+        # Use first_seen to avoid scanning partitions from before the issues existed.
+        # last_seen is asynchronously updated and may lag behind events already in Snuba.
+        start = min(group.first_seen for group in partition) - timedelta(minutes=5)
+        expired, start = outside_retention_with_modified_start(
+            start, end, Organization(organization_id)
+        )
+        if expired:
+            continue
+
+        project_ids_by_group = {group.id: group.project_id for group in partition}
+        request = Request(
+            dataset=dataset.value,
+            app_id="eventstore",
+            query=Query(
+                match=Entity(dataset.value),
+                select=[
+                    Column("group_id"),
+                    Function(
+                        "argMax",
+                        [
+                            Column("event_id"),
+                            Function("tuple", [Column("timestamp"), Column("event_id")]),
+                        ],
+                        "event_id",
+                    ),
+                ],
+                groupby=[Column("group_id")],
+                where=[
+                    Condition(
+                        Column("project_id"), Op.IN, list(set(project_ids_by_group.values()))
+                    ),
+                    Condition(Column("group_id"), Op.IN, list(project_ids_by_group)),
+                    Condition(Column("timestamp"), Op.GTE, start),
+                    Condition(Column("timestamp"), Op.LT, end),
+                ],
+                limit=Limit(len(partition)),
+            ),
+            tenant_ids={"organization_id": organization_id},
+        )
+        request_contexts.append((request, project_ids_by_group))
+
+    if not request_contexts:
+        return {}
+
+    latest_event_ids = {}
+    results = bulk_snuba_queries(
+        [request for request, _ in request_contexts],
+        referrer=Referrer.GROUP_GET_LATEST_BULK.value,
+    )
+    for (_request, project_ids_by_group), result in zip(request_contexts, results, strict=True):
+        for row in result["data"]:
+            group_id = int(row["group_id"])
+            latest_event_ids[group_id] = (project_ids_by_group[group_id], row["event_id"])
+
+    return latest_event_ids
+
+
+def get_oldest_or_latest_event(
+    group: Group,
+    ordering: EventOrdering,
+    conditions: Sequence[Condition] | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> GroupEvent | None:
+    if group.issue_category == GroupCategory.ERROR:
+        dataset = Dataset.Events
+    else:
+        dataset = Dataset.IssuePlatform
+
+    all_conditions = [
+        Condition(Column("project_id"), Op.IN, [group.project.id]),
+        Condition(Column("group_id"), Op.IN, [group.id]),
+    ]
+
+    if conditions:
+        all_conditions.extend(conditions)
+
+    events = eventstore.backend.get_events_snql(
+        organization_id=group.project.organization_id,
+        group_id=group.id,
+        start=start,
+        end=end,
+        conditions=all_conditions,
         limit=1,
         orderby=ordering.value,
         referrer="Group.get_latest",
+        dataset=dataset,
+        tenant_ids={"organization_id": group.project.organization_id},
     )
 
     if events:
-        return events[0]
+        return events[0].for_group(group)
 
     return None
 
 
-class GroupManager(BaseManager):
+# Arbitrary number of candidate events to consider when we need to pick a
+# recommended event whose session replay is verified to exist.
+RECOMMENDED_EVENT_REPLAY_CANDIDATES = 10
+
+# Upping the inner limit to 10k samples if the verify_replay_exists flag is set.
+RECOMMENDED_EVENT_INNER_LIMIT = 1000
+RECOMMENDED_EVENT_REPLAY_INNER_LIMIT = 10000
+
+
+def get_recommended_event(
+    group: Group,
+    conditions: Sequence[Condition] | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    verify_replay_exists: bool = False,
+) -> GroupEvent | None:
+    if group.issue_category == GroupCategory.ERROR:
+        dataset = Dataset.Events
+    else:
+        dataset = Dataset.IssuePlatform
+
+    all_conditions = [
+        Condition(Column("project_id"), Op.IN, [group.project.id]),
+        Condition(Column("group_id"), Op.IN, [group.id]),
+    ]
+
+    if conditions:
+        all_conditions.extend(conditions)
+
+    default_end = group.last_seen + timedelta(minutes=1)
+    default_start = default_end - timedelta(days=7)
+
+    resolved_start = start if start else default_start
+    resolved_end = end if end else default_end
+
+    expired, _ = outside_retention_with_modified_start(
+        start=resolved_start,
+        end=resolved_end,
+        organization=Organization(group.project.organization_id),
+    )
+
+    if expired:
+        return None
+
+    limit = RECOMMENDED_EVENT_REPLAY_CANDIDATES if verify_replay_exists else 1
+    inner_limit = (
+        RECOMMENDED_EVENT_REPLAY_INNER_LIMIT
+        if verify_replay_exists
+        else RECOMMENDED_EVENT_INNER_LIMIT
+    )
+
+    events = eventstore.backend.get_events_snql(
+        organization_id=group.project.organization_id,
+        group_id=group.id,
+        start=resolved_start,
+        end=resolved_end,
+        conditions=all_conditions,
+        limit=limit,
+        orderby=EventOrdering.RECOMMENDED.value,
+        referrer="Group.get_helpful",
+        dataset=dataset,
+        tenant_ids={"organization_id": group.project.organization_id},
+        inner_limit=inner_limit,
+    )
+
+    if not events:
+        return None
+
+    if verify_replay_exists:
+        event = _select_event_with_existing_replay(group, events, resolved_start, resolved_end)
+    else:
+        event = events[0]
+
+    return event.for_group(group)
+
+
+def _get_replay_id_from_event(event: Event) -> str | None:
+    replay_id = get_path(event.data, "contexts", "replay", "replay_id")
+    if replay_id:
+        return replay_id
+    return event.get_tag("replayId")
+
+
+def _normalize_replay_id(replay_id: str | None) -> str | None:
+    """Normalize a replay id to the 32 char dashless hex used by the replays dataset."""
+    if not replay_id:
+        return None
+    try:
+        return uuid.UUID(hex=replay_id).hex
+    except ValueError:
+        return None
+
+
+def _select_event_with_existing_replay(
+    group: Group,
+    events: Sequence[Event],
+    start: datetime,
+    end: datetime,
+) -> Event:
+    """
+    Select an event with a replay id after it has been verified to exist in the replays dataset.
+    """
+    from sentry.replays.usecases.replay_existence import filter_existing_replay_ids
+    from sentry.utils.snuba import SnubaError
+
+    replay_id_to_event: dict[str, Event] = {}
+    for event in events:
+        # Replays store ids as dash-less hex strings.
+        normalized = _normalize_replay_id(_get_replay_id_from_event(event))
+        if normalized is not None and normalized not in replay_id_to_event:
+            replay_id_to_event[normalized] = event
+
+    if not replay_id_to_event:
+        metrics.incr(
+            "issue_details.recommended_event.replay_verify",
+            tags={"outcome": "no_candidates"},
+        )
+        return events[0]
+
+    try:
+        with metrics.timer("issue_details.recommended_event.replay_verify_duration"):
+            existing_replay_ids = filter_existing_replay_ids(
+                project_ids=[group.project.id],
+                start=start,
+                end=end,
+                replay_ids=list(replay_id_to_event.keys()),
+                tenant_ids={"organization_id": group.project.organization_id},
+            )
+    except SnubaError:
+        logger.exception("issue_details.recommended_event.replay_verify_error")
+        metrics.incr(
+            "issue_details.recommended_event.replay_verify",
+            tags={"outcome": "query_error"},
+        )
+        return events[0]
+
+    for replay_id, event in replay_id_to_event.items():
+        if replay_id in existing_replay_ids:
+            metrics.incr(
+                "issue_details.recommended_event.replay_verify",
+                tags={"outcome": "verified"},
+            )
+            return event
+
+    metrics.incr(
+        "issue_details.recommended_event.replay_verify",
+        tags={"outcome": "fell_back"},
+    )
+    return events[0]
+
+
+class GroupManager(BaseManager["Group"]):
     use_for_related_fields = True
 
-    def by_qualified_short_id(self, organization_id, short_id):
-        short_id = parse_short_id(short_id)
-        if not short_id:
+    def get_queryset(self) -> BaseQuerySet[Group, Group]:
+        return super().get_queryset().with_post_update_signal(True)
+
+    def by_qualified_short_id(
+        self,
+        organization_id: int,
+        short_id: str,
+        *,
+        project_ids: Collection[int] | None,
+    ) -> Group:
+        return self.by_qualified_short_id_bulk(
+            organization_id, [short_id], project_ids=project_ids
+        )[0]
+
+    def by_qualified_short_id_bulk(
+        self,
+        organization_id: int,
+        short_ids_raw: list[str],
+        *,
+        project_ids: Collection[int] | None,
+    ) -> Sequence[Group]:
+        """
+        Resolve qualified short ids (e.g. ``PROJECT-123``) to groups.
+
+        Always scoped to ``organization_id``. ``project_ids`` is **required** (keyword-only, no
+        default) to prevent an accidental in-org IDOR: when it is a collection (including an
+        empty one), the lookup is additionally scoped to those projects so a short id
+        referencing a project the caller cannot access does not resolve. Callers with an
+        authorized-project set (the projects the actor is allowed to see) MUST pass it so
+        project-level permissions are enforced at the query layer rather than via a post-hoc
+        check. Pass ``project_ids=None`` ONLY when the caller legitimately operates
+        organization-wide (e.g. commit/PR linking, system RPCs, or reads already scoped to the
+        requested projects downstream); doing so is explicit and reviewable at the call site.
+        """
+        short_ids = []
+        for short_id_raw in short_ids_raw:
+            parsed_short_id = parse_short_id(short_id_raw)
+            if parsed_short_id is None:
+                raise Group.DoesNotExist()
+            short_ids.append(parsed_short_id)
+        if not short_ids:
             raise Group.DoesNotExist()
-        return Group.objects.exclude(
+
+        project_short_id_lookup = defaultdict(list)
+        for short_id in short_ids:
+            project_short_id_lookup[short_id.project_slug].append(short_id.short_id)
+
+        short_id_lookup = reduce(
+            or_,
+            [
+                Q(project__slug=slug, short_id__in=short_ids)
+                for slug, short_ids in project_short_id_lookup.items()
+            ],
+        )
+
+        base_group_queryset = self.exclude(
             status__in=[
                 GroupStatus.PENDING_DELETION,
                 GroupStatus.DELETION_IN_PROGRESS,
                 GroupStatus.PENDING_MERGE,
             ]
-        ).get(
-            project__organization=organization_id,
-            project__slug=short_id.project_slug,
-            short_id=short_id.short_id,
-        )
+        ).filter(project__organization=organization_id)
 
-    def from_kwargs(self, project, **kwargs):
-        from sentry.event_manager import HashDiscarded, EventManager
+        if project_ids is not None:
+            base_group_queryset = base_group_queryset.filter(project_id__in=project_ids)
 
-        manager = EventManager(kwargs)
-        manager.normalize()
-        try:
-            return manager.save(project)
+        groups = list(base_group_queryset.filter(short_id_lookup).select_related("project"))
+        # Key the lookup by ShortId(project_slug, short_id): short ids are only unique per
+        # project, so the integer short_id alone collides across projects (PROJ-A-1 vs PROJ-B-1).
+        # parse_short_id lowercases the slug, so lowercase the project slug to match.
+        group_lookup: set[ShortId] = {
+            ShortId(group.project.slug.lower(), group.short_id) for group in groups
+        }
 
-        # TODO(jess): this method maybe isn't even used?
-        except HashDiscarded as e:
-            logger.info("discarded.hash", extra={"project_id": project, "description": str(e)})
+        # If any requested short_ids are missing after the exact slug match,
+        # fallback to a case-insensitive slug lookup to handle legacy/mixed-case slugs.
+        # Handles legacy project slugs that may not be entirely lowercase.
+        missing_by_slug = defaultdict(list)
+        for sid in short_ids:
+            if sid not in group_lookup:
+                missing_by_slug[sid.project_slug].append(sid.short_id)
 
-    def from_event_id(self, project, event_id):
-        """
-        Resolves the 32 character event_id string into
-        a Group for which it is found.
-        """
+        if len(missing_by_slug) > 0:
+            ci_short_id_lookup = reduce(
+                or_,
+                [
+                    Q(project__slug__iexact=slug, short_id__in=sids)
+                    for slug, sids in missing_by_slug.items()
+                ],
+            )
+
+            fallback_groups = list(
+                base_group_queryset.filter(ci_short_id_lookup).select_related("project")
+            )
+
+            groups.extend(fallback_groups)
+            group_lookup.update(
+                ShortId(group.project.slug.lower(), group.short_id) for group in fallback_groups
+            )
+
+        # Throw an error if we cannot find a group for any short id requested
+        for short_id in short_ids:
+            if short_id not in group_lookup:
+                raise Group.DoesNotExist()
+        return groups
+
+    def from_event_id(self, project: Project, event_id: str) -> Group:
+        """Resolves the 32 character event_id string into a Group for which it is found."""
         group_id = None
 
-        event = eventstore.get_event_by_id(project.id, event_id)
+        event = eventstore.backend.get_event_by_id(project.id, event_id)
 
         if event:
             group_id = event.group_id
@@ -233,54 +653,212 @@ class GroupManager(BaseManager):
             # a Group.
             raise Group.DoesNotExist()
 
-        return Group.objects.get(id=group_id)
+        return self.get(id=group_id)
 
-    def filter_by_event_id(self, project_ids, event_id):
-        event_ids = [event_id]
-        conditions = [["group_id", "IS NOT NULL", None]]
-        data = eventstore.get_events(
+    def filter_by_event_id(
+        self,
+        project_ids: Sequence[int],
+        event_id: str,
+        tenant_ids: dict[str, int | str] | None = None,
+    ) -> QuerySet[Group]:
+        events = eventstore.backend.get_events(
             filter=eventstore.Filter(
-                event_ids=event_ids, project_ids=project_ids, conditions=conditions
+                event_ids=[event_id],
+                project_ids=project_ids,
+                conditions=[["group_id", "IS NOT NULL", None]],
+            ),
+            eap_conditions=and_trace_item_filters(
+                build_event_id_in_filter([event_id]),
+                TraceItemFilter(
+                    exists_filter=ExistsFilter(
+                        key=AttributeKey(name="group_id", type=AttributeKey.TYPE_INT)
+                    )
+                ),
             ),
             limit=max(len(project_ids), 100),
             referrer="Group.filter_by_event_id",
+            tenant_ids=tenant_ids,
+        )
+        return self.filter(id__in={event.group_id for event in events})
+
+    def get_groups_by_external_issue(
+        self,
+        integration: Integration | RpcIntegration,
+        organizations: Iterable[Organization],
+        external_issue_key: str | None,
+    ) -> QuerySet[Group]:
+        """
+        `organizations` must already be limited to those with `integration` installed;
+        this does not re-check the installs.
+        """
+        from sentry.integrations.models.external_issue import ExternalIssue
+        from sentry.models.grouplink import GroupLink
+
+        organization_ids = [o.id for o in organizations]
+
+        external_issues = ExternalIssue.objects.filter(
+            integration_id=integration.id, organization_id__in=organization_ids
+        )
+        if external_issue_key is not None:
+            external_issues = external_issues.filter(key=external_issue_key)
+
+        group_link_subquery = GroupLink.objects.filter(
+            linked_id__in=external_issues.values_list("id", flat=True)
+        ).values_list("group_id", flat=True)
+
+        return self.filter(
+            id__in=group_link_subquery,
+            project__organization_id__in=organization_ids,
+        ).select_related("project")
+
+    def update_group_status(
+        self,
+        groups: Iterable[Group],
+        status: int,
+        substatus: int | None,
+        activity_type: ActivityType,
+        activity_data: Mapping[str, Any] | None = None,
+        send_activity_notification: bool = True,
+        from_substatus: int | None = None,
+        detector_id: int | None = None,
+        update_date: datetime | None = None,
+    ) -> None:
+        """For each groups, update status to `status` and create an Activity."""
+        from sentry.models.activity import Activity
+        from sentry.models.groupopenperiod import update_group_open_period
+
+        modified_groups_list = []
+        selected_groups = Group.objects.filter(id__in=[g.id for g in groups]).exclude(
+            status=status, substatus=substatus
         )
 
-        group_ids = {evt.group_id for evt in data}
-
-        return Group.objects.filter(id__in=group_ids)
-
-    def get_groups_by_external_issue(self, integration, external_issue_key):
-        from sentry.models import ExternalIssue, GroupLink
-
-        return Group.objects.filter(
-            id__in=GroupLink.objects.filter(
-                linked_id__in=ExternalIssue.objects.filter(
-                    key=external_issue_key,
-                    integration_id=integration.id,
-                    organization_id__in=integration.organizations.values_list("id", flat=True),
-                ).values_list("id", flat=True)
-            ).values_list("group_id", flat=True),
-            project__organization_id__in=integration.organizations.values_list("id", flat=True),
+        should_update_priority = (
+            from_substatus == GroupSubStatus.ESCALATING
+            and activity_type == ActivityType.AUTO_SET_ONGOING
         )
 
+        # Track the resolved groups that are being unresolved and need to have their open period reopened
+        should_reopen_open_period = {
+            group.id: group.status == GroupStatus.RESOLVED for group in selected_groups
+        }
+        resolved_at = update_date if update_date is not None else timezone.now()
+        updated_priority = {}
+        for group in selected_groups:
+            group.status = status
+            group.substatus = substatus
+            if status == GroupStatus.RESOLVED:
+                group.resolved_at = resolved_at
+            if should_update_priority:
+                priority = get_priority_for_ongoing_group(group)
+                if priority and group.priority != priority:
+                    group.priority = priority
+                    updated_priority[group.id] = priority
 
+            modified_groups_list.append(group)
+
+        Group.objects.bulk_update(
+            modified_groups_list, ["status", "substatus", "priority", "resolved_at"]
+        )
+
+        for group in modified_groups_list:
+            activity = Activity.objects.create_group_activity(
+                group,
+                activity_type,
+                data=activity_data,
+                send_notification=send_activity_notification,
+                datetime=update_date,
+                detector_id=detector_id,
+            )
+            record_group_history_from_activity_type(group, activity_type.value)
+
+            if group.id in updated_priority:
+                new_priority = updated_priority[group.id]
+                Activity.objects.create_group_activity(
+                    group=group,
+                    type=ActivityType.SET_PRIORITY,
+                    data={
+                        "priority": new_priority.to_str(),
+                        "reason": PriorityChangeReason.ONGOING,
+                    },
+                    datetime=update_date,
+                    detector_id=detector_id,
+                )
+                record_group_history(group, PRIORITY_TO_GROUP_HISTORY_STATUS[new_priority])
+
+            is_status_resolved = status == GroupStatus.RESOLVED
+            is_status_unresolved = status == GroupStatus.UNRESOLVED
+
+            # The open period is only updated when a group is resolved or reopened. We don't want to
+            # update the open period when a group transitions between different substatuses within UNRESOLVED.
+            if is_status_resolved:
+                update_group_open_period(
+                    group=group,
+                    new_status=GroupStatus.RESOLVED,
+                    resolution_time=activity.datetime,
+                )
+            elif is_status_unresolved and should_reopen_open_period[group.id]:
+                update_group_open_period(
+                    group=group,
+                    new_status=GroupStatus.UNRESOLVED,
+                )
+
+    def from_share_id(self, share_id: str) -> Group:
+        if not share_id or len(share_id) != 32:
+            raise Group.DoesNotExist
+
+        from sentry.models.groupshare import GroupShare
+
+        return self.get(id__in=GroupShare.objects.filter(uuid=share_id).values_list("group_id")[:1])
+
+    def filter_to_team(self, team: Team) -> QuerySet[Group]:
+        from sentry.models.groupassignee import GroupAssignee
+        from sentry.models.project import Project
+
+        project_list = Project.objects.get_for_team_ids(team_ids=[team.id])
+        user_ids = list(team.member_set.values_list("user_id", flat=True))
+
+        assigned_groups = (
+            GroupAssignee.objects.filter(team=team)
+            .union(GroupAssignee.objects.filter(user_id__in=user_ids))
+            .values_list("group_id", flat=True)
+        )
+
+        return self.filter(
+            project__in=project_list,
+            id__in=assigned_groups,
+        )
+
+    def get_issues_mapping(
+        self,
+        group_ids: Iterable[int],
+        project_ids: Sequence[int],
+        organization: Organization,
+    ) -> Mapping[int, str | None]:
+        """Create a dictionary of group_ids to their qualified_short_ids."""
+        return {
+            i.id: i.qualified_short_id
+            for i in self.filter(
+                id__in=group_ids,
+                project_id__in=project_ids,
+                project__organization=organization,
+            ).select_related("project")
+        }
+
+
+@cell_silo_model
 class Group(Model):
     """
     Aggregated message which summarizes a set of Events.
     """
 
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Excluded
 
     project = FlexibleForeignKey("sentry.Project")
-    logger = models.CharField(
-        max_length=64, blank=True, default=str(DEFAULT_LOGGER_NAME), db_index=True
-    )
+    logger = models.CharField(max_length=64, blank=True, default=str(DEFAULT_LOGGER_NAME))
     level = BoundedPositiveIntegerField(
         choices=[(key, str(val)) for key, val in sorted(LOG_LEVELS.items())],
         default=logging.ERROR,
         blank=True,
-        db_index=True,
     )
     message = models.TextField()
     culprit = models.CharField(
@@ -289,7 +867,7 @@ class Group(Model):
     num_comments = BoundedPositiveIntegerField(default=0, null=True)
     platform = models.CharField(max_length=64, null=True)
     status = BoundedPositiveIntegerField(
-        default=0,
+        default=GroupStatus.UNRESOLVED,
         choices=(
             (GroupStatus.UNRESOLVED, _("Unresolved")),
             (GroupStatus.RESOLVED, _("Resolved")),
@@ -297,7 +875,17 @@ class Group(Model):
         ),
         db_index=True,
     )
-    times_seen = BoundedPositiveIntegerField(default=1, db_index=True)
+    substatus = BoundedIntegerField(
+        null=True,
+        choices=(
+            (GroupSubStatus.UNTIL_ESCALATING, _("Until escalating")),
+            (GroupSubStatus.ONGOING, _("Ongoing")),
+            (GroupSubStatus.ESCALATING, _("Escalating")),
+            (GroupSubStatus.UNTIL_CONDITION_MET, _("Until condition met")),
+            (GroupSubStatus.FOREVER, _("Forever")),
+        ),
+    )
+    times_seen = BoundedPositiveIntegerField(default=1)
     last_seen = models.DateTimeField(default=timezone.now, db_index=True)
     first_seen = models.DateTimeField(default=timezone.now, db_index=True)
     first_release = FlexibleForeignKey("sentry.Release", null=True, on_delete=models.PROTECT)
@@ -306,13 +894,21 @@ class Group(Model):
     active_at = models.DateTimeField(null=True, db_index=True)
     time_spent_total = BoundedIntegerField(default=0)
     time_spent_count = BoundedIntegerField(default=0)
-    score = BoundedIntegerField(default=0)
     # deprecated, do not use. GroupShare has superseded
-    is_public = models.NullBooleanField(default=False, null=True)
-    data = GzippedDictField(blank=True, null=True)
+    is_public = models.BooleanField(default=False, null=True)
+    data = LegacyTextJSONField(null=True)
     short_id = BoundedBigIntegerField(null=True)
+    type = BoundedPositiveIntegerField(
+        default=DEFAULT_TYPE_ID, db_default=DEFAULT_TYPE_ID, db_index=True
+    )
+    priority = models.PositiveIntegerField(null=True)
+    priority_locked_at = models.DateTimeField(null=True)
+    seer_fixability_score = models.FloatField(null=True)
+    seer_autofix_last_triggered = models.DateTimeField(null=True)
+    # This actually represents the last timestamp when the explorer agent completes a step
+    seer_explorer_autofix_last_triggered = models.DateTimeField(null=True)
 
-    objects = GroupManager(cache_fields=("id",))
+    objects: ClassVar[GroupManager] = GroupManager(cache_fields=("id",))
 
     class Meta:
         app_label = "sentry"
@@ -320,15 +916,32 @@ class Group(Model):
         verbose_name_plural = _("grouped messages")
         verbose_name = _("grouped message")
         permissions = (("can_view", "Can view"),)
-        index_together = [("project", "first_release"), ("project", "id")]
+        indexes = [
+            models.Index(fields=("project", "first_release")),
+            models.Index(fields=("project", "id")),
+            models.Index(fields=("project", "status", "last_seen", "id")),
+            models.Index(fields=("project", "status", "type", "last_seen", "id")),
+            models.Index(fields=("project", "status", "substatus", "last_seen", "id")),
+            models.Index(fields=("project", "status", "substatus", "type", "last_seen", "id")),
+            models.Index(fields=("project", "status", "substatus", "id")),
+            models.Index(fields=("status", "substatus", "id")),  # TODO: Remove this
+            models.Index(fields=("status", "substatus", "first_seen")),
+            models.Index(fields=("project", "status", "priority", "last_seen", "id")),
+        ]
         unique_together = (("project", "short_id"),)
 
     __repr__ = sane_repr("project_id")
 
-    def __str__(self):
-        return f"({self.times_seen}) {self.error()}"
+    def __str__(self) -> str:
+        return f"({self.times_seen}) {self.title}"
 
-    def save(self, *args, **kwargs):
+    def save(
+        self,
+        force_insert: bool | tuple[ModelBase, ...] = False,
+        force_update: bool = False,
+        using: str | None = None,
+        update_fields: Iterable[str] | None = None,
+    ) -> None:
         if not self.last_seen:
             self.last_seen = timezone.now()
         if not self.first_seen:
@@ -339,51 +952,126 @@ class Group(Model):
         self.message = strip(self.message)
         if self.message:
             self.message = truncatechars(self.message.splitlines()[0], 255)
-        if self.times_seen is None:
+        if cast("int | None", self.times_seen) is None:
             self.times_seen = 1
-        self.score = type(self).calculate_score(
-            times_seen=self.times_seen, last_seen=self.last_seen
+        super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,
         )
-        super().save(*args, **kwargs)
 
-    def get_absolute_url(self, params=None, event_id=None):
-        # Built manually in preference to django.core.urlresolvers.reverse,
+    def get_absolute_url(
+        self,
+        params: Mapping[str, str] | None = None,
+        event_id: str | None = None,
+    ) -> str:
+        # Built manually in preference to django.urls.reverse,
         # because reverse has a measured performance impact.
-        event_path = f"events/{event_id}/" if event_id else ""
-        url = "organizations/{org}/issues/{id}/{event_path}{params}".format(
-            org=urlquote(self.organization.slug),
-            id=self.id,
-            event_path=event_path,
-            params="?" + urlencode(params) if params else "",
-        )
-        return absolute_uri(url)
+        organization = self.organization
+
+        if self.issue_category == GroupCategory.FEEDBACK:
+            path = f"/organizations/{organization.slug}/feedback/"
+            params = {
+                **(params or {}),
+                "feedbackSlug": f"{self.project.slug}:{self.id}",
+                "project": str(self.project.id),
+            }
+            query = urlencode(params)
+            return organization.absolute_url(path, query=query)
+        else:
+            path = f"/organizations/{organization.slug}/issues/{self.id}/"
+            if event_id:
+                path += f"events/{event_id}/"
+            query = None
+            if params:
+                query = urlencode(params)
+            return organization.absolute_url(path, query=query)
+
+    def get_absolute_api_url(self) -> str:
+        path = f"/issues/{self.id}/"
+        return self.organization.absolute_api_url(path=path)
 
     @property
-    def qualified_short_id(self):
+    def qualified_short_id(self) -> str | None:
         if self.short_id is not None:
             return f"{self.project.slug.upper()}-{base32_encode(self.short_id)}"
+        return None
 
-    def is_over_resolve_age(self):
-        resolve_age = self.project.get_option("sentry:resolve_age", None)
-        if not resolve_age:
-            return False
-        return self.last_seen < timezone.now() - timedelta(hours=int(resolve_age))
-
-    def is_ignored(self):
+    def is_ignored(self) -> bool:
         return self.get_status() == GroupStatus.IGNORED
 
-    def is_unresolved(self):
+    def is_unresolved(self) -> bool:
         return self.get_status() == GroupStatus.UNRESOLVED
 
-    # TODO(dcramer): remove in 9.0 / after plugins no long ref
-    is_muted = is_ignored
-
-    def is_resolved(self):
+    def is_resolved(self) -> bool:
         return self.get_status() == GroupStatus.RESOLVED
 
-    def get_status(self):
+    def has_replays(self) -> bool:
+        def make_snuba_params_for_replay_count_query() -> SnubaParams:
+            return SnubaParams(
+                organization=self.project.organization,
+                projects=[self.project],
+                user=None,
+                start=datetime.now() - timedelta(days=14),
+                end=datetime.now(),
+                environments=[],
+                teams=[],
+            )
+
+        def _cache_key(issue_id: int) -> str:
+            return f"group:has_replays:{issue_id}"
+
+        from sentry.replays.usecases.replay_counts import get_replay_counts
+        from sentry.search.events.types import SnubaParams
+
+        metrics.incr("group.has_replays")
+
+        # XXX(jferg) Note that this check will preclude backend projects from receiving the "View Replays"
+        # link in their notification. This will need to be addressed in a future change.
+        if not self.project.flags.has_replays:
+            metrics.incr("group.has_replays.project_has_replays_false")
+            return False
+
+        cached_has_replays = cache.get(_cache_key(self.id))
+        if cached_has_replays is not None:
+            metrics.incr(
+                "group.has_replays.cached",
+                tags={
+                    "has_replays": cached_has_replays,
+                },
+            )
+            return cached_has_replays
+
+        data_source = (
+            Dataset.Discover
+            if self.issue_category == GroupCategory.ERROR
+            else Dataset.IssuePlatform
+        )
+
+        counts = get_replay_counts(
+            make_snuba_params_for_replay_count_query(),
+            f"issue.id:[{self.id}]",
+            return_ids=False,
+            data_source=data_source,
+        )
+
+        has_replays = counts.get(self.id, 0) > 0
+        # need to refactor counts so that the type of the key returned in the dict is always a str
+        # for typing
+        metrics.incr(
+            "group.has_replays.replay_count_query",
+            tags={
+                "has_replays": has_replays,
+            },
+        )
+        cache.set(_cache_key(self.id), has_replays, 300)
+
+        return has_replays
+
+    def get_status(self) -> int:
         # XXX(dcramer): GroupSerializer reimplements this logic
-        from sentry.models import GroupSnooze
+        from sentry.models.groupsnooze import GroupSnooze
 
         status = self.status
 
@@ -396,12 +1084,10 @@ class Group(Model):
                 if not snooze.is_valid(group=self):
                     status = GroupStatus.UNRESOLVED
 
-        if status == GroupStatus.UNRESOLVED and self.is_over_resolve_age():
-            return GroupStatus.RESOLVED
         return status
 
-    def get_share_id(self):
-        from sentry.models import GroupShare
+    def get_share_id(self) -> str | None:
+        from sentry.models.groupshare import GroupShare
 
         try:
             return GroupShare.objects.filter(group_id=self.id).values_list("uuid", flat=True)[0]
@@ -409,50 +1095,159 @@ class Group(Model):
             # Otherwise it has not been shared yet.
             return None
 
-    @classmethod
-    def from_share_id(cls, share_id):
-        if not share_id or len(share_id) != 32:
-            raise cls.DoesNotExist
-
-        from sentry.models import GroupShare
-
-        return cls.objects.get(id=GroupShare.objects.filter(uuid=share_id).values_list("group_id"))
-
-    def get_score(self):
-        return type(self).calculate_score(self.times_seen, self.last_seen)
-
-    def get_latest_event(self):
-        if not hasattr(self, "_latest_event"):
-            self._latest_event = self.get_latest_event_for_environments()
-
-        return self._latest_event
-
-    def get_latest_event_for_environments(self, environments=()):
-        return get_oldest_or_latest_event_for_environments(
-            EventOrdering.LATEST,
-            environments=environments,
-            issue_id=self.id,
-            project_id=self.project_id,
+    def get_latest_event(
+        self,
+        conditions: Sequence[Condition] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> GroupEvent | None:
+        """
+        Returns the latest/newest event given the conditions and time range.
+        If no event is found, returns None.
+        """
+        return get_oldest_or_latest_event(
+            group=self,
+            ordering=EventOrdering.LATEST,
+            conditions=conditions,
+            start=start,
+            end=end,
         )
 
-    def get_oldest_event_for_environments(self, environments=()):
-        return get_oldest_or_latest_event_for_environments(
-            EventOrdering.OLDEST,
-            environments=environments,
-            issue_id=self.id,
-            project_id=self.project_id,
+    def get_latest_event_for_environments(
+        self, environments: Sequence[str] = ()
+    ) -> GroupEvent | None:
+        """
+        Legacy special case of `self.get_latest_event` for environments and no date range.
+        Kept for compatability, but it's advised to use `self.get_latest_event` directly.
+        """
+        conditions = (
+            [Condition(Column("environment"), Op.IN, environments)] if len(environments) > 0 else []
+        )
+        return self.get_latest_event(conditions=conditions)
+
+    def get_oldest_event(
+        self,
+        conditions: Sequence[Condition] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> GroupEvent | None:
+        """
+        Returns the oldest event given the conditions and time range.
+        If no event is found, returns None.
+        """
+        return get_oldest_or_latest_event(
+            group=self,
+            ordering=EventOrdering.OLDEST,
+            conditions=conditions,
+            start=start,
+            end=end,
         )
 
-    def get_first_release(self):
-        if self.first_release_id is None:
-            return tagstore.get_first_release(self.project_id, self.id)
+    def get_oldest_event_for_environments(
+        self, environments: Sequence[str] = ()
+    ) -> GroupEvent | None:
+        """
+        Legacy special case of `self.get_oldest_event` for environments and no date range.
+        Kept for compatability, but it's advised to use `self.get_oldest_event` directly.
+        """
+        conditions = (
+            [Condition(Column("environment"), Op.IN, environments)] if len(environments) > 0 else []
+        )
+        return self.get_oldest_event(conditions=conditions)
 
-        return self.first_release.version
+    def get_recommended_event(
+        self,
+        conditions: Sequence[Condition] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        verify_replay_exists: bool = False,
+    ) -> GroupEvent | None:
+        """
+        Returns a recommended event given the conditions and time range.
+        If a helpful recommendation is not found, it will fallback to the latest event.
+        If neither are found, returns None.
 
-    def get_last_release(self):
-        return tagstore.get_last_release(self.project_id, self.id)
+        When ``verify_replay_exists`` is set, the recommendation prefers the
+        highest-ranked event whose session replay is verified to exist in the
+        replays dataset, falling back to the normal recommendation otherwise.
+        """
+        maybe_event = get_recommended_event(
+            group=self,
+            conditions=conditions,
+            start=start,
+            end=end,
+            verify_replay_exists=verify_replay_exists,
+        )
+        return (
+            maybe_event
+            if maybe_event
+            else self.get_latest_event(conditions=conditions, start=start, end=end)
+        )
 
-    def get_event_type(self):
+    def get_recommended_event_for_environments(
+        self,
+        environments: Sequence[Environment] = (),
+        conditions: Sequence[Condition] | None = None,
+    ) -> GroupEvent | None:
+        """
+        Legacy special case of `self.get_recommended_event` for environments and no date range.
+        Kept for compatability, but it's advised to use `self.get_recommended_event` directly.
+        """
+        all_conditions: list[Condition] = list(conditions) if conditions else []
+        if len(environments) > 0:
+            all_conditions.append(
+                Condition(Column("environment"), Op.IN, [e.name for e in environments])
+            )
+        return self.get_recommended_event(conditions=all_conditions)
+
+    def get_suspect_commit(self) -> Commit | None:
+        from sentry.models.groupowner import GroupOwner, GroupOwnerType
+
+        suspect_commit_owner = (
+            GroupOwner.objects.filter(
+                group_id=self.id,
+                project_id=self.project_id,
+                type=GroupOwnerType.SUSPECT_COMMIT.value,
+                context__isnull=False,
+            )
+            .order_by("-date_added")
+            .first()
+        )
+
+        if not suspect_commit_owner:
+            return None
+
+        commit_id = suspect_commit_owner.context.get("commitId")
+        if not commit_id:
+            return None
+
+        commit = Commit.objects.filter(id=commit_id)
+        return commit.first()
+
+    def get_first_release(self, environment_names: list[str] | None = None) -> str | None:
+        from sentry.models.release import Release
+
+        if self.first_release and not environment_names:
+            return self.first_release.version
+
+        return Release.objects.get_group_release_version(
+            self.project_id, self.id, environment_names
+        )
+
+    def get_last_release(
+        self, environment_names: list[str] | None = None, use_cache: bool = True
+    ) -> str | None:
+        from sentry.models.release import Release
+
+        return Release.objects.get_group_release_version(
+            project_id=self.project_id,
+            group_id=self.id,
+            environment_names=environment_names,
+            first=False,
+            use_cache=use_cache,
+        )
+
+    def get_event_type(self) -> eventtypes.EventTypeStr:
         """
         Return the type of this issue.
 
@@ -460,61 +1255,124 @@ class Group(Model):
         """
         return self.data.get("type", "default")
 
-    def get_event_metadata(self):
+    def get_event_metadata(self) -> dict[str, Any]:
         """
         Return the metadata of this issue.
 
         See ``sentry.eventtypes``.
         """
-        return self.data["metadata"]
+        metadata = self.data["metadata"]
+        return metadata
 
     @property
-    def title(self):
-        et = eventtypes.get(self.get_event_type())()
-        return et.get_title(self.get_event_metadata())
+    def title(self) -> str:
+        title = self.data.get("title")
+        event_type = self.get_event_type()
 
-    def location(self):
+        # TODO: It may be that we don't have to restrict this to just default and error types
+        if title and event_type in ["default", "error"]:
+            return title
+
+        event_type_instance = eventtypes.get(event_type)()
+        return event_type_instance.get_title(self.get_event_metadata())
+
+    def location(self) -> str | None:
         et = eventtypes.get(self.get_event_type())()
         return et.get_location(self.get_event_metadata())
 
-    def error(self):
-        warnings.warn("Group.error is deprecated, use Group.title", DeprecationWarning)
-        return self.title
-
-    error.short_description = _("error")
-
     @property
-    def message_short(self):
-        warnings.warn("Group.message_short is deprecated, use Group.title", DeprecationWarning)
-        return self.title
-
-    @property
-    def organization(self):
+    def organization(self) -> Organization:
         return self.project.organization
 
     @property
-    def checksum(self):
-        warnings.warn("Group.checksum is no longer used", DeprecationWarning)
-        return ""
+    def sdk(self) -> str | None:
+        """returns normalized SDK name"""
 
-    def get_email_subject(self):
+        try:
+            sdk_name = self.get_event_metadata()["sdk"]["name_normalized"]
+        except KeyError:
+            return None
+        return sdk_name
+
+    def get_email_subject(self) -> str:
         return f"{self.qualified_short_id} - {self.title}"
 
-    def count_users_seen(self):
-        return tagstore.get_groups_user_counts(
-            [self.project_id], [self.id], environment_ids=None, start=self.first_seen
+    def count_users_seen(
+        self,
+        referrer: str = Referrer.TAGSTORE_GET_GROUPS_USER_COUNTS.value,
+        environment_ids: list[int] | None = None,
+    ) -> int:
+        return tagstore.backend.get_groups_user_counts(
+            [self.project_id],
+            [self.id],
+            environment_ids=environment_ids,
+            start=self.first_seen,
+            tenant_ids={"organization_id": self.project.organization_id},
+            referrer=referrer,
         )[self.id]
 
-    @classmethod
-    def calculate_score(cls, times_seen, last_seen):
-        return math.log(float(times_seen or 1)) * 600 + float(last_seen.strftime("%s"))
+    def get_assignee(self) -> Team | RpcUser | None:
+        from sentry.models.groupassignee import GroupAssignee
 
-    @staticmethod
-    def issues_mapping(group_ids, project_ids, organization):
-        """ Create a dictionary of group_ids to their qualified_short_ids """
-        return {
-            i.id: i.qualified_short_id
-            for i in Group.objects.filter(
-                id__in=group_ids, project_id__in=project_ids, project__organization=organization
+        try:
+            group_assignee = GroupAssignee.objects.get(group=self)
+        except GroupAssignee.DoesNotExist:
+            return None
+
+        assigned_actor: Actor = group_assignee.assigned_actor()
+
+        return assigned_actor.resolve()
+
+    @property
+    def times_seen_with_pending(self) -> int:
+        """
+        Returns `times_seen` with any additional pending updates from `buffers` added on. This value
+        must be set first.
+        """
+        return self.times_seen + self.times_seen_pending
+
+    @property
+    def times_seen_pending(self) -> int:
+        assert hasattr(self, "_times_seen_pending")
+        if not hasattr(self, "_times_seen_pending"):
+            logger.error("Attempted to fetch pending `times_seen` value without first setting it")
+
+        return getattr(self, "_times_seen_pending", 0)
+
+    @times_seen_pending.setter
+    def times_seen_pending(self, times_seen: int) -> None:
+        self._times_seen_pending = times_seen
+
+    @property
+    def issue_type(self) -> GroupTypeClass:
+        return get_group_type_by_type_id(self.type)
+
+    @property
+    def issue_category(self) -> GroupCategory:
+        return GroupCategory(self.issue_type.category)
+
+
+@receiver(pre_save, sender=Group, dispatch_uid="pre_save_group_default_substatus", weak=False)
+def pre_save_group_default_substatus(
+    instance: Group, sender: type[Group], *args: object, **kwargs: object
+) -> None:
+    # TODO(snigdha): Replace the logging with a ValueError once we are confident that this is working as expected.
+    if instance:
+        if instance.status == GroupStatus.IGNORED:
+            if instance.substatus not in IGNORED_SUBSTATUS_CHOICES:
+                logger.error(
+                    "Invalid substatus for IGNORED group.",
+                    extra={"substatus": instance.substatus},
+                )
+        elif instance.status == GroupStatus.UNRESOLVED:
+            if instance.substatus not in UNRESOLVED_SUBSTATUS_CHOICES:
+                logger.error(
+                    "Invalid substatus for UNRESOLVED group",
+                    extra={"substatus": instance.substatus},
+                )
+        # We only support substatuses for UNRESOLVED and IGNORED groups
+        elif instance.substatus is not None:
+            logger.error(
+                "No substatus allowed for group",
+                extra={"status": instance.status, "substatus": instance.substatus},
             )
-        }

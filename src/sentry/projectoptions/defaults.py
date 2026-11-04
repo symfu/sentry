@@ -1,64 +1,288 @@
+from sentry.conf.server import DEFAULT_GROUPING_CONFIG
+from sentry.constants import (
+    AUTOFIX_AUTOMATION_TUNING_DEFAULT,
+    SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
+    TARGET_SAMPLE_RATE_DEFAULT,
+)
 from sentry.projectoptions import register
 
-# latest epoch
-LATEST_EPOCH = 7
+# This controls what sentry:option-epoch value is given to a project when it is created
+# The epoch of a project will determine what options are valid options for that specific project
+LATEST_EPOCH = 17
 
-# grouping related configs
-#
-# The default values are hardcoded because some grouping configs might
-# only exists temporarily for testing purposes.  If we delete them from
-# the codebase and a customer still has them set in the options we want to
-# fall back to the oldest config.
-#
-# TODO: we might instead want to fall back to the latest of the project's
-# epoch instead.
-LEGACY_GROUPING_CONFIG = "legacy:2019-03-12"
-DEFAULT_GROUPING_CONFIG = "newstyle:2019-10-29"
-register(
-    key="sentry:grouping_config",
-    epoch_defaults={
-        1: LEGACY_GROUPING_CONFIG,
-        3: "newstyle:2019-05-08",
-        4: DEFAULT_GROUPING_CONFIG,
-    },
-)
-
-# Grouping enhancements defaults
-LEGACY_GROUPING_ENHANCEMENTS_BASE = "legacy:2019-03-12"
-DEFAULT_GROUPING_ENHANCEMENTS_BASE = "common:2019-03-23"
-register(
-    key="sentry:grouping_enhancements_base",
-    epoch_defaults={1: LEGACY_GROUPING_ENHANCEMENTS_BASE, 3: DEFAULT_GROUPING_ENHANCEMENTS_BASE},
-)
+register(key="sentry:grouping_config", default=DEFAULT_GROUPING_CONFIG)
 register(key="sentry:grouping_enhancements", default="")
-
-# server side fingerprinting defaults.
+register(key="sentry:derived_grouping_enhancements", default="")
 register(key="sentry:fingerprinting_rules", default="")
+
+# Secondary grouping setup to run in addition for transition phase.
+#
+# To ensure we minimize unnecessary load, we TTL the secondary grouping setup
+# to `SENTRY_GROUPING_UPDATE_MIGRATION_PHASE` days
+register(key="sentry:secondary_grouping_expiry", default=0)
+register(key="sentry:secondary_grouping_config", default=None)
+
+# Has this project had its issues backfilled into the Seer database, and if so, when did the
+# backfill complete? (This is a temporary way to flag projects as we roll out Seer grouping, because
+# it can be flipped on in the backfill script, unlike inclusion in a getsentry feature handler.)
+register(key="sentry:similarity_backfill_completed", default=None)
+
+register(
+    key="sentry:group_action_log_backfill_completed",
+    default=None,
+    epoch_defaults={16: True},
+)
+
 
 # The JavaScript loader version that is the project default.  This option
 # is expected to be never set but the epoch defaults are used if no
 # version is set on a project's DSN.
-register(key="sentry:default_loader_version", epoch_defaults={1: "4.x", 2: "5.x", 7: "6.x"})
+register(
+    key="sentry:default_loader_version",
+    epoch_defaults={
+        1: "4.x",
+        2: "5.x",
+        7: "6.x",
+        8: "7.x",
+        13: "8.x",
+        14: "9.x",
+        15: "10.x",
+        17: "11.x",
+    },
+)
 
-# Default symbol sources.  The ios source does not exist by default and
-# will be skipped later.  The microsoft source exists by default and is
-# unlikely to be disabled.
+# Default symbol sources. The ios source does not exist by default and
+# will be skipped later. The microsoft source exists by default and is
+# unlikely to be disabled. Platform-specific sources may be added via
+# set_default_symbol_sources() when a project is created.
 register(
     key="sentry:builtin_symbol_sources",
-    epoch_defaults={1: ["ios"], 2: ["ios", "microsoft"], 5: ["ios", "microsoft", "android"]},
+    epoch_defaults={
+        1: ["ios"],
+        2: ["ios", "microsoft"],
+        5: ["ios", "microsoft", "android"],
+        9: ["ios", "microsoft", "android", "nuget"],
+    },
 )
+
+# Apply source server (srcsrv) info from native debug files to symbolicated frames.
+# Opt-in because rewriting `abs_path` affects code mappings and source links.
+register(key="sentry:enable_native_source_server_mapping", default=False)
 
 # Default legacy-browsers filter
 register(key="filters:legacy-browsers", epoch_defaults={1: "0"})
 
-# Default legacy-browsers filter
+# Default web crawlers filter
 register(key="filters:web-crawlers", epoch_defaults={1: "1", 6: "0"})
 
-# Default legacy-browsers filter
+# Default browser extensions filter
 register(key="filters:browser-extensions", epoch_defaults={1: "0"})
 
-# Default legacy-browsers filter
+# Default localhost filter
 register(key="filters:localhost", epoch_defaults={1: "0"})
 
-# Default dynamic sampling rules
-register(key="sentry:dynamicSampling", epoch_defaults={1: []})
+# Default react hydration errors filter
+register(key="filters:react-hydration-errors", epoch_defaults={1: "1"})
+
+# Default NextJS chunk load error filter
+register(key="filters:chunk-load-error", epoch_defaults={1: "1"})
+
+# Default custom error filter (enabled for all projects)
+register(key="filters:custom-error", epoch_defaults={1: "1"})
+
+# Default breakdowns config
+register(
+    key="sentry:breakdowns",
+    epoch_defaults={
+        1: {
+            "span_ops": {
+                "type": "spanOperations",
+                "matches": ["http", "db", "browser", "resource", "ui"],
+            }
+        },
+    },
+)
+
+# NOTE: this is the HealthCheck filter, the name should match Relay reason (which is filtered-transaction)
+register(key="filters:filtered-transaction", default="1")
+
+# Which user-defined tags should be copied from transaction events to the
+# extracted performance metrics.
+register(key="sentry:transaction_metrics_custom_tags", epoch_defaults={1: []})
+
+# c.f. set_default_disabled_detectors, which can disable detectors on project creation
+# for specific platforms
+DEFAULT_PROJECT_PERFORMANCE_DETECTION_SETTINGS = {
+    "uncompressed_assets_detection_enabled": True,
+    "consecutive_http_spans_detection_enabled": True,
+    "large_http_payload_detection_enabled": True,
+    "n_plus_one_db_queries_detection_enabled": True,
+    "n_plus_one_api_calls_detection_enabled": True,
+    "db_on_main_thread_detection_enabled": True,
+    "file_io_on_main_thread_detection_enabled": True,
+    "consecutive_db_queries_detection_enabled": True,
+    "large_render_blocking_asset_detection_enabled": True,
+    "slow_db_queries_detection_enabled": True,
+    "http_overhead_detection_enabled": True,
+    "transaction_duration_regression_detection_enabled": True,
+    "function_duration_regression_detection_enabled": True,
+    "db_query_injection_detection_enabled": False,
+    "web_vitals_detection_enabled": True,
+    "ai_issue_detection_enabled": True,
+}
+
+DEFAULT_PROJECT_PERFORMANCE_GENERAL_SETTINGS = {
+    "enable_images": False,
+}
+
+# A dict containing all the specific detection thresholds and rates.
+register(
+    key="sentry:performance_issue_settings",
+    default=DEFAULT_PROJECT_PERFORMANCE_DETECTION_SETTINGS,
+)
+
+register(
+    key="sentry:performance_general_settings",
+    default=DEFAULT_PROJECT_PERFORMANCE_GENERAL_SETTINGS,
+)
+
+register(
+    key="sentry:replay_rage_click_issues",
+    default=True,
+)
+
+register(
+    key="sentry:replay_hydration_error_issues",
+    default=True,
+)
+
+register(
+    key="sentry:toolbar_allowed_origins",
+    default=[],
+)
+
+# Opt-in to Relay expanding JSON-like string attributes on EAP items into KVList
+# attributes, so the nested keys become searchable.
+register(
+    key="sentry:relay_automatic_json_expansion",
+    default=False,
+)
+
+register(
+    key="sentry:feedback_user_report_notifications",
+    epoch_defaults={12: True},
+)
+
+register(
+    key="sentry:feedback_ai_spam_detection",
+    default=True,
+)
+
+# Whether releases should be auto-created from ingested telemetry. When disabled,
+# releases must be created explicitly (e.g. via the Sentry CLI).
+register(
+    key="sentry:enable_auto_release_creation",
+    default=True,
+)
+
+
+# Replacement rules for transaction names discovered by the transaction clusterer.
+# Contains a mapping from rule to last seen timestamp,
+# for example `{"/organizations/*/**": 1334318402}`
+register(key="sentry:transaction_name_cluster_rules", default={})
+
+# The JavaScript loader dynamic SDK options that are the project defaults.
+register(
+    key="sentry:default_loader_options",
+    epoch_defaults={
+        10: {
+            "hasPerformance": True,
+            "hasReplay": True,
+        }
+    },
+)
+
+# The available loader SDK versions
+register(
+    key="sentry:loader_available_sdk_versions",
+    epoch_defaults={
+        1: ["11.x", "10.x", "9.x", "8.x", "7.x", "6.x", "5.x", "4.x"],
+        11: ["11.x", "10.x", "9.x", "8.x", "7.x"],
+    },
+)
+
+# Dynamic sampling rate in project-level "manual" configuration mode
+register(key="sentry:target_sample_rate", default=TARGET_SAMPLE_RATE_DEFAULT)
+
+# Should tempest fetch screenshots for this project
+register(key="sentry:tempest_fetch_screenshots", default=False)
+
+# Should autofix run automatically on new issues
+register(key="sentry:autofix_automation_tuning", default=AUTOFIX_AUTOMATION_TUNING_DEFAULT)
+
+# Should seer scanner run automatically on new issues
+register(key="sentry:seer_scanner_automation", default=True)
+
+# Per-project JSON blob of Seer Agentic triage tweaks. Prototyping only — not a
+# stable API; the shape of the blob is expected to change.
+register(key="sentry:seer_nightshift_tweaks", default=None)
+
+# Seer project preferences
+register(
+    key="sentry:seer_automated_run_stopping_point",
+    default=SEER_AUTOMATED_RUN_STOPPING_POINT_DEFAULT,
+)
+register(key="sentry:seer_automation_handoff_point", default=None)
+register(key="sentry:seer_automation_handoff_target", default=None)
+register(key="sentry:seer_automation_handoff_integration_id", default=None)
+register(key="sentry:seer_automation_handoff_auto_create_pr", default=False)
+# Should Autofix automatically iterate on the PRs it opens for this project's issues
+register(key="sentry:seer_pr_iteration", default=True)
+
+SEER_PROJECT_PREFERENCE_OPTION_KEYS = [
+    "sentry:seer_automated_run_stopping_point",
+    "sentry:seer_automation_handoff_point",
+    "sentry:seer_automation_handoff_target",
+    "sentry:seer_automation_handoff_integration_id",
+    "sentry:seer_automation_handoff_auto_create_pr",
+    "sentry:autofix_automation_tuning",
+    "sentry:seer_scanner_automation",
+    "sentry:seer_pr_iteration",
+]
+
+# Boolean to enable/disable preprod size analysis for this project.
+register(key="sentry:preprod_size_enabled_by_customer", default=True)
+
+# Structured search filter to determine which preprod builds get size analysis.
+register(key="sentry:preprod_size_enabled_query", default="")
+
+# Boolean to enable/disable preprod build distribution for this project.
+register(key="sentry:preprod_distribution_enabled_by_customer", default=True)
+
+# Structured search filter to determine which preprod builds get build distribution.
+register(key="sentry:preprod_distribution_enabled_query", default="")
+
+# Boolean to enable/disable build distribution PR comments for this project.
+register(key="sentry:preprod_distribution_pr_comments_enabled_by_customer", default=True)
+
+# Boolean to enable/disable snapshot PR comments for this project. When True, the
+# task posts a comment only if the comparison reports a diff.
+register(key="sentry:preprod_snapshot_pr_comments_enabled", default=False)
+
+# When True, treat snapshot additions as a diff worth posting a PR comment.
+register(key="sentry:preprod_snapshot_pr_comments_post_on_added", default=False)
+
+# When True, treat snapshot removals as a diff worth posting a PR comment.
+register(key="sentry:preprod_snapshot_pr_comments_post_on_removed", default=True)
+
+# When True, treat pixel-level snapshot changes as a diff worth posting a PR comment.
+register(key="sentry:preprod_snapshot_pr_comments_post_on_changed", default=True)
+
+# When True, treat snapshot renames as a diff worth posting a PR comment.
+register(key="sentry:preprod_snapshot_pr_comments_post_on_renamed", default=False)
+
+# When True, post/update a PR comment with size analysis results for this project.
+register(key="sentry:preprod_size_pr_comments_enabled", default=False)
+
+# Whether to enable on-demand source context fetching from SCM integrations
+register(key="sentry:scm_source_context_enabled", default=False)

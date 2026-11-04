@@ -1,19 +1,144 @@
+import logging
+from typing import Any
+
+from django.conf import settings
 from django.contrib.auth import logout
 from django.contrib.auth.models import AnonymousUser
+from django.http import HttpRequest
+from django.utils.http import url_has_allowed_host_and_scheme
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
+from rest_framework.exceptions import ValidationError
+from rest_framework.request import Request
 from rest_framework.response import Response
 
-from sentry.api.authentication import QuietBasicAuthentication
-from sentry.api.base import Endpoint
-from sentry.api.serializers import DetailedUserSerializer, serialize
+from sentry import analytics
+from sentry.analytics.events.auth_v2 import AuthV2DeleteLogin
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.authentication import QuietBasicAuthentication, UserAuthTokenAuthentication
+from sentry.api.base import Endpoint, control_silo_endpoint
+from sentry.api.exceptions import SsoRequired
+from sentry.api.serializers import serialize
 from sentry.api.validators import AuthVerifyValidator
-from sentry.models import Authenticator
-from sentry.utils import auth, json
-from sentry.utils.functional import extract_lazy_object
+from sentry.api.validators.auth import MISSING_PASSWORD_OR_U2F_CODE
+from sentry.auth.authenticators.u2f import U2fInterface
+from sentry.auth.principal import (
+    acting_user_id,
+    is_owned_by_acting_user,
+    require_user,
+    set_request_principal,
+)
+from sentry.auth.providers.saml2.provider import handle_saml_single_logout
+from sentry.auth.services.auth.impl import promote_request_rpc_user
+from sentry.auth.superuser import SUPERUSER_ORG_ID, SuperuserAccessSerializer
+from sentry.demo_mode.utils import is_demo_user
+from sentry.organizations.services.organization import organization_service
+from sentry.ratelimits.config import RateLimitConfig
+from sentry.types.ratelimit import RateLimit, RateLimitCategory
+from sentry.users.api.serializers.user import DetailedSelfUserSerializer
+from sentry.users.models.authenticator import Authenticator
+from sentry.utils import auth, json, metrics
+from sentry.utils.auth import DISABLE_SSO_CHECK_FOR_LOCAL_DEV, has_completed_sso, initiate_login
+from sentry.utils.settings import is_self_hosted
+from sudo.utils import grant_sudo_privileges
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+PREFILLED_SU_MODAL_KEY = "prefilled_su_modal"
 
 
-class AuthIndexEndpoint(Endpoint):
+@control_silo_endpoint
+class BaseAuthIndexEndpoint(Endpoint):
+    """
+    Base endpoint to manage session authentication. Shared between
+    AuthIndexEndpoint and StaffAuthIndexEndpoint (in getsentry)
+    """
+
+    owner = ApiOwner.FOUNDATIONS
+    authentication_classes = (QuietBasicAuthentication, SessionAuthentication)
+
+    permission_classes = ()
+
+    def get(self, request: Request) -> Response:
+        if not request.user.is_authenticated:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        user = promote_request_rpc_user(request)
+        return Response(serialize(user, user, DetailedSelfUserSerializer()))
+
+    @staticmethod
+    def _reauthenticate_with_sso(request: Request, org_id: int) -> None:
+        """
+        If a user without a password is hitting this, it means they need to re-identify with SSO.
+        """
+        redirect = request.META.get("HTTP_REFERER", None)
+        if not url_has_allowed_host_and_scheme(redirect, allowed_hosts=(request.get_host(),)):
+            redirect = None
+        initiate_login(request, redirect)
+        organization_context = organization_service.get_organization_by_id(
+            id=org_id, include_teams=False, include_projects=False
+        )
+        assert organization_context, "Failed to fetch organization in _reauthenticate_with_sso"
+        raise SsoRequired(
+            organization=organization_context.organization,
+            request=request,
+            after_login_redirect=redirect,
+        )
+
+    @staticmethod
+    def _verify_user_via_inputs(validator: AuthVerifyValidator, request: Request) -> bool:
+        assert request.user.is_authenticated
+        # See if we have a u2f challenge/response
+        if "challenge" in validator.validated_data and "response" in validator.validated_data:
+            try:
+                interface = Authenticator.objects.get_interface(require_user(request), "u2f")
+                assert isinstance(interface, U2fInterface)
+                if not interface.is_enrolled():
+                    raise LookupError()
+                challenge = json.loads(validator.validated_data["challenge"])
+                response = json.loads(validator.validated_data["response"])
+                authenticated = interface.validate_response(request, challenge, response)
+                if not authenticated:
+                    logger.warning(
+                        "u2f_authentication.verification_failed",
+                        extra={"user": acting_user_id(request.user)},
+                    )
+                else:
+                    metrics.incr("auth.2fa.success", sample_rate=1.0, skip_internal=False)
+                return authenticated
+            except ValueError as err:
+                logger.warning(
+                    "u2f_authentication.value_error",
+                    extra={"user": acting_user_id(request.user), "error_message": err},
+                )
+            except LookupError:
+                logger.warning(
+                    "u2f_authentication.interface_not_enrolled",
+                    extra={
+                        "validated_data": validator.validated_data,
+                        "user": acting_user_id(request.user),
+                    },
+                )
+        # attempt password authentication
+        elif "password" in validator.validated_data:
+            authenticated = promote_request_rpc_user(request).check_password(
+                validator.validated_data["password"]
+            )
+            if authenticated:
+                metrics.incr("auth.password.success", sample_rate=1.0, skip_internal=False)
+            return authenticated
+        return False
+
+
+@control_silo_endpoint
+class AuthIndexEndpoint(BaseAuthIndexEndpoint):
+    publish_status = {
+        "DELETE": ApiPublishStatus.PRIVATE,
+        "GET": ApiPublishStatus.PRIVATE,
+        "PUT": ApiPublishStatus.PRIVATE,
+        "POST": ApiPublishStatus.PRIVATE,
+    }
     """
     Manage session authentication
 
@@ -22,18 +147,65 @@ class AuthIndexEndpoint(Endpoint):
     and simple HTTP authentication.
     """
 
-    authentication_classes = [QuietBasicAuthentication, SessionAuthentication]
+    def initialize_request(self, request: HttpRequest, *args: Any, **kwargs: Any) -> Request:
+        rv = super().initialize_request(request, *args, **kwargs)
+        # Allow Bearer token authentication for GET (whoami) only.
+        # POST/PUT/DELETE are session-management operations where Bearer auth
+        # is inappropriate — the original restriction to QuietBasicAuthentication
+        # and SessionAuthentication is intentional for those methods.
+        if request.method == "GET":
+            rv.authenticators = [UserAuthTokenAuthentication(), *(rv.authenticators or [])]
+        return rv
 
-    permission_classes = ()
+    enforce_rate_limit = True
+    rate_limits = RateLimitConfig(
+        limit_overrides={
+            "PUT": {
+                RateLimitCategory.USER: RateLimit(
+                    limit=20, window=60 * 60
+                ),  # 20 PUT requests per hour per user
+            }
+        }
+    )
 
-    def get(self, request):
-        if not request.user.is_authenticated():
-            return Response(status=status.HTTP_400_BAD_REQUEST)
+    def _validate_superuser(
+        self, validator: AuthVerifyValidator, request: Request, verify_authenticator: bool
+    ) -> bool:
+        """
+        For a superuser, they need to be validated before we can grant an active superuser session.
+        If the user has a password or u2f device, authenticate the password/challenge that was sent is valid.
+        If the user doesn't have a password or u2f device, we say they're authenticated if they have a
+        valid SSO session.
 
-        user = extract_lazy_object(request._request.user)
-        return Response(serialize(user, user, DetailedUserSerializer()))
+        By nature of granting an active superuser session, we want to make sure that the user has completed
+        SSO and if they do not, we redirect them back to the SSO login.
 
-    def post(self, request):
+        """
+        logger.info(
+            "auth-index.validate_superuser",
+            extra={
+                "user": acting_user_id(request.user),
+                "raise_exception": not DISABLE_SSO_CHECK_FOR_LOCAL_DEV,
+                "verify_authenticator": verify_authenticator,
+            },
+        )
+        # Disable exception for missing password or u2f code if we're running locally
+        validator.is_valid(raise_exception=not DISABLE_SSO_CHECK_FOR_LOCAL_DEV)
+
+        authenticated = (
+            self._verify_user_via_inputs(validator, request)
+            if (not DISABLE_SSO_CHECK_FOR_LOCAL_DEV and verify_authenticator) or is_self_hosted()
+            else True
+        )
+
+        if SUPERUSER_ORG_ID:
+            if not has_completed_sso(request, SUPERUSER_ORG_ID):
+                request.session[PREFILLED_SU_MODAL_KEY] = request.data
+                self._reauthenticate_with_sso(request, SUPERUSER_ORG_ID)
+
+        return authenticated
+
+    def post(self, request: Request) -> Response:
         """
         Authenticate a User
         ```````````````````
@@ -49,12 +221,15 @@ class AuthIndexEndpoint(Endpoint):
 
             curl -X ###METHOD### -u username:password ###URL###
         """
-        if not request.user.is_authenticated():
+        if not request.user.is_authenticated:
             return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        if is_demo_user(request.user):
+            return Response(status=status.HTTP_403_FORBIDDEN)
 
         # If 2fa login is enabled then we cannot sign in with username and
         # password through this api endpoint.
-        if Authenticator.objects.user_has_2fa(request.user):
+        if require_user(request).has_2fa():
             return Response(
                 {
                     "2fa_required": True,
@@ -65,7 +240,7 @@ class AuthIndexEndpoint(Endpoint):
 
         try:
             # Must use the real request object that Django knows about
-            auth.login(request._request, request.user)
+            auth.login(request._request, promote_request_rpc_user(request))
         except auth.AuthUserPasswordExpired:
             return Response(
                 {
@@ -74,55 +249,98 @@ class AuthIndexEndpoint(Endpoint):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        request.user = request._request.user
+        set_request_principal(request, request._request.user, request.auth)
 
         return self.get(request)
 
-    def put(self, request):
+    def put(self, request: Request) -> Response:
         """
         Verify a User
         `````````````
 
-        This endpoint verifies the currently authenticated user (for example, to gain superuser).
+        This endpoint verifies the currently authenticated user (for example, to gain superuser)
+        through 3 methods (password and u2f device (provided in the request data) and valid sso
+        session if the user is a superuser). If the request is from the superuser modal and the
+        current superuser is verified, superuser access is granted.
 
         :auth: required
         """
-        if not request.user.is_authenticated():
+        if not request.user.is_authenticated:
             return Response(status=status.HTTP_401_UNAUTHORIZED)
 
+        if request.data.get("isSuperuserOrgAuth") and request.user.is_superuser:
+            su = getattr(request, "superuser", None)
+            if not su or not su.is_active:
+                return Response(
+                    {"detail": {"code": "superuser-required"}},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            org_slug = request.data.get("orgSlug")
+            if not org_slug:
+                return Response(
+                    {"detail": "orgSlug is required"}, status=status.HTTP_400_BAD_REQUEST
+                )
+            if not organization_service.check_organization_by_slug(
+                slug=org_slug, only_visible=False
+            ):
+                return Response(
+                    {"detail": "Organization not found"}, status=status.HTTP_404_NOT_FOUND
+                )
+            serializer = SuperuserAccessSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            su.authorize_org(
+                org_slug,
+                serializer.validated_data["superuserAccessCategory"],
+                serializer.validated_data["superuserReason"],
+            )
+            return Response(status=status.HTTP_200_OK)
+
         validator = AuthVerifyValidator(data=request.data)
-        if not validator.is_valid():
-            return self.respond(validator.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        authenticated = False
-
-        # See if we have a u2f challenge/response
-        if "challenge" in validator.validated_data and "response" in validator.validated_data:
+        if not (request.user.is_superuser and request.data.get("isSuperuserModal")):
             try:
-                interface = Authenticator.objects.get_interface(request.user, "u2f")
-                if not interface.is_enrolled():
-                    raise LookupError()
+                validator.is_valid(raise_exception=True)
+            except ValidationError:
+                return Response({"detail": {"code": MISSING_PASSWORD_OR_U2F_CODE}}, status=400)
 
-                challenge = json.loads(validator.validated_data["challenge"])
-                response = json.loads(validator.validated_data["response"])
-                authenticated = interface.validate_response(request, challenge, response)
-            except ValueError:
-                pass
-            except LookupError:
-                pass
-
-        # attempt password authentication
+            authenticated = self._verify_user_via_inputs(validator, request)
         else:
-            authenticated = request.user.check_password(validator.validated_data["password"])
+            verify_authenticator = False
 
-        # UI treats 401s by redirecting, this 401 should be ignored
+            if not DISABLE_SSO_CHECK_FOR_LOCAL_DEV and not is_self_hosted():
+                if SUPERUSER_ORG_ID:
+                    verify_authenticator = organization_service.check_organization_by_id(
+                        id=SUPERUSER_ORG_ID, only_visible=False
+                    )
+
+                if verify_authenticator:
+                    if not Authenticator.objects.filter(
+                        is_owned_by_acting_user(request.user), type=U2fInterface.type
+                    ).exists():
+                        return Response(
+                            {"detail": {"code": "no_u2f"}}, status=status.HTTP_403_FORBIDDEN
+                        )
+                logger.info(
+                    "auth-index.put",
+                    extra={
+                        "organization": SUPERUSER_ORG_ID,
+                        "user": acting_user_id(request.user),
+                        "verify_authenticator": verify_authenticator,
+                    },
+                )
+            try:
+                authenticated = self._validate_superuser(validator, request, verify_authenticator)
+            except ValidationError:
+                return Response({"detail": {"code": MISSING_PASSWORD_OR_U2F_CODE}}, status=400)
+
         if not authenticated:
             return Response({"detail": {"code": "ignore"}}, status=status.HTTP_403_FORBIDDEN)
 
-        try:
-            # Must use the real request object that Django knows about
-            auth.login(request._request, request.user)
-        except auth.AuthUserPasswordExpired:
+        user = promote_request_rpc_user(request)
+        if user.is_password_expired:
+            metrics.incr(
+                "sudo_modal.failure",
+            )
             return Response(
                 {
                     "code": "password-expired",
@@ -131,17 +349,63 @@ class AuthIndexEndpoint(Endpoint):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        request.user = request._request.user
+        # Must use the HttpRequest so SudoMiddleware can set the sudo cookie.
+        grant_sudo_privileges(request._request)
+        metrics.incr(
+            "sudo_modal.success",
+        )
+
+        if request.user.is_superuser and request.data.get("isSuperuserModal"):
+            request.superuser.set_logged_in(request.user)
+            org_slug = request.data.get("superuserOrgSlug")
+            if org_slug:
+                serializer = SuperuserAccessSerializer(data=request.data)
+                serializer.is_valid(raise_exception=True)
+                request.superuser.authorize_org(
+                    org_slug,
+                    serializer.validated_data["superuserAccessCategory"],
+                    serializer.validated_data["superuserReason"],
+                )
+
+        set_request_principal(request, request._request.user, request.auth)
 
         return self.get(request)
 
-    def delete(self, request, *args, **kwargs):
+    def delete(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         """
         Logout the Authenticated User
         `````````````````````````````
 
         Deauthenticate all active sessions for this user.
         """
+        # Allows demo user to log out from its current session but not others
+        if is_demo_user(request.user) and request.data.get("all", None) is True:
+            return Response(status=status.HTTP_403_FORBIDDEN)
+
+        # If there is an SLO URL, return it to frontend so the browser can redirect
+        # the user back to the IdP site to delete the IdP session cookie
+        slo_url = handle_saml_single_logout(request)
+
+        # For signals to work here, we must promote the request.user to a full user object
         logout(request._request)
-        request.user = AnonymousUser()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        set_request_principal(request, AnonymousUser(), request.auth)
+
+        # Force cookies to be deleted
+        response = Response()
+        response.delete_cookie(settings.CSRF_COOKIE_NAME, domain=settings.CSRF_COOKIE_DOMAIN)
+        response.delete_cookie(settings.SESSION_COOKIE_NAME, domain=settings.SESSION_COOKIE_DOMAIN)
+
+        if referrer := request.GET.get("referrer"):
+            analytics.record(
+                AuthV2DeleteLogin(
+                    event=referrer,
+                )
+            )
+
+        if slo_url:
+            response.status_code = status.HTTP_200_OK
+            response.data = {"sloUrl": slo_url}
+        else:
+            response.status_code = status.HTTP_204_NO_CONTENT
+
+        return response

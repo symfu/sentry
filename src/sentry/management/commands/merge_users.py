@@ -1,18 +1,18 @@
 import operator
 import sys
+from functools import reduce
 
-from collections import defaultdict
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db.models import Q
 
-from sentry.models import Organization, OrganizationMember, User
-from functools import reduce
+from sentry.models.organization import Organization
+from sentry.users.models.user import User
 
 
 class Command(BaseCommand):
     help = "Attempts to repair any invalid data within Sentry"
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--organization", help="Find all potential duplicate users within that organization."
         )
@@ -31,20 +31,11 @@ class Command(BaseCommand):
             help="Don't remove merged accounts.",
         )
 
-    def _get_organization_user_sets(self, organization):
-        queryset = OrganizationMember.objects.filter(organization=organization).select_related(
-            "user"
-        )
+    def _get_organization_user_sets(self, organization: Organization) -> list[list[User]]:
+        # TODO: This logic cannot work in the hybrid cloud world, entire process needs redesign.
+        raise NotImplementedError
 
-        members_by_email = defaultdict(list)
-        for member in queryset:
-            if not member.user:
-                continue
-            members_by_email[member.user.email].append(member.user)
-
-        return list(members_by_email.values())
-
-    def _confirm_merge(self, primary_user, other_users):
+    def _confirm_merge(self, primary_user: User, other_users: list[User]) -> bool:
         message = "Merge {} into {}? [Yn] ".format(
             ", ".join(o.username for o in other_users), primary_user.username
         )
@@ -55,7 +46,7 @@ class Command(BaseCommand):
             elif response == "n":
                 return False
 
-    def handle(self, *usernames, **options):
+    def handle(self, *usernames: str, **options: object) -> None:
         assert usernames or options.get("organization")
 
         noinput = options.get("noinput", False)

@@ -1,10 +1,10 @@
-from django.contrib.auth.management.commands.createsuperuser import Command
+from django.contrib.auth.management.commands.createsuperuser import Command as DjangoCommand
 
 
-class Command(Command):
+class Command(DjangoCommand):
     help = "Performs any pending database migrations and upgrades"
 
-    def handle(self, **options):
+    def handle(self, **options: object) -> None:
         from sentry.runner import call_command
 
         call_command("sentry.runner.commands.createuser.createuser", superuser=True)

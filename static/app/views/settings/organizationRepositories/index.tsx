@@ -1,0 +1,460 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {IconAdd} from '@sentry/icons/add';
+import {useInfiniteQuery, useQuery, useQueryClient} from '@tanstack/react-query';
+import groupBy from 'lodash/groupBy';
+import mapValues from 'lodash/mapValues';
+import sortBy from 'lodash/sortBy';
+import uniq from 'lodash/uniq';
+
+import {Button} from '@sentry/scraps/button';
+import {Input} from '@sentry/scraps/input';
+import {Stack} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+import {useModal} from '@sentry/scraps/modal';
+
+import {hasEveryAccess} from 'sentry/components/acl/access';
+import {AnalyticsArea} from 'sentry/components/analyticsArea';
+import {ConnectRepositoryModal} from 'sentry/components/connectRepository/connectRepositoryModal';
+import {orgCodeMappingsInfiniteOptions} from 'sentry/components/connectRepository/queries';
+import {LoadingError} from 'sentry/components/loadingError';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {SentryDocumentTitle} from 'sentry/components/sentryDocumentTitle';
+import {t, tct} from 'sentry/locale';
+import type {
+  Integration,
+  OrganizationIntegration,
+  Repository,
+} from 'sentry/types/integrations';
+import type {AvatarProject, Project} from 'sentry/types/project';
+import {useFetchAllPages} from 'sentry/utils/api/apiFetch';
+import {apiOptions} from 'sentry/utils/api/apiOptions';
+import {isScmProvider} from 'sentry/utils/integrationUtil';
+import {organizationRepositoriesInfiniteOptions} from 'sentry/utils/repositories/repoQueryOptions';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {SettingsPageHeader} from 'sentry/views/settings/components/settingsPageHeader';
+import {ConnectProviderDropdown} from 'sentry/views/settings/organizationRepositories/components/connectProviderDropdown';
+import {NoIntegrationsEmptyState} from 'sentry/views/settings/organizationRepositories/components/noIntegrationsEmptyState';
+import {
+  InstallationOverrideProvider,
+  type InstallationWrapperProps,
+  ScmRepositoryTable,
+} from 'sentry/views/settings/organizationRepositories/components/scmRepositoryTable';
+import {useRepoSearch} from 'sentry/views/settings/organizationRepositories/hooks/useRepoSearch';
+
+import {organizationConfigIntegrationsQueryOptions} from './hooks/organizationConfigIntegrationsQueryOptions';
+import {organizationIntegrationsQueryOptions} from './hooks/organizationIntegrationsQueryOptions';
+import {useDeleteIntegration} from './hooks/useDeleteIntegration';
+import {useInstallationSettings} from './hooks/useInstallationSettings';
+import {useSyncRepositories} from './hooks/useSyncRepositories';
+import {getProviderConfigUrl} from './getProviderConfigUrl';
+import type {ScmInstallation} from './types';
+
+interface AutoSyncContextValue {
+  autoSyncIntegrationId: string | null;
+  clearAutoSync: () => void;
+}
+
+// Signals which just-connected integration should auto-sync.
+const AutoSyncContext = createContext<AutoSyncContextValue>({
+  autoSyncIntegrationId: null,
+  clearAutoSync: () => {},
+});
+
+// Auto-sync a freshly connected integration once syncNow is ready, so repos
+// appear without a refresh. The clear handles remounts, the ref handles same-mount re-runs.
+function useAutoSyncOnConnect(
+  integrationId: string,
+  syncNow: (() => void) | undefined,
+  enabled: boolean
+) {
+  const {autoSyncIntegrationId, clearAutoSync} = useContext(AutoSyncContext);
+  const hasSyncedRef = useRef(false);
+  const shouldSync = enabled && integrationId === autoSyncIntegrationId;
+  useEffect(() => {
+    if (shouldSync && syncNow && !hasSyncedRef.current) {
+      hasSyncedRef.current = true;
+      clearAutoSync();
+      syncNow();
+    }
+  }, [shouldSync, syncNow, clearAutoSync]);
+}
+
+function ConnectedInstallation({installation, children}: InstallationWrapperProps) {
+  const organization = useOrganization();
+  const queryClient = useQueryClient();
+
+  const hasAccess = hasEveryAccess(['org:integrations'], {organization});
+
+  const reposOptions = organizationRepositoriesInfiniteOptions({
+    organization,
+    staleTime: 0,
+  });
+  const integrationsOptions = organizationIntegrationsQueryOptions({
+    organization,
+  });
+
+  // XXX: We have to fetch each integration to load the configData. This is not
+  // provided by the integrations list query.
+  const {data: integrationWithConfig} = useQuery(
+    apiOptions.as<OrganizationIntegration>()(
+      '/organizations/$organizationIdOrSlug/integrations/$integrationId/',
+      {
+        path: {
+          organizationIdOrSlug: organization.slug,
+          integrationId: installation.integration.id,
+        },
+        staleTime: 60_000,
+      }
+    )
+  );
+
+  const {openSettings} = useInstallationSettings(integrationWithConfig);
+
+  const handleDelete = useDeleteIntegration({
+    onSuccess: () => {
+      queryClient.invalidateQueries({queryKey: integrationsOptions.queryKey});
+      queryClient.invalidateQueries({queryKey: reposOptions.queryKey});
+    },
+  });
+
+  const {syncNow, isSyncing} = useSyncRepositories(installation.integration, {
+    onSynced: () => queryClient.invalidateQueries({queryKey: reposOptions.queryKey}),
+  });
+
+  useAutoSyncOnConnect(installation.integration.id, syncNow, hasAccess);
+
+  // Settings cannot be opened until we've loaded the integrationWithConfig
+  const settingsButtonProps = {
+    disabled: integrationWithConfig === undefined,
+  };
+
+  const uninstallButtonProps = hasAccess
+    ? undefined
+    : {
+        disabled: true,
+        tooltipProps: {
+          title: t(
+            'You must be an organization owner, manager or admin to uninstall this provider'
+          ),
+        },
+      };
+
+  const overrides = {
+    integration: integrationWithConfig ?? installation.integration,
+    onSettings: openSettings,
+    settingsButtonProps,
+    onUninstall: () => handleDelete(installation.integration),
+    uninstallButtonProps,
+    onSync: hasAccess ? syncNow : undefined,
+    isSyncing,
+  } as const;
+
+  return (
+    <InstallationOverrideProvider value={overrides}>
+      {children}
+    </InstallationOverrideProvider>
+  );
+}
+
+const SCM_PROVIDER_ORDER = [
+  'github',
+  'github_enterprise',
+  'gitlab',
+  'bitbucket',
+  'bitbucket_server',
+  'vsts',
+];
+
+// Always renders the + connect action on each repo row. No edit branch —
+// editing is triggered by clicking a mapped project chip instead.
+function ConnectRepoRowAction({
+  repo,
+  providerKey,
+  openModal,
+}: {
+  openModal: ReturnType<typeof useModal>['openModal'];
+  providerKey: string;
+  repo: Repository;
+}) {
+  return (
+    <Button
+      size="zero"
+      icon={<IconAdd />}
+      aria-label={t('Connect project')}
+      onClick={() =>
+        openModal(modalProps => (
+          <ConnectRepositoryModal
+            {...modalProps}
+            lockedSide="repo"
+            mode="connect"
+            repositoryId={repo.id}
+            repoName={repo.name}
+            providerKey={providerKey}
+            integrationId={repo.integrationId}
+            externalId={repo.externalId}
+          />
+        ))
+      }
+    />
+  );
+}
+
+function openMappedProjectEditModal({
+  repo,
+  avatarProject,
+  providerKey,
+  projectsBySlug,
+  openModal,
+}: {
+  avatarProject: AvatarProject;
+  openModal: ReturnType<typeof useModal>['openModal'];
+  projectsBySlug: Record<string, Project>;
+  providerKey: string;
+  repo: Repository;
+}) {
+  const project = projectsBySlug[avatarProject.slug];
+  if (!project) {
+    return;
+  }
+  openModal(modalProps => (
+    <ConnectRepositoryModal
+      {...modalProps}
+      lockedSide="repo"
+      mode="edit"
+      project={project}
+      repositoryId={repo.id}
+      repoName={repo.name}
+      providerKey={providerKey}
+      integrationId={repo.integrationId}
+      externalId={repo.externalId}
+    />
+  ));
+}
+
+export default function OrganizationRepositories() {
+  const organization = useOrganization();
+  const {openModal} = useModal();
+  const [searchTerm, setSearchTerm] = useState('');
+  const [autoSyncIntegrationId, setAutoSyncIntegrationId] = useState<string | null>(null);
+  const clearAutoSync = useCallback(() => setAutoSyncIntegrationId(null), []);
+
+  const providersQuery = useQuery(
+    organizationConfigIntegrationsQueryOptions({organization})
+  );
+
+  const scmProviders = useMemo(() => {
+    const providers = (providersQuery.data?.providers ?? []).filter(isScmProvider);
+    return sortBy(providers, [
+      p => {
+        const idx = SCM_PROVIDER_ORDER.indexOf(p.key);
+        return idx === -1 ? SCM_PROVIDER_ORDER.length : idx;
+      },
+      p => p.name,
+    ]);
+  }, [providersQuery.data]);
+
+  const scmProviderKeys = useMemo(() => scmProviders.map(p => p.key), [scmProviders]);
+
+  // XXX: We avoid passing includeConfig here as it significantly slows down
+  // the request. We'll load the config for each SCM integration in the
+  // ConnectedInstallation component.
+  const integrationsQuery = useQuery(
+    organizationIntegrationsQueryOptions({organization})
+  );
+
+  const scmIntegrations = useMemo(() => {
+    if (integrationsQuery.data === undefined) {
+      return [];
+    }
+    return integrationsQuery.data.filter(
+      i =>
+        i !== null &&
+        i.organizationIntegrationStatus === 'active' &&
+        i.status === 'active' &&
+        scmProviderKeys.includes(i.provider.key)
+    );
+  }, [integrationsQuery.data, scmProviderKeys]);
+
+  const reposQueryOptions = organizationRepositoriesInfiniteOptions({
+    organization,
+    staleTime: 0,
+  });
+  const reposQuery = useInfiniteQuery(reposQueryOptions);
+  useFetchAllPages({result: reposQuery});
+
+  const allRepos = useMemo<Repository[]>(
+    () => reposQuery.data?.pages.flatMap(page => page.json) ?? [],
+    [reposQuery.data]
+  );
+  const reposLoading =
+    !reposQuery.data || reposQuery.hasNextPage || reposQuery.isFetchingNextPage;
+
+  const reposByIntegrationId = useMemo(
+    () => groupBy(allRepos, r => r.integrationId),
+    [allRepos]
+  );
+
+  const codeMappingsQuery = useInfiniteQuery(
+    orgCodeMappingsInfiniteOptions(organization.slug)
+  );
+  useFetchAllPages({result: codeMappingsQuery});
+
+  const mappedProjectSlugsByRepoId = useMemo(() => {
+    const mappings = codeMappingsQuery.data?.pages.flatMap(p => p.json) ?? [];
+    const byRepoId = groupBy(mappings, m => m.repoId);
+    return mapValues(byRepoId, ms => uniq(ms.map(m => m.projectSlug)));
+  }, [codeMappingsQuery.data]);
+
+  const allMappedSlugs = useMemo(
+    () => uniq(Object.values(mappedProjectSlugsByRepoId).flat()),
+    [mappedProjectSlugsByRepoId]
+  );
+  const {projects: mappedProjects} = useProjects({slugs: allMappedSlugs});
+  const projectsBySlug = useMemo(
+    () => Object.fromEntries(mappedProjects.map(p => [p.slug, p])),
+    [mappedProjects]
+  );
+
+  const mappingsLoading =
+    codeMappingsQuery.isPending ||
+    codeMappingsQuery.hasNextPage ||
+    codeMappingsQuery.isFetchingNextPage;
+
+  const installationsByProviderKey = useMemo(() => {
+    const installations = scmIntegrations.map<ScmInstallation>(integration => ({
+      integration,
+      repositories: reposByIntegrationId[integration.id] ?? [],
+      reposLoading,
+      manageUrl: getProviderConfigUrl(integration) ?? undefined,
+      mappedProjectSlugsByRepoId,
+      mappingsLoading,
+      repoActions: (repo: Repository) => (
+        <ConnectRepoRowAction
+          repo={repo}
+          providerKey={integration.provider.key}
+          openModal={openModal}
+        />
+      ),
+      onMappedProjectClick: (repo: Repository, avatarProject: AvatarProject) =>
+        openMappedProjectEditModal({
+          repo,
+          avatarProject,
+          providerKey: integration.provider.key,
+          projectsBySlug,
+          openModal,
+        }),
+    }));
+    return groupBy(installations, i => i.integration.provider.key);
+  }, [
+    scmIntegrations,
+    reposByIntegrationId,
+    reposLoading,
+    mappedProjectSlugsByRepoId,
+    projectsBySlug,
+    mappingsLoading,
+    openModal,
+  ]);
+
+  // A newly connected provider has no repos imported yet. Refetch to render its
+  // row, then flag it to auto-sync, which polls until those repos appear.
+  const handleAddIntegration = (data: Integration) => {
+    setAutoSyncIntegrationId(data.id);
+    integrationsQuery.refetch();
+  };
+
+  const autoSyncContextValue = useMemo(
+    () => ({autoSyncIntegrationId, clearAutoSync}),
+    [autoSyncIntegrationId, clearAutoSync]
+  );
+
+  const repoMatches = useRepoSearch(allRepos, searchTerm);
+
+  const isLoading = providersQuery.isPending || integrationsQuery.isPending;
+  const isError =
+    providersQuery.isError || integrationsQuery.isError || reposQuery.isError;
+
+  const pageDescription = tct(
+    'Connecting a repo to a project enables [suspectCommits:Suspect Commits] on issues, [suggestedAssignees:Suggested Assignees] based on code owners, the ability to mark an issue [resolvedViaCommit:Resolved via Commit or PR], and is a requirement for [seer:Seer].',
+    {
+      suspectCommits: (
+        <ExternalLink href="https://docs.sentry.io/product/issues/suspect-commits/" />
+      ),
+      suggestedAssignees: (
+        <ExternalLink href="https://docs.sentry.io/product/issues/ownership-rules/#code-owners" />
+      ),
+      resolvedViaCommit: (
+        <ExternalLink href="https://docs.sentry.io/product/releases/associate-commits/#associate-commits-with-a-release" />
+      ),
+      seer: (
+        <ExternalLink href="https://docs.sentry.io/product/ai-in-sentry/seer/#seer-capabilities" />
+      ),
+    }
+  );
+
+  return (
+    <AnalyticsArea name="repositories-v2">
+      <AutoSyncContext.Provider value={autoSyncContextValue}>
+        <SentryDocumentTitle title={t('Repositories')} orgSlug={organization.slug} />
+        <SettingsPageHeader
+          title={t('Repositories')}
+          subtitle={pageDescription}
+          action={
+            scmIntegrations.length > 0 ? (
+              <ConnectProviderDropdown
+                providers={scmProviders.filter(p => p.canAdd)}
+                onAddIntegration={handleAddIntegration}
+              />
+            ) : undefined
+          }
+        />
+        {isLoading ? (
+          <LoadingIndicator />
+        ) : isError ? (
+          <LoadingError
+            onRetry={() => {
+              providersQuery.refetch();
+              integrationsQuery.refetch();
+              reposQuery.refetch();
+            }}
+          />
+        ) : (
+          <Stack gap="lg">
+            <Input
+              type="search"
+              placeholder={t('Search repositories')}
+              value={searchTerm}
+              onChange={e => setSearchTerm(e.target.value)}
+            />
+            {!integrationsQuery.isPending && scmIntegrations.length === 0 ? (
+              <NoIntegrationsEmptyState
+                providers={scmProviders}
+                onAddIntegration={handleAddIntegration}
+              />
+            ) : (
+              scmProviders
+                .filter(p => installationsByProviderKey[p.key])
+                .map(provider => (
+                  <ScmRepositoryTable
+                    key={provider.key}
+                    provider={provider}
+                    installations={installationsByProviderKey[provider.key]!}
+                    repoMatches={repoMatches}
+                    installationWrapper={ConnectedInstallation}
+                  />
+                ))
+            )}
+          </Stack>
+        )}
+      </AutoSyncContext.Provider>
+    </AnalyticsArea>
+  );
+}

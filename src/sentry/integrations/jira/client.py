@@ -1,76 +1,30 @@
 import datetime
-import jwt
-import re
 import logging
-from urllib.parse import parse_qs, urlparse, urlsplit
+from collections.abc import Mapping
+from typing import Any, cast
+from urllib.parse import parse_qs, urlsplit
 
+from requests import PreparedRequest
 
-from sentry.integrations.atlassian_connect import get_query_hash
-from sentry.shared_integrations.exceptions import ApiError
 from sentry.integrations.client import ApiClient
-from sentry.utils.http import absolute_uri
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.services.integration.model import RpcIntegration
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.integrations.utils.atlassian_connect import get_query_hash
+from sentry.integrations.utils.jira import get_jira_key, parse_jira_issue_key
+from sentry.shared_integrations.exceptions import ApiError
+from sentry.shared_integrations.response import MappingApiResponse, SequenceApiResponse
+from sentry.utils import jwt
 
 logger = logging.getLogger("sentry.integrations.jira")
 
-JIRA_KEY = f"{urlparse(absolute_uri()).hostname}.jira"
-ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 CUSTOMFIELD_PREFIX = "customfield_"
 
-
-class JiraCloud:
-    """
-    Contains the jira-cloud specifics that a JiraClient needs
-    in order to communicate with jira
-    """
-
-    def __init__(self, shared_secret):
-        self.shared_secret = shared_secret
-
-    @property
-    def cache_prefix(self):
-        return "sentry-jira-2:"
-
-    def request_hook(self, method, path, data, params, **kwargs):
-        """
-        Used by Jira Client to apply the jira-cloud authentication
-        """
-        # handle params that are already part of the path
-        url_params = dict(parse_qs(urlsplit(path).query))
-        url_params.update(params or {})
-        path = path.split("?")[0]
-
-        jwt_payload = {
-            "iss": JIRA_KEY,
-            "iat": datetime.datetime.utcnow(),
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(seconds=5 * 60),
-            "qsh": get_query_hash(path, method.upper(), url_params),
-        }
-        encoded_jwt = jwt.encode(jwt_payload, self.shared_secret)
-        params = dict(jwt=encoded_jwt, **(url_params or {}))
-        request_spec = kwargs.copy()
-        request_spec.update(dict(method=method, path=path, data=data, params=params))
-        return request_spec
-
-    def user_id_field(self):
-        """
-        Jira-Cloud requires GDPR compliant API usage so we have to use accountId
-        """
-        return "accountId"
-
-    def user_query_param(self):
-        """
-        Jira-Cloud requires GDPR compliant API usage so we have to use query
-        """
-        return "query"
-
-    def user_id_get_param(self):
-        """
-        Jira-Cloud requires GDPR compliant API usage so we have to use accountId
-        """
-        return "accountId"
+STATUS_SEARCH_PAGE_SIZE = 200
+STATUS_SEARCH_MAX_PAGES = 20
 
 
-class JiraApiClient(ApiClient):
+class JiraCloudClient(ApiClient):
     # TODO: Update to v3 endpoints
     COMMENTS_URL = "/rest/api/2/issue/%s/comment"
     COMMENT_URL = "/rest/api/2/issue/%s/comment/%s"
@@ -79,91 +33,126 @@ class JiraApiClient(ApiClient):
     ISSUE_URL = "/rest/api/2/issue/%s"
     META_URL = "/rest/api/2/issue/createmeta"
     PRIORITIES_URL = "/rest/api/2/priority"
+    PROJECTS_PAGINATED_URL = "/rest/api/2/project/search"
     PROJECT_URL = "/rest/api/2/project"
-    SEARCH_URL = "/rest/api/2/search/"
+    SEARCH_URL = "/rest/api/2/search/jql/"
     VERSIONS_URL = "/rest/api/2/project/%s/versions"
     USERS_URL = "/rest/api/2/user/assignable/search"
     USER_URL = "/rest/api/2/user"
     SERVER_INFO_URL = "/rest/api/2/serverInfo"
+    STATUS_SEARCH_URL = "/rest/api/2/statuses/search"
     ASSIGN_URL = "/rest/api/2/issue/%s/assignee"
     TRANSITION_URL = "/rest/api/2/issue/%s/transitions"
     EMAIL_URL = "/rest/api/3/user/email"
     AUTOCOMPLETE_URL = "/rest/api/2/jql/autocompletedata/suggestions"
+    PROPERTIES_URL = "/rest/api/3/issue/%s/properties/%s"
 
-    integration_name = "jira"
+    integration_name = IntegrationProviderSlug.JIRA.value
+    # Configures `get_with_pagination`, used by the paginated `get_project_statuses`.
+    page_size = STATUS_SEARCH_PAGE_SIZE
+    page_number_limit = STATUS_SEARCH_MAX_PAGES
 
     # This timeout is completely arbitrary. Jira doesn't give us any
     # caching headers to work with. Ideally we want a duration that
     # lets the user make their second jira issue with cached data.
     cache_time = 240
 
-    def __init__(self, base_url, jira_style, verify_ssl, logging_context=None):
-        self.base_url = base_url
-        # `jira_style` encapsulates differences between jira server & jira cloud.
-        # We only support one API version for Jira, but server/cloud require different
-        # authentication mechanisms and caching.
-        self.jira_style = jira_style
-        super().__init__(verify_ssl, logging_context)
+    def __init__(
+        self,
+        integration: RpcIntegration | Integration,
+        verify_ssl: bool,
+        logging_context: Any | None = None,
+    ) -> None:
+        self.base_url = integration.metadata["base_url"]
+        self.shared_secret = integration.metadata["shared_secret"]
+        super().__init__(
+            integration_id=integration.id,
+            verify_ssl=verify_ssl,
+            logging_context=logging_context,
+        )
 
-    def get_cache_prefix(self):
-        return self.jira_style.cache_prefix
+    def finalize_request(self, prepared_request: PreparedRequest) -> PreparedRequest:
+        assert prepared_request.url is not None
+        assert prepared_request.method is not None
+        path = prepared_request.url[len(self.base_url) :]
+        url_params = dict(parse_qs(urlsplit(path).query))
+        path = path.split("?")[0]
+        now = datetime.datetime.now(datetime.UTC)
+        jwt_payload = {
+            "iss": get_jira_key(),
+            "iat": now,
+            "exp": now + datetime.timedelta(seconds=5 * 60),
+            "qsh": get_query_hash(
+                uri=path,
+                method=prepared_request.method.upper(),
+                query_params=url_params,
+            ),
+        }
+        encoded_jwt = jwt.encode(jwt_payload, self.shared_secret)
+        prepared_request.headers["Authorization"] = f"JWT {encoded_jwt}"
+        return prepared_request
 
-    def request(self, method, path, data=None, params=None, **kwargs):
+    def get_cache_prefix(self) -> str:
+        return "sentry-jira-2:"
+
+    def user_id_get_param(self) -> str:
         """
-        Use the request_hook method for our specific style of Jira to
-        add authentication data and transform parameters.
+        Jira-Cloud requires GDPR compliant API usage so we have to use accountId
         """
-        request_spec = self.jira_style.request_hook(method, path, data, params, **kwargs)
-        if "headers" not in request_spec:
-            request_spec["headers"] = {}
+        return "accountId"
 
-        # Force adherence to the GDPR compliant API conventions.
-        # See
-        # https://developer.atlassian.com/cloud/jira/platform/deprecation-notice-user-privacy-api-migration-guide
-        request_spec["headers"]["x-atlassian-force-account-id"] = "true"
-        return self._request(**request_spec)
+    def user_id_field(self) -> str:
+        """
+        Jira-Cloud requires GDPR compliant API usage so we have to use accountId
+        """
+        return "accountId"
 
-    def user_id_get_param(self):
-        return self.jira_style.user_id_get_param()
+    def user_query_param(self) -> str:
+        """
+        Jira-Cloud requires GDPR compliant API usage so we have to use query
+        """
+        return "query"
 
-    def user_id_field(self):
-        return self.jira_style.user_id_field()
+    def get_issue(self, issue_id: str) -> MappingApiResponse:
+        return self.get_mapping(self.ISSUE_URL % (issue_id,))
 
-    def user_query_param(self):
-        return self.jira_style.user_query_param()
-
-    def get_issue(self, issue_id):
-        return self.get(self.ISSUE_URL % (issue_id,))
-
-    def search_issues(self, query):
-        # check if it looks like an issue id
-        if ISSUE_KEY_RE.match(query):
-            jql = 'id="%s"' % query.replace('"', '\\"')
+    def search_issues(self, query: str) -> MappingApiResponse:
+        issue_key = parse_jira_issue_key(query, self.base_url)
+        if issue_key is not None:
+            # the key pattern cannot contain a quote, so it needs no escaping
+            jql = f'id="{issue_key}"'
         else:
-            jql = 'text ~ "%s"' % query.replace('"', '\\"')
-        return self.get(self.SEARCH_URL, params={"jql": jql})
+            q = query.replace('"', '\\"')
+            jql = f'text ~ "{q}"'
+        return self.get_mapping(self.SEARCH_URL, params={"jql": jql, "fields": "*all"})
 
-    def create_comment(self, issue_key, comment):
-        return self.post(self.COMMENTS_URL % issue_key, data={"body": comment})
+    def create_comment(self, issue_key: str, comment: str) -> MappingApiResponse:
+        return self.post_mapping(self.COMMENTS_URL % issue_key, data={"body": comment})
 
-    def update_comment(self, issue_key, comment_id, comment):
-        return self.put(self.COMMENT_URL % (issue_key, comment_id), data={"body": comment})
+    def update_comment(self, issue_key: str, comment_id: str, comment: str) -> MappingApiResponse:
+        return self.put_mapping(self.COMMENT_URL % (issue_key, comment_id), data={"body": comment})
 
-    def get_projects_list(self):
-        return self.get_cached(self.PROJECT_URL)
+    def get_projects_paginated(
+        self, params: Mapping[str, object] | None = None
+    ) -> MappingApiResponse:
+        return self.get_mapping(self.PROJECTS_PAGINATED_URL, params=params)
 
-    def get_project_key_for_id(self, project_id):
+    def get_projects_list(self) -> SequenceApiResponse:
+        """deprecated - please use paginated projects endpoint"""
+        return self.get_cached_sequence(self.PROJECT_URL)
+
+    def get_project_key_for_id(self, project_id: str | int) -> str:
         if not project_id:
             return ""
         projects = self.get_projects_list()
         for project in projects:
             if project["id"] == project_id:
-                return project["key"].encode("utf-8")
+                return project["key"]
         return ""
 
-    def get_create_meta_for_project(self, project):
+    def get_create_meta_for_project(self, project: str | int) -> MappingApiResponse | None:
         params = {"expand": "projects.issuetypes.fields", "projectIds": project}
-        metas = self.get_cached(self.META_URL, params=params)
+        metas = self.get_cached_mapping(self.META_URL, params=params)
         # We saw an empty JSON response come back from the API :(
         if not metas:
             logger.info(
@@ -177,7 +166,7 @@ class JiraApiClient(ApiClient):
             raise ApiError(f"More than one project found matching {project}.")
 
         try:
-            return metas["projects"][0]
+            return cast(MappingApiResponse, metas["projects"][0])
         except IndexError:
             logger.info(
                 "jira.get-create-meta.key-error",
@@ -185,64 +174,88 @@ class JiraApiClient(ApiClient):
             )
             return None
 
-    def get_versions(self, project):
-        return self.get_cached(self.VERSIONS_URL % project)
+    def get_versions(self, project: str | int) -> SequenceApiResponse:
+        return self.get_cached_sequence(self.VERSIONS_URL % project)
 
-    def get_priorities(self):
-        return self.get_cached(self.PRIORITIES_URL)
+    def get_priorities(self) -> SequenceApiResponse:
+        return self.get_cached_sequence(self.PRIORITIES_URL)
 
-    def get_users_for_project(self, project):
+    def search_users_for_project(self, project: str | int, username: str) -> SequenceApiResponse:
         # Jira Server wants a project key, while cloud is indifferent.
         project_key = self.get_project_key_for_id(project)
-        return self.get_cached(self.USERS_URL, params={"project": project_key})
-
-    def search_users_for_project(self, project, username):
-        # Jira Server wants a project key, while cloud is indifferent.
-        project_key = self.get_project_key_for_id(project)
-        return self.get_cached(
+        return self.get_cached_sequence(
             self.USERS_URL, params={"project": project_key, self.user_query_param(): username}
         )
 
-    def search_users_for_issue(self, issue_key, email):
-        return self.get_cached(
+    def search_users_for_issue(self, issue_key: str, email: str) -> SequenceApiResponse:
+        return self.get_cached_sequence(
             self.USERS_URL, params={"issueKey": issue_key, self.user_query_param(): email}
         )
 
-    def get_user(self, user_id):
+    def get_user(self, user_id: str) -> MappingApiResponse:
         user_id_get_param = self.user_id_get_param()
-        return self.get_cached(self.USER_URL, params={user_id_get_param: user_id})
+        return self.get_cached_mapping(self.USER_URL, params={user_id_get_param: user_id})
 
-    def create_issue(self, raw_form_data):
+    def create_issue(self, raw_form_data: Mapping[str, object]) -> MappingApiResponse:
         data = {"fields": raw_form_data}
-        return self.post(self.CREATE_URL, data=data)
+        return self.post_mapping(self.CREATE_URL, data=data)
 
-    def get_server_info(self):
-        return self.get(self.SERVER_INFO_URL)
+    def get_server_info(self) -> MappingApiResponse:
+        return self.get_mapping(self.SERVER_INFO_URL)
 
-    def get_valid_statuses(self):
-        return self.get_cached(self.STATUS_URL)
+    def get_valid_statuses(self) -> SequenceApiResponse:
+        return self.get_cached_sequence(self.STATUS_URL)
 
-    def get_transitions(self, issue_key):
-        return self.get_cached(self.TRANSITION_URL % issue_key)["transitions"]
+    def get_transitions(self, issue_key: str) -> SequenceApiResponse:
+        return cast(
+            SequenceApiResponse, self.get_mapping(self.TRANSITION_URL % issue_key)["transitions"]
+        )
 
-    def transition_issue(self, issue_key, transition_id):
-        return self.post(self.TRANSITION_URL % issue_key, {"transition": {"id": transition_id}})
+    def transition_issue(self, issue_key: str, transition_id: str) -> MappingApiResponse:
+        return self.post_mapping(
+            self.TRANSITION_URL % issue_key, data={"transition": {"id": transition_id}}
+        )
 
-    def assign_issue(self, key, name_or_account_id):
+    def assign_issue(self, key: str, name_or_account_id: str) -> MappingApiResponse:
         user_id_field = self.user_id_field()
-        return self.put(self.ASSIGN_URL % key, data={user_id_field: name_or_account_id})
+        return self.put_mapping(self.ASSIGN_URL % key, data={user_id_field: name_or_account_id})
 
-    def get_email(self, account_id):
-        user = self.get_cached(self.EMAIL_URL, params={"accountId": account_id})
-        return user.get("email")
+    def set_issue_property(self, issue_key: str, badge_num: int) -> MappingApiResponse:
+        module_key = "sentry-issues-glance"
+        properties_key = f"com.atlassian.jira.issue:{get_jira_key()}:{module_key}:status"
+        data = {"type": "badge", "value": {"label": badge_num}}
+        return self.put_mapping(self.PROPERTIES_URL % (issue_key, properties_key), data=data)
 
-    def get_field_autocomplete(self, name, value):
+    def get_email(self, account_id: str | None) -> str | None:
+        user = self.get_cached_mapping(self.EMAIL_URL, params={"accountId": account_id})
+        email = user.get("email")
+        return email
+
+    def get_field_autocomplete(self, name: str, value: str) -> MappingApiResponse:
         if name.startswith(CUSTOMFIELD_PREFIX):
             # Transform `customfield_0123` into `cf[0123]`
             cf_id = name[len(CUSTOMFIELD_PREFIX) :]
             jql_name = f"cf[{cf_id}]"
         else:
             jql_name = name
-        return self.get_cached(
+        return self.get_cached_mapping(
             self.AUTOCOMPLETE_URL, params={"fieldName": jql_name, "fieldValue": value}
         )
+
+    def get_project_statuses(self, project_id: str, paginate: bool = False) -> dict[str, Any]:
+        if not paginate:
+            # TODO: Remove this after rolling out lazy status feature flag fully
+            return dict(
+                self.get_cached_mapping(self.STATUS_SEARCH_URL, params={"projectId": project_id})
+            )
+
+        values = self.get_with_pagination(
+            self.STATUS_SEARCH_URL,
+            gen_params=lambda page_num, page_size: {
+                "projectId": project_id,
+                "startAt": page_num * page_size,
+                "maxResults": page_size,
+            },
+            get_results=lambda resp: resp.get("values", []),
+        )
+        return {"values": values}

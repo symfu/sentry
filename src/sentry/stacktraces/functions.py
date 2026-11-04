@@ -1,11 +1,45 @@
-import re
+from __future__ import annotations
 
+import re
+from collections.abc import Callable, Mapping
+from typing import Any
+from urllib.parse import urlparse
+
+from django.core.exceptions import ValidationError
+from django.core.validators import URLValidator
+
+from sentry.interfaces.stacktrace import Frame
 from sentry.stacktraces.platform import get_behavior_family_for_platform
 from sentry.utils.safe import setdefault_path
 
-
 _windecl_hash = re.compile(r"^@?(.*?)@[0-9]+$")
 _rust_hash = re.compile(r"::h[a-z0-9]{16}$")
+# Regex for the 40-character hash IL2CPP appends to every managed method name it emits, as in
+# `NativeButtons_DoSomeWorkHere_m7486FA1E8A228E806BA045D26ABECC87DFD436B4`,
+# `NativeButtons_DoSomeWorkHere_m7486FA1E8A228E806BA045D26ABECC87DFD436B4_inline`, etc.
+_il2cpp_method_hash = re.compile(
+    r"""
+    # The hash itself
+    _m[0-9a-fA-F]{40}
+    # Lookahead for descriptor suffixes which may be appended after the hash, in any combination;
+    # each names a distinct generated function rather than decorating one, so they're kept while the
+    # hash goes. Ends with `$` to ensure no trailing unrecognized suffixes are allowed.
+    (?=
+        (
+            _gshared
+            | _fshared
+            | _inline
+            | _AdjustorThunk
+            | _Multicast
+            | _Open(Static|Instance|Virtual|Interface|GenericVirtual|GenericInterface)(Invoker)?
+            | _gp(_\d+)+
+        )*
+        $
+    )
+    """,
+    re.VERBOSE,
+)
+_gnu_version = re.compile(r"@@?GLIBC_([0-9.]+)$")
 _cpp_trailer_re = re.compile(r"(\bconst\b|&)$")
 _rust_blanket_re = re.compile(r"^([A-Z] as )")
 _lambda_re = re.compile(
@@ -31,12 +65,15 @@ _anon_namespace_re = re.compile(
     \?A0x[a-f0-9]{8}::
     """
 )
+_function_token_break_re = re.compile(r"\s|[({<\[]")
 
 
 PAIRS = {"(": ")", "{": "}", "[": "]", "<": ">"}
 
 
-def replace_enclosed_string(s, start, end, replacement=None):
+def replace_enclosed_string(
+    s: str, start: str, end: str, replacement: str | Callable[[str, int], str] | None = None
+) -> str:
     if start not in s:
         return s
 
@@ -52,18 +89,21 @@ def replace_enclosed_string(s, start, end, replacement=None):
         elif char == end:
             depth -= 1
             if depth == 0:
-                if replacement is not None:
-                    if callable(replacement):
-                        rv.append(replacement(s[pair_start + 1 : idx], pair_start))
-                    else:
-                        rv.append(replacement)
+                if isinstance(replacement, str):
+                    rv.append(replacement)
+                elif replacement is not None:
+                    assert pair_start is not None
+                    rv.append(replacement(s[pair_start + 1 : idx], pair_start))
         elif depth == 0:
             rv.append(char)
 
     return "".join(rv)
 
 
-def split_func_tokens(s):
+def split_func_tokens(s: str) -> list[str]:
+    if s and _function_token_break_re.search(s) is None:
+        return [s]
+
     buf = []
     rv = []
     stack = []
@@ -92,7 +132,7 @@ def split_func_tokens(s):
     return ["".join(x) for x in rv]
 
 
-def trim_function_name(function, platform, normalize_lambdas=True):
+def trim_function_name(function: str, platform: str | None, normalize_lambdas: bool = True) -> str:
     """Given a function value from the frame's function attribute this returns
     a trimmed version that can be stored in `function_name`.  This is only used
     if the client did not supply a value itself already.
@@ -100,11 +140,11 @@ def trim_function_name(function, platform, normalize_lambdas=True):
     if platform == "csharp":
         return trim_csharp_function_name(function)
     if get_behavior_family_for_platform(platform) == "native":
-        return trim_native_function_name(function, normalize_lambdas=normalize_lambdas)
+        return trim_native_function_name(function, platform, normalize_lambdas=normalize_lambdas)
     return function
 
 
-def trim_csharp_function_name(function):
+def trim_csharp_function_name(function: str) -> str:
     """This trims off signatures from C# frames.  This takes advantage of the
     Unity not emitting any return values and using a space before the argument
     list.
@@ -117,7 +157,9 @@ def trim_csharp_function_name(function):
     return function.split(" (", 1)[0]
 
 
-def trim_native_function_name(function, normalize_lambdas=True):
+def trim_native_function_name(
+    function: str, platform: str | None, normalize_lambdas: bool = True
+) -> str:
     if function in ("<redacted>", "<unknown>"):
         return function
 
@@ -127,6 +169,14 @@ def trim_native_function_name(function, normalize_lambdas=True):
     # Ensure we don't operate on objc functions
     if function.startswith(("[", "+[", "-[")):
         return function
+
+    # Remove special `[clone .foo]` annotations for cloned/split functions
+    def process_brackets(value: str, start: int) -> str:
+        if value.startswith("clone ."):
+            return ""
+        return "[%s]" % value
+
+    function = replace_enclosed_string(function, "[", "]", process_brackets).rstrip()
 
     # Chop off C++ trailers
     while True:
@@ -142,6 +192,7 @@ def trim_native_function_name(function, normalize_lambdas=True):
         function.replace("operator<<", "operator⟨⟨")
         .replace("operator<", "operator⟨")
         .replace("operator()", "operator◯")
+        .replace("operator->", "operator⟿")
         .replace(" -> ", " ⟿ ")
         .replace("`anonymous namespace'", "〔anonymousnamespace〕")
     )
@@ -153,7 +204,7 @@ def trim_native_function_name(function, normalize_lambdas=True):
     # something like `lambda_deadbeefeefffeeffeeff` whereas clang for
     # instance will name it `main::$_0` which will tell us in which outer
     # function it was declared.
-    if normalize_lambdas:
+    if normalize_lambdas and ("lambda" in function or "$_" in function):
         function = _lambda_re.sub("lambda", function)
 
     # Normalize MSVC anonymous namespaces from inline functions.  For inline
@@ -161,11 +212,11 @@ def trim_native_function_name(function, normalize_lambdas=True):
     # their hash.  For regular functions,  "`anonymous namespace'" is used.
     # The regular expression matches the trailing "::" to avoid accidental
     # replacement in mangled function names.
-    if normalize_lambdas:
+    if normalize_lambdas and "?A0x" in function:
         function = _anon_namespace_re.sub("〔anonymousnamespace〕::", function)
 
     # Remove the arguments if there is one.
-    def process_args(value, start):
+    def process_args(value: str, start: int) -> str:
         value = value.strip()
         if value in ("anonymous namespace", "operator"):
             return "(%s)" % value
@@ -173,9 +224,13 @@ def trim_native_function_name(function, normalize_lambdas=True):
 
     function = replace_enclosed_string(function, "(", ")", process_args)
 
+    # Must run after the argument list is gone: the hash is only recognisable at the end of a
+    # symbol, and PDB gives Symbolicator `Foo_Bar_m<hash>(args)` where DWARF gives the bare name.
+    function = _il2cpp_method_hash.sub("", function)
+
     # Resolve generic types, but special case rust which uses things like
     # <Foo as Bar>::baz to denote traits.
-    def process_generics(value, start):
+    def process_generics(value: str, start: int) -> str:
         # Special case for lambdas
         if value == "lambda" or _lambda_re.match(value):
             return "<%s>" % value
@@ -190,6 +245,8 @@ def trim_native_function_name(function, normalize_lambdas=True):
 
     function = replace_enclosed_string(function, "<", ">", process_generics)
 
+    is_thunk = "thunk for " in function  # swift
+
     tokens = split_func_tokens(function)
 
     # MSVC demangles generic operator functions with a space between the
@@ -202,23 +259,48 @@ def trim_native_function_name(function, normalize_lambdas=True):
     # find the token which is the function name.  Since we chopped of C++
     # trailers there are only two cases we care about: the token left to
     # the -> return marker which is for instance used in Swift and if that
-    # is not found, the last token in the last.
+    # is not found, consider the last token to be the function.
     #
     # ["unsigned", "int", "whatever"] -> whatever
     # ["@objc", "whatever", "->", "int"] -> whatever
-    try:
-        func_token = tokens[tokens.index("⟿") - 1]
-    except ValueError:
-        if tokens:
+    if function.find("initialization expression of") != -1:
+        # Swift initializer expression.
+        last_of_index = len(tokens) - 1 - tokens[::-1].index("of")
+        func_token = tokens[last_of_index + 1]
+        if func_token == "static":
+            # Static initializer expression, the object is the next token.
+            func_token = tokens[last_of_index + 2]
+        if func_token.startswith(":"):
+            # Trim the colon from the function name.
+            func_token = func_token[1:]
+        func_token = "initializer expression of " + func_token
+    elif tokens:
+        try:
+            last_arrow_index = len(tokens) - 1 - tokens[::-1].index("⟿")
+            func_token = tokens[last_arrow_index - 1]
+            if func_token == "throws":
+                # Throwing Swift function, the function name is the previous token.
+                func_token = tokens[last_arrow_index - 2]
+        except (ValueError, IndexError):
+            # No arrow, use the last token.
+            last_arrow_index = -1
             func_token = tokens[-1]
-        else:
-            func_token = None
+    else:
+        func_token = None
 
     if func_token:
+        if func_token.startswith("@") and platform in ("cocoa", "swift"):
+            # Found a Swift attribute instead of a function name, must be an
+            # anonymous function
+            func_token = ("thunk for " if is_thunk else "") + "closure"
+        elif "closure" in tokens and func_token != "closure":
+            # Found a closure.
+            func_token = "closure in " + func_token
+
         function = (
             func_token.replace("⟨", "<")
             .replace("◯", "()")
-            .replace(" ⟿ ", " -> ")
+            .replace("⟿", "->")
             .replace("〔anonymousnamespace〕", "`anonymous namespace'")
         )
 
@@ -227,13 +309,20 @@ def trim_native_function_name(function, normalize_lambdas=True):
         function = original_function
 
     # trim off rust markers
-    function = _rust_hash.sub("", function)
+    if "::h" in function:
+        function = _rust_hash.sub("", function)
+
+    # trim off gnu symbol versioning info
+    if "@GLIBC_" in function:
+        function = _gnu_version.sub("", function)
 
     # trim off windows decl markers
-    return _windecl_hash.sub("\\1", function)
+    return _windecl_hash.sub("\\1", function) if "@" in function else function
 
 
-def get_function_name_for_frame(frame, platform=None):
+def get_function_name_for_frame(
+    frame: Frame | Mapping[str, Any], platform: str | None = None
+) -> str | None:
     """Given a frame object or dictionary this returns the actual function
     name trimmed.
     """
@@ -248,9 +337,42 @@ def get_function_name_for_frame(frame, platform=None):
     rv = frame.get("function")
     if rv:
         return trim_function_name(rv, frame.get("platform") or platform)
+    return None
 
 
-def set_in_app(frame, value):
+def get_source_link_for_frame(frame: Frame) -> str | None:
+    """If source_link points to a GitHub raw content link, process it so that
+    we can return the GitHub equivalent with the line number, and use it as a
+    stacktrace link. Otherwise, return the link as is.
+    """
+    source_link = getattr(frame, "source_link", None)
+    if source_link is None:
+        return None
+
+    try:
+        URLValidator()(source_link)
+    except ValidationError:
+        return None
+
+    parse_result = urlparse(source_link)
+    if parse_result.netloc == "raw.githubusercontent.com":
+        path_parts = parse_result.path.split("/")
+        if path_parts[0] == "":
+            # the path starts with a "/" so the first element is empty string
+            del path_parts[0]
+
+        # at minimum, the path must have an author/org, a repo, and a file
+        if len(path_parts) >= 3:
+            source_link = "https://www.github.com/" + path_parts[0] + "/" + path_parts[1] + "/blob"
+            for remaining_part in path_parts[2:]:
+                source_link += "/" + remaining_part
+            if getattr(frame, "lineno", None):
+                source_link += "#L" + str(frame.lineno)
+    return source_link
+
+
+def set_in_app(frame: dict[str, Any], value: bool) -> None:
+    """Set the value of in_app in the frame to the given value."""
     orig_in_app = frame.get("in_app")
     if orig_in_app == value:
         return

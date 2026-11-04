@@ -1,12 +1,19 @@
-from sentry.testutils import AcceptanceTestCase
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions
+from selenium.webdriver.support.wait import WebDriverWait
+
+from sentry.testutils.cases import AcceptanceTestCase
+from sentry.testutils.silo import no_silo_test
 
 
+@no_silo_test
 class OrganizationDeveloperSettingsNewAcceptanceTest(AcceptanceTestCase):
     """
     As a developer, I can create an integration, install it, and uninstall it
     """
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.team = self.create_team(organization=self.organization, name="Tesla Motors")
         self.project = self.create_project(
@@ -16,27 +23,30 @@ class OrganizationDeveloperSettingsNewAcceptanceTest(AcceptanceTestCase):
         self.login_as(self.user)
         self.org_developer_settings_path = f"/settings/{self.organization.slug}/developer-settings/"
 
-    def load_page(self, url):
+    def load_page(self, url: str) -> None:
         self.browser.get(url)
-        self.browser.wait_until_not(".loading-indicator")
+        self.browser.wait_until_not('[data-test-id="loading-indicator"]')
 
-    def test_create_new_public_integration(self):
+    def test_create_new_public_integration(self) -> None:
         self.load_page(self.org_developer_settings_path)
+        self.browser.click('[aria-label="Create New Integration"]')
 
-        self.browser.click('[aria-label="New Public Integration"]')
-
+        self.browser.click_when_visible(f'a[href="{self.org_developer_settings_path}new-public/"]')
         self.browser.element('input[name="name"]').send_keys("Tesla")
         self.browser.element('input[name="author"]').send_keys("Elon Musk")
         self.browser.element('input[name="webhookUrl"]').send_keys("https://example.com/webhook")
 
         self.browser.click('[aria-label="Save Changes"]')
 
-        self.browser.wait_until(xpath="//span[contains(text(), 'Client ID')]", timeout=3)
+        self.browser.wait_until('input[name="clientId"][readonly]', timeout=3)
 
-    def test_create_new_internal_integration(self):
+    def test_create_new_internal_integration(self) -> None:
         self.load_page(self.org_developer_settings_path)
+        self.browser.click('[aria-label="Create New Integration"]')
 
-        self.browser.click('[aria-label="New Internal Integration"]')
+        self.browser.click_when_visible(
+            f'a[href="{self.org_developer_settings_path}new-internal/"]'
+        )
 
         self.browser.element('input[name="name"]').send_keys("Tesla")
 
@@ -45,12 +55,13 @@ class OrganizationDeveloperSettingsNewAcceptanceTest(AcceptanceTestCase):
         self.browser.wait_until(xpath="//button//span[contains(text(), 'New Token')]", timeout=3)
 
 
+@no_silo_test
 class OrganizationDeveloperSettingsEditAcceptanceTest(AcceptanceTestCase):
     """
     As a developer, I can edit an existing integration
     """
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.user = self.create_user("foo@example.com")
         self.org = self.create_organization(name="Tesla", owner=self.user)
@@ -67,49 +78,69 @@ class OrganizationDeveloperSettingsEditAcceptanceTest(AcceptanceTestCase):
             f"/settings/{self.org.slug}/developer-settings/{self.sentry_app.slug}"
         )
 
-    def load_page(self, url):
+    def load_page(self, url: str) -> None:
         self.browser.get(url)
-        self.browser.wait_until_not(".loading-indicator")
+        self.browser.wait_until_not('[data-test-id="loading-indicator"]')
 
-    def test_edit_integration_schema(self):
+    def test_edit_integration_schema(self) -> None:
         self.load_page(self.org_developer_settings_path)
 
         textarea = self.browser.element('textarea[name="schema"]')
-        textarea.clear()
+        # WebElement.clear() doesn't fire input events, so React-controlled
+        # textareas keep their old form state. Backspace each character so
+        # React's onChange runs.
+        current_value = textarea.get_attribute("value")
+        assert current_value is not None
+        textarea.send_keys(Keys.BACKSPACE * len(current_value))
         textarea.send_keys("{}")
 
         self.browser.click('[aria-label="Save Changes"]')
 
-        self.browser.wait_until(".ref-success")
+        self.browser.wait_until('[role="status"]')
 
-        link = self.browser.find_element_by_link_text("Tesla App")
+        self.browser.wait_until('[data-test-id="tesla-app"]')
+
+        link = self.browser.find_element(by=By.LINK_TEXT, value="Tesla App")
         link.click()
 
-        self.browser.wait_until_not(".loading-indicator")
+        self.browser.wait_until_not('[data-test-id="loading-indicator"]')
 
         schema = self.browser.element('textarea[name="schema"]')
         assert schema.text == ""
 
-    def test_remove_tokens_internal_app(self):
+    def test_remove_tokens_internal_app(self) -> None:
         internal_app = self.create_internal_integration(name="Internal App", organization=self.org)
+        self.create_internal_integration_token(user=self.user, internal_integration=internal_app)
         url = f"/settings/{self.org.slug}/developer-settings/{internal_app.slug}"
 
         self.load_page(url)
 
-        self.browser.click('[data-test-id="token-delete"]')
-        self.browser.wait_until(".ref-success")
+        self.browser.click('[aria-label="Revoke"]')
+        self.browser.click('[data-test-id="confirm-button"]')
 
-        assert self.browser.find_element_by_xpath(
-            "//div[contains(text(), 'No tokens created yet.')]"
+        wait = WebDriverWait(self.browser.driver, 10)
+        wait.until(
+            expected_conditions.text_to_be_present_in_element(
+                (By.CSS_SELECTOR, '[role="status"]'),
+                "Token successfully deleted.",
+            )
+        )
+        wait.until(
+            expected_conditions.text_to_be_present_in_element(
+                (By.TAG_NAME, "body"),
+                "You haven't created any authentication tokens yet.",
+            )
         )
 
-    def test_add_tokens_internal_app(self):
+    def test_add_tokens_internal_app(self) -> None:
         internal_app = self.create_internal_integration(name="Internal App", organization=self.org)
         url = f"/settings/{self.org.slug}/developer-settings/{internal_app.slug}"
 
         self.load_page(url)
 
-        self.browser.click('[data-test-id="token-add"]')
-        self.browser.wait_until(".ref-success")
+        assert self.browser.element_exists('[aria-label="Generated token"]') is False
 
-        assert len(self.browser.elements('[data-test-id="token-delete"]')) == 2
+        self.browser.click('[data-test-id="token-add"]')
+        self.browser.wait_until('[role="status"]')
+
+        assert len(self.browser.elements('[aria-label="Generated token"]')) == 1

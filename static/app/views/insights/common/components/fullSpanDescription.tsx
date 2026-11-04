@@ -1,0 +1,152 @@
+import {Fragment, type ReactNode} from 'react';
+import styled from '@emotion/styled';
+import {IconOpen} from '@sentry/icons/open';
+
+import {CodeBlock} from '@sentry/scraps/codeBlock';
+
+import {ClippedBox} from 'sentry/components/clippedBox';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {t} from 'sentry/locale';
+import {getAttributeValue} from 'sentry/utils/fields/getAttributeValue';
+import {SQLishFormatter} from 'sentry/utils/sqlish';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useSpans} from 'sentry/views/insights/common/queries/useDiscover';
+import {useModuleURL} from 'sentry/views/insights/common/utils/useModuleURL';
+import {prettyPrintJsonString} from 'sentry/views/insights/database/utils/jsonUtils';
+import {ModuleName, SpanFields} from 'sentry/views/insights/types';
+
+const formatter = new SQLishFormatter();
+
+interface Props {
+  moduleName: ModuleName;
+  group?: string | null;
+  shortDescription?: string;
+}
+
+export function FullSpanDescription({group, shortDescription, moduleName}: Props) {
+  const {data: indexedSpans, isFetching: areIndexedSpansLoading} = useSpans(
+    {
+      search: MutableSearch.fromQueryObject({
+        'span.group': group ?? undefined,
+      }),
+      limit: 1,
+      fields: [
+        SpanFields.PROJECT_ID,
+        SpanFields.TRANSACTION_SPAN_ID,
+        SpanFields.SPAN_DESCRIPTION,
+        SpanFields.DB_SYSTEM_NAME,
+      ],
+    },
+    'api.insights.span-description'
+  );
+
+  const indexedSpan = indexedSpans?.[0];
+  const indexedSpanDescription = getAttributeValue(
+    indexedSpan ?? {},
+    SpanFields.SPAN_DESCRIPTION,
+    'string'
+  );
+  const description = indexedSpanDescription ?? shortDescription;
+  const system = getAttributeValue(
+    indexedSpan ?? {},
+    SpanFields.DB_SYSTEM_NAME,
+    'string'
+  );
+
+  if (areIndexedSpansLoading) {
+    return (
+      <PaddedSpinner>
+        <LoadingIndicator mini relative />
+      </PaddedSpinner>
+    );
+  }
+
+  if (!description) {
+    return null;
+  }
+
+  if (moduleName === ModuleName.DB) {
+    if (system === 'mongodb') {
+      let stringifiedQuery = '';
+      let result: ReturnType<typeof prettyPrintJsonString> | undefined;
+
+      if (indexedSpanDescription) {
+        result = prettyPrintJsonString(indexedSpanDescription);
+      } else if (description) {
+        result = prettyPrintJsonString(description);
+      } else {
+        stringifiedQuery = description || 'N/A';
+      }
+
+      if (result) {
+        stringifiedQuery = result.prettifiedQuery;
+      }
+
+      return (
+        <QueryClippedBox group={group}>
+          <CodeBlock language="json">{stringifiedQuery}</CodeBlock>
+        </QueryClippedBox>
+      );
+    }
+
+    return (
+      <QueryClippedBox group={group}>
+        <CodeBlock language="sql">
+          {formatter.toString(description, {maxLineLength: LINE_LENGTH})}
+        </CodeBlock>
+      </QueryClippedBox>
+    );
+  }
+
+  if (moduleName === ModuleName.RESOURCE) {
+    return <CodeBlock language="http">{description}</CodeBlock>;
+  }
+
+  return <Fragment>{description}</Fragment>;
+}
+
+type TruncatedQueryClipBoxProps = {
+  children: ReactNode;
+  group: string | null | undefined;
+};
+
+function QueryClippedBox({group, children}: TruncatedQueryClipBoxProps) {
+  const navigate = useNavigate();
+  const databaseURL = useModuleURL(ModuleName.DB);
+  const location = useLocation();
+
+  return (
+    <StyledClippedBox
+      btnText={group ? t('View full query') : undefined}
+      clipHeight={500}
+      buttonProps={
+        group
+          ? {
+              icon: <IconOpen />,
+              onClick: () =>
+                navigate({
+                  pathname: `${databaseURL}/spans/span/${group}`,
+                  query: {...location.query, isExpanded: true},
+                }),
+            }
+          : undefined
+      }
+    >
+      {children}
+    </StyledClippedBox>
+  );
+}
+
+const LINE_LENGTH = 60;
+
+const PaddedSpinner = styled('div')`
+  padding: 0 ${p => p.theme.space.xs};
+`;
+
+const StyledClippedBox = styled(ClippedBox)`
+  > div > div {
+    z-index: 1;
+  }
+`;

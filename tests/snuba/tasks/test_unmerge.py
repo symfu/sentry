@@ -1,62 +1,99 @@
+from __future__ import annotations
+
 import functools
 import hashlib
 import itertools
 import logging
 import uuid
-from collections import OrderedDict
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
-import pytz
+from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+from unittest.mock import patch
 
-from sentry.utils.compat.mock import patch
 from django.utils import timezone
 
-from sentry import eventstream, tagstore
-from sentry.app import tsdb
-from sentry.models import Environment, Group, GroupHash, GroupRelease, Release, UserReport
-from sentry.similarity import features, _make_index_backend
+from sentry import eventstream, tsdb
+from sentry.issues.action_log.types import (
+    ActionSource,
+    GroupActionType,
+    first_seen_idempotency_key,
+)
+from sentry.issues.models.groupactionlogentry import GroupActionLogEntry
+from sentry.models.environment import Environment
+from sentry.models.group import Group
+from sentry.models.groupenvironment import GroupEnvironment
+from sentry.models.grouphash import GroupHash
+from sentry.models.grouprelease import GroupRelease
+from sentry.models.release import Release
+from sentry.models.userreport import UserReport
+from sentry.services.eventstore.models import GroupEvent
+from sentry.similarity import _make_index_backend, features
+from sentry.tasks.merge import merge_groups
 from sentry.tasks.unmerge import (
     get_caches,
     get_event_user_from_interface,
     get_fingerprint,
     get_group_backfill_attributes,
     get_group_creation_attributes,
+    publish_destination_first_seen,
+    repair_denormalizations,
+    start_unmerge,
     unmerge,
 )
-from sentry.testutils import SnubaTestCase, TestCase
-from sentry.utils.dates import to_timestamp
-from sentry.utils import redis
-from sentry.testutils.helpers.datetime import before_now, iso_format
+from sentry.taskworker.selfchain_idempotency import mark_spawned
+from sentry.testutils.cases import SnubaTestCase, TestCase
+from sentry.testutils.helpers.datetime import before_now
 from sentry.testutils.helpers.features import with_feature
-from sentry.tasks.merge import merge_groups
-
-from sentry.utils.compat import map
+from sentry.testutils.outbox import outbox_runner
+from sentry.tsdb.base import TSDBModel
+from sentry.utils import redis
 
 # Use the default redis client as a cluster client in the similarity index
 index = _make_index_backend(redis.clusters.get("default").get_local_client(0))
 
 
-@patch("sentry.similarity.features.index", new=index)
+@patch.object(features, "index", new=index)
 class UnmergeTestCase(TestCase, SnubaTestCase):
-    def test_get_fingerprint(self):
+    def store_group_event(self, data: dict[str, Any]) -> GroupEvent:
+        event = self.store_event(data=data, project_id=self.project.id)
+        assert event.group is not None
+        return event.for_group(event.group)
+
+    @patch("sentry.tasks.unmerge.Group")
+    @patch("sentry.tasks.unmerge.current_task")
+    def test_selfchain_skips_when_already_spawned(
+        self, mock_current_task: mock.MagicMock, mock_group: mock.MagicMock
+    ) -> None:
+        # A prior delivery of this activation already spawned its continuation; a broker re-pend
+        # must short-circuit before touching the DB (proving no re-processing / no fork).
+        mock_current_task.return_value = SimpleNamespace(id="unmerge-act-skip")
+        mark_spawned("unmerge", "unmerge-act-skip")
+
+        unmerge(self.project.id, 123, 456, ["abcabc"], None, batch_size=5)
+
+        assert mock_group.objects.get.call_count == 0
+
+    def test_get_fingerprint(self) -> None:
+        event = self.store_event(data={"message": "Hello world"}, project_id=self.project.id)
+        assert event.group is not None
         assert (
-            get_fingerprint(
-                self.store_event(data={"message": "Hello world"}, project_id=self.project.id)
-            )
-            == hashlib.md5(b"Hello world").hexdigest()
+            get_fingerprint(event.for_group(event.group)) == hashlib.md5(b"Hello world").hexdigest()
         )
 
+        fingerprint_event = self.store_event(
+            data={"message": "Hello world", "fingerprint": ["Not hello world"]},
+            project_id=self.project.id,
+        )
+        assert fingerprint_event.group is not None
         assert (
-            get_fingerprint(
-                self.store_event(
-                    data={"message": "Hello world", "fingerprint": ["Not hello world"]},
-                    project_id=self.project.id,
-                )
-            )
+            get_fingerprint(fingerprint_event.for_group(fingerprint_event.group))
             == hashlib.md5(b"Not hello world").hexdigest()
         )
 
-    def test_get_group_creation_attributes(self):
-        now = datetime.utcnow().replace(microsecond=0, tzinfo=timezone.utc)
+    def test_get_group_creation_attributes(self) -> None:
+        now = timezone.now().replace(microsecond=0)
         e1 = self.store_event(
             data={
                 "fingerprint": ["group1"],
@@ -65,7 +102,7 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 "type": "default",
                 "level": "info",
                 "tags": {"logger": "javascript"},
-                "timestamp": iso_format(now),
+                "timestamp": now.isoformat(),
             },
             project_id=self.project.id,
         )
@@ -77,7 +114,7 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 "type": "default",
                 "level": "error",
                 "tags": {"logger": "python"},
-                "timestamp": iso_format(now),
+                "timestamp": now.isoformat(),
             },
             project_id=self.project.id,
         )
@@ -89,20 +126,26 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 "type": "default",
                 "level": "debug",
                 "tags": {"logger": "java"},
-                "timestamp": iso_format(now),
+                "timestamp": now.isoformat(),
             },
             project_id=self.project.id,
         )
-        events = [e1, e2, e3]
+        assert e1.group is not None
+        assert e2.group is not None
+        assert e3.group is not None
+        events = [
+            e1.for_group(e1.group),
+            e2.for_group(e2.group),
+            e3.for_group(e3.group),
+        ]
 
-        assert get_group_creation_attributes(get_caches(), events) == {
+        assert get_group_creation_attributes(get_caches(), e1.group, events) == {
             "active_at": now,
             "first_seen": now,
             "last_seen": now,
             "platform": "java",
             "message": "Hello from JavaScript",
             "level": logging.INFO,
-            "score": Group.calculate_score(3, now),
             "logger": "java",
             "times_seen": 3,
             "first_release": None,
@@ -112,10 +155,12 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 "last_received": e1.data["received"],
                 "metadata": {"title": "Hello from JavaScript"},
             },
+            "status": e1.group.status,
+            "substatus": e1.group.substatus,
         }
 
-    def test_get_group_backfill_attributes(self):
-        now = datetime.utcnow().replace(microsecond=0, tzinfo=timezone.utc)
+    def test_get_group_backfill_attributes(self) -> None:
+        now = timezone.now().replace(microsecond=0)
 
         assert get_group_backfill_attributes(
             get_caches(),
@@ -126,61 +171,68 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 platform="javascript",
                 message="Hello from JavaScript",
                 level=logging.INFO,
-                score=Group.calculate_score(3, now),
                 logger="javascript",
                 times_seen=1,
                 first_release=None,
                 culprit="",
-                data={"type": "default", "last_received": to_timestamp(now), "metadata": {}},
+                data={"type": "default", "last_received": now.timestamp(), "metadata": {}},
             ),
             [
-                self.store_event(
+                self.store_group_event(
                     data={
                         "platform": "python",
                         "message": "Hello from Python",
-                        "timestamp": iso_format(now - timedelta(hours=1)),
+                        "timestamp": (now - timedelta(hours=1)).isoformat(),
                         "type": "default",
                         "level": "debug",
                         "tags": {"logger": "java"},
                     },
-                    project_id=self.project.id,
                 ),
-                self.store_event(
+                self.store_group_event(
                     data={
                         "platform": "java",
                         "message": "Hello from Java",
-                        "timestamp": iso_format(now - timedelta(hours=2)),
+                        "timestamp": (now - timedelta(hours=2)).isoformat(),
                         "type": "default",
                         "level": "debug",
                         "tags": {"logger": "java"},
                     },
-                    project_id=self.project.id,
                 ),
             ],
         ) == {
             "active_at": now - timedelta(hours=2),
             "first_seen": now - timedelta(hours=2),
             "platform": "java",
-            "score": Group.calculate_score(3, now),
             "logger": "java",
             "times_seen": 3,
             "first_release": None,
         }
 
     @with_feature("projects:similarity-indexing")
-    def test_unmerge(self):
-        now = before_now(minutes=5).replace(microsecond=0, tzinfo=pytz.utc)
+    def test_unmerge(self) -> None:
+        # Replace second=0 to ensure all 17 events (now+0s to now+17s)
+        # stay within the same hour bucket. Without this, if now is within
+        # 17 seconds of an hour boundary, events can cross into the next
+        # bucket causing count mismatches.
+        now = before_now(minutes=5).replace(second=0, microsecond=0)
 
-        def time_from_now(offset=0):
+        def time_from_now(offset: int = 0) -> datetime:
             return now + timedelta(seconds=offset)
 
         project = self.create_project()
-
+        project.date_added = timezone.now() - timedelta(minutes=10)
+        project.save()
         sequence = itertools.count(0)
         tag_values = itertools.cycle(["red", "green", "blue"])
         user_values = itertools.cycle([{"id": 1}, {"id": 2}])
 
-        def create_message_event(template, parameters, environment, release, fingerprint="group1"):
+        def create_message_event(
+            template: str,
+            parameters: object,
+            environment: str,
+            release: str | None,
+            fingerprint: str = "group1",
+        ) -> GroupEvent:
             i = next(sequence)
 
             event_id = uuid.UUID(fields=(i, 0x0, 0x1000, 0x80, 0x80, 0x808080808080)).hex
@@ -198,13 +250,14 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                     "user": next(user_values),
                     "tags": tags,
                     "fingerprint": [fingerprint],
-                    "timestamp": iso_format(now + timedelta(seconds=i)),
+                    "timestamp": (now + timedelta(seconds=i)).isoformat(),
                     "environment": environment,
                     "release": release,
                 },
                 project_id=project.id,
             )
 
+            assert event.group is not None
             UserReport.objects.create(
                 project_id=project.id,
                 group_id=event.group.id,
@@ -216,9 +269,9 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
 
             features.record([event])
 
-            return event
+            return event.for_group(event.group)
 
-        events = OrderedDict()
+        events: dict[str | None, list[GroupEvent]] = {}
 
         for event in (
             create_message_event(
@@ -250,42 +303,35 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
 
         events.setdefault(get_fingerprint(event), []).append(event)
 
-        merge_source, source, destination = list(Group.objects.all())
+        merge_source, source, destination = list(Group.objects.all().order_by("id"))
 
         assert len(events) == 3
-        assert sum(map(len, events.values())) == 17
+        assert sum(len(x) for x in events.values()) == 17
 
         production_environment = Environment.objects.get(
             organization_id=project.organization_id, name="production"
         )
 
         with self.tasks():
-            eventstream_state = eventstream.start_merge(project.id, [merge_source.id], source.id)
-            merge_groups.delay([merge_source.id], source.id)
-            eventstream.end_merge(eventstream_state)
-
-        assert {
-            (gtv.value, gtv.times_seen)
-            for gtv in tagstore.get_group_tag_values(
-                project.id, source.id, production_environment.id, "color"
+            eventstream_state = eventstream.backend.start_merge(
+                project.id, [merge_source.id], source.id
             )
-        } == {("red", 6), ("green", 5), ("blue", 5)}
+            merge_groups.delay([merge_source.id], source.id)
+            eventstream.backend.end_merge(eventstream_state)
 
         similar_items = features.compare(source)
         assert len(similar_items) == 2
         assert similar_items[0][0] == source.id
         assert similar_items[0][1]["message:message:character-shingles"] == 1.0
         assert similar_items[1][0] == destination.id
-        assert similar_items[1][1]["message:message:character-shingles"] < 1.0
+        similar_message_score = similar_items[1][1]["message:message:character-shingles"]
+        assert similar_message_score is not None
+        assert similar_message_score < 1.0
 
         with self.tasks():
-            eventstream_state = eventstream.start_unmerge(
-                project.id, [list(events.keys())[0]], source.id, destination.id
-            )
             unmerge.delay(
                 project.id, source.id, destination.id, [list(events.keys())[0]], None, batch_size=5
             )
-            eventstream.end_unmerge(eventstream_state)
 
         assert (
             list(
@@ -309,15 +355,15 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
         assert source.id != destination.id
         assert source.project == destination.project
 
-        destination_event_ids = map(lambda event: event.event_id, list(events.values())[1])
+        destination_event_ids = set(map(lambda event: event.event_id, list(events.values())[1]))
 
-        assert set(
+        assert destination_event_ids == set(
             UserReport.objects.filter(group_id=source.id).values_list("event_id", flat=True)
-        ) == set(destination_event_ids)
+        )
 
-        assert set(
+        assert list(
             GroupHash.objects.filter(group_id=source.id).values_list("hash", flat=True)
-        ) == set(itertools.islice(events.keys(), 2))
+        ) == [list(events.keys())[1]]
 
         assert set(
             GroupRelease.objects.filter(group_id=source.id).values_list(
@@ -325,24 +371,17 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
             )
         ) == {("production", time_from_now(10), time_from_now(15))}
 
-        assert {
-            (gtv.value, gtv.times_seen)
-            for gtv in tagstore.get_group_tag_values(
-                project.id, destination.id, production_environment.id, "color"
-            )
-        } == {("red", 4), ("green", 3), ("blue", 3)}
+        destination_event_ids = set(
+            map(lambda event: event.event_id, list(events.values())[0] + list(events.values())[2])
+        )
 
-        destination_event_ids = map(
-            lambda event: event.event_id, list(events.values())[0] + list(events.values())[2]
+        assert destination_event_ids == set(
+            UserReport.objects.filter(group_id=destination.id).values_list("event_id", flat=True)
         )
 
         assert set(
-            UserReport.objects.filter(group_id=destination.id).values_list("event_id", flat=True)
-        ) == set(destination_event_ids)
-
-        assert set(
             GroupHash.objects.filter(group_id=destination.id).values_list("hash", flat=True)
-        ) == set(itertools.islice(events.keys(), 2, 3))
+        ) == {list(events.keys())[0], list(events.keys())[2]}
 
         assert set(
             GroupRelease.objects.filter(group_id=destination.id).values_list(
@@ -353,53 +392,75 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
             ("staging", time_from_now(16), time_from_now(16)),
         }
 
-        assert {
-            (gtk.value, gtk.times_seen)
-            for gtk in tagstore.get_group_tag_values(
-                project.id, destination.id, production_environment.id, "color"
+        staging_environment = Environment.objects.get(
+            organization_id=project.organization_id, name="staging"
+        )
+
+        assert set(
+            GroupEnvironment.objects.filter(group_id=source.id).values_list(
+                "environment_id", "first_seen"
             )
-        } == {("red", 4), ("blue", 3), ("green", 3)}
+        ) == {(production_environment.id, time_from_now(10))}
+
+        assert set(
+            GroupEnvironment.objects.filter(group_id=destination.id).values_list(
+                "environment_id", "first_seen"
+            )
+        ) == {
+            (production_environment.id, time_from_now(0)),
+            (staging_environment.id, time_from_now(16)),
+        }
 
         rollup_duration = 3600
 
-        time_series = tsdb.get_range(
-            tsdb.models.group,
+        time_series = tsdb.backend.get_range(
+            TSDBModel.group,
             [source.id, destination.id],
             now - timedelta(seconds=rollup_duration),
             time_from_now(17),
             rollup_duration,
+            tenant_ids={"referrer": "get_range", "organization_id": 1},
         )
 
-        environment_time_series = tsdb.get_range(
-            tsdb.models.group,
+        environment_time_series = tsdb.backend.get_range(
+            TSDBModel.group,
             [source.id, destination.id],
             now - timedelta(seconds=rollup_duration),
             time_from_now(17),
             rollup_duration,
             environment_ids=[production_environment.id],
+            tenant_ids={"referrer": "get_range", "organization_id": 1},
         )
 
-        def get_expected_series_values(rollup, events, function=None):
+        def get_expected_series_values(
+            rollup: int,
+            events: Sequence[GroupEvent],
+            function: Callable[[Any, GroupEvent], Any] | None = None,
+        ) -> dict[float, Any]:
             if function is None:
 
-                def function(aggregate, event):
+                def function(aggregate: Any, event: GroupEvent) -> Any:
                     return (aggregate if aggregate is not None else 0) + 1
 
-            expected = {}
+            expected: dict[float, float] = {}
             for event in events:
-                k = float((to_timestamp(event.datetime) // rollup_duration) * rollup_duration)
+                k = float((event.datetime.timestamp() // rollup_duration) * rollup_duration)
                 expected[k] = function(expected.get(k), event)
 
             return expected
 
-        def assert_series_contains(expected, actual, default=0):
-            actual = dict(actual)
+        def assert_series_contains(
+            expected: Mapping[float, Any],
+            actual: Iterable[tuple[float, Any]],
+            default: Any = 0,
+        ) -> None:
+            actual_dict = dict(actual)
 
             for key, value in expected.items():
-                assert actual.get(key, 0) == value
+                assert actual_dict.get(key, 0) == value
 
-            for key in set(actual.keys()) - set(expected.keys()):
-                assert actual.get(key, 0) == default
+            for key in set(actual_dict.keys()) - set(expected.keys()):
+                assert actual_dict.get(key, 0) == default
 
         assert_series_contains(
             get_expected_series_values(rollup_duration, list(events.values())[1]),
@@ -429,26 +490,30 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
             0,
         )
 
-        time_series = tsdb.get_distinct_counts_series(
-            tsdb.models.users_affected_by_group,
+        time_series = tsdb.backend.get_distinct_counts_series(
+            TSDBModel.users_affected_by_group,
             [source.id, destination.id],
             now - timedelta(seconds=rollup_duration),
             time_from_now(17),
             rollup_duration,
+            tenant_ids={"referrer": "r", "organization_id": 1234},
         )
 
-        environment_time_series = tsdb.get_distinct_counts_series(
-            tsdb.models.users_affected_by_group,
+        environment_time_series = tsdb.backend.get_distinct_counts_series(
+            TSDBModel.users_affected_by_group,
             [source.id, destination.id],
             now - timedelta(seconds=rollup_duration),
             time_from_now(17),
             rollup_duration,
             environment_id=production_environment.id,
+            tenant_ids={"referrer": "r", "organization_id": 1234},
         )
 
-        def collect_by_user_tag(aggregate, event):
+        def collect_by_user_tag(aggregate: Any, event: GroupEvent) -> Any:
             aggregate = aggregate if aggregate is not None else set()
-            aggregate.add(get_event_user_from_interface(event.data["user"]).tag_value)
+            aggregate.add(
+                get_event_user_from_interface(event.data["user"], event.group.project).tag_value
+            )
             return aggregate
 
         for series in [time_series, environment_time_series]:
@@ -474,7 +539,9 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 time_series[destination.id],
             )
 
-        def strip_zeroes(data):
+        def strip_zeroes(
+            data: dict[int, list[tuple[float, dict[int, float]]]],
+        ) -> dict[int, list[tuple[float, dict[int, float]]]]:
             for group_id, series in data.items():
                 for _, values in series:
                     for key, val in list(values.items()):
@@ -483,32 +550,32 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
 
             return data
 
-        def collect_by_release(group, aggregate, event):
+        def collect_by_release(group: Group, aggregate: Any, event: GroupEvent) -> Any:
             aggregate = aggregate if aggregate is not None else {}
             release = event.get_tag("sentry:release")
-            if not release:
-                return aggregate
-            release = GroupRelease.objects.get(
+            assert release
+            release_id = GroupRelease.objects.get(
                 group_id=group.id,
                 environment=event.data["environment"],
                 release_id=Release.objects.get(
                     organization_id=project.organization_id, version=release
                 ).id,
             ).id
-            aggregate[release] = aggregate.get(release, 0) + 1
+            aggregate[release_id] = aggregate.get(release_id, 0) + 1
             return aggregate
 
         items = {}
         for i in [source.id, destination.id]:
             items[i] = list(GroupRelease.objects.filter(group_id=i).values_list("id", flat=True))
 
-        time_series = strip_zeroes(
-            tsdb.get_frequency_series(
-                tsdb.models.frequent_releases_by_group,
+        frequency_time_series = strip_zeroes(
+            tsdb.backend.get_frequency_series(
+                TSDBModel.frequent_releases_by_group,
                 items,
                 now - timedelta(seconds=rollup_duration),
                 time_from_now(17),
                 rollup_duration,
+                tenant_ids={"referrer": "r", "organization_id": 1234},
             )
         )
 
@@ -518,7 +585,7 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 list(events.values())[1],
                 functools.partial(collect_by_release, source),
             ),
-            time_series[source.id],
+            frequency_time_series[source.id],
             {},
         )
 
@@ -528,7 +595,7 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 list(events.values())[0] + list(events.values())[2],
                 functools.partial(collect_by_release, destination),
             ),
-            time_series[destination.id],
+            frequency_time_series[destination.id],
             {},
         )
 
@@ -536,17 +603,18 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
         for i in [source.id, destination.id]:
             items[i] = list(Environment.objects.all().values_list("id", flat=True))
 
-        time_series = strip_zeroes(
-            tsdb.get_frequency_series(
-                tsdb.models.frequent_environments_by_group,
+        frequency_time_series = strip_zeroes(
+            tsdb.backend.get_frequency_series(
+                TSDBModel.frequent_environments_by_group,
                 items,
                 now - timedelta(seconds=rollup_duration),
                 time_from_now(17),
                 rollup_duration,
+                tenant_ids={"referrer": "r", "organization_id": 1234},
             )
         )
 
-        def collect_by_environment(aggregate, event):
+        def collect_by_environment(aggregate: Any, event: GroupEvent) -> Any:
             aggregate = aggregate if aggregate is not None else {}
             environment = Environment.objects.get(
                 organization_id=project.organization_id, name=event.data["environment"]
@@ -558,7 +626,7 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
             get_expected_series_values(
                 rollup_duration, list(events.values())[1], collect_by_environment
             ),
-            time_series[source.id],
+            frequency_time_series[source.id],
             {},
         )
 
@@ -568,7 +636,7 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
                 list(events.values())[0] + list(events.values())[2],
                 collect_by_environment,
             ),
-            time_series[destination.id],
+            frequency_time_series[destination.id],
             {},
         )
 
@@ -583,7 +651,9 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
             },
         )
         assert source_similar_items[1][0] == destination.id
-        assert source_similar_items[1][1]["message:message:character-shingles"] < 1.0
+        source_message_score = source_similar_items[1][1]["message:message:character-shingles"]
+        assert source_message_score is not None
+        assert source_message_score < 1.0
 
         destination_similar_items = features.compare(destination)
         assert destination_similar_items[0] == (
@@ -596,4 +666,151 @@ class UnmergeTestCase(TestCase, SnubaTestCase):
             },
         )
         assert destination_similar_items[1][0] == source.id
-        assert destination_similar_items[1][1]["message:message:character-shingles"] < 1.0
+        destination_message_score = destination_similar_items[1][1][
+            "message:message:character-shingles"
+        ]
+        assert destination_message_score is not None
+        assert destination_message_score < 1.0
+
+    def test_unmerge_logs_first_seen_for_new_destination(self) -> None:
+        now = before_now(minutes=5).replace(microsecond=0)
+
+        def store(fingerprint: str, offset: int) -> GroupEvent:
+            return self.store_group_event(
+                data={
+                    "message": f"{fingerprint} {offset}",
+                    "fingerprint": [fingerprint],
+                    "timestamp": (now + timedelta(seconds=offset)).isoformat(),
+                },
+            )
+
+        moved = [store("moved", offset) for offset in range(5)]
+        kept = [store("kept", offset) for offset in range(5, 7)]
+        merge_source = moved[0].group
+        source = kept[0].group
+        assert merge_source is not None and source is not None
+
+        with self.tasks():
+            eventstream_state = eventstream.backend.start_merge(
+                self.project.id, [merge_source.id], source.id
+            )
+            merge_groups.delay([merge_source.id], source.id)
+            eventstream.backend.end_merge(eventstream_state)
+
+        # Events are scanned newest-first, so the batch that creates the destination
+        # doesn't contain its oldest event.
+        with outbox_runner(), self.tasks():
+            unmerge.delay(
+                self.project.id, source.id, None, [get_fingerprint(moved[0])], None, batch_size=2
+            )
+
+        destination = Group.objects.exclude(id=source.id).get(project_id=self.project.id)
+        assert destination.first_seen == now
+
+        entry = GroupActionLogEntry.objects.get(
+            group_id=destination.id, type=GroupActionType.FIRST_SEEN
+        )
+        assert entry.idempotency_key == first_seen_idempotency_key(destination.id)
+        assert entry.source == ActionSource.SYSTEM
+        assert entry.date_added == now
+        assert entry.data == {"first_seen": now.isoformat()}
+        # The activity feed only serves a logged FIRST_SEEN when it's the oldest entry,
+        # and UNMERGE_DESTINATION was logged before the scan finished.
+        log = list(
+            GroupActionLogEntry.objects.user_visible()
+            .filter(group_id=destination.id)
+            .order_by("-date_added", "-id")[:100]
+        )
+        assert GroupActionType.UNMERGE_DESTINATION in {e.type for e in log}
+        assert log[-1].id == entry.id
+
+    @mock.patch("sentry.tasks.unmerge.similarity")
+    def test_repair_denormalizations_skips_similarity_when_backfilled_to_seer(
+        self, mock_similarity: mock.MagicMock
+    ) -> None:
+        project = self.create_project()
+        project.update_option("sentry:similarity_backfill_completed", True)
+
+        event = self.store_event(
+            data={"message": "Test event", "fingerprint": ["test-group"]},
+            project_id=project.id,
+        )
+
+        assert event.group is not None
+        repair_denormalizations(get_caches(), project, [event.for_group(event.group)])
+
+        mock_similarity.record.assert_not_called()
+
+    @mock.patch("sentry.tasks.unmerge.similarity")
+    def test_repair_denormalizations_records_similarity_when_not_backfilled(
+        self, mock_similarity: mock.MagicMock
+    ) -> None:
+        project = self.create_project()
+
+        event = self.store_event(
+            data={"message": "Test event", "fingerprint": ["test-group"]},
+            project_id=project.id,
+        )
+
+        assert event.group is not None
+        group_event = event.for_group(event.group)
+        repair_denormalizations(get_caches(), project, [group_event])
+
+        mock_similarity.record.assert_called_once_with(project, [group_event])
+
+
+class StartUnmergeTest(TestCase):
+    def test_delegates_to_unmerge(self) -> None:
+        with patch.object(unmerge, "delay") as mock_delay:
+            start_unmerge(
+                project_id=1,
+                source_id=2,
+                destination_id=None,
+                fingerprints=["abc", "def"],
+                actor_id=3,
+                batch_size=500,
+            )
+
+        mock_delay.assert_called_once_with(1, 2, None, ["abc", "def"], 3, batch_size=500)
+
+
+class PublishDestinationFirstSeenTest(TestCase):
+    def _entries(self, group_id: int) -> list[GroupActionLogEntry]:
+        return list(
+            GroupActionLogEntry.objects.filter(group_id=group_id, type=GroupActionType.FIRST_SEEN)
+        )
+
+    def test_dated_at_first_seen(self) -> None:
+        first_seen = before_now(days=3).replace(microsecond=0)
+        group = self.create_group(project=self.project, first_seen=first_seen)
+
+        publish_destination_first_seen(self.project, [group.id])
+
+        [entry] = self._entries(group.id)
+        assert entry.idempotency_key == first_seen_idempotency_key(group.id)
+        assert entry.source == ActionSource.SYSTEM
+        assert entry.date_added == first_seen
+        assert entry.data == {"first_seen": first_seen.isoformat()}
+
+    def test_idempotent(self) -> None:
+        group = self.create_group(project=self.project)
+
+        publish_destination_first_seen(self.project, [group.id])
+        publish_destination_first_seen(self.project, [group.id])
+
+        assert len(self._entries(group.id)) == 1
+
+    def test_ignores_other_projects(self) -> None:
+        other_group = self.create_group(project=self.create_project())
+
+        publish_destination_first_seen(self.project, [other_group.id])
+
+        assert self._entries(other_group.id) == []
+
+    @with_feature({"projects:issue-action-log-write-to-db": False})
+    def test_skipped_when_write_disabled(self) -> None:
+        group = self.create_group(project=self.project)
+
+        publish_destination_first_seen(self.project, [group.id])
+
+        assert self._entries(group.id) == []

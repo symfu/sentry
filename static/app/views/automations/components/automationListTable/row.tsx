@@ -1,0 +1,95 @@
+import styled from '@emotion/styled';
+
+import {Flex} from '@sentry/scraps/layout';
+
+import {Placeholder} from 'sentry/components/placeholder';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {ActionCell} from 'sentry/components/workflowEngine/gridCell/actionCell';
+import {AutomationTitleCell} from 'sentry/components/workflowEngine/gridCell/automationTitleCell';
+import {TimeAgoCell} from 'sentry/components/workflowEngine/gridCell/timeAgoCell';
+import type {Automation} from 'sentry/types/workflowEngine/automations';
+import {ListItemCheckbox} from 'sentry/utils/list/listItemSelectCheckbox';
+import {AutomationListConnectedDetectors} from 'sentry/views/automations/components/automationListTable/connectedDetectors';
+import {ProjectsCell} from 'sentry/views/automations/components/automationListTable/projectsCell';
+import {getAutomationActions} from 'sentry/views/automations/hooks/utils';
+
+type AutomationListRowProps = {
+  automation: Automation;
+  canEdit: boolean;
+  onSelect: (id: string) => void;
+  selected: boolean;
+};
+
+export function AutomationListRow({
+  automation,
+  canEdit,
+  selected,
+  onSelect,
+}: AutomationListRowProps) {
+  const actions = getAutomationActions(automation);
+  const {enabled, lastTriggered, detectorIds} = automation;
+
+  return (
+    <AutomationSimpleTableRow
+      variant={enabled ? 'default' : 'faded'}
+      data-test-id="automation-list-row"
+    >
+      <SimpleTable.RowCell>
+        <Flex gap="md" align="center">
+          {canEdit && (
+            <Flex align="center" flexShrink={0} width="20px" height="20px">
+              <ListItemCheckbox
+                checked={selected}
+                onChange={() => onSelect(automation.id)}
+              />
+            </Flex>
+          )}
+          <AutomationTitleCell automation={automation} />
+        </Flex>
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <TimeAgoCell date={lastTriggered} />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <ActionCell actions={actions} disabled={!enabled} />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <ProjectsCell automation={automation} />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <AutomationListConnectedDetectors detectorIds={detectorIds} />
+      </SimpleTable.RowCell>
+    </AutomationSimpleTableRow>
+  );
+}
+
+export function AutomationListRowSkeleton() {
+  return (
+    <AutomationSimpleTableRow>
+      <SimpleTable.RowCell>
+        <Placeholder height="20px" />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <Placeholder height="20px" />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <Placeholder height="20px" />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <Placeholder height="20px" />
+      </SimpleTable.RowCell>
+      <SimpleTable.RowCell>
+        <Placeholder height="20px" />
+      </SimpleTable.RowCell>
+    </AutomationSimpleTableRow>
+  );
+}
+
+const AutomationSimpleTableRow = styled(SimpleTable.Row)`
+  min-height: 54px;
+
+  &:hover {
+    background-color: ${p =>
+      p.theme.tokens.interactive.transparent.neutral.background.hover};
+  }
+`;

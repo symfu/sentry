@@ -1,52 +1,58 @@
-import responses
 import datetime
-
-from django.utils import timezone
-from exam import fixture
+from collections.abc import Mapping
+from datetime import timezone
+from functools import cached_property
 from time import time
+from typing import cast
 
-from sentry.testutils import IntegrationRepositoryTestCase, TestCase
-from sentry.models import Identity, IdentityProvider, Integration, Repository
+import responses
+
+from fixtures.vsts import COMMIT_DETAILS_EXAMPLE, COMPARE_COMMITS_EXAMPLE, FILE_CHANGES_EXAMPLE
 from sentry.integrations.vsts.repository import VstsRepositoryProvider
+from sentry.models.repository import Repository
+from sentry.organizations.services.organization.serial import serialize_rpc_organization
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import IntegrationRepositoryTestCase, TestCase
+from sentry.testutils.silo import assume_test_silo_mode, control_silo_test
+from sentry.users.models.identity import Identity
 
-from .testutils import COMPARE_COMMITS_EXAMPLE, COMMIT_DETAILS_EXAMPLE, FILE_CHANGES_EXAMPLE
 
-
+@control_silo_test
 class VisualStudioRepositoryProviderTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.base_url = "https://visualstudio.com/"
         self.vsts_external_id = "654321"
 
-    @fixture
-    def provider(self):
+    @cached_property
+    def provider(self) -> VstsRepositoryProvider:
         return VstsRepositoryProvider("integrations:vsts")
 
     @responses.activate
-    def test_compare_commits(self):
+    def test_compare_commits(self) -> None:
         responses.add(
             responses.POST,
-            "https://visualstudio.com/_apis/git/repositories/None/commitsBatch",
+            "https://visualstudio.com/_apis/git/repositories/123/commitsBatch",
             body=COMPARE_COMMITS_EXAMPLE,
         )
         responses.add(
             responses.GET,
-            "https://visualstudio.com/_apis/git/repositories/None/commits/6c36052c58bde5e57040ebe6bdb9f6a52c906fff/changes",
+            "https://visualstudio.com/_apis/git/repositories/123/commits/6c36052c58bde5e57040ebe6bdb9f6a52c906fff/changes",
             body=FILE_CHANGES_EXAMPLE,
         )
         responses.add(
             responses.GET,
-            "https://visualstudio.com/_apis/git/repositories/None/commits/6c36052c58bde5e57040ebe6bdb9f6a52c906fff",
+            "https://visualstudio.com/_apis/git/repositories/123/commits/6c36052c58bde5e57040ebe6bdb9f6a52c906fff",
             body=COMMIT_DETAILS_EXAMPLE,
         )
 
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider="vsts",
             external_id=self.vsts_external_id,
             name="Hello world",
             metadata={"domain_name": self.base_url},
         )
         default_auth = Identity.objects.create(
-            idp=IdentityProvider.objects.create(type="vsts", config={}),
+            idp=self.create_identity_provider(type="vsts"),
             user=self.user,
             external_id="123",
             data={
@@ -57,13 +63,15 @@ class VisualStudioRepositoryProviderTest(TestCase):
             },
         )
         integration.add_organization(self.organization, self.user, default_auth.id)
-        repo = Repository.objects.create(
-            provider="visualstudio",
-            name="example",
-            organization_id=self.organization.id,
-            config={"instance": self.base_url, "project": "project-name", "name": "example"},
-            integration_id=integration.id,
-        )
+        with assume_test_silo_mode(SiloMode.CELL):
+            repo = Repository.objects.create(
+                provider="visualstudio",
+                name="example",
+                organization_id=self.organization.id,
+                external_id="123",
+                config={"instance": self.base_url, "project": "project-name", "name": "example"},
+                integration_id=integration.id,
+            )
 
         res = self.provider.compare_commits(repo, "a", "b")
 
@@ -80,9 +88,9 @@ class VisualStudioRepositoryProviderTest(TestCase):
         ]
 
     @responses.activate
-    def test_build_repository_config(self):
+    def test_build_repository_config(self) -> None:
         organization = self.create_organization()
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider="vsts",
             external_id=self.vsts_external_id,
             name="Hello world",
@@ -96,9 +104,12 @@ class VisualStudioRepositoryProviderTest(TestCase):
             "project": "MyFirstProject",
             "installation": integration.id,
         }
-        data = self.provider.build_repository_config(organization, data)
+        repository_config = self.provider.build_repository_config(
+            serialize_rpc_organization(organization, include_projects=False, include_teams=False),
+            data,
+        )
 
-        assert data == {
+        assert repository_config == {
             "name": "MyFirstProject",
             "external_id": self.vsts_external_id,
             "url": "https://mbittker.visualstudio.com/_git/MyFirstProject/",
@@ -110,7 +121,7 @@ class VisualStudioRepositoryProviderTest(TestCase):
             "integration_id": integration.id,
         }
 
-    def test_repository_external_slug(self):
+    def test_repository_external_slug(self) -> None:
         repo = Repository(
             name="MyFirstProject",
             url="https://mbittker.visualstudio.com/_git/MyFirstProject/",
@@ -119,22 +130,32 @@ class VisualStudioRepositoryProviderTest(TestCase):
         result = self.provider.repository_external_slug(repo)
         assert result == repo.external_id
 
+    def test_repository_external_slug_without_external_id(self) -> None:
+        repo = Repository(
+            name="MyFirstProject",
+            url="https://mbittker.visualstudio.com/_git/MyFirstProject/",
+            external_id=None,
+        )
+        result = self.provider.repository_external_slug(repo)
+        assert result is None
 
+
+@control_silo_test
 class AzureDevOpsRepositoryProviderTest(IntegrationRepositoryTestCase):
     provider_name = "integrations:vsts"
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.base_url = "https://visualstudio.com/"
         self.vsts_external_id = "654321"
-        self.integration = Integration.objects.create(
+        self.integration = self.create_provider_integration(
             provider="vsts",
             external_id=self.vsts_external_id,
             name="Hello world",
             metadata={"domain_name": self.base_url},
         )
         default_auth = Identity.objects.create(
-            idp=IdentityProvider.objects.create(type="vsts", config={}),
+            idp=self.create_identity_provider(type="vsts"),
             user=self.user,
             external_id="123",
             data={
@@ -145,13 +166,14 @@ class AzureDevOpsRepositoryProviderTest(IntegrationRepositoryTestCase):
             },
         )
         self.integration.add_organization(self.organization, self.user, default_auth.id)
-        self.repo = Repository.objects.create(
-            provider="visualstudio",
-            name="example",
-            organization_id=self.organization.id,
-            config={"instance": self.base_url, "project": "project-name", "name": "example"},
-            integration_id=self.integration.id,
-        )
+        with assume_test_silo_mode(SiloMode.CELL):
+            self.repo = Repository.objects.create(
+                provider="visualstudio",
+                name="example",
+                organization_id=self.organization.id,
+                config={"instance": self.base_url, "project": "project-name", "name": "example"},
+                integration_id=self.integration.id,
+            )
         self.integration.get_provider().setup()
 
         self.default_repository_config = {
@@ -164,48 +186,48 @@ class AzureDevOpsRepositoryProviderTest(IntegrationRepositoryTestCase):
         }
         self.login_as(self.user)
 
-    @fixture
-    def provider(self):
-        return VstsRepositoryProvider("integrations:vsts")
-
-    def tearDown(self):
+    def tearDown(self) -> None:
         super().tearDown()
         responses.reset()
 
-    def add_create_repository_responses(self, repository_config):
+    def add_create_repository_responses(self, repository_config: Mapping[str, object]) -> None:
         responses.add(
             responses.GET,
             "https://visualstudio.com/_apis/git/repositories/123",
             json=repository_config,
         )
 
-    def assert_repository(self, repository_config, organization_id=None):
+    @assume_test_silo_mode(SiloMode.CELL)
+    def assert_repository(
+        self, repository_config: Mapping[str, object], organization_id: int | None = None
+    ) -> None:
         repo = Repository.objects.get(
             organization_id=organization_id or self.organization.id,
             provider=self.provider_name,
             external_id=repository_config["id"],
         )
         assert repo.name == repository_config["name"]
-        assert repo.url == repository_config["_links"]["web"]["href"]
+        links = cast(Mapping[str, Mapping[str, object]], repository_config["_links"])
+        assert repo.url == links["web"]["href"]
         assert repo.integration_id == self.integration.id
         assert repo.config == {
             "instance": self.base_url,
-            "project": repository_config["project"]["name"],
+            "project": cast(Mapping[str, object], repository_config["project"])["name"],
             "name": repository_config["name"],
         }
 
     @responses.activate
-    def test_create_repository(self):
+    def test_create_repository(self) -> None:
         response = self.create_repository(self.default_repository_config, self.integration.id)
         assert response.status_code == 201
         self.assert_repository(self.default_repository_config)
 
-    def test_data_has_no_installation_id(self):
+    def test_data_has_no_installation_id(self) -> None:
         response = self.create_repository(self.default_repository_config, None)
         assert response.status_code == 400
         self.assert_error_message(response, "validation", "requires an integration id")
 
-    def test_data_integration_does_not_exist(self):
+    def test_data_integration_does_not_exist(self) -> None:
         integration_id = self.integration.id
         self.integration.delete()
 
@@ -215,7 +237,7 @@ class AzureDevOpsRepositoryProviderTest(IntegrationRepositoryTestCase):
             response, "not found", "Integration matching query does not exist."
         )
 
-    def test_org_given_has_no_installation(self):
+    def test_org_given_has_no_installation(self) -> None:
         organization = self.create_organization(owner=self.user)
         response = self.create_repository(
             self.default_repository_config, self.integration.id, organization.slug
@@ -223,7 +245,7 @@ class AzureDevOpsRepositoryProviderTest(IntegrationRepositoryTestCase):
         assert response.status_code == 404
 
     @responses.activate
-    def test_get_repo_request_fails(self):
+    def test_get_repo_request_fails(self) -> None:
         responses.add(
             responses.GET,
             "https://visualstudio.com/_apis/git/repositories/123",

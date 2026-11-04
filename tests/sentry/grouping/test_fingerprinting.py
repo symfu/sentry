@@ -1,18 +1,42 @@
+from typing import Any
+from unittest.mock import patch
+
 import pytest
 
-from sentry.grouping.fingerprinting import FingerprintingRules, InvalidFingerprintingConfig
+from sentry.conf.server import FALL_2025_GROUPING_CONFIG, WINTER_2023_GROUPING_CONFIG
+from sentry.grouping.api import (
+    _apply_custom_title_if_needed,
+    get_default_grouping_config_dict,
+    get_grouping_variants_for_event,
+    load_grouping_config,
+)
+from sentry.grouping.context import GroupingContext
+from sentry.grouping.fingerprinting import FingerprintingConfig
+from sentry.grouping.fingerprinting.exceptions import InvalidFingerprintingConfig
+from sentry.grouping.fingerprinting.utils import resolve_fingerprint_values
+from sentry.grouping.strategies.base import StrategyConfiguration
+from sentry.grouping.variants import BaseVariant
+from sentry.services.eventstore.models import Event
+from sentry.testutils.pytest.fixtures import InstaSnapshotter, django_db_all
+from tests.sentry.grouping import FingerprintInput, with_fingerprint_input
 
-from tests.sentry.grouping import with_fingerprint_input
+GROUPING_CONFIG = get_default_grouping_config_dict()
 
 
-def test_basic_parsing(insta_snapshot):
-    rules = FingerprintingRules.from_config_string(
+def test_basic_parsing() -> None:
+    rules = FingerprintingConfig.from_config_string(
         """
 # This is a config
 type:DatabaseUnavailable                        -> DatabaseUnavailable
 function:assertion_failed module:foo            -> AssertionFailed, foo
 app:true                                        -> aha
+app:true                                        -> {{default}}
 app:true                                        -> {{ default }}
+app:true                                        -> {{  default }}
+app:true                                        -> {{default}}, stuff
+app:true                                        -> {{ default }}, stuff
+app:true                                        -> {{  default }}, stuff
+app:true                                        -> "default stuff"
 !path:**/foo/**                                 -> everything
 !"path":**/foo/**                               -> everything
 logger:sentry.*                                 -> logger-, {{ logger }}
@@ -24,31 +48,97 @@ logger:sentry.*                                 -> logger-{{ logger }} title="Me
     assert rules._to_config_structure() == {
         "rules": [
             {
+                "text": 'type:"DatabaseUnavailable" -> "DatabaseUnavailable"',
                 "matchers": [["type", "DatabaseUnavailable"]],
                 "fingerprint": ["DatabaseUnavailable"],
                 "attributes": {},
             },
             {
+                "text": 'function:"assertion_failed" module:"foo" -> "AssertionFailed", "foo"',
                 "matchers": [["function", "assertion_failed"], ["module", "foo"]],
                 "fingerprint": ["AssertionFailed", "foo"],
                 "attributes": {},
             },
-            {"matchers": [["app", "true"]], "fingerprint": ["aha"], "attributes": {}},
-            {"matchers": [["app", "true"]], "fingerprint": ["{{ default }}"], "attributes": {}},
-            {"matchers": [["!path", "**/foo/**"]], "fingerprint": ["everything"], "attributes": {}},
-            {"matchers": [["!path", "**/foo/**"]], "fingerprint": ["everything"], "attributes": {}},
             {
+                "text": 'app:"true" -> "aha"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["aha"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}", "stuff"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}", "stuff"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}", "stuff"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}", "stuff"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}", "stuff"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}", "stuff"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "default stuff"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["default stuff"],
+                "attributes": {},
+            },
+            {
+                "text": '!path:"**/foo/**" -> "everything"',
+                "matchers": [["!path", "**/foo/**"]],
+                "fingerprint": ["everything"],
+                "attributes": {},
+            },
+            {
+                "text": '!path:"**/foo/**" -> "everything"',
+                "matchers": [["!path", "**/foo/**"]],
+                "fingerprint": ["everything"],
+                "attributes": {},
+            },
+            {
+                "text": 'logger:"sentry.*" -> "logger-", "{{ logger }}"',
                 "matchers": [["logger", "sentry.*"]],
                 "fingerprint": ["logger-", "{{ logger }}"],
                 "attributes": {},
             },
-            {"matchers": [["message", "\\x\xff"]], "fingerprint": ["stuff"], "attributes": {}},
             {
+                "text": 'message:"\\xÿ" -> "stuff"',
+                "matchers": [["message", "\\x\xff"]],
+                "fingerprint": ["stuff"],
+                "attributes": {},
+            },
+            {
+                "text": 'logger:"sentry.*" -> "logger-", "{{ logger }}" title="Message from {{ logger }}"',
                 "matchers": [["logger", "sentry.*"]],
                 "fingerprint": ["logger-", "{{ logger }}"],
                 "attributes": {"title": "Message from {{ logger }}"},
             },
             {
+                "text": 'logger:"sentry.*" -> "logger-", "{{ logger }}" title="Message from {{ logger }}"',
                 "matchers": [["logger", "sentry.*"]],
                 "fingerprint": ["logger-", "{{ logger }}"],
                 "attributes": {"title": "Message from {{ logger }}"},
@@ -58,15 +148,15 @@ logger:sentry.*                                 -> logger-{{ logger }} title="Me
     }
 
     assert (
-        FingerprintingRules._from_config_structure(
+        FingerprintingConfig._from_config_structure(
             rules._to_config_structure()
         )._to_config_structure()
         == rules._to_config_structure()
     )
 
 
-def test_rule_export():
-    rules = FingerprintingRules.from_config_string(
+def test_rule_export() -> None:
+    rules = FingerprintingConfig.from_config_string(
         """
 logger:sentry.*                                 -> logger, {{ logger }}, title="Message from {{ logger }}"
 """
@@ -75,16 +165,67 @@ logger:sentry.*                                 -> logger, {{ logger }}, title="
         "attributes": {"title": "Message from {{ logger }}"},
         "fingerprint": ["logger", "{{ logger }}"],
         "matchers": [["logger", "sentry.*"]],
+        "text": 'logger:"sentry.*" -> "logger", "{{ logger }}" title="Message from {{ logger }}"',
     }
 
 
-def test_parsing_errors():
+def test_rule_text_round_trips() -> None:
+    rules = FingerprintingConfig.from_config_string(
+        'logger:sentry.* -> logger-{{ logger }}, "two words", {{ default }} title="From {{ logger }}"'
+    )
+    [rule] = rules.rules
+    assert (
+        rule.text
+        == 'logger:"sentry.*" -> "logger-", "{{ logger }}", "two words", "{{ default }}" title="From {{ logger }}"'
+    )
+    [reparsed] = FingerprintingConfig.from_config_string(rule.text).rules
+    assert reparsed.fingerprint == rule.fingerprint
+    assert reparsed.attributes == rule.attributes
+
+
+def test_parsing_errors() -> None:
     with pytest.raises(InvalidFingerprintingConfig):
-        FingerprintingRules.from_config_string("invalid.message:foo -> bar")
+        FingerprintingConfig.from_config_string("invalid.message:foo -> bar")
 
 
-def test_automatic_argument_splitting():
-    rules = FingerprintingRules.from_config_string(
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (
+            "error.type:A -> a\n# comment\nerror.type:B → b",
+            'Invalid syntax near "→ b" (line 3, column 14): use "->" instead of "→"',
+        ),
+        (
+            "error.type:B => b",
+            'Invalid syntax near "=> b" (line 1, column 14): use "->" instead of "=>"',
+        ),
+        (
+            'message:"a -> b" → b',
+            'Invalid syntax near "→ b" (line 1, column 18): use "->" instead of "→"',
+        ),
+        (
+            "error.type:B b",
+            'Invalid syntax near "error.type:B b" (line 1, column 1): expected "->" between the matchers and the fingerprint',
+        ),
+        (
+            "error.type:B-> b",
+            'Invalid syntax near "-> b" (line 1, column 13): add a space before "->"',
+        ),
+        # The arrow is fine, so the error points at `{d`, not at the `->` and `→` in the values
+        (
+            'error.type:B -> b->c "x → y" {d',
+            'Invalid syntax near "{d" (line 1, column 30)',
+        ),
+    ],
+)
+def test_parsing_error_messages(config: str, message: str) -> None:
+    with pytest.raises(InvalidFingerprintingConfig) as e:
+        FingerprintingConfig.from_config_string(config)
+    assert str(e.value) == message
+
+
+def test_automatic_argument_splitting() -> None:
+    rules = FingerprintingConfig.from_config_string(
         """
 logger:test -> logger-{{ logger }}
 logger:test -> logger-, {{ logger }}
@@ -95,21 +236,25 @@ logger:test2 -> logger-, {{ logger }}, -, {{ level }}
     assert rules._to_config_structure() == {
         "rules": [
             {
+                "text": 'logger:"test" -> "logger-", "{{ logger }}"',
                 "matchers": [["logger", "test"]],
                 "fingerprint": ["logger-", "{{ logger }}"],
                 "attributes": {},
             },
             {
+                "text": 'logger:"test" -> "logger-", "{{ logger }}"',
                 "matchers": [["logger", "test"]],
                 "fingerprint": ["logger-", "{{ logger }}"],
                 "attributes": {},
             },
             {
+                "text": 'logger:"test2" -> "logger-", "{{ logger }}", "-", "{{ level }}"',
                 "matchers": [["logger", "test2"]],
                 "fingerprint": ["logger-", "{{ logger }}", "-", "{{ level }}"],
                 "attributes": {},
             },
             {
+                "text": 'logger:"test2" -> "logger-", "{{ logger }}", "-", "{{ level }}"',
                 "matchers": [["logger", "test2"]],
                 "fingerprint": ["logger-", "{{ logger }}", "-", "{{ level }}"],
                 "attributes": {},
@@ -119,48 +264,237 @@ logger:test2 -> logger-, {{ logger }}, -, {{ level }}
     }
 
 
-def test_discover_field_parsing(insta_snapshot):
-    rules = FingerprintingRules.from_config_string(
+def test_discover_field_parsing() -> None:
+    rules = FingerprintingConfig.from_config_string(
         """
 # This is a config
 error.type:DatabaseUnavailable                        -> DatabaseUnavailable
 stack.function:assertion_failed stack.module:foo      -> AssertionFailed, foo
 app:true                                        -> aha
 app:true                                        -> {{ default }}
+release:foo                                     -> release-foo
 """
     )
     assert rules._to_config_structure() == {
         "rules": [
             {
+                "text": 'type:"DatabaseUnavailable" -> "DatabaseUnavailable"',
                 "matchers": [["type", "DatabaseUnavailable"]],
                 "fingerprint": ["DatabaseUnavailable"],
                 "attributes": {},
             },
             {
+                "text": 'function:"assertion_failed" module:"foo" -> "AssertionFailed", "foo"',
                 "matchers": [["function", "assertion_failed"], ["module", "foo"]],
                 "fingerprint": ["AssertionFailed", "foo"],
                 "attributes": {},
             },
-            {"matchers": [["app", "true"]], "fingerprint": ["aha"], "attributes": {}},
-            {"matchers": [["app", "true"]], "fingerprint": ["{{ default }}"], "attributes": {}},
+            {
+                "text": 'app:"true" -> "aha"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["aha"],
+                "attributes": {},
+            },
+            {
+                "text": 'app:"true" -> "{{ default }}"',
+                "matchers": [["app", "true"]],
+                "fingerprint": ["{{ default }}"],
+                "attributes": {},
+            },
+            {
+                "text": 'release:"foo" -> "release-foo"',
+                "matchers": [["release", "foo"]],
+                "fingerprint": ["release-foo"],
+                "attributes": {},
+            },
         ],
         "version": 1,
     }
 
     assert (
-        FingerprintingRules._from_config_structure(
+        FingerprintingConfig._from_config_structure(
             rules._to_config_structure()
         )._to_config_structure()
         == rules._to_config_structure()
     )
 
 
-@with_fingerprint_input("input")
-def test_event_hash_variant(insta_snapshot, input):
-    config, evt = input.create_event()
+@django_db_all  # Because initializing context checks options
+def test_variable_resolution() -> None:
+    # TODO: This should be fleshed out to test way more cases, at which point we'll need to add some
+    # actual data here
+    event = Event(
+        project_id=908415,
+        event_id="11211231",
+        data={
+            "exception": {
+                "values": [
+                    {
+                        "type": "FailedToFetchError",
+                        "value": "That's ball number 6 that Charlie hasn't brought back!",
+                    }
+                ]
+            },
+        },
+    )
+    context = GroupingContext(StrategyConfiguration(), event)
 
-    def dump_variant(v):
-        rv = v.as_dict()
+    for fingerprint_entry, expected_resolved_value in [
+        ("{{ default }}", "{{ default }}"),
+        ("{{default}}", "{{ default }}"),
+        ("{{  default }}", "{{ default }}"),
+        ("{{ dog }}", "<unrecognized-variable-dog>"),
+        ("{{ message }}", "That's ball number <int> that Charlie hasn't brought back!"),
+        ("{{ value }}", "That's ball number <int> that Charlie hasn't brought back!"),
+        ("{{ error.value }}", "That's ball number <int> that Charlie hasn't brought back!"),
+        ("{{ raw_message }}", "That's ball number 6 that Charlie hasn't brought back!"),
+        ("{{ raw_value }}", "That's ball number 6 that Charlie hasn't brought back!"),
+        ("{{ error.raw_value }}", "That's ball number 6 that Charlie hasn't brought back!"),
+    ]:
+        assert resolve_fingerprint_values([fingerprint_entry], event, context) == [
+            expected_resolved_value
+        ], f"Entry {fingerprint_entry} resolved incorrectly"
+
+
+@django_db_all
+def test_variable_resolution_with_stacktrace_in_threads() -> None:
+    event = Event(
+        project_id=908415,
+        event_id="11211231",
+        data={
+            "platform": "cocoa",
+            "exception": {
+                "values": [
+                    {
+                        "type": "MyApp.SampleError",
+                        "value": "Code=0",
+                        "mechanism": {"type": "NSError"},
+                    }
+                ]
+            },
+            "threads": {
+                "values": [
+                    {"id": 0, "crashed": False, "current": False},
+                    {
+                        "id": 1,
+                        "crashed": False,
+                        "current": True,
+                        "stacktrace": {
+                            "frames": [
+                                {"function": "main", "in_app": False, "package": "/usr/lib/dyld"},
+                                {
+                                    "function": "ViewController.captureError",
+                                    "module": "MyApp.ViewController",
+                                    "abs_path": "/Users/me/MyApp/ViewController.swift",
+                                    "filename": "ViewController.swift",
+                                    "package": "/var/containers/MyApp.app/MyApp",
+                                    "in_app": True,
+                                },
+                            ]
+                        },
+                    },
+                ]
+            },
+        },
+    )
+    context = GroupingContext(StrategyConfiguration(), event)
+
+    for fingerprint_entry, expected_resolved_value in [
+        ("{{ stack.function }}", "ViewController.captureError"),
+        ("{{ stack.module }}", "MyApp.ViewController"),
+        ("{{ stack.abs_path }}", "/Users/me/MyApp/ViewController.swift"),
+        ("{{ stack.filename }}", "ViewController.swift"),
+        ("{{ stack.package }}", "MyApp"),
+    ]:
+        assert resolve_fingerprint_values([fingerprint_entry], event, context) == [
+            expected_resolved_value
+        ], f"Entry {fingerprint_entry} resolved incorrectly"
+
+
+# TODO: Once we have fully transitioned off of the `newstyle:2023-01-11` grouping config, we can
+# remove this test entirely, as the new behavior is also tested in `test_variable_resolution` above
+@django_db_all
+def test_resolves_unknown_variables_correctly_given_config_value() -> None:
+    fingerprint = ["{{ dog }}"]
+    event_data = {"message": "Dogs are great!", "fingerprint": fingerprint}
+    event = Event(event_id="11212012123120120415201309082013", project_id=908415, data=event_data)
+    winter_2023_config = load_grouping_config(
+        get_default_grouping_config_dict(WINTER_2023_GROUPING_CONFIG)
+    )
+    fall_2025_config = load_grouping_config(
+        get_default_grouping_config_dict(FALL_2025_GROUPING_CONFIG)
+    )
+
+    # Under the current config, we ask for legacy behavior, and as a result the unknown fingerprint
+    # variable is returned as is
+    with (
+        patch(
+            "sentry.grouping.api.resolve_fingerprint_values", wraps=resolve_fingerprint_values
+        ) as mock_resolve_fingerprint_values,
+        patch(
+            "sentry.grouping.api._apply_custom_title_if_needed", wraps=_apply_custom_title_if_needed
+        ) as mock_apply_custom_title_if_needed,
+    ):
+        get_grouping_variants_for_event(event, winter_2023_config)
+
+        context = mock_resolve_fingerprint_values.call_args.args[2]
+        assert isinstance(context, GroupingContext)
+
+        assert mock_resolve_fingerprint_values.call_count == 1
+        assert mock_apply_custom_title_if_needed.call_count == 1
+        assert (
+            mock_resolve_fingerprint_values.call_args.kwargs["use_legacy_unknown_variable_handling"]
+            is True
+        )
+        assert (
+            mock_apply_custom_title_if_needed.call_args.kwargs[
+                "use_legacy_unknown_variable_handling"
+            ]
+            is True
+        )
+        assert resolve_fingerprint_values(
+            fingerprint, event, context, use_legacy_unknown_variable_handling=True
+        ) == ["{{ dog }}"]
+
+    # Under the new config, we ask for non-legacy behavior, and as a result the unknown fingerprint
+    # variable is replaced by a string flagging the problem
+    with (
+        patch(
+            "sentry.grouping.api.resolve_fingerprint_values", wraps=resolve_fingerprint_values
+        ) as mock_resolve_fingerprint_values,
+        patch(
+            "sentry.grouping.api._apply_custom_title_if_needed", wraps=_apply_custom_title_if_needed
+        ) as mock_apply_custom_title_if_needed,
+    ):
+        get_grouping_variants_for_event(event, fall_2025_config)
+
+        context = mock_resolve_fingerprint_values.call_args.args[2]
+        assert isinstance(context, GroupingContext)
+
+        assert mock_resolve_fingerprint_values.call_count == 1
+        assert mock_apply_custom_title_if_needed.call_count == 1
+        assert (
+            mock_resolve_fingerprint_values.call_args.kwargs["use_legacy_unknown_variable_handling"]
+            is False
+        )
+        assert (
+            mock_apply_custom_title_if_needed.call_args.kwargs[
+                "use_legacy_unknown_variable_handling"
+            ]
+            is False
+        )
+        assert resolve_fingerprint_values(
+            fingerprint, event, context, use_legacy_unknown_variable_handling=False
+        ) == ["<unrecognized-variable-dog>"]
+
+
+@with_fingerprint_input("input")
+@django_db_all  # because of `options` usage
+def test_event_hash_variant(insta_snapshot: InstaSnapshotter, input: FingerprintInput) -> None:
+    config, event = input.create_event()
+
+    def dump_variant(variant: BaseVariant) -> dict[str, Any]:
+        rv = variant.as_dict()
 
         for key in "hash", "description", "config":
             rv.pop(key, None)
@@ -174,8 +508,13 @@ def test_event_hash_variant(insta_snapshot, input):
     insta_snapshot(
         {
             "config": config.to_json(),
-            "fingerprint": evt.data["fingerprint"],
-            "title": evt.data["title"],
-            "variants": {k: dump_variant(v) for (k, v) in evt.get_grouping_variants().items()},
+            "fingerprint": event.data["fingerprint"],
+            "title": event.data["title"],
+            "variants": {
+                variant_name: dump_variant(variant)
+                for (variant_name, variant) in event.get_grouping_variants(
+                    force_config=GROUPING_CONFIG
+                ).items()
+            },
         }
     )

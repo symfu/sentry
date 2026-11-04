@@ -1,0 +1,130 @@
+import {useParams as useReactRouterParams} from 'react-router';
+
+import {render, screen} from 'sentry-test/reactTestingLibrary';
+
+import {useParams} from 'sentry/utils/useParams';
+
+const mockUsingCustomerDomain = jest.fn();
+const mockCustomerDomain = jest.fn();
+
+jest.mock('sentry/constants', () => {
+  const sentryConstant = jest.requireActual('sentry/constants');
+  return {
+    ...sentryConstant,
+
+    get USING_CUSTOMER_DOMAIN() {
+      return mockUsingCustomerDomain();
+    },
+
+    get CUSTOMER_DOMAIN() {
+      return mockCustomerDomain();
+    },
+  };
+});
+
+describe('useParams', () => {
+  describe('when the path has no params', () => {
+    it('returns an empty object', () => {
+      let params: any;
+      function HomePage() {
+        // oxlint-disable-next-line react/globals -- Test captures the hook result in an outer variable to assert on it.
+        params = useParams();
+        return null;
+      }
+
+      render(<HomePage />, {
+        initialRouterConfig: {
+          route: '/issues/',
+          location: {pathname: '/issues/'},
+        },
+      });
+
+      expect(params).toEqual({});
+    });
+  });
+
+  describe('when the path has some params', () => {
+    it('returns an object of the URL params', () => {
+      let params: any;
+      function HomePage() {
+        // oxlint-disable-next-line react/globals -- Test captures the hook result in an outer variable to assert on it.
+        params = useParams();
+        return null;
+      }
+
+      render(<HomePage />, {
+        initialRouterConfig: {
+          route: '/organizations/:slug/',
+          location: {pathname: '/organizations/sentry/'},
+        },
+      });
+      expect(params).toEqual({slug: 'sentry'});
+    });
+  });
+
+  describe('customer domains', () => {
+    afterEach(() => {
+      jest.resetAllMocks();
+    });
+
+    it('populates orgId when customer domain is being used', () => {
+      mockUsingCustomerDomain.mockReturnValue(true);
+      mockCustomerDomain.mockReturnValue('albertos-apples');
+
+      let originalParams: any;
+      let paramsValue: any;
+
+      function Component() {
+        // oxlint-disable-next-line react/globals -- Test captures the hook result in an outer variable to assert on it.
+        originalParams = useReactRouterParams();
+        // oxlint-disable-next-line react/globals -- Test captures the hook result in an outer variable to assert on it.
+        paramsValue = useParams();
+        return <div>rendered component for org: {paramsValue.orgId ?? 'no org id'}</div>;
+      }
+
+      render(<Component />, {
+        initialRouterConfig: {
+          route: '/issues/',
+          location: {pathname: '/issues/'},
+        },
+      });
+
+      expect(
+        screen.getByText('rendered component for org: albertos-apples')
+      ).toBeInTheDocument();
+      expect(originalParams).toEqual({});
+      expect(paramsValue).toEqual({
+        orgId: 'albertos-apples',
+      });
+    });
+
+    it('does not populate orgId when customer domain is not being used', () => {
+      mockUsingCustomerDomain.mockReturnValue(false);
+      mockCustomerDomain.mockReturnValue(undefined);
+
+      let originalParams: any;
+      let paramsValue: any;
+
+      function Component() {
+        // oxlint-disable-next-line react/globals -- Test captures the hook result in an outer variable to assert on it.
+        originalParams = useReactRouterParams();
+        // oxlint-disable-next-line react/globals -- Test captures the hook result in an outer variable to assert on it.
+        paramsValue = useParams();
+        return <div>rendered component for org: {paramsValue.orgId ?? 'no org id'}</div>;
+      }
+
+      render(<Component />, {
+        initialRouterConfig: {
+          route: '/issues/',
+          location: {pathname: '/issues/'},
+        },
+      });
+
+      expect(
+        screen.getByText('rendered component for org: no org id')
+      ).toBeInTheDocument();
+      expect(originalParams).toEqual({});
+      expect(paramsValue).toEqual({});
+    });
+  });
+});

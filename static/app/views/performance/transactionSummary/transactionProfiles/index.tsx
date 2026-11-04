@@ -1,0 +1,136 @@
+import {useCallback, useMemo} from 'react';
+import styled from '@emotion/styled';
+import {parseAsString, useQueryState, useQueryStates} from 'nuqs';
+
+import {Grid} from '@sentry/scraps/layout';
+
+import * as Layout from 'sentry/components/layouts/thirds';
+import {DatePageFilter} from 'sentry/components/pageFilters/date/datePageFilter';
+import {EnvironmentPageFilter} from 'sentry/components/pageFilters/environment/environmentPageFilter';
+import {PageFilterBar} from 'sentry/components/pageFilters/pageFilterBar';
+import {useSpanSearchQueryBuilderProps} from 'sentry/components/performance/spanSearchQueryBuilder';
+import {DataCategory} from 'sentry/types/core';
+import {isAggregateField} from 'sentry/utils/discover/fields';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {useDatePageFilterProps} from 'sentry/utils/useDatePageFilterProps';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useMaxPickableDays} from 'sentry/utils/useMaxPickableDays';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {TraceItemSearchQueryBuilder} from 'sentry/views/explore/components/traceItemSearchQueryBuilder';
+import {
+  parseAsScalar,
+  parseAsSingleScalar,
+} from 'sentry/views/explore/queryParams/parsers';
+import {redirectToPerformanceHomepage} from 'sentry/views/performance/transactionSummary/pageLayout';
+
+import {TransactionProfilesContent} from './content';
+
+function EAPSearchBar({
+  projects,
+  initialQuery,
+  onSearch,
+}: {
+  initialQuery: string;
+  onSearch: (query: string) => void;
+  projects: number[];
+}) {
+  const {spanSearchQueryBuilderProps} = useSpanSearchQueryBuilderProps({
+    projects,
+    initialQuery,
+    onSearch,
+    searchSource: 'transaction_profiles',
+  });
+
+  return (
+    <TraceItemSearchQueryBuilder {...spanSearchQueryBuilderProps} disallowFreeText />
+  );
+}
+
+const searchParamsParsers = {
+  cursor: parseAsString,
+  query: parseAsString.withDefault(''),
+};
+
+interface ProfilesProps {
+  transaction: string;
+}
+
+function Profiles({transaction}: ProfilesProps) {
+  const {projects} = useProjects();
+  const [projectId] = useQueryState('project', parseAsSingleScalar);
+  const [{query: rawQuery}, setSearchParams] = useQueryStates(searchParamsParsers);
+
+  const project = projects.find(p => p.id === projectId);
+
+  const query = useMemo(() => {
+    const conditions = new MutableSearch(rawQuery);
+    conditions.setFilterValues('is_transaction', ['true']);
+    conditions.setFilterValues('transaction', [transaction]);
+
+    Object.keys(conditions.filters).forEach(field => {
+      if (isAggregateField(field)) {
+        conditions.removeFilter(field);
+      }
+    });
+
+    return conditions.formatString();
+  }, [transaction, rawQuery]);
+
+  const handleSearch = useCallback(
+    (searchQuery: string) => {
+      setSearchParams({cursor: null, query: searchQuery || null}, {history: 'push'});
+    },
+    [setSearchParams]
+  );
+
+  const projectIds = useMemo(
+    () => (project ? [parseInt(project?.id, 10)] : undefined),
+    [project]
+  );
+
+  const maxPickableDays = useMaxPickableDays({
+    dataCategories: [DataCategory.PROFILE_DURATION, DataCategory.PROFILE_DURATION_UI],
+  });
+  const datePageFilterProps = useDatePageFilterProps(maxPickableDays);
+
+  return (
+    <StyledMain width="full">
+      <Grid columns={{zero: '1fr', xl: 'auto 1fr'}} gap="xl" marginBottom="xl">
+        <PageFilterBar condensed>
+          <EnvironmentPageFilter />
+          <DatePageFilter {...datePageFilterProps} />
+        </PageFilterBar>
+        <EAPSearchBar
+          projects={projectIds ?? []}
+          initialQuery={rawQuery}
+          onSearch={handleSearch}
+        />
+      </Grid>
+      <TransactionProfilesContent query={query} />
+    </StyledMain>
+  );
+}
+
+const StyledMain = styled(Layout.Main)`
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+`;
+
+function ProfilesIndex() {
+  const organization = useOrganization();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [transaction] = useQueryState('transaction', parseAsScalar);
+
+  if (!transaction) {
+    redirectToPerformanceHomepage(organization, location, navigate);
+    return null;
+  }
+
+  return <Profiles transaction={transaction} />;
+}
+
+export default ProfilesIndex;

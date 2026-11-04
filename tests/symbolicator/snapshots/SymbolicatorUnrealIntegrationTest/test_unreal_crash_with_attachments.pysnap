@@ -1,7 +1,5 @@
 ---
-created: '2021-01-05T09:42:55.087777Z'
-creator: sentry
-source: tests/symbolicator/test_unreal_full.py
+source: tests/symbolicator/test_unreal_full.py::test_unreal_crash_with_attachments
 ---
 contexts:
   device:
@@ -12,9 +10,11 @@ contexts:
     name: Parallels Display Adapter (WDDM)
     type: gpu
   os:
-    name: Windows 10
+    name: Windows
+    os: Windows 10
+    raw_description: Windows 10
     type: os
-    version: 10.0.17134
+    version: '10'
   unreal:
     app_default_locate: en-US
     base_dir: //Mac/Home/Desktop/WindowsNoEditor/YetAnother/Binaries/Win64/
@@ -164,11 +164,31 @@ sdk:
 stacktrace: null
 threads:
   values:
-  - crashed: false
-    id: 248
+  - id: 248
     stacktrace:
       frames:
       - data:
+          orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7548229e5'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff754814ea9'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -176,6 +196,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -184,12 +205,34 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff754814ea9'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff754814ea9'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe03a9bf10'
         package: C:\Windows\System32\VCRUNTIME140.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -197,6 +240,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -221,11 +265,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c3f2cc448'
         rsp: '0x8c3f2cc418'
-  - crashed: false
-    id: 9772
+  - id: 9772
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -233,6 +277,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -240,6 +285,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -264,11 +310,11 @@ threads:
         rip: '0x7ffe100fd854'
         rsi: '0x7ffe10083140'
         rsp: '0x8c3f79fb48'
-  - crashed: false
-    id: 8188
+  - id: 8188
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -276,6 +322,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -283,6 +330,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -307,11 +355,11 @@ threads:
         rip: '0x7ffe100fd854'
         rsi: '0x7ffe10083140'
         rsp: '0x8c3fc6f838'
-  - crashed: false
-    id: 10188
+  - id: 10188
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -319,6 +367,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -326,6 +375,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -352,11 +402,11 @@ threads:
         rsp: '0x8c4013f6b8'
   - crashed: true
     id: 6900
-  - crashed: false
-    id: 5200
+  - id: 5200
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -364,6 +414,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -371,6 +422,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -378,6 +430,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -385,6 +438,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -409,11 +463,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c3ebbf438'
-  - crashed: false
-    id: 9648
+  - id: 9648
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -421,6 +475,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -428,6 +483,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -435,6 +491,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -442,6 +499,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -466,11 +524,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4068f738'
-  - crashed: false
-    id: 4372
+  - id: 4372
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -478,6 +536,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -485,6 +544,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -492,6 +552,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -499,6 +560,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -523,11 +585,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4070f778'
-  - crashed: false
-    id: 10628
+  - id: 10628
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -535,6 +597,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -542,6 +605,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -549,6 +613,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -573,11 +638,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4078f858'
-  - crashed: false
-    id: 11280
+  - id: 11280
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -585,6 +650,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -592,6 +658,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -599,6 +666,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -606,6 +674,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -613,6 +682,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -637,11 +707,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4080f468'
-  - crashed: false
-    id: 2432
+  - id: 2432
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -649,6 +719,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -656,6 +727,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -663,6 +735,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -670,6 +743,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -694,11 +768,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4088f808'
-  - crashed: false
-    id: 6680
+  - id: 6680
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -706,6 +780,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -713,6 +788,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -720,6 +796,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -727,6 +804,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -734,6 +812,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -758,11 +837,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4090f958'
-  - crashed: false
-    id: 6492
+  - id: 6492
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -770,6 +849,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -777,6 +857,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -784,6 +865,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -791,6 +873,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -798,6 +881,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -822,11 +906,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4098fa68'
-  - crashed: false
-    id: 6080
+  - id: 6080
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -834,6 +918,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -841,6 +926,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -848,6 +934,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -855,6 +942,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -862,6 +950,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -886,11 +975,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40a0f2f8'
-  - crashed: false
-    id: 6984
+  - id: 6984
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -898,6 +987,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -905,6 +995,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -912,6 +1003,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -919,6 +1011,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -926,6 +1019,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -950,11 +1044,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40a8f868'
-  - crashed: false
-    id: 10192
+  - id: 10192
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -962,6 +1056,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -969,6 +1064,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -993,11 +1089,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40b0f5c8'
-  - crashed: false
-    id: 11120
+  - id: 11120
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1005,6 +1101,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1012,6 +1109,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1036,11 +1134,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40b8fa78'
-  - crashed: false
-    id: 4872
+  - id: 4872
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1048,6 +1146,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1072,11 +1171,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40c0fa78'
-  - crashed: false
-    id: 4160
+  - id: 4160
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1084,6 +1183,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1091,6 +1191,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1115,11 +1216,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40c8f838'
-  - crashed: false
-    id: 11048
+  - id: 11048
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1127,6 +1228,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1134,6 +1236,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1158,11 +1261,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40d0f8a8'
-  - crashed: false
-    id: 7512
+  - id: 7512
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1170,6 +1273,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1177,6 +1281,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1184,6 +1289,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1191,6 +1297,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1215,11 +1322,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c40d8f9f8'
-  - crashed: false
-    id: 8684
+  - id: 8684
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1227,6 +1334,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1234,6 +1342,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1241,6 +1350,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1265,11 +1375,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c3ebdfab8'
         rsp: '0x8c3ebdfa88'
-  - crashed: false
-    id: 5444
+  - id: 5444
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1277,6 +1387,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1284,6 +1395,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1291,6 +1403,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1315,11 +1428,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c3ebff488'
         rsp: '0x8c3ebff458'
-  - crashed: false
-    id: 12064
+  - id: 12064
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1327,6 +1440,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1335,12 +1449,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff75482017a'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1365,11 +1491,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c40dafb28'
         rsp: '0x8c40dafaf8'
-  - crashed: false
-    id: 468
+  - id: 468
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1377,6 +1503,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1385,12 +1512,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff75482017a'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1415,11 +1554,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c40dcf6c8'
         rsp: '0x8c40dcf698'
-  - crashed: false
-    id: 8276
+  - id: 8276
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1427,6 +1566,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1435,12 +1575,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff75482017a'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1465,11 +1617,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c40def448'
         rsp: '0x8c40def418'
-  - crashed: false
-    id: 7604
+  - id: 7604
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1477,6 +1629,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1484,6 +1637,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1491,6 +1645,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1515,11 +1670,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c40e0f588'
         rsp: '0x8c40e0f558'
-  - crashed: false
-    id: 8056
+  - id: 8056
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1527,6 +1682,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1534,6 +1690,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1541,6 +1698,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1565,11 +1723,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c40e2f868'
         rsp: '0x8c40e2f838'
-  - crashed: false
-    id: 7540
+  - id: 7540
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1577,6 +1735,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1584,6 +1743,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1591,6 +1751,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1615,11 +1776,11 @@ threads:
         rip: '0x7ffe100fa584'
         rsi: '0x0'
         rsp: '0x8c412ff828'
-  - crashed: false
-    id: 9920
+  - id: 9920
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1627,6 +1788,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1634,6 +1796,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1641,6 +1804,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1665,11 +1829,11 @@ threads:
         rip: '0x7ffe100fa584'
         rsi: '0x0'
         rsp: '0x8c4131fd08'
-  - crashed: false
-    id: 4264
+  - id: 4264
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1677,6 +1841,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1685,12 +1850,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff754b6efc5'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1715,11 +1892,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4133f728'
         rsp: '0x8c4133f6f8'
-  - crashed: false
-    id: 2548
+  - id: 2548
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1727,6 +1904,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1734,6 +1912,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1741,6 +1920,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1765,11 +1945,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4135fb98'
         rsp: '0x8c4135fb68'
-  - crashed: false
-    id: 3060
+  - id: 3060
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1777,6 +1957,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1784,6 +1965,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1791,6 +1973,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1815,11 +1998,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4137fa18'
         rsp: '0x8c4137f9e8'
-  - crashed: false
-    id: 664
+  - id: 664
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1827,6 +2010,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1834,6 +2018,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1841,6 +2026,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1865,11 +2051,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4139fa38'
         rsp: '0x8c4139fa08'
-  - crashed: false
-    id: 3028
+  - id: 3028
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1877,6 +2063,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1884,6 +2071,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1891,6 +2079,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1915,11 +2104,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c413bf8f8'
         rsp: '0x8c413bf8c8'
-  - crashed: false
-    id: 964
+  - id: 964
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1927,6 +2116,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1951,11 +2141,11 @@ threads:
         rip: '0x7ffe100fd854'
         rsi: '0x7ffe10083140'
         rsp: '0x8c4223f9f8'
-  - crashed: false
-    id: 9124
+  - id: 9124
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1963,6 +2153,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1970,6 +2161,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -1977,6 +2169,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2001,11 +2194,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c418bfc08'
         rsp: '0x8c418bfbd8'
-  - crashed: false
-    id: 9264
+  - id: 9264
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2013,6 +2206,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2020,6 +2214,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2027,6 +2222,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2051,11 +2247,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4270fa48'
         rsp: '0x8c4270fa18'
-  - crashed: false
-    id: 7528
+  - id: 7528
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2063,6 +2259,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2070,6 +2267,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2094,11 +2292,11 @@ threads:
         rip: '0x7ffe100fd854'
         rsi: '0x7ffe10083140'
         rsp: '0x8c42bdfa78'
-  - crashed: false
-    id: 4136
+  - id: 4136
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2106,6 +2304,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2113,6 +2312,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2120,6 +2320,7 @@ threads:
         package: C:\Windows\System32\combase.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2127,6 +2328,7 @@ threads:
         package: C:\Windows\System32\combase.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2134,6 +2336,7 @@ threads:
         package: C:\Windows\System32\combase.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2141,6 +2344,7 @@ threads:
         package: C:\Windows\System32\combase.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2148,6 +2352,7 @@ threads:
         package: C:\Windows\System32\combase.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2155,6 +2360,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2162,6 +2368,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2169,6 +2376,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2176,6 +2384,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2183,6 +2392,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2190,6 +2400,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2197,6 +2408,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2204,6 +2416,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2211,6 +2424,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2218,6 +2432,7 @@ threads:
         package: C:\Windows\System32\combase.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2225,6 +2440,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2232,6 +2448,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2239,6 +2456,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2246,6 +2464,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2253,6 +2472,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2260,6 +2480,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2267,6 +2488,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2274,6 +2496,7 @@ threads:
         package: C:\Windows\System32\RTWorkQ.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2281,6 +2504,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2288,6 +2512,7 @@ threads:
         package: C:\Windows\System32\RTWorkQ.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2295,6 +2520,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2319,11 +2545,11 @@ threads:
         rip: '0x7ffe100faa54'
         rsi: '0x0'
         rsp: '0x8c430af608'
-  - crashed: false
-    id: 10520
+  - id: 10520
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2331,6 +2557,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2339,12 +2566,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2369,11 +2608,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c418df688'
         rsp: '0x8c418df658'
-  - crashed: false
-    id: 10828
+  - id: 10828
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2381,6 +2620,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2389,12 +2629,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2419,11 +2671,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c418ff998'
         rsp: '0x8c418ff968'
-  - crashed: false
-    id: 6428
+  - id: 6428
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2431,6 +2683,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2439,12 +2692,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2469,11 +2734,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4191f678'
         rsp: '0x8c4191f648'
-  - crashed: false
-    id: 11276
+  - id: 11276
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2481,6 +2746,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2489,12 +2755,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2519,11 +2797,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4193f7b8'
         rsp: '0x8c4193f788'
-  - crashed: false
-    id: 11076
+  - id: 11076
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2531,6 +2809,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2539,12 +2818,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2569,11 +2860,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4195f738'
         rsp: '0x8c4195f708'
-  - crashed: false
-    id: 9748
+  - id: 9748
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2581,6 +2872,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2589,12 +2881,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2619,11 +2923,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4197f9f8'
         rsp: '0x8c4197f9c8'
-  - crashed: false
-    id: 6820
+  - id: 6820
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2631,6 +2935,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2639,12 +2944,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2669,11 +2986,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c4199fac8'
         rsp: '0x8c4199fa98'
-  - crashed: false
-    id: 5932
+  - id: 5932
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2681,6 +2998,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2689,12 +3007,24 @@ threads:
         trust: scan
       - data:
           orig_in_app: -1
+          symbolicator_status: symbolicated
+        function: truncated
+        in_app: false
+        instruction_addr: '0x7ff7549e3f3c'
+        package: \\Mac\Home\Desktop\WindowsNoEditor\YetAnother\Binaries\Win64\YetAnother.exe
+        raw_function: <truncated>
+        symbol: <truncated>
+        trust: scan
+      - data:
+          category: internals
+          orig_in_app: -1
           symbolicator_status: missing
         in_app: false
         instruction_addr: '0x7ffe0ca99252'
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2719,11 +3049,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c419bf6d8'
         rsp: '0x8c419bf6a8'
-  - crashed: false
-    id: 10672
+  - id: 10672
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2731,6 +3061,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2755,11 +3086,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x8c419df628'
         rsp: '0x8c419df5f8'
-  - crashed: false
-    id: 3096
+  - id: 3096
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2767,6 +3098,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2774,6 +3106,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2781,6 +3114,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2805,11 +3139,11 @@ threads:
         rip: '0x7ffe100fa584'
         rsi: '0x0'
         rsp: '0x8c419efb58'
-  - crashed: false
-    id: 10944
+  - id: 10944
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2817,6 +3151,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2824,6 +3159,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2831,6 +3167,7 @@ threads:
         package: C:\Windows\System32\XAudio2_7.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2838,6 +3175,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2845,6 +3183,7 @@ threads:
         package: C:\Windows\System32\XAudio2_7.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2852,6 +3191,7 @@ threads:
         package: C:\Windows\System32\XAudio2_7.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2859,6 +3199,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2866,6 +3207,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2873,6 +3215,7 @@ threads:
         package: C:\Windows\System32\AudioSes.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2880,6 +3223,7 @@ threads:
         package: C:\Windows\System32\AudioSes.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2887,6 +3231,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2894,6 +3239,7 @@ threads:
         package: C:\Windows\System32\AudioSes.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2901,6 +3247,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2908,6 +3255,7 @@ threads:
         package: C:\Windows\System32\AudioSes.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2915,6 +3263,7 @@ threads:
         package: C:\Windows\System32\AudioSes.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2922,6 +3271,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2946,11 +3296,11 @@ threads:
         rip: '0x7ffe100faa54'
         rsi: '0x0'
         rsp: '0x8c4357f4f8'
-  - crashed: false
-    id: 7648
+  - id: 7648
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2958,6 +3308,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2982,11 +3333,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c43a4f4d8'
-  - crashed: false
-    id: 612
+  - id: 612
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -2994,6 +3345,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -3001,6 +3353,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -3008,6 +3361,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -3032,11 +3386,11 @@ threads:
         rip: '0x7ffe100f9f84'
         rsi: '0x0'
         rsp: '0x8c4188f7a8'
-  - crashed: false
-    id: 10900
+  - id: 10900
     stacktrace:
       frames:
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -3044,6 +3398,7 @@ threads:
         package: C:\Windows\System32\ntdll.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -3051,6 +3406,7 @@ threads:
         package: C:\Windows\System32\kernel32.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false
@@ -3058,6 +3414,7 @@ threads:
         package: C:\Windows\System32\KERNELBASE.dll
         trust: scan
       - data:
+          category: internals
           orig_in_app: -1
           symbolicator_status: missing
         in_app: false

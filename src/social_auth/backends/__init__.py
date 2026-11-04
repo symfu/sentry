@@ -10,40 +10,51 @@ Also the modules *must* define a BACKENDS dictionary with the backend name
 enabled.
 """
 
-import logging
-import requests
-import threading
+from __future__ import annotations
 
-from requests_oauthlib import OAuth1
-from django.contrib.auth import authenticate
-from django.utils.crypto import get_random_string, constant_time_compare
+import logging
+import threading
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 from urllib.error import HTTPError
+from urllib.parse import parse_qsl, urlencode
 from urllib.request import Request
-from urllib.parse import urlencode
+
+import requests
+from django.conf import settings
+from django.contrib.auth import authenticate, load_backend
+from django.contrib.auth.base_user import AbstractBaseUser
+from django.http import HttpRequest
+from django.utils.crypto import constant_time_compare, get_random_string
+from requests_oauthlib import OAuth1
+
+from sentry.users.models.user import User
+from sentry.users.services.user import RpcUser
+from sentry.users.services.user.service import user_service
+from sentry.utils import json
+from sentry.utils.auth import record_suspended_user_rejection
+from sentry.utils.http import absolute_uri
+from social_auth.exceptions import (
+    AuthCanceled,
+    AuthFailed,
+    AuthMissingParameter,
+    AuthStateForbidden,
+    AuthStateMissing,
+    AuthTokenError,
+    AuthUnknownError,
+    BackendError,
+    StopPipeline,
+)
 from social_auth.models import UserSocialAuth
 from social_auth.utils import (
-    setting,
-    model_to_ctype,
-    ctype_to_model,
     clean_partial_pipeline,
-    url_add_parameters,
+    ctype_to_model,
     dsa_urlopen,
+    model_to_ctype,
     parse_qs,
+    setting,
+    url_add_parameters,
 )
-from social_auth.exceptions import (
-    StopPipeline,
-    AuthFailed,
-    AuthCanceled,
-    AuthUnknownError,
-    AuthTokenError,
-    AuthMissingParameter,
-    AuthStateMissing,
-    AuthStateForbidden,
-    BackendError,
-)
-
-from sentry.utils import json
-from sentry.utils.compat import map
 
 PIPELINE = setting(
     "SOCIAL_AUTH_PIPELINE",
@@ -60,6 +71,8 @@ PIPELINE = setting(
     ),
 )
 
+UNSAFE_QUERY_PARAMS = ["client_id", "redirect_uri", "state", "response_type"]
+
 logger = logging.getLogger("social_auth")
 
 
@@ -70,7 +83,7 @@ class SocialAuthBackend:
     name = ""  # provider name, it's stored in database
     supports_inactive_user = False
 
-    def authenticate(self, request, *args, **kwargs):
+    def authenticate(self, request: HttpRequest | None, *args: Any, **kwargs: Any) -> User | None:
         """Authenticate user using social credentials
 
         Authentication is made if this is the correct backend, backend
@@ -84,7 +97,7 @@ class SocialAuthBackend:
         if not (self.name and kwargs.get(self.name) and "response" in kwargs):
             return None
 
-        response = kwargs.get("response")
+        response = cast("Mapping[str, Any]", kwargs.get("response"))
         pipeline = PIPELINE
         kwargs = kwargs.copy()
         kwargs["backend"] = self
@@ -104,12 +117,19 @@ class SocialAuthBackend:
         if social_user:
             # define user.social_user attribute to track current social
             # account
-            user = social_user.user
-            user.social_user = social_user
-            user.is_new = out.get("is_new")
+            user: User = social_user.user
+            setattr(user, "social_user", social_user)
+            setattr(user, "is_new", out.get("is_new"))
             return user
+        return None
 
-    def pipeline(self, pipeline, request, *args, **kwargs):
+    def pipeline(
+        self,
+        pipeline: Iterable[str],
+        request: HttpRequest | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         """Pipeline"""
         out = kwargs.copy()
 
@@ -122,10 +142,10 @@ class SocialAuthBackend:
             out["pipeline_index"] = base_index + idx
             mod_name, func_name = name.rsplit(".", 1)
             mod = __import__(mod_name, {}, {}, [func_name])
-            func = getattr(mod, func_name, None)
+            func = getattr(mod, func_name)
 
             try:
-                result = {}
+                result: dict[str, Any] = {}
                 if func_name == "save_status_to_session":
                     result = func(request, *args, **out) or {}
                 else:
@@ -146,15 +166,21 @@ class SocialAuthBackend:
             clean_partial_pipeline(kwargs["request"])
         return out
 
-    def extra_data(self, user, uid, response, details):
+    def extra_data(
+        self,
+        user: RpcUser | AbstractBaseUser,
+        uid: str,
+        response: Mapping[str, Any],
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return default blank user extra data"""
         return {}
 
-    def get_user_id(self, details, response):
+    def get_user_id(self, details: Mapping[str, Any], response: Mapping[str, Any]) -> str:
         """Must return a unique ID from values returned on details"""
         raise NotImplementedError("Implement in subclass")
 
-    def get_user_details(self, response):
+    def get_user_details(self, response: Mapping[str, Any]) -> dict[str, Any]:
         """Must return user details in a know internal struct:
         {'username': <username if any>,
          'email': <user email if any>,
@@ -165,7 +191,7 @@ class SocialAuthBackend:
         raise NotImplementedError("Implement in subclass")
 
     @classmethod
-    def tokens(cls, instance):
+    def tokens(cls, instance: UserSocialAuth) -> dict[str, Any]:
         """Return the tokens needed to authenticate the access to any API the
         service might provide. The return value will be a dictionary with the
         token type name as key and the token value.
@@ -177,12 +203,17 @@ class SocialAuthBackend:
         else:
             return {}
 
-    def get_user(self, user_id):
+    def get_user(self, user_id: int) -> RpcUser | None:
         """
         Return user with given ID from the User model used by this backend.
         This is called by django.contrib.auth.middleware.
         """
-        return UserSocialAuth.get_user(user_id)
+        user = user_service.get_user(user_id=user_id)
+        if user and user.is_active and not user.is_suspended:
+            return user
+        if user and user.is_suspended:
+            record_suspended_user_rejection("social_get_user")
+        return None
 
 
 class OAuthBackend(SocialAuthBackend):
@@ -199,15 +230,21 @@ class OAuthBackend(SocialAuthBackend):
     access_token is always stored.
     """
 
-    EXTRA_DATA = None
+    EXTRA_DATA: list[tuple[str, str]] | None = None
     ID_KEY = "id"
 
-    def get_user_id(self, details, response):
+    def get_user_id(self, details: Mapping[str, Any], response: Mapping[str, Any]) -> str:
         """OAuth providers return an unique user id in response"""
         return response[self.ID_KEY]
 
     @classmethod
-    def extra_data(cls, user, uid, response, details=None):
+    def extra_data(
+        cls,
+        user: RpcUser | AbstractBaseUser,
+        uid: str,
+        response: Mapping[str, Any],
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return access_token and extra defined names to store in
         extra_data field"""
         data = {"access_token": response.get("access_token", "")}
@@ -246,9 +283,10 @@ class BaseAuth:
         AUTH_BACKEND   Authorization backend related with this service
     """
 
-    AUTH_BACKEND = None
+    AUTH_BACKEND: type[SocialAuthBackend]
+    request: Any
 
-    def __init__(self, request, redirect):
+    def __init__(self, request: HttpRequest, redirect: str) -> None:
         self.request = request
         # TODO(python3): use {**x, **y} syntax once 2.7 support is dropped
         data = request.GET.copy()
@@ -256,20 +294,22 @@ class BaseAuth:
         self.data = data
         self.redirect = redirect
 
-    def auth_url(self):
+    def auth_url(self) -> str:
         """Must return redirect URL to auth provider"""
         raise NotImplementedError("Implement in subclass")
 
-    def auth_html(self):
+    def auth_html(self) -> str:
         """Must return login HTML content returned by provider"""
         raise NotImplementedError("Implement in subclass")
 
-    def auth_complete(self, *args, **kwargs):
+    def auth_complete(self, *args: Any, **kwargs: Any) -> RpcUser | None:
         """Completes logging process, must return user instance"""
         raise NotImplementedError("Implement in subclass")
 
-    def to_session_dict(self, next_idx, *args, **kwargs):
+    def to_session_dict(self, next_idx: int, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Returns dict to store on session for partial pipeline."""
+        backend = kwargs["backend"]
+        kwargs["backend"] = f"{backend.__module__}.{backend.__class__.__name__}"
         return {
             "next": next_idx,
             "backend": self.AUTH_BACKEND.name,
@@ -277,7 +317,9 @@ class BaseAuth:
             "kwargs": {key: model_to_ctype(val) for key, val in kwargs.items()},
         }
 
-    def from_session_dict(self, session_data, *args, **kwargs):
+    def from_session_dict(
+        self, session_data: Mapping[str, Any], *args: Any, **kwargs: Any
+    ) -> tuple[int, tuple[Any, ...], dict[str, Any]]:
         """Takes session saved data to continue pipeline and merges with any
         new extra argument needed. Returns tuple with next pipeline index
         entry, arguments and keyword arguments to continue the process."""
@@ -286,22 +328,29 @@ class BaseAuth:
         kwargs = kwargs.copy()
         saved_kwargs = {key: ctype_to_model(val) for key, val in session_data["kwargs"].items()}
         saved_kwargs.update((key, val) for key, val in kwargs.items())
+
+        if isinstance(saved_kwargs.get("backend"), str):
+            backend_path = saved_kwargs["backend"]
+            if backend_path in settings.AUTHENTICATION_BACKENDS:
+                saved_kwargs["backend"] = load_backend(backend_path)
+
         return (session_data["next"], args, saved_kwargs)
 
-    def continue_pipeline(self, *args, **kwargs):
+    def continue_pipeline(self, *args: Any, **kwargs: Any) -> RpcUser | None:
         """Continue previous halted pipeline"""
         kwargs.update({"auth": self, self.AUTH_BACKEND.name: True})
-        return authenticate(*args, **kwargs)
+        return cast("RpcUser | None", authenticate(*args, **kwargs))
 
-    def request_token_extra_arguments(self):
+    def request_token_extra_arguments(self) -> dict[str, Any]:
         """Return extra arguments needed on request-token process,
         setting is per backend and defined by:
             <backend name in uppercase>_REQUEST_TOKEN_EXTRA_ARGUMENTS.
         """
         backend_name = self.AUTH_BACKEND.name.upper().replace("-", "_")
-        return setting(backend_name + "_REQUEST_TOKEN_EXTRA_ARGUMENTS", {})
+        value = setting(backend_name + "_REQUEST_TOKEN_EXTRA_ARGUMENTS", {})
+        return value
 
-    def auth_extra_arguments(self):
+    def auth_extra_arguments(self) -> dict[str, Any]:
         """Return extra arguments needed on auth process, setting is per
         backend and defined by:
             <backend name in uppercase>_AUTH_EXTRA_ARGUMENTS.
@@ -317,23 +366,23 @@ class BaseAuth:
         return extra_arguments
 
     @property
-    def uses_redirect(self):
+    def uses_redirect(self) -> bool:
         """Return True if this provider uses redirect url method,
         otherwise return false."""
         return True
 
     @classmethod
-    def enabled(cls):
+    def enabled(cls) -> bool:
         """Return backend enabled status, all enabled by default"""
         return True
 
-    def disconnect(self, user, association_id=None):
+    def disconnect(self, user: User, association_id: int | None = None) -> None:
         """Deletes current backend from user if associated.
         Override if extra operations are needed.
         """
         name = self.AUTH_BACKEND.name
         do_revoke = setting("SOCIAL_AUTH_REVOKE_TOKENS_ON_DISCONNECT")
-        filter_args = {}
+        filter_args: dict[str, Any] = {}
 
         if association_id:
             filter_args["id"] = association_id
@@ -346,14 +395,8 @@ class BaseAuth:
                 instance.revoke_token(drop_token=False)
         instances.delete()
 
-    def build_absolute_uri(self, path=None):
-        """Build absolute URI for given path. Replace http:// schema with
-        https:// if SOCIAL_AUTH_REDIRECT_IS_HTTPS is defined.
-        """
-        uri = self.request.build_absolute_uri(path)
-        if setting("SOCIAL_AUTH_REDIRECT_IS_HTTPS"):
-            uri = uri.replace("http://", "https://")
-        return uri
+    def build_absolute_uri(self, path: str | None = None) -> str:
+        return absolute_uri(path)
 
 
 class OAuthAuth(BaseAuth):
@@ -361,43 +404,43 @@ class OAuthAuth(BaseAuth):
 
     SETTINGS_KEY_NAME = ""
     SETTINGS_SECRET_NAME = ""
-    SCOPE_VAR_NAME = None
+    SCOPE_VAR_NAME: str | None = None
     SCOPE_PARAMETER_NAME = "scope"
-    DEFAULT_SCOPE = None
+    DEFAULT_SCOPE: list[str] | None = None
     SCOPE_SEPARATOR = " "
 
-    def __init__(self, request, redirect):
+    def __init__(self, request: HttpRequest, redirect: str) -> None:
         """Init method"""
         super().__init__(request, redirect)
         self.redirect_uri = self.build_absolute_uri(self.redirect)
 
     @classmethod
-    def get_key_and_secret(cls):
+    def get_key_and_secret(cls) -> tuple[str, str]:
         """Return tuple with Consumer Key and Consumer Secret for current
         service provider. Must return (key, secret), order *must* be respected.
         """
         return (setting(cls.SETTINGS_KEY_NAME), setting(cls.SETTINGS_SECRET_NAME))
 
     @classmethod
-    def enabled(cls):
+    def enabled(cls) -> bool:
         """Return backend enabled status by checking basic settings"""
         return bool(setting(cls.SETTINGS_KEY_NAME) and setting(cls.SETTINGS_SECRET_NAME))
 
-    def get_scope(self):
+    def get_scope(self) -> list[str]:
         """Return list with needed access scope"""
-        scope = self.DEFAULT_SCOPE or []
+        scope: list[str] = self.DEFAULT_SCOPE or []
         if self.SCOPE_VAR_NAME:
             scope = scope + setting(self.SCOPE_VAR_NAME, [])
         return scope
 
-    def get_scope_argument(self):
+    def get_scope_argument(self) -> dict[str, str]:
         param = {}
         scope = self.get_scope()
         if scope:
             param[self.SCOPE_PARAMETER_NAME] = self.SCOPE_SEPARATOR.join(scope)
         return param
 
-    def user_data(self, access_token, *args, **kwargs):
+    def user_data(self, access_token: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         """Loads user data from service. Implement in subclass"""
         return {}
 
@@ -415,7 +458,7 @@ class BaseOAuth1(OAuthAuth):
     REQUEST_TOKEN_URL = ""
     ACCESS_TOKEN_URL = ""
 
-    def auth_url(self):
+    def auth_url(self) -> str:
         """Return redirect url"""
         token = self.unauthorized_token()
         name = self.AUTH_BACKEND.name + "unauthorized_token_name"
@@ -425,7 +468,7 @@ class BaseOAuth1(OAuthAuth):
         self.request.session.modified = True
         return self.oauth_authorization_request(token)
 
-    def auth_complete(self, *args, **kwargs):
+    def auth_complete(self, *args: Any, **kwargs: Any) -> RpcUser | None:
         """Return user, might be logged in"""
         # Multiple unauthorized tokens are supported (see #521)
         name = self.AUTH_BACKEND.name + "unauthorized_token_name"
@@ -454,16 +497,16 @@ class BaseOAuth1(OAuthAuth):
                 raise
         return self.do_auth(access_token, *args, **kwargs)
 
-    def do_auth(self, access_token, *args, **kwargs):
+    def do_auth(self, access_token: Any, *args: Any, **kwargs: Any) -> RpcUser | None:
         """Finish the auth process once the access_token was retrieved"""
         data = self.user_data(access_token)
         if data is not None:
             data["access_token"] = access_token.to_string()
 
         kwargs.update({"auth": self, "response": data, self.AUTH_BACKEND.name: True})
-        return authenticate(*args, **kwargs)
+        return cast("RpcUser | None", authenticate(*args, **kwargs))
 
-    def unauthorized_token(self):
+    def unauthorized_token(self) -> Any:
         """Return request for unauthorized token (first stage)"""
         params = self.request_token_extra_arguments()
         params.update(self.get_scope_argument())
@@ -475,7 +518,7 @@ class BaseOAuth1(OAuthAuth):
         )
         return response.content
 
-    def oauth_authorization_request(self, token):
+    def oauth_authorization_request(self, token: Any) -> str:
         """Generate OAuth request to authorize token."""
         if not isinstance(token, dict):
             token = parse_qs(token)
@@ -485,7 +528,7 @@ class BaseOAuth1(OAuthAuth):
         params["redirect_uri"] = self.redirect_uri
         return self.AUTHORIZATION_URL + "?" + urlencode(params)
 
-    def oauth_auth(self, token=None, oauth_verifier=None):
+    def oauth_auth(self, token: Any = None, oauth_verifier: str | None = None) -> OAuth1:
         key, secret = self.get_key_and_secret()
         oauth_verifier = oauth_verifier or self.data.get("oauth_verifier")
         token = token or {}
@@ -498,18 +541,24 @@ class BaseOAuth1(OAuthAuth):
             verifier=oauth_verifier,
         )
 
-    def oauth_request(self, token, url, extra_params=None, method="GET"):
+    def oauth_request(
+        self,
+        token: Any,
+        url: str,
+        extra_params: Mapping[str, Any] | None = None,
+        method: str = "GET",
+    ) -> Any:
         """Generate OAuth request, setups callback url"""
         return self.request(url, auth=self.oauth_auth(token))
 
-    def fetch_response(self, request):
+    def fetch_response(self, request: Any) -> str:
         """Executes request and fetches service response"""
         response = dsa_urlopen(request.to_url())
         return "\n".join(response.readlines())
 
-    def access_token(self, token):
+    def access_token(self, token: Any) -> Any:
         """Return request for access token value"""
-        return self.get_querystring(self.ACCESS_TOKEN_URL, auth=self.oauth_auth(token))
+        return self.request(self.ACCESS_TOKEN_URL, auth=self.oauth_auth(token))
 
 
 class BaseOAuth2(OAuthAuth):
@@ -523,27 +572,26 @@ class BaseOAuth2(OAuthAuth):
         ACCESS_TOKEN_URL        Token URL
     """
 
-    AUTHORIZATION_URL = None
-    ACCESS_TOKEN_URL = None
-    REFRESH_TOKEN_URL = None
-    REVOKE_TOKEN_URL = None
+    AUTHORIZATION_URL: str
+    ACCESS_TOKEN_URL: str
+    REVOKE_TOKEN_URL: str | None = None
     REVOKE_TOKEN_METHOD = "POST"
     RESPONSE_TYPE = "code"
     REDIRECT_STATE = True
     STATE_PARAMETER = True
 
-    def state_token(self):
+    def state_token(self) -> str:
         """Generate csrf token to include as state parameter."""
         return get_random_string(32)
 
-    def get_redirect_uri(self, state=None):
+    def get_redirect_uri(self, state: str | None = None) -> str:
         """Build redirect_uri with redirect_state parameter."""
         uri = self.redirect_uri
         if self.REDIRECT_STATE and state:
             uri = url_add_parameters(uri, {"redirect_state": state})
         return uri
 
-    def auth_params(self, state=None):
+    def auth_params(self, state: str | None = None) -> dict[str, Any]:
         client_id, client_secret = self.get_key_and_secret()
         params = {"client_id": client_id, "redirect_uri": self.get_redirect_uri(state)}
         if self.STATE_PARAMETER and state:
@@ -552,7 +600,7 @@ class BaseOAuth2(OAuthAuth):
             params["response_type"] = self.RESPONSE_TYPE
         return params
 
-    def auth_url(self):
+    def auth_url(self) -> str:
         """Return redirect url"""
         if self.STATE_PARAMETER or self.REDIRECT_STATE:
             # Store state in session for further request validation. The state
@@ -570,13 +618,32 @@ class BaseOAuth2(OAuthAuth):
         params.update(self.get_scope_argument())
         params.update(self.auth_extra_arguments())
 
-        if self.request.META.get("QUERY_STRING"):
-            query_string = "&" + self.request.META["QUERY_STRING"]
-        else:
-            query_string = ""
+        query_string = self._get_safe_query_string()
         return self.AUTHORIZATION_URL + "?" + urlencode(params) + query_string
 
-    def validate_state(self):
+    def _get_safe_query_string(self) -> str:
+        """
+        Returns filtered query string without client_id parameter.
+        """
+
+        query_string = self.request.META.get("QUERY_STRING", "")
+        if not query_string:
+            return ""
+
+        parsed_params = parse_qsl(query_string, keep_blank_values=True)
+        safe_params = []
+
+        for param_name, param_value in parsed_params:
+            # Remove client_id parameter
+            if param_name.lower() not in UNSAFE_QUERY_PARAMS:
+                safe_params.append((param_name, param_value))
+
+        if safe_params:
+            return "&" + urlencode(safe_params)
+        else:
+            return ""
+
+    def validate_state(self) -> str | None:
         """Validate state value. Raises exception on error, returns state
         value if valid."""
         if not self.STATE_PARAMETER and not self.REDIRECT_STATE:
@@ -592,12 +659,12 @@ class BaseOAuth2(OAuthAuth):
                 raise AuthStateForbidden(self)
         return state
 
-    def process_error(self, data):
+    def process_error(self, data: Mapping[str, Any]) -> None:
         error = data.get("error_description") or data.get("error")
         if error:
             raise AuthFailed(self, error)
 
-    def auth_complete_params(self, state=None):
+    def auth_complete_params(self, state: str | None = None) -> dict[str, Any]:
         client_id, client_secret = self.get_key_and_secret()
         return {
             "grant_type": "authorization_code",  # request auth code
@@ -608,10 +675,10 @@ class BaseOAuth2(OAuthAuth):
         }
 
     @classmethod
-    def auth_headers(cls):
+    def auth_headers(cls) -> dict[str, str]:
         return {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
 
-    def auth_complete(self, *args, **kwargs):
+    def auth_complete(self, *args: Any, **kwargs: Any) -> RpcUser | None:
         """Completes logging process, must return user instance"""
         self.process_error(self.data)
         params = self.auth_complete_params(self.validate_state())
@@ -636,7 +703,7 @@ class BaseOAuth2(OAuthAuth):
         return self.do_auth(response["access_token"], response=response, *args, **kwargs)
 
     @classmethod
-    def refresh_token_params(cls, token, provider):
+    def refresh_token_params(cls, token: str, provider: str) -> dict[str, str]:
         client_id, client_secret = cls.get_key_and_secret()
         return {
             "refresh_token": token,
@@ -646,63 +713,58 @@ class BaseOAuth2(OAuthAuth):
         }
 
     @classmethod
-    def refresh_token(cls, token, provider):
+    def refresh_token(cls, token: str, provider: str) -> Any:
         params = cls.refresh_token_params(token, provider)
-        response = requests.post(
-            cls.REFRESH_TOKEN_URL or cls.ACCESS_TOKEN_URL, data=params, headers=cls.auth_headers()
-        )
+        response = requests.post(cls.ACCESS_TOKEN_URL, data=params, headers=cls.auth_headers())
         response.raise_for_status()
         return response.json()
 
     @classmethod
-    def revoke_token_params(cls, token, uid):
+    def revoke_token_params(cls, token: str, uid: str) -> dict[str, str] | None:
         return None
 
     @classmethod
-    def revoke_token_headers(cls, token, uid):
+    def revoke_token_headers(cls, token: str, uid: str) -> dict[str, str] | None:
         return None
 
     @classmethod
-    def process_revoke_token_response(cls, response):
-        return response.code == 200
+    def process_revoke_token_response(cls, response: Any) -> bool:
+        return bool(response.code == 200)
 
     @classmethod
-    def revoke_token(cls, token, uid):
+    def revoke_token(cls, token: str, uid: str) -> bool | None:
         if not cls.REVOKE_TOKEN_URL:
-            return
+            return None
         url = cls.REVOKE_TOKEN_URL.format(token=token, uid=uid)
         params = cls.revoke_token_params(token, uid) or {}
         headers = cls.revoke_token_headers(token, uid) or {}
-        data = None
+        data: bytes | None = None
 
         if cls.REVOKE_TOKEN_METHOD == "GET":
             url = f"{url}?{urlencode(params)}"
         else:
-            data = urlencode(params)
+            data = urlencode(params).encode()
 
-        request = Request(url, data=data, headers=headers)
-        if cls.REVOKE_TOKEN_URL.lower() not in ("get", "post"):
-            # Patch get_method to return the needed method
-            request.get_method = lambda: cls.REVOKE_TOKEN_METHOD
+        request = Request(url, data=data, headers=headers, method=cls.REVOKE_TOKEN_METHOD)
         response = dsa_urlopen(request)
         return cls.process_revoke_token_response(response)
 
-    def do_auth(self, access_token, *args, **kwargs):
+    def do_auth(self, access_token: Any, *args: Any, **kwargs: Any) -> RpcUser | None:
         """Finish the auth process once the access_token was retrieved"""
         data = self.user_data(access_token, *args, **kwargs)
         response = kwargs.get("response") or {}
         response.update(data or {})
         kwargs.update({"auth": self, "response": response, self.AUTH_BACKEND.name: True})
-        return authenticate(*args, **kwargs)
+        return cast("RpcUser | None", authenticate(*args, **kwargs))
 
 
 # Cache for discovered backends.
-BACKENDSCACHE = {}
+BACKENDSCACHE: dict[str, type[BaseAuth]] = {}
 
 _import_lock = threading.Lock()
 
 
-def get_backends(force_load=False):
+def get_backends(force_load: bool = False) -> dict[str, type[BaseAuth]]:
     """
     Entry point to the BACKENDS cache. If BACKENDSCACHE hasn't been
     populated, each of the modules referenced in
@@ -721,8 +783,6 @@ def get_backends(force_load=False):
     A force_load boolean arg is also provided so that get_backend
     below can retry a requested backend that may not yet be discovered.
     """
-    global BACKENDSCACHE
-
     if not BACKENDSCACHE or force_load:
         with _import_lock:
             for auth_backend in setting("AUTHENTICATION_BACKENDS"):
@@ -738,7 +798,7 @@ def get_backends(force_load=False):
     return BACKENDSCACHE
 
 
-def get_backend(name, *args, **kwargs):
+def get_backend(name: str, *args: Any, **kwargs: Any) -> BaseAuth | None:
     get_backends()
 
     try:

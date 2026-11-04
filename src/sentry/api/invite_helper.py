@@ -1,212 +1,341 @@
-from urllib.parse import urlencode, parse_qsl
-from django.utils.crypto import constant_time_compare
-from django.core.urlresolvers import reverse
+from __future__ import annotations
 
-from sentry.utils import metrics
-from sentry.utils.audit import create_audit_entry
-from sentry.models import (
-    AuditLogEntryEvent,
-    Authenticator,
-    AuthIdentity,
-    AuthProvider,
-    OrganizationMember,
+import dataclasses
+from logging import Logger
+
+from django.contrib.auth.models import AnonymousUser
+from django.http.request import HttpRequest
+from django.utils.crypto import constant_time_compare
+
+from sentry import audit_log
+from sentry.auth.email import emails_match
+from sentry.models.authidentity import AuthIdentity
+from sentry.models.authprovider import AuthProvider
+from sentry.organizations.services.organization import (
+    RpcOrganizationMember,
+    RpcUserInviteContext,
+    organization_service,
 )
 from sentry.signals import member_joined
+from sentry.users.models.user import User
+from sentry.utils import metrics
+from sentry.utils.audit import create_audit_entry
 
-INVITE_COOKIE = "pending-invite"
-COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+
+def add_invite_details_to_session(
+    request: HttpRequest,
+    member_id: int,
+    token: str,
+    organization_id: int,
+) -> None:
+    """Add member ID and token to the request session"""
+    request.session["invite_token"] = token
+    request.session["invite_member_id"] = member_id
+    request.session["invite_organization_id"] = organization_id
 
 
-def add_invite_cookie(request, response, member_id, token):
-    url = reverse("sentry-accept-invite", args=[member_id, token])
-    response.set_cookie(
-        INVITE_COOKIE,
-        urlencode({"memberId": member_id, "token": token, "url": url}),
-        max_age=COOKIE_MAX_AGE,
+def remove_invite_details_from_session(request: HttpRequest) -> None:
+    """Deletes invite details from the request session"""
+    request.session.pop("invite_member_id", None)
+    request.session.pop("invite_token", None)
+    request.session.pop("invite_organization_id", None)
+
+
+@dataclasses.dataclass
+class InviteDetails:
+    invite_token: str | None
+    invite_member_id: int | None
+    invite_organization_id: int | None
+
+
+def get_invite_details(request: HttpRequest) -> InviteDetails:
+    return InviteDetails(
+        invite_token=request.session.get("invite_token", None),
+        invite_member_id=request.session.get("invite_member_id", None),
+        invite_organization_id=request.session.get("invite_organization_id"),
     )
-
-
-def remove_invite_cookie(request, response):
-    if INVITE_COOKIE in request.COOKIES:
-        response.delete_cookie(INVITE_COOKIE)
-
-
-def get_invite_cookie(request):
-    if INVITE_COOKIE not in request.COOKIES:
-        return None
-
-    # memberId should be coerced back to an integer
-    invite_data = dict(parse_qsl(request.COOKIES.get(INVITE_COOKIE)))
-    invite_data["memberId"] = int(invite_data["memberId"])
-
-    return invite_data
 
 
 class ApiInviteHelper:
     @classmethod
-    def from_cookie_or_email(cls, request, organization, email, instance=None, logger=None):
+    def from_session_or_email(
+        cls,
+        request: HttpRequest,
+        organization_id: int,
+        email: str,
+        logger: Logger | None = None,
+    ) -> ApiInviteHelper | None:
         """
         Initializes the ApiInviteHelper by locating the pending organization
-        member via the currently set pending invite cookie, or via the passed
-        email if no cookie is currently set.
+        member via the currently set pending invite details in the session, or
+        via the passed email if no cookie is currently set.
         """
-        pending_invite = get_invite_cookie(request)
+        invite_details = get_invite_details(request)
+        # Came from a different organization.
+        if (
+            invite_details.invite_organization_id is not None
+            and invite_details.invite_organization_id != organization_id
+        ):
+            invite_details = InviteDetails(None, None, None)
 
-        try:
-            if pending_invite is not None:
-                om = OrganizationMember.objects.get(
-                    id=pending_invite["memberId"], token=pending_invite["token"]
-                )
-            else:
-                om = OrganizationMember.objects.get(
-                    email=email, organization=organization, user=None
-                )
-        except OrganizationMember.DoesNotExist:
+        invite = None
+        if invite_details.invite_token and invite_details.invite_member_id:
+            invite = organization_service.get_invite_by_id(
+                organization_id=organization_id,
+                organization_member_id=invite_details.invite_member_id,
+                user_id=request.user.id,
+            )
+        else:
+            invite = organization_service.get_invite_by_id(
+                organization_id=organization_id, email=email, user_id=request.user.id
+            )
+        if invite is None:
             # Unable to locate the pending organization member. Cannot setup
             # the invite helper.
             return None
 
         return cls(
-            request=request, member_id=om.id, token=om.token, instance=instance, logger=logger
+            request=request,
+            invite_context=invite,
+            token=invite_details.invite_token,
+            logger=logger,
         )
 
     @classmethod
-    def from_cookie(cls, request, instance=None, logger=None):
-        org_invite = get_invite_cookie(request)
+    def from_session(
+        cls,
+        request: HttpRequest,
+        logger: Logger | None = None,
+    ) -> ApiInviteHelper | None:
+        invite_details = get_invite_details(request)
 
-        if not org_invite:
+        if not invite_details.invite_token or not invite_details.invite_member_id:
             return None
 
-        try:
-            return ApiInviteHelper(
-                request=request,
-                member_id=org_invite["memberId"],
-                token=org_invite["token"],
-                instance=instance,
-                logger=logger,
-            )
-        except OrganizationMember.DoesNotExist:
+        invite_context = organization_service.get_invite_by_id(
+            organization_member_id=invite_details.invite_member_id,
+            organization_id=invite_details.invite_organization_id,
+            user_id=request.user.id,
+        )
+        if invite_context is None:
             if logger:
-                logger.error("Invalid pending invite cookie", exc_info=True)
+                logger.exception("Invalid pending invite cookie")
             return None
 
-    def __init__(self, request, member_id, token, instance=None, logger=None):
-        self.request = request
-        self.member_id = member_id
-        self.token = token
-        self.instance = instance
-        self.logger = logger
-        self.om = self.organization_member
-
-    def handle_success(self):
-        member_joined.send_robust(
-            member=self.om,
-            organization=self.om.organization,
-            sender=self.instance if self.instance else self,
+        api_invite_helper = ApiInviteHelper(
+            request=request,
+            invite_context=invite_context,
+            token=invite_details.invite_token,
+            logger=logger,
         )
 
-    def handle_member_already_exists(self):
+        return api_invite_helper
+
+    def __init__(
+        self,
+        request: HttpRequest,
+        invite_context: RpcUserInviteContext,
+        token: str | None,
+        logger: Logger | None = None,
+    ) -> None:
+        self.request = request
+        self.token = token
+        self.logger = logger
+        self.invite_context = invite_context
+
+    def handle_member_already_exists(self) -> None:
         if self.logger:
             self.logger.info(
                 "Pending org invite not accepted - User already org member",
-                extra={"organization_id": self.om.organization.id, "user_id": self.request.user.id},
+                extra={
+                    "organization_id": self.invite_context.organization.id,
+                    "user_id": self.request.user.id,
+                },
             )
 
-    def handle_member_has_no_sso(self):
+    def handle_member_has_no_sso(self) -> None:
         if self.logger:
             self.logger.info(
                 "Pending org invite not accepted - User did not have SSO",
-                extra={"organization_id": self.om.organization.id, "user_id": self.request.user.id},
+                extra={
+                    "organization_id": self.invite_context.organization.id,
+                    "user_id": self.request.user.id,
+                },
             )
 
-    def handle_invite_not_approved(self):
+    def handle_invite_not_approved(self) -> None:
         if not self.invite_approved:
-            self.om.delete()
+            assert self.invite_context.member
+            member = self.invite_context.member
+            organization_service.delete_organization_member(
+                organization_member_id=member.id,
+                organization_id=self.invite_context.organization.id,
+            )
+            create_audit_entry(
+                self.request,
+                organization_id=self.invite_context.organization.id,
+                target_object=member.id,
+                event=audit_log.get_event_id("INVITE_REQUEST_REMOVE"),
+                data={"email": member.email},
+            )
 
     @property
-    def organization_member(self):
-        return OrganizationMember.objects.select_related("organization").get(pk=self.member_id)
+    def member_pending(self) -> bool:
+        assert self.invite_context.member
+        return self.invite_context.member.is_pending
 
     @property
-    def member_pending(self):
-        return self.om.is_pending
+    def invite_approved(self) -> bool:
+        assert self.invite_context.member
+        return self.invite_context.member.invite_approved
 
     @property
-    def invite_approved(self):
-        return self.om.invite_approved
-
-    @property
-    def valid_token(self):
+    def valid_token(self) -> bool:
         if self.token is None:
             return False
-        if self.om.token_expired:
+        assert self.invite_context.member
+        if self.invite_context.member.token_expired:
             return False
-        return constant_time_compare(self.om.token or self.om.legacy_token, self.token)
+        tokens_are_equal = constant_time_compare(
+            self.invite_context.member.token or self.invite_context.member.legacy_token,
+            self.token,
+        )
+        return tokens_are_equal
 
     @property
-    def user_authenticated(self):
-        return self.request.user.is_authenticated()
+    def invite_is_valid(self) -> bool:
+        return self.member_pending and self.invite_approved and self.valid_token
+
+    def is_valid_invite_for_email(self, email: str) -> bool:
+        member = self.invite_context.member
+        return (
+            member is not None
+            and bool(member.email)
+            and self.invite_is_valid
+            and emails_match(member.email, email)
+        )
 
     @property
-    def needs_2fa(self):
-        org_requires_2fa = self.om.organization.flags.require_2fa.is_set
-        user_has_2fa = Authenticator.objects.user_has_2fa(self.request.user.id)
-        return org_requires_2fa and not user_has_2fa
+    def user_authenticated(self) -> bool:
+        return self.request.user.is_authenticated
 
     @property
-    def member_already_exists(self):
+    def member_already_exists(self) -> bool:
         if not self.user_authenticated:
             return False
-
-        return OrganizationMember.objects.filter(
-            organization=self.om.organization, user=self.request.user
-        ).exists()
+        # Must match the authenticated request user — not merely "the resolved
+        # member has some user_id".
+        return self.invite_context.user_id == self.request.user.id
 
     @property
-    def valid_request(self):
+    def valid_request(self) -> bool:
         return (
             self.member_pending
             and self.invite_approved
             and self.valid_token
             and self.user_authenticated
-            and not self.needs_2fa
+            and not any(self.get_onboarding_steps().values())
         )
 
-    def accept_invite(self, user=None):
-        om = self.om
-
-        if user is None:
-            user = self.request.user
+    def accept_invite(self, user: User | AnonymousUser) -> RpcOrganizationMember | None:
+        member = self.invite_context.member
+        assert member
 
         if self.member_already_exists:
             self.handle_member_already_exists()
-            om.delete()
-            return
+            if self._valid_cleanup_target():
+                organization_service.delete_organization_member(
+                    organization_member_id=self.invite_context.invite_organization_member_id,
+                    organization_id=self.invite_context.organization.id,
+                )
+            return None
 
         try:
-            provider = AuthProvider.objects.get(organization=om.organization)
+            provider = AuthProvider.objects.get(organization_id=self.invite_context.organization.id)
         except AuthProvider.DoesNotExist:
             provider = None
 
         # If SSO is required, check for valid AuthIdentity
         if provider and not provider.flags.allow_unlinked:
             # AuthIdentity has a unique constraint on provider and user
-            if not AuthIdentity.objects.filter(auth_provider=provider, user=user).exists():
+            if not AuthIdentity.objects.filter(auth_provider=provider, user=user.id).exists():
                 self.handle_member_has_no_sso()
-                return
+                return None
 
-        om.set_user(user)
-        om.save()
+        new_om = organization_service.set_user_for_organization_member(
+            organization_member_id=member.id,
+            user_id=user.id,
+            organization_id=self.invite_context.organization.id,
+        )
+        if new_om:
+            self.invite_context.member = member = new_om
 
         create_audit_entry(
             self.request,
             actor=user,
-            organization=om.organization,
-            target_object=om.id,
-            target_user=user,
-            event=AuditLogEntryEvent.MEMBER_ACCEPT,
-            data=om.get_audit_log_data(),
+            organization_id=self.invite_context.organization.id,
+            target_object=member.id,
+            target_user_id=user.id,
+            event=audit_log.get_event_id("MEMBER_ACCEPT"),
+            data=member.get_audit_log_metadata(),
         )
 
-        self.handle_success()
         metrics.incr("organization.invite-accepted", sample_rate=1.0)
+        organization_service.schedule_signal(
+            member_joined,
+            organization_id=member.organization_id,
+            args=dict(
+                user_id=member.user_id,
+                organization_member_id=member.id,
+            ),
+        )
+
+        return member
+
+    def _valid_cleanup_target(self) -> bool:
+        """
+        Authorize the stale-invite cleanup-delete branch of ``accept_invite``.
+
+        When the authenticated user is already a member of the org, the helper
+        may delete the OrganizationMember referenced by the URL (a stale
+        pending invite). To prevent a logged-in user from using this path to
+        delete arbitrary members, require that the caller holds a token
+        matching that specific pending invite.
+
+        ``self.invite_context.member`` is the current user's own OM in this
+        branch — not the invite — so we re-fetch the OM at
+        ``invite_organization_member_id`` (no user_id scoping) to read the
+        invite's own token.
+        """
+        if self.token is None:
+            return False
+        invite_om_id = self.invite_context.invite_organization_member_id
+        if invite_om_id is None:
+            return False
+
+        invite_context = organization_service.get_invite_by_id(
+            organization_id=self.invite_context.organization.id,
+            organization_member_id=invite_om_id,
+        )
+        if invite_context is None or invite_context.member is None:
+            return False
+        invite_om = invite_context.member
+        if not invite_om.is_pending or invite_om.token_expired:
+            return False
+        return constant_time_compare(
+            invite_om.token or invite_om.legacy_token,
+            self.token,
+        )
+
+    def _needs_2fa(self) -> bool:
+        org_requires_2fa = self.invite_context.organization.flags.require_2fa
+        return org_requires_2fa and (
+            not self.request.user.is_authenticated or not self.request.user.has_2fa()
+        )
+
+    def get_onboarding_steps(self) -> dict[str, bool]:
+        return {
+            "needs2fa": self._needs_2fa(),
+            # needs email verification is being removed
+            "needsEmailVerification": False,
+        }

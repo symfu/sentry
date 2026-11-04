@@ -1,0 +1,375 @@
+import {Fragment, useState} from 'react';
+import {useTheme} from '@emotion/react';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+import {IconOpen} from '@sentry/icons/open';
+import {useQuery} from '@tanstack/react-query';
+import type {LocationDescriptor} from 'history';
+
+import {Button} from '@sentry/scraps/button';
+import {DropdownMenu} from '@sentry/scraps/dropdownMenu';
+import {Container, Flex} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Pagination} from '@sentry/scraps/pagination';
+import {RevealOnHover} from '@sentry/scraps/revealOnHover';
+import {Text} from '@sentry/scraps/text';
+
+import {
+  issueTagValuesApiOptions,
+  fetchIssueTagApiOptions,
+} from 'sentry/actionCreators/group';
+import {openNavigateToExternalLinkModal} from 'sentry/actionCreators/modal';
+import {DeviceName} from 'sentry/components/deviceName';
+import {getContextIcon} from 'sentry/components/events/contexts/utils';
+import {extractSelectionParameters} from 'sentry/components/pageFilters/parse';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {TimeSince} from 'sentry/components/timeSince';
+import {t, tct} from 'sentry/locale';
+import type {Group, Tag, TagValue} from 'sentry/types/group';
+import {escapeDoubleQuotes, percent} from 'sentry/utils';
+import {selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
+import {SavedQueryDatasets} from 'sentry/utils/discover/types';
+import {escapeIssueTagKey, generateQueryWithTag} from 'sentry/utils/queryString';
+import {isValidUrl} from 'sentry/utils/string/isValidUrl';
+import {useCopyToClipboard} from 'sentry/utils/useCopyToClipboard';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useParams} from 'sentry/utils/useParams';
+import {hasDatasetSelector} from 'sentry/views/dashboards/utils';
+import {TagBar} from 'sentry/views/issueDetails/groupTags/tagDistribution';
+import {useIssueDetailsEventView} from 'sentry/views/issueDetails/hooks/useIssueDetailsDiscoverQuery';
+import {getUserTagValue} from 'sentry/views/issueDetails/utils';
+
+import {TagDetailsTable, type TagSort} from './tagDetailsTable';
+
+const DEFAULT_SORT: TagSort = 'count';
+
+// Rows treat a null value (e.g. events without a user) the same as '' and render
+// it as "(empty)".
+type TagValueRow = TagValue & {value: string};
+
+export function TagDetailsDrawerContent({group}: {group: Group}) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const organization = useOrganization();
+  const {tagKey} = useParams<{tagKey: string}>();
+
+  const sort = (location.query.tagDrawerSort as TagSort | undefined) ?? DEFAULT_SORT;
+
+  const {
+    data: tagValuesResponse,
+    isError: tagValuesIsError,
+    isPending: tagValuesIsPending,
+  } = useQuery({
+    ...issueTagValuesApiOptions({
+      organization,
+      groupId: group.id,
+      tagKey,
+      sort,
+      cursor: location.query.tagDrawerCursor as string | undefined,
+    }),
+    select: selectJsonWithHeaders,
+  });
+  const tagValues = tagValuesResponse?.json.map((tv): TagValueRow => ({
+    ...tv,
+    value: tv.value ?? '',
+  }));
+
+  const {
+    data: tag,
+    isError: tagIsError,
+    isPending: tagIsPending,
+  } = useQuery(fetchIssueTagApiOptions({organization, groupId: group.id, tagKey}));
+
+  const isError = tagValuesIsError || tagIsError;
+  const isPending = tagValuesIsPending || tagIsPending;
+
+  const {cursor: _cursor, page: _page, ...currentQuery} = location.query;
+  const paginationCaption = tct('[count] results', {
+    count: (tag?.uniqueValues ?? 0).toLocaleString(),
+  });
+
+  const getSortLocation = (newSort: TagSort) => ({
+    pathname: location.pathname,
+    query: {
+      ...currentQuery,
+      tagDrawerCursor: undefined,
+      tagDrawerSort: newSort,
+    },
+  });
+
+  return (
+    <Fragment>
+      <Container flexShrink={0}>
+        <TagDetailsTable sort={sort} getSortLocation={getSortLocation}>
+          {isPending ? (
+            <SimpleTable.Loading />
+          ) : isError ? (
+            <SimpleTable.Error message={t('There was an error loading tag details')} />
+          ) : tag && tagValues?.length ? (
+            tagValues.map((tv, i) => (
+              <TagDetailsRow
+                key={`${tv.value}-${i}`}
+                group={group}
+                tag={tag}
+                tagValue={tv}
+              />
+            ))
+          ) : (
+            <SimpleTable.Empty>{t('No tag values found')}</SimpleTable.Empty>
+          )}
+        </TagDetailsTable>
+      </Container>
+      {isPending || isError ? null : (
+        <Pagination
+          caption={paginationCaption}
+          onCursor={(cursor, path, query) =>
+            navigate({
+              pathname: path,
+              query: {
+                ...query,
+                tagDrawerCursor: cursor,
+              },
+            })
+          }
+          size="xs"
+          pageLinks={tagValuesResponse?.headers.Link}
+        />
+      )}
+    </Fragment>
+  );
+}
+
+function TagDetailsRow({
+  group,
+  tag,
+  tagValue,
+}: {
+  group: Group;
+  tag: Tag;
+  tagValue: TagValueRow;
+}) {
+  const organization = useOrganization();
+  const location = useLocation();
+
+  const key = tagValue.key ?? tag.key;
+  const query =
+    key === 'environment'
+      ? {
+          environment: tagValue.value,
+          query: undefined,
+        }
+      : {
+          query:
+            tagValue.query ||
+            `${escapeIssueTagKey(key)}:"${escapeDoubleQuotes(tagValue.value)}"`,
+        };
+
+  const allEventsLocation = {
+    pathname: `/organizations/${organization.slug}/issues/${group.id}/events/recommended/`,
+    query: {
+      ...location.query,
+      ...query,
+    },
+  };
+  const percentage = Math.round(percent(tagValue.count ?? 0, tag.totalValues ?? 0));
+  // Ensure no item shows 100% when there are multiple tag values
+  const hasMultipleItems = (tag.uniqueValues ?? 0) > 1;
+  const cappedPercentage = hasMultipleItems && percentage >= 100 ? 99 : percentage;
+  const displayPercentage =
+    cappedPercentage < 1
+      ? '<1%'
+      : hasMultipleItems && percentage >= 100
+        ? '>99%'
+        : `${cappedPercentage.toFixed(0)}%`;
+
+  return (
+    <RevealOnHover>
+      {props => (
+        <SimpleTable.Row {...props} data-test-id="group-tag-value">
+          <SimpleTable.RowCell>
+            <TagDetailsValue
+              valueLocation={allEventsLocation}
+              tagKey={key}
+              tagValue={tagValue}
+            />
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <Text ellipsis variant="inherit">
+              {textProps => <TimeSince {...textProps} date={tagValue.lastSeen} />}
+            </Text>
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell justify="end">
+            {tagValue.count.toLocaleString()}
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell justify="end" gap="md">
+            {displayPercentage}
+            {tag.totalValues ? (
+              <Container width="45px">
+                <TagBar percentage={percentage} />
+              </Container>
+            ) : (
+              '--'
+            )}
+          </SimpleTable.RowCell>
+          <SimpleTable.RowCell>
+            <TagValueActionsMenu group={group} tag={tag} tagValue={tagValue} />
+          </SimpleTable.RowCell>
+        </SimpleTable.Row>
+      )}
+    </RevealOnHover>
+  );
+}
+
+function TagDetailsValue({
+  valueLocation,
+  tagKey,
+  tagValue,
+}: {
+  tagKey: string;
+  tagValue: TagValueRow;
+  valueLocation: LocationDescriptor;
+}) {
+  const theme = useTheme();
+  const userValues = getUserTagValue(tagValue);
+  const value =
+    tagValue.value === '' ? <Text variant="muted">{t('(empty)')}</Text> : tagValue.value;
+  let valueComponent: React.ReactNode = value;
+  if (tagValue.value !== '') {
+    if (tagKey === 'user') {
+      valueComponent = (
+        <Flex align="center" gap="sm" minWidth={0} overflow="hidden">
+          {getContextIcon({
+            alias: 'user',
+            type: 'user',
+            value: tagValue,
+            contextIconProps: {
+              size: 'md',
+            },
+            theme,
+          })}
+          <Flex wrap="wrap" gap="xs" minWidth={0}>
+            <Text>{userValues.title}</Text>
+            {userValues.subtitle && <Text variant="muted">{userValues.subtitle}</Text>}
+          </Flex>
+        </Flex>
+      );
+    } else if (tagKey === 'device') {
+      valueComponent = <DeviceName value={tagValue.value} />;
+    }
+  }
+
+  return (
+    <Flex gap="xs" align="center" minWidth={0} overflow="hidden">
+      <Container minWidth={0} overflow="hidden">
+        {layoutProps => (
+          <Text variant="primary">
+            {textProps => (
+              <Link
+                className={`${layoutProps.className} ${textProps.className}`}
+                to={valueLocation}
+              >
+                {valueComponent}
+              </Link>
+            )}
+          </Text>
+        )}
+      </Container>
+      {isValidUrl(tagValue.value) && (
+        <Text variant="muted">
+          {props => (
+            <Button
+              {...props}
+              variant="link"
+              icon={<IconOpen />}
+              aria-label="Open link"
+              data-test-id="group-tag-url"
+              size="xs"
+              onClick={() => openNavigateToExternalLinkModal({linkText: tagValue.value})}
+            />
+          )}
+        </Text>
+      )}
+    </Flex>
+  );
+}
+
+function TagValueActionsMenu({
+  group,
+  tag,
+  tagValue,
+}: {
+  group: Group;
+  tag: Tag;
+  tagValue: TagValueRow;
+}) {
+  const organization = useOrganization();
+  const location = useLocation();
+  const {copy} = useCopyToClipboard();
+
+  const referrer = 'tag-details-drawer';
+  const key = escapeIssueTagKey(tagValue.key ?? tag.key);
+  const query = tagValue.query
+    ? {
+        query: tagValue.query,
+      }
+    : generateQueryWithTag({referrer}, {key, value: tagValue.value});
+  const globalSelectionParams = extractSelectionParameters(location.query);
+  const eventView = useIssueDetailsEventView({group, queryProps: query});
+  const [isVisible, setIsVisible] = useState(false);
+
+  return (
+    <RevealOnHover.Action visible={isVisible}>
+      <DropdownMenu
+        size="xs"
+        strategy="fixed"
+        onOpenChange={isOpen => setIsVisible(isOpen)}
+        trigger={triggerProps => (
+          <OverlayTrigger.IconButton
+            {...triggerProps}
+            aria-label={t('Tag Value Actions Menu')}
+            icon={<IconEllipsis />}
+          />
+        )}
+        items={[
+          {
+            key: 'open-in-discover',
+            label: t('Open in Explore'),
+            to: eventView.getResultsViewUrlTarget(
+              organization,
+              false,
+              hasDatasetSelector(organization) ? SavedQueryDatasets.ERRORS : undefined
+            ),
+            hidden: !group || !organization.features.includes('discover-basic'),
+          },
+          {
+            key: 'view-events',
+            label: t('View other events with this tag value'),
+            to: {
+              pathname: `/organizations/${organization.slug}/issues/${group.id}/events/`,
+              query: {...globalSelectionParams, ...query},
+            },
+          },
+          {
+            key: 'view-issues',
+            label: t('Search issues with this tag value'),
+            to: {
+              pathname: `/organizations/${organization.slug}/issues/`,
+              query: {...globalSelectionParams, ...query},
+            },
+          },
+          {
+            key: 'copy-value',
+            label: t('Copy tag value to clipboard'),
+            onAction: () =>
+              copy(tagValue.value, {
+                successMessage: t('Copied tag value to clipboard'),
+              }),
+            hidden: tagValue.value === '',
+          },
+        ]}
+      />
+    </RevealOnHover.Action>
+  );
+}

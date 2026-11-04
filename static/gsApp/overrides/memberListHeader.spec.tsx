@@ -1,0 +1,91 @@
+import {MemberFixture} from 'sentry-fixture/member';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+
+import {BillingConfigFixture} from 'getsentry-test/fixtures/billingConfig';
+import {SubscriptionFixture} from 'getsentry-test/fixtures/subscription';
+import {PlanTier} from 'getsentry-test/planTier';
+import {act, render, screen} from 'sentry-test/reactTestingLibrary';
+
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+
+import MemberListHeader from 'getsentry/overrides/memberListHeader';
+import {SubscriptionStore} from 'getsentry/stores/subscriptionStore';
+
+describe('MemberListHeader', () => {
+  const organization = OrganizationFixture();
+
+  const disabledMember = MemberFixture({
+    flags: {
+      'idp:provisioned': false,
+      'idp:role-restricted': false,
+      'member-limit:restricted': true,
+      'sso:invalid': false,
+      'sso:linked': false,
+      'partnership:restricted': false,
+    },
+  });
+  const enabledMember = MemberFixture({});
+  const sub = SubscriptionFixture({
+    organization,
+    canTrial: false,
+    plan: 'am1_f',
+  });
+
+  beforeEach(() => {
+    SubscriptionStore.set(organization.slug, sub);
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/billing-config/`,
+      query: {tier: 'upsell'},
+      body: BillingConfigFixture(PlanTier.AM2),
+    });
+  });
+
+  it('does not render a loading indicator while waiting for the subscription', async () => {
+    SubscriptionStore.init();
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/`,
+      body: sub,
+    });
+
+    render(
+      <MemberListHeader
+        organization={organization}
+        members={[disabledMember, enabledMember]}
+      />,
+      {additionalWrapper: SimpleTable}
+    );
+
+    expect(screen.queryByTestId('loading-indicator')).not.toBeInTheDocument();
+    expect(
+      await screen.findByText('Multiple members requires Team Plan or above')
+    ).toBeInTheDocument();
+  });
+
+  it('show upgrade if disabled member', async () => {
+    const members = [disabledMember, enabledMember];
+
+    render(<MemberListHeader organization={organization} members={members} />, {
+      additionalWrapper: SimpleTable,
+    });
+
+    expect(
+      await screen.findByText('Multiple members requires Team Plan or above')
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId('member-settings-table-header-upsell-button')
+    ).toBeInTheDocument();
+  });
+
+  it('do not show upgrade if no disabled member', async () => {
+    const members = [enabledMember];
+
+    render(<MemberListHeader organization={organization} members={members} />, {
+      additionalWrapper: SimpleTable,
+    });
+
+    await act(tick);
+    expect(
+      screen.queryByTestId('member-settings-table-header-upsell-button')
+    ).not.toBeInTheDocument();
+  });
+});

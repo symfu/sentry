@@ -1,0 +1,52 @@
+import styled from '@emotion/styled';
+
+import * as Timeline from 'sentry/components/replays/breadcrumbs/timeline';
+import {countColumns} from 'sentry/components/replays/utils';
+
+type LineStyle = 'dotted' | 'solid' | 'none';
+
+const DarkerLine = styled(Timeline.Col)<{lineStyle: LineStyle}>`
+  border-right: 1px ${p => p.lineStyle}
+    ${p => p.theme.tokens.border.transparent.neutral.muted};
+  text-align: right;
+  line-height: 14px;
+`;
+
+function Gridlines({
+  children,
+  cols,
+  lineStyle,
+  remaining,
+}: {
+  cols: number;
+  lineStyle: LineStyle;
+  remaining: number;
+  children?: (i: number) => React.ReactNode;
+}) {
+  return (
+    <Timeline.Columns totalColumns={cols} remainder={remaining}>
+      {Array.from(Array.from({length: cols}), (_, i) => (
+        <DarkerLine key={i} lineStyle={lineStyle}>
+          {children ? children(i) : null}
+        </DarkerLine>
+      ))}
+    </Timeline.Columns>
+  );
+}
+
+type Props = {
+  durationMs: number;
+  width: number;
+};
+
+export function MajorGridlines({durationMs, width}: Props) {
+  const {cols, remaining} = countColumns(durationMs, width);
+
+  return <Gridlines cols={cols} lineStyle="solid" remaining={remaining} />;
+}
+
+export function MinorGridlines({durationMs, width}: Props) {
+  const {cols, remaining} = countColumns(durationMs, width, 20);
+
+  return <Gridlines cols={cols} lineStyle="dotted" remaining={remaining} />;
+}

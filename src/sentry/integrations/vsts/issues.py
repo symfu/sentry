@@ -1,44 +1,108 @@
+from __future__ import annotations
+
+import re
+from abc import ABC
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, NoReturn, cast
+from urllib.parse import ParseResult
+
+from django.urls import reverse
+from django.utils.translation import gettext as _
 from mistune import markdown
 
-from collections import OrderedDict
-from django.core.urlresolvers import reverse
-from django.utils.translation import ugettext as _
+from sentry import options
+from sentry.auth.principal import RequestPrincipal
+from sentry.constants import ObjectStatus
+from sentry.integrations.mixins import ResolveSyncAction
+from sentry.integrations.mixins.issues import IntegrationSyncTargetNotFound, IssueSyncIntegration
+from sentry.integrations.services.integration import integration_service
+from sentry.integrations.source_code_management.issues import SourceCodeIssueIntegration
+from sentry.integrations.types import IntegrationIssueConfigField, IntegrationProviderSlug
+from sentry.integrations.utils.issue_url import get_url_origin, parse_issue_url
+from sentry.models.activity import Activity
+from sentry.shared_integrations.exceptions import (
+    ApiError,
+    ApiUnauthorized,
+    IntegrationConfigurationError,
+    IntegrationError,
+    IntegrationFormError,
+)
+from sentry.silo.base import all_silo_function
+from sentry.users.models.identity import Identity
+from sentry.users.services.user import RpcUser
+from sentry.users.services.user.service import user_service
 
-from sentry.models import IntegrationExternalProject, OrganizationIntegration, User
-from sentry.integrations.issues import IssueSyncMixin
-from sentry.shared_integrations.exceptions import ApiUnauthorized, ApiError
+if TYPE_CHECKING:
+    from sentry.integrations.models.external_issue import ExternalIssue
+    from sentry.models.group import Group
+
+# Specific substring to identify Azure Entra ID "identity deleted" errors
+# Example: According to Microsoft Entra, your Identity xxx is currently Deleted within the following Microsoft Entra tenant: xxx Please contact your Microsoft Entra administrator to resolve this.
+VSTS_IDENTITY_DELETED_ERROR_SUBSTRING = [
+    "is currently Deleted within the following Microsoft Entra tenant"
+]
+
+VSTS_ISSUE_TITLE_MAX_LENGTH = 128
+
+# Represents error codes caused by misconfiguration when creating a ticket
+# Example: Error Communicating with Azure DevOps (HTTP 400): TF401320: Rule Error for field xxx. Error code: Required, HasValues, LimitedToValues, AllowsOldValue, InvalidEmpty.
+VSTS_INTEGRATION_FORM_ERROR_CODES_SUBSTRINGS = ["TF401320"]
 
 
-class VstsIssueSync(IssueSyncMixin):
+class VstsIssuesSpec(IssueSyncIntegration, SourceCodeIssueIntegration, ABC):
     description = "Integrate Azure DevOps work items by linking a project."
-    slug = "vsts"
+    slug = IntegrationProviderSlug.AZURE_DEVOPS.value
     conf_key = slug
 
     issue_fields = frozenset(["id", "title", "url"])
     done_categories = frozenset(["Resolved", "Completed", "Closed"])
 
-    def get_persisted_default_config_fields(self):
+    @property
+    def instance(self) -> str:
+        raise NotImplementedError
+
+    def get_persisted_default_config_fields(self) -> Sequence[str]:
         return ["project", "work_item_type"]
 
-    def create_default_repo_choice(self, default_repo):
+    def create_default_repo_choice(self, default_repo: str) -> tuple[str, str]:
         # default_repo should be the project_id
-        project = self.get_client().get_project(self.instance, default_repo)
+        project = self.get_client().get_project(default_repo)
         return (project["id"], project["name"])
 
-    def get_project_choices(self, group=None, **kwargs):
+    def raise_error(self, exc: Exception, identity: Identity | None = None) -> NoReturn:
+        # Reraise Azure Specific Errors correctly
+        if isinstance(exc, ApiError) and any(
+            substring in str(exc) for substring in VSTS_IDENTITY_DELETED_ERROR_SUBSTRING
+        ):
+            raise ApiUnauthorized(text=str(exc))
+        elif isinstance(exc, ApiError) and any(
+            substring in str(exc) for substring in VSTS_INTEGRATION_FORM_ERROR_CODES_SUBSTRINGS
+        ):
+            # Parse the field name from the error message
+            # Example: TF401320: Rule Error for field Empowered Team. Error code: Required, HasValues, LimitedToValues, AllowsOldValue, InvalidEmpty.
+            try:
+                field_name = str(exc).split("Error for field ")[1].split(".")[0]
+                raise IntegrationFormError(field_errors={field_name: f"{field_name} is required."})
+            except IndexError:
+                raise IntegrationFormError()
+        raise super().raise_error(exc, identity)
+
+    def get_project_choices(
+        self, group: Group | None = None, **kwargs: Any
+    ) -> tuple[str | None, Sequence[tuple[str, str]]]:
         client = self.get_client()
         try:
-            projects = client.get_projects(self.instance)
+            projects = client.get_projects()
         except (ApiError, ApiUnauthorized, KeyError) as e:
             self.raise_error(e)
 
         project_choices = [(project["id"], project["name"]) for project in projects]
 
         params = kwargs.get("params", {})
+        project = kwargs.get("project")
         if group:
             default_project_id = group.project_id
-        elif kwargs.get("project"):
-            project = kwargs.get("project")
+        elif project:
             default_project_id = project.id
         else:
             default_project_id = projects[0]["id"]
@@ -63,15 +127,16 @@ class VstsIssueSync(IssueSyncMixin):
 
         return default_project, project_choices
 
-    def get_work_item_choices(self, project, group=None):
+    def get_work_item_choices(
+        self, project: str, group: Group | None = None
+    ) -> tuple[str | None, Sequence[tuple[str, str]]]:
         client = self.get_client()
         try:
-            item_categories = client.get_work_item_categories(self.instance, project)["value"]
+            item_categories = client.get_work_item_categories(project)["value"]
         except (ApiError, ApiUnauthorized, KeyError) as e:
             self.raise_error(e)
 
-        # we want to maintain ordering of the items
-        item_type_map = OrderedDict()
+        item_type_map = {}
         for item in item_categories:
             for item_type_object in item["workItemTypes"]:
                 # the type is the last part of the url
@@ -93,10 +158,10 @@ class VstsIssueSync(IssueSyncMixin):
 
         return default_item_type, item_tuples
 
-    def get_create_issue_config_no_group(self, project):
-        return self.get_create_issue_config(None, None, project=project)
-
-    def get_create_issue_config(self, group, user, **kwargs):
+    @all_silo_function
+    def get_create_issue_config(
+        self, group: Group | None, user: RequestPrincipal, **kwargs: object
+    ) -> list[IntegrationIssueConfigField]:
         kwargs["link_referrer"] = "vsts_integration"
         fields = []
         if group:
@@ -105,8 +170,8 @@ class VstsIssueSync(IssueSyncMixin):
             # Workitems (issues) are associated with the project not the repository.
         default_project, project_choices = self.get_project_choices(group, **kwargs)
 
-        work_item_choices = []
-        default_work_item = None
+        work_item_choices: Sequence[tuple[str, str]] = []
+        default_work_item: str | None = None
         if default_project:
             default_work_item, work_item_choices = self.get_work_item_choices(
                 default_project, group
@@ -132,9 +197,12 @@ class VstsIssueSync(IssueSyncMixin):
                 "label": _("Work Item Type"),
                 "placeholder": _("Bug"),
             },
-        ] + fields
+            *fields,
+        ]
 
-    def get_link_issue_config(self, group, **kwargs):
+    def get_link_issue_config(
+        self, group: Group, **kwargs: Any
+    ) -> list[IntegrationIssueConfigField]:
         fields = super().get_link_issue_config(group, **kwargs)
         org = group.organization
         autocomplete_url = reverse("sentry-extensions-vsts-search", args=[org.slug, self.model.id])
@@ -144,16 +212,16 @@ class VstsIssueSync(IssueSyncMixin):
                 field["type"] = "select"
         return fields
 
-    def get_issue_url(self, key, **kwargs):
+    def get_issue_url(self, key: str) -> str:
         return f"{self.instance}_workitems/edit/{key}"
 
-    def create_issue(self, data, **kwargs):
+    def create_issue(self, data: Mapping[str, str], **kwargs: Any) -> Mapping[str, Any]:
         """
         Creates the issue on the remote service and returns an issue ID.
         """
         project_id = data.get("project")
         if project_id is None:
-            raise ValueError("Azure DevOps expects project")
+            raise IntegrationFormError({"project": "Project is required."})
 
         client = self.get_client()
 
@@ -161,9 +229,11 @@ class VstsIssueSync(IssueSyncMixin):
         description = data["description"]
         item_type = data["work_item_type"]
 
+        if len(title) > VSTS_ISSUE_TITLE_MAX_LENGTH:
+            title = title[: VSTS_ISSUE_TITLE_MAX_LENGTH - 3] + "..."
+
         try:
             created_item = client.create_work_item(
-                instance=self.instance,
                 project=project_id,
                 item_type=item_type,
                 title=title,
@@ -182,9 +252,40 @@ class VstsIssueSync(IssueSyncMixin):
             "metadata": {"display_name": "{}#{}".format(project_name, created_item["id"])},
         }
 
-    def get_issue(self, issue_id, **kwargs):
+    def get_issue_link_data(self, url: str) -> dict[str, str]:
+        parsed = parse_issue_url(url)
+        base = parse_issue_url(self.instance)
+
+        def account_and_path(parsed_url: ParseResult) -> tuple[str | None, str]:
+            if parsed_url.hostname == "dev.azure.com":
+                account, _, path = parsed_url.path.lstrip("/").partition("/")
+                return account.casefold(), f"/{path}"
+            if parsed_url.hostname and parsed_url.hostname.endswith(".visualstudio.com"):
+                return parsed_url.hostname.removesuffix(".visualstudio.com"), parsed_url.path
+            return None, parsed_url.path
+
+        account, path = account_and_path(parsed)
+        installed_account, _ = account_and_path(base)
+        match = re.fullmatch(r"/(?:[^/]+/)?_workitems/edit/(\d+)", path)
+        origin = get_url_origin(parsed)
+        base_origin = get_url_origin(base)
+        if (
+            not account
+            or account != installed_account
+            or origin is None
+            or base_origin is None
+            or origin[0] != base_origin[0]
+            or origin[2] != base_origin[2]
+            or not match
+        ):
+            raise IntegrationFormError(
+                {"externalIssue": "Issue URL does not belong to this installation"}
+            )
+        return {"externalIssue": match[1]}
+
+    def get_issue(self, issue_id: str | int, **kwargs: Any) -> Mapping[str, Any]:
         client = self.get_client()
-        work_item = client.get_work_item(self.instance, issue_id)
+        work_item = client.get_work_item(issue_id)
         return {
             "key": str(work_item["id"]),
             "title": work_item["fields"]["System.Title"],
@@ -196,12 +297,18 @@ class VstsIssueSync(IssueSyncMixin):
             },
         }
 
-    def sync_assignee_outbound(self, external_issue, user, assign=True, **kwargs):
+    def sync_assignee_outbound(
+        self,
+        external_issue: ExternalIssue,
+        user: RpcUser | None,
+        assign: bool = True,
+        **kwargs: Any,
+    ) -> None:
         client = self.get_client()
         assignee = None
 
-        if assign is True:
-            sentry_emails = [email.email.lower() for email in user.get_verified_emails()]
+        if user and assign is True:
+            sentry_emails = [email.lower() for email in user.emails]
             continuation_token = None
             while True:
                 vsts_users = client.get_users(self.model.name, continuation_token)
@@ -225,29 +332,42 @@ class VstsIssueSync(IssueSyncMixin):
                         "issue_key": external_issue.key,
                     },
                 )
-                return
+                raise IntegrationSyncTargetNotFound("No matching VSTS user found.")
 
         try:
-            client.update_work_item(self.instance, external_issue.key, assigned_to=assignee)
-        except (ApiUnauthorized, ApiError):
+            client.update_work_item(external_issue.key, assigned_to=assignee)
+        except (ApiUnauthorized, ApiError) as e:
             self.logger.info(
                 "vsts.failed-to-assign",
                 extra={
                     "integration_id": external_issue.integration_id,
-                    "user_id": user.id,
+                    "user_id": user.id if user else None,
                     "issue_key": external_issue.key,
                 },
             )
+            if isinstance(e, ApiUnauthorized):
+                raise IntegrationConfigurationError(
+                    "Insufficient permissions to assign user to the VSTS issue."
+                ) from e
+            raise IntegrationError("There was an error assigning the issue.") from e
+        except Exception as e:
+            self.raise_error(e)
 
-    def sync_status_outbound(self, external_issue, is_resolved, project_id, **kwargs):
+    def sync_status_outbound(
+        self, external_issue: ExternalIssue, is_resolved: bool, project_id: int
+    ) -> None:
         client = self.get_client()
-        work_item = client.get_work_item(self.instance, external_issue.key)
+        try:
+            work_item = client.get_work_item(external_issue.key)
+        except Exception as e:
+            self.raise_error(e)
+
         # For some reason, vsts doesn't include the project id
         # in the work item response.
         # TODO(jess): figure out if there's a better way to do this
         vsts_project_name = work_item["fields"]["System.TeamProject"]
 
-        vsts_projects = client.get_projects(self.instance)
+        vsts_projects = client.get_projects()
 
         vsts_project_id = None
         for p in vsts_projects:
@@ -255,15 +375,12 @@ class VstsIssueSync(IssueSyncMixin):
                 vsts_project_id = p["id"]
                 break
 
-        try:
-            external_project = IntegrationExternalProject.objects.get(
-                external_id=vsts_project_id,
-                organization_integration_id__in=OrganizationIntegration.objects.filter(
-                    organization_id=external_issue.organization_id,
-                    integration_id=external_issue.integration_id,
-                ),
-            )
-        except IntegrationExternalProject.DoesNotExist:
+        integration_external_project = integration_service.get_integration_external_project(
+            organization_id=external_issue.organization_id,
+            integration_id=external_issue.integration_id,
+            external_id=vsts_project_id,
+        )
+        if integration_external_project is None:
             self.logger.info(
                 "vsts.external-project-not-found",
                 extra={
@@ -275,12 +392,14 @@ class VstsIssueSync(IssueSyncMixin):
             return
 
         status = (
-            external_project.resolved_status if is_resolved else external_project.unresolved_status
+            integration_external_project.resolved_status
+            if is_resolved
+            else integration_external_project.unresolved_status
         )
 
         try:
-            client.update_work_item(self.instance, external_issue.key, state=status)
-        except (ApiUnauthorized, ApiError) as error:
+            client.update_work_item(external_issue.key, state=status)
+        except ApiUnauthorized as error:
             self.logger.info(
                 "vsts.failed-to-change-status",
                 extra={
@@ -290,48 +409,72 @@ class VstsIssueSync(IssueSyncMixin):
                     "exception": error,
                 },
             )
+            raise
+        except Exception as e:
+            self.raise_error(e)
 
-    def should_unresolve(self, data):
-        done_states = self.get_done_states(data["project"])
-        return not data["new_state"] in done_states or data["old_state"] is None
+    def get_resolve_sync_action(self, data: Mapping[str, Any]) -> ResolveSyncAction:
+        done_states = self._get_done_statuses(data["project"])
+        return ResolveSyncAction.from_resolve_unresolve(
+            should_resolve=(
+                data["old_state"] not in done_states and data["new_state"] in done_states
+            ),
+            should_unresolve=(data["new_state"] not in done_states or data["old_state"] is None),
+        )
 
-    def should_resolve(self, data):
-        done_states = self.get_done_states(data["project"])
-        return not data["old_state"] in done_states and data["new_state"] in done_states
-
-    def get_done_states(self, project):
+    def _get_done_statuses(self, project: str) -> set[str]:
         client = self.get_client()
         try:
-            all_states = client.get_work_item_states(self.instance, project)["value"]
+            all_states = client.get_work_item_states(project)["value"]
         except ApiError as err:
+            # An empty set is indistinguishable from a project where nothing is done, so
+            # `get_resolve_sync_action` would unresolve on every transition and the inbound
+            # sync would then advance the issue's watermark past the resolve it just lost.
+            # Raising leaves both the status and the watermark alone, as jira already does.
             self.logger.info(
                 "vsts.get-done-states.failed",
                 extra={"integration_id": self.model.id, "exception": err},
             )
-            return []
-        done_states = [
-            state["name"] for state in all_states if state["category"] in self.done_categories
-        ]
-        return done_states
+            raise
+        return {state["name"] for state in all_states if state["category"] in self.done_categories}
 
-    def get_issue_display_name(self, external_issue):
-        if external_issue.metadata is None:
-            return ""
-        return external_issue.metadata["display_name"]
+    def get_issue_display_name(self, external_issue: ExternalIssue) -> str:
+        display_name = (external_issue.metadata or {}).get("display_name", "")
+        return display_name
 
-    def create_comment(self, issue_id, user_id, group_note):
+    def create_comment(self, issue_id: str, user_id: int, group_note: Activity) -> dict[str, Any]:
         comment = group_note.data["text"]
         quoted_comment = self.create_comment_attribution(user_id, comment)
-        return self.get_client().update_work_item(self.instance, issue_id, comment=quoted_comment)
+        return cast(
+            "dict[str, Any]",
+            self.get_client().update_work_item(issue_id, comment=quoted_comment),
+        )
 
-    def create_comment_attribution(self, user_id, comment_text):
+    def create_comment_attribution(self, user_id: int, comment_text: str) -> str:
         # VSTS uses markdown or xml
         # https://docs.microsoft.com/en-us/microsoftteams/platform/concepts/bots/bots-text-formats
-        user = User.objects.get(id=user_id)
-        attribution = "%s wrote:\n\n" % user.name
+        user = user_service.get_user(user_id=user_id)
+        if user is None:
+            return comment_text
+        attribution = f"{user.name} wrote:\n\n"
         quoted_comment = f"{attribution}<blockquote>{comment_text}</blockquote>"
         return quoted_comment
 
-    def update_comment(self, issue_id, user_id, external_comment_id, comment_text):
-        # Azure does not support updating comments
+    def update_comment(self, issue_id: str, user_id: int, group_note: Activity) -> None:
+        # Azure does not support updating comments.
         pass
+
+    def search_issues(self, query: str | None, **kwargs: object) -> dict[str, Any]:
+        client = self.get_client()
+
+        integration = integration_service.get_integration(
+            integration_id=self.org_integration.integration_id,
+            status=ObjectStatus.ACTIVE,
+            using_replica=options.get("integration_service.get_integration.using_replica"),
+        )
+        if not integration:
+            raise IntegrationError("Azure DevOps integration not found")
+
+        resp = client.search_issues(query=query, account_name=integration.name)
+        assert isinstance(resp, dict)
+        return resp

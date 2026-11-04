@@ -1,12 +1,17 @@
-from typing import Any, MutableMapping, Optional
+from collections.abc import MutableMapping
+from typing import Any
 
 from django.conf import settings
+
+from sentry.conf.types.kafka_definition import Topic
+from sentry.conf.types.topic_definition import TopicDefinition
 
 SUPPORTED_KAFKA_CONFIGURATION = (
     # Check https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md
     # for the full list of available options
     "bootstrap.servers",
     "compression.type",
+    "max.poll.interval.ms",
     "message.max.bytes",
     "sasl.mechanism",
     "sasl.username",
@@ -27,6 +32,7 @@ SUPPORTED_KAFKA_CONFIGURATION = (
     "ssl.keystore.location",
     "ssl.keystore.password",
     "ssl.sigalgs.list",
+    "acks",
 )
 COMMON_SECTION = "common"
 PRODUCERS_SECTION = "producers"
@@ -35,7 +41,7 @@ ADMIN_SECTION = "admin"
 KNOWN_SECTIONS = (COMMON_SECTION, PRODUCERS_SECTION, CONSUMERS_SECTION, ADMIN_SECTION)
 
 
-def _get_legacy_kafka_cluster_options(cluster_name):
+def _get_legacy_kafka_cluster_options(cluster_name: str) -> dict[str, Any]:
     options = settings.KAFKA_CLUSTERS[cluster_name]
 
     options = {k: v for k, v in options.items() if k not in KNOWN_SECTIONS}
@@ -46,8 +52,11 @@ def _get_legacy_kafka_cluster_options(cluster_name):
 
 
 def _get_kafka_cluster_options(
-    cluster_name, config_section, only_bootstrap=False, override_params=None
-):
+    cluster_name: str,
+    config_section: str,
+    only_bootstrap: bool = False,
+    override_params: MutableMapping[str, Any] | None = None,
+) -> dict[str, Any]:
     options = {}
     custom_options = settings.KAFKA_CLUSTERS[cluster_name].get(config_section, {})
     common_options = settings.KAFKA_CLUSTERS[cluster_name].get(COMMON_SECTION, {})
@@ -73,21 +82,59 @@ def _get_kafka_cluster_options(
     return options
 
 
-def get_kafka_producer_cluster_options(cluster_name):
+def get_kafka_producer_cluster_options(cluster_name: str) -> dict[str, Any]:
     return _get_kafka_cluster_options(cluster_name, PRODUCERS_SECTION)
 
 
 def get_kafka_consumer_cluster_options(
-    cluster_name: str, override_params: Optional[MutableMapping[str, Any]] = None
-) -> MutableMapping[Any, Any]:
+    cluster_name: str,
+    override_params: MutableMapping[str, Any] | None = None,
+    topic: Topic | None = None,
+) -> dict[str, Any]:
+    # Per-topic consumer config (keyed by the region-stable Topic enum value) layers on
+    # top of the cluster's consumer config but below any explicit override_params.
+    topic_config = settings.KAFKA_TOPIC_CONSUMER_CONFIG.get(topic.value, {}) if topic else {}
+    merged = {**topic_config, **(override_params or {})}
     return _get_kafka_cluster_options(
-        cluster_name, CONSUMERS_SECTION, only_bootstrap=True, override_params=override_params
+        cluster_name, CONSUMERS_SECTION, only_bootstrap=True, override_params=merged or None
     )
 
 
 def get_kafka_admin_cluster_options(
-    cluster_name: str, override_params: Optional[MutableMapping[str, Any]] = None
-) -> MutableMapping[Any, Any]:
+    cluster_name: str, override_params: MutableMapping[str, Any] | None = None
+) -> dict[str, Any]:
     return _get_kafka_cluster_options(
         cluster_name, ADMIN_SECTION, only_bootstrap=True, override_params=override_params
     )
+
+
+def get_topic_definition(topic: Topic | str, kafka_slice_id: int | None = None) -> TopicDefinition:
+    topic_name = topic if isinstance(topic, str) else topic.value
+
+    if kafka_slice_id is not None:
+        sliced_topics = settings.SLICED_KAFKA_TOPICS
+        key = (topic_name, kafka_slice_id)
+
+        if key not in sliced_topics:
+            raise KeyError(
+                f"No configuration found for topic '{topic_name}' with slice ID {kafka_slice_id}"
+            )
+
+        definition = sliced_topics[key]
+
+        return {
+            "cluster": definition["cluster"],
+            "real_topic_name": definition["topic"],
+        }
+
+    real_topic_name = settings.KAFKA_TOPIC_OVERRIDES.get(topic_name, topic_name)
+
+    if isinstance(topic, str):
+        cluster = settings.KAFKA_TOPIC_TO_CLUSTER.get(real_topic_name, "default")
+    else:
+        cluster = settings.KAFKA_TOPIC_TO_CLUSTER[real_topic_name]
+
+    return {
+        "cluster": cluster,
+        "real_topic_name": real_topic_name,
+    }

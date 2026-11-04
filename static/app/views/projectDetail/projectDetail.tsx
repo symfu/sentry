@@ -1,0 +1,297 @@
+import {Fragment, useCallback, useEffect, useMemo} from 'react';
+import {IconEllipsis} from '@sentry/icons/ellipsis';
+import {IconIssues} from '@sentry/icons/issues';
+import {IconSettings} from '@sentry/icons/settings';
+import {IconSiren} from '@sentry/icons/siren';
+import pick from 'lodash/pick';
+
+import type {MenuItemProps} from '@sentry/scraps/dropdownMenu';
+import {Stack, Container} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+
+import {fetchOrganizationDetails} from 'sentry/actionCreators/organization';
+import {fetchTagValues} from 'sentry/actionCreators/tags';
+import {hasEveryAccess} from 'sentry/components/acl/access';
+import {ProjectsBadge} from 'sentry/components/core/badge/projectsBadge';
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import * as Layout from 'sentry/components/layouts/thirds';
+import {LoadingError} from 'sentry/components/loadingError';
+import {NoProjectMessage} from 'sentry/components/noProjectMessage';
+import {updateProjects} from 'sentry/components/pageFilters/actions';
+import {PageFiltersContainer} from 'sentry/components/pageFilters/container';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {Placeholder} from 'sentry/components/placeholder';
+import {MissingProjectMembership} from 'sentry/components/projects/missingProjectMembership';
+import {SentryDocumentTitle} from 'sentry/components/sentryDocumentTitle';
+import {DEFAULT_RELATIVE_PERIODS} from 'sentry/constants';
+import {t, tct} from 'sentry/locale';
+import {defined} from 'sentry/utils/defined';
+import {isDemoModeActive} from 'sentry/utils/demoMode';
+import {decodeScalar} from 'sentry/utils/queryString';
+import {routeTitleGen} from 'sentry/utils/routeTitle';
+import {useApi} from 'sentry/utils/useApi';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useParams} from 'sentry/utils/useParams';
+import {useProjects} from 'sentry/utils/useProjects';
+import {makeMonitorCreatePathname} from 'sentry/views/detectors/pathnames';
+import {TopBar} from 'sentry/views/navigation/topBar';
+import {makeProjectsPathname} from 'sentry/views/projects/pathname';
+
+import {ERRORS_BASIC_CHART_PERIODS} from './charts/projectErrorsBasicChart';
+import {ProjectScoreCards} from './projectScoreCards/projectScoreCards';
+import {ProjectCharts} from './projectCharts';
+import {ProjectFilters} from './projectFilters';
+import {ProjectIssues} from './projectIssues';
+import {ProjectLatestReleases} from './projectLatestReleases';
+import {ProjectQuickLinks} from './projectQuickLinks';
+import {ProjectTeamAccess} from './projectTeamAccess';
+
+export function ProjectDetail() {
+  const api = useApi();
+  const params = useParams<{orgId: string; projectId: string}>();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const organization = useOrganization();
+  const {projects, fetching: loadingProjects} = useProjects();
+  const {selection} = usePageFilters();
+  const project = projects.find(p => p.slug === params.projectId);
+  const query = decodeScalar(location.query.query, '');
+  const projectQueryParam = decodeScalar(location.query.project);
+  const hasPerformance = organization.features.includes('performance-view');
+  const hasDiscover = organization.features.includes('discover-basic');
+  const hasTransactions = hasPerformance && project?.firstTransactionEvent;
+  const projectId = project?.id;
+  const isProjectStabilized =
+    defined(project?.id) &&
+    project.id === projectQueryParam &&
+    project.id === String(selection.projects[0]);
+  const hasSessions = project?.hasSessions ?? null;
+  const hasOnlyBasicChart = !hasPerformance && !hasDiscover && !hasSessions;
+  const title = routeTitleGen(
+    t('Project %s', params.projectId),
+    organization.slug,
+    false
+  );
+  const visibleCharts = useMemo(() => {
+    if (hasTransactions || hasSessions) {
+      return ['chart1', 'chart2'];
+    }
+    return ['chart1'];
+  }, [hasTransactions, hasSessions]);
+
+  const onRetryProjects = useCallback(() => {
+    fetchOrganizationDetails(api, params.orgId);
+  }, [api, params.orgId]);
+
+  const handleSearch = useCallback(
+    (searchQuery: string) => {
+      navigate(
+        {
+          pathname: location.pathname,
+          query: {
+            ...location.query,
+            query: searchQuery,
+          },
+        },
+        {replace: true}
+      );
+    },
+    [navigate, location.query, location.pathname]
+  );
+
+  const tagValueLoader = useCallback(
+    (key: string, search: string) => {
+      return fetchTagValues({
+        api,
+        orgSlug: organization.slug,
+        tagKey: key,
+        search,
+        projectIds: projectQueryParam ? [projectQueryParam] : undefined,
+        endpointParams: location.query,
+      });
+    },
+    [api, organization.slug, location.query, projectQueryParam]
+  );
+
+  useEffect(() => {
+    function syncProjectWithSlug() {
+      if (projectId && projectId !== projectQueryParam) {
+        // if someone visits /organizations/sentry/projects/javascript/ (without ?project=XXX) we need to update URL and globalSelection with the right project ID
+        updateProjects([Number(projectId)], undefined, undefined);
+        navigate(
+          {pathname: location.pathname, query: {...location.query, project: projectId}},
+          {replace: true}
+        );
+      }
+    }
+    syncProjectWithSlug();
+  }, [projectQueryParam, projectId, navigate, location.pathname, location.query]);
+
+  if (!loadingProjects && !project) {
+    return (
+      <Stack flex={1} padding="2xl 3xl">
+        <LoadingError
+          message={t('This project could not be found.')}
+          onRetry={onRetryProjects}
+        />
+      </Stack>
+    );
+  }
+
+  if (!loadingProjects && project && !project.hasAccess) {
+    return (
+      <Stack flex={1}>
+        <MissingProjectMembership organization={organization} project={project} />
+      </Stack>
+    );
+  }
+
+  const canCreateAlert =
+    isDemoModeActive() ||
+    hasEveryAccess(['alerts:write'], {organization}) ||
+    projects.some(p => hasEveryAccess(['alerts:write'], {project: p}));
+
+  const projectActions: MenuItemProps[] = [
+    {
+      key: 'view-all-issues',
+      label: t('View All Issues'),
+      leadingItems: <IconIssues size="md" />,
+      to: project?.id
+        ? // if we are still fetching project, we can use project slug to build issue stream url and let the redirect handle it
+          `/organizations/${params.orgId}/issues/?project=${project.id}`
+        : `/${params.orgId}/${params.projectId}`,
+    },
+    {
+      key: 'create-monitor',
+      label: t('Create Monitor'),
+      leadingItems: <IconSiren size="md" />,
+      to: {
+        pathname: makeMonitorCreatePathname(organization.slug),
+        query: {project: projectId},
+      },
+      disabled: !canCreateAlert,
+      tooltip: canCreateAlert
+        ? undefined
+        : tct(
+            'Ask your organization owner or manager to [settingsLink:enable alerts access] for you.',
+            {settingsLink: <Link to={`/settings/${organization.slug}/`} />}
+          ),
+      tooltipOptions: {maxWidth: 270},
+    },
+    {
+      key: 'project-settings',
+      label: t('Project Settings'),
+      leadingItems: <IconSettings size="md" />,
+      to: `/settings/${params.orgId}/projects/${params.projectId}/`,
+    },
+  ];
+
+  return (
+    <SentryDocumentTitle title={title}>
+      <PageFiltersContainer
+        disablePersistence
+        skipLoadLastUsed
+        showAbsolute={!hasOnlyBasicChart}
+      >
+        <Stack flex={1}>
+          <NoProjectMessage organization={organization}>
+            <TopBar.Slot
+              name="breadcrumbs"
+              title={{
+                type: 'page-title',
+                label: project?.slug ?? params.projectId,
+                leadingGraphic: project ? (
+                  <ProjectsBadge
+                    projectPlatforms={project.platform ? [project.platform] : []}
+                  />
+                ) : (
+                  <Placeholder width="16px" height="16px" />
+                ),
+                trailingActions: {
+                  type: 'menu',
+                  items: projectActions,
+                  triggerLabel: t('Project Actions'),
+                  triggerIcon: <IconEllipsis />,
+                },
+              }}
+              items={[
+                {
+                  type: 'link',
+                  label: t('Projects'),
+                  to: makeProjectsPathname({path: '/', organization}),
+                },
+              ]}
+            />
+
+            <Layout.Body noRowGap>
+              <Layout.Main>
+                <Container marginBottom="xl">
+                  <ProjectFilters
+                    query={query}
+                    onSearch={handleSearch}
+                    relativeDateOptions={
+                      hasOnlyBasicChart
+                        ? pick(DEFAULT_RELATIVE_PERIODS, ERRORS_BASIC_CHART_PERIODS)
+                        : undefined
+                    }
+                    tagValueLoader={tagValueLoader}
+                  />
+                </Container>
+
+                <ProjectScoreCards
+                  organization={organization}
+                  isProjectStabilized={isProjectStabilized}
+                  selection={selection}
+                  hasSessions={hasSessions}
+                  hasTransactions={hasTransactions}
+                  query={query}
+                  project={project}
+                  location={location}
+                />
+                {isProjectStabilized && (
+                  <Fragment>
+                    {visibleCharts.map((id, index) => (
+                      <ErrorBoundary mini key={`project-charts-${id}`}>
+                        <ProjectCharts
+                          location={location}
+                          organization={organization}
+                          chartId={id}
+                          chartIndex={index}
+                          projectId={project?.id}
+                          hasSessions={hasSessions}
+                          hasTransactions={!!hasTransactions}
+                          visibleCharts={visibleCharts}
+                          query={query}
+                          project={project}
+                        />
+                      </ErrorBoundary>
+                    ))}
+                    <ProjectIssues
+                      organization={organization}
+                      location={location}
+                      projectId={selection.projects[0]!}
+                      query={query}
+                    />
+                  </Fragment>
+                )}
+              </Layout.Main>
+              <Layout.Side>
+                <ProjectTeamAccess organization={organization} project={project} />
+                <ProjectLatestReleases
+                  organization={organization}
+                  projectSlug={params.projectId}
+                  location={location}
+                  isProjectStabilized={isProjectStabilized}
+                  project={project}
+                />
+                <ProjectQuickLinks organization={organization} project={project} />
+              </Layout.Side>
+            </Layout.Body>
+          </NoProjectMessage>
+        </Stack>
+      </PageFiltersContainer>
+    </SentryDocumentTitle>
+  );
+}

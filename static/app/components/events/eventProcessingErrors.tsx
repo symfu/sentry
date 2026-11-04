@@ -1,0 +1,144 @@
+import {useMemo} from 'react';
+import startCase from 'lodash/startCase';
+import moment from 'moment-timezone';
+
+import {InfoTip} from '@sentry/scraps/info';
+import {Flex} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+
+import type {ErrorMessage} from 'sentry/components/events/interfaces/crashContent/exception/actionableItems';
+import {useActionableItemsWithProguardErrors} from 'sentry/components/events/interfaces/crashContent/exception/useActionableItems';
+import {
+  KeyValueTableCard,
+  KeyValueTableCardGrid,
+} from 'sentry/components/tables/keyValueTable';
+import {t, tct} from 'sentry/locale';
+import type {Event} from 'sentry/types/event';
+import type {Project} from 'sentry/types/project';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+import {FoldSection} from 'sentry/views/issueDetails/foldSection';
+
+type Props = {
+  event: Event;
+  isShare: boolean;
+  project: Project;
+};
+
+const keyMapping = {
+  image_uuid: 'Debug ID',
+  image_name: 'File Name',
+  image_path: 'File Path',
+};
+
+export const DOCS_URLS: Record<string, string> = {
+  release: 'https://docs.sentry.io/cli/releases/#creating-releases',
+  environment:
+    'https://docs.sentry.io/concepts/key-terms/environments/#environment-naming-requirements',
+};
+
+function EventErrorCard({
+  title,
+  data,
+}: {
+  data: Array<{key: string; subject: any; value: any}>;
+  title: string;
+}) {
+  const contentItems = data.map(datum => {
+    return {item: datum};
+  });
+
+  // Find the first item that has a corresponding documentation URL
+  const docLink = data
+    .map(d => {
+      const value = String(d.value || '').toLowerCase();
+      return DOCS_URLS[value];
+    })
+    .find(Boolean);
+
+  const titleElement = docLink ? (
+    <Flex gap="md" align="center">
+      {title}
+      <InfoTip
+        title={tct('Learn more about this error in our [docLink:documentation]', {
+          docLink: <ExternalLink href={docLink} />,
+        })}
+        size="sm"
+        position="top"
+      />
+    </Flex>
+  ) : (
+    <div>{title}</div>
+  );
+
+  return <KeyValueTableCard contentItems={contentItems} title={titleElement} />;
+}
+
+function EventErrorDescription({error}: {error: ErrorMessage}) {
+  const {title, data: errorData} = error;
+
+  const cleanedData = useMemo(() => {
+    const data = errorData || {};
+    if (data.message === 'None') {
+      // Python ensures a message string, but "None" doesn't make sense here
+      // oxlint-disable-next-line react/immutability
+      delete data.message;
+    }
+
+    if (typeof data.image_path === 'string') {
+      // Separate the image name for readability
+      const separator = /^([a-z]:\\|\\\\)/i.test(data.image_path) ? '\\' : '/';
+      const path = data.image_path.split(separator);
+      // oxlint-disable-next-line react/immutability
+      data.image_name = path.splice(-1, 1)[0];
+      // oxlint-disable-next-line react/immutability
+      data.image_path = path.length ? path.join(separator) + separator : '';
+    }
+
+    if (typeof data.server_time === 'string' && typeof data.sdk_time === 'string') {
+      // oxlint-disable-next-line react/immutability
+      data.message = t(
+        'Adjusted timestamps by %s',
+        moment
+          .duration(moment.utc(data.server_time).diff(moment.utc(data.sdk_time)))
+          .humanize()
+      );
+    }
+
+    return Object.entries(data)
+      .map(([key, value]) => ({
+        key,
+        value,
+        // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+        subject: keyMapping[key] || startCase(key),
+      }))
+      .filter(d => {
+        if (!d.value) {
+          return true;
+        }
+        return !!d.value;
+      });
+  }, [errorData]);
+
+  return <EventErrorCard title={title} data={cleanedData} />;
+}
+
+export function EventProcessingErrors({event, project, isShare}: Props) {
+  const errors = useActionableItemsWithProguardErrors({event, project, isShare});
+
+  if (!errors || errors.length === 0) {
+    return null;
+  }
+
+  return (
+    <FoldSection
+      sectionKey={SectionKey.PROCESSING_ERROR}
+      title={t('Event Processing Errors')}
+    >
+      <KeyValueTableCardGrid>
+        {errors.map((error, idx) => {
+          return <EventErrorDescription key={idx} error={error} />;
+        })}
+      </KeyValueTableCardGrid>
+    </FoldSection>
+  );
+}

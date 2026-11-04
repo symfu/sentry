@@ -1,0 +1,182 @@
+import type {ComponentProps} from 'react';
+import {LocationFixture} from 'sentry-fixture/locationFixture';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {RouteComponentPropsFixture} from 'sentry-fixture/routeComponentPropsFixture';
+
+import {BillingConfigFixture} from 'getsentry-test/fixtures/billingConfig';
+import {PlanDetailsLookupFixture} from 'getsentry-test/fixtures/planDetailsLookup';
+import {SubscriptionFixture} from 'getsentry-test/fixtures/subscription';
+import {PlanTier} from 'getsentry-test/planTier';
+import {render, screen, userEvent, within} from 'sentry-test/reactTestingLibrary';
+import {resetMockDate, setMockDate} from 'sentry-test/utils';
+
+import {SubscriptionStore} from 'getsentry/stores/subscriptionStore';
+import AMCheckout from 'getsentry/views/amCheckout/';
+
+describe('ChooseYourBillingCycle', () => {
+  const api = new MockApiClient();
+  const organization = OrganizationFixture();
+  const subscription = SubscriptionFixture({
+    organization,
+    plan: 'am3_f',
+    billingPeriodEnd: '2025-08-28',
+  });
+
+  beforeEach(() => {
+    api.clear();
+    setMockDate(new Date('2025-08-13'));
+    MockApiClient.clearMockResponses();
+    SubscriptionStore.set(organization.slug, subscription);
+
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/`,
+      method: 'GET',
+      body: {},
+    });
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/billing-config/`,
+      method: 'GET',
+      body: BillingConfigFixture(PlanTier.AM3),
+    });
+    MockApiClient.addMockResponse({
+      method: 'POST',
+      url: '/_experiment/log_exposure/',
+      body: {},
+    });
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/subscription/preview/`,
+      method: 'GET',
+      body: {
+        invoiceItems: [],
+      },
+    });
+    MockApiClient.addMockResponse({
+      url: `/customers/${organization.slug}/billing-details/`,
+      method: 'GET',
+    });
+  });
+
+  afterEach(() => {
+    resetMockDate();
+    organization.features = [];
+  });
+
+  async function assertCycleText({
+    monthlyInfo,
+    yearlyInfo,
+  }: {
+    monthlyInfo: string | RegExp;
+    yearlyInfo: string | RegExp;
+  }) {
+    expect(
+      await screen.findByText('Pay monthly or yearly, your choice')
+    ).toBeInTheDocument();
+
+    const monthlyCard = screen.getByTestId('billing-cycle-option-monthly');
+    expect(
+      screen.getByRole('radio', {name: 'Monthly billing cycle'})
+    ).toBeInTheDocument();
+    expect(within(monthlyCard).getByText('Monthly')).toBeInTheDocument();
+    expect(within(monthlyCard).queryByText(/save 10%/)).not.toBeInTheDocument();
+    expect(within(monthlyCard).getByText(monthlyInfo)).toBeInTheDocument();
+    expect(within(monthlyCard).getByText(/Cancel anytime/)).toBeInTheDocument();
+
+    const yearlyCard = screen.getByTestId('billing-cycle-option-annual');
+    expect(screen.getByRole('radio', {name: 'Yearly billing cycle'})).toBeInTheDocument();
+    expect(within(yearlyCard).getByText('Yearly')).toBeInTheDocument();
+    expect(within(yearlyCard).getByText(/save 10%/)).toBeInTheDocument();
+    expect(within(yearlyCard).getByText(yearlyInfo)).toBeInTheDocument();
+    expect(
+      within(yearlyCard).getByText(/PAYG usage billed monthly, discount does not apply/)
+    ).toBeInTheDocument();
+  }
+
+  const routeProps = RouteComponentPropsFixture();
+
+  function ExampleAMCheckout({
+    location,
+  }: {
+    location: ComponentProps<typeof AMCheckout>['location'];
+  }) {
+    return (
+      <AMCheckout {...routeProps} api={api} location={location} navigate={jest.fn()} />
+    );
+  }
+
+  it('renders for upgrade from developer', async () => {
+    render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+    await assertCycleText({
+      // org is on monthly cycle, but is on developer plan, so upgrade should apply immediately and create a new period
+      monthlyInfo: /Billed on the 13th of each month/,
+      yearlyInfo: /Billed annually/,
+    });
+  });
+
+  it('renders for coterm upgrade', async () => {
+    const monthlySub = SubscriptionFixture({
+      organization,
+      plan: 'am3_business',
+      billingPeriodEnd: '2025-08-28',
+    });
+    SubscriptionStore.set(organization.slug, monthlySub);
+    render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+    await assertCycleText({
+      // org is on monthly cycle and is paid plan, so upgrade should apply immediately to the current period
+      monthlyInfo: /Billed on the 29th of each month/,
+      yearlyInfo: /Billed annually/,
+    });
+  });
+
+  it('renders for monthly downgrade', async () => {
+    const annualSub = SubscriptionFixture({
+      planDetails: PlanDetailsLookupFixture('am2_business_auf'),
+      billingPeriodStart: '2025-07-16',
+      billingPeriodEnd: '2026-07-15',
+      organization,
+    });
+    SubscriptionStore.set(organization.slug, annualSub);
+    render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+    await assertCycleText({
+      monthlyInfo: /Billed on the 16th of each month/,
+      yearlyInfo: /Billed annually/,
+    });
+  });
+
+  it('renders for migrating partner customers', async () => {
+    const partnerSub = SubscriptionFixture({
+      billingInterval: 'annual',
+      sponsoredType: 'FOO',
+      partner: {
+        isActive: true,
+        externalId: 'foo',
+        partnership: {
+          id: 'foo',
+          displayName: 'FOO',
+          supportNote: '',
+        },
+        name: '',
+      },
+      organization,
+    });
+    SubscriptionStore.set(organization.slug, partnerSub);
+    render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+    await assertCycleText({
+      monthlyInfo: /Billed monthly starting on your selected start date on submission/,
+      yearlyInfo: /Billed annually from your selected start date on submission/,
+    });
+  });
+
+  it('can select billing cycle', async () => {
+    render(<ExampleAMCheckout location={LocationFixture()} />, {organization});
+
+    const monthly = await screen.findByRole('radio', {name: 'Monthly billing cycle'});
+    const annual = screen.getByRole('radio', {name: 'Yearly billing cycle'});
+
+    expect(monthly).toBeChecked();
+    expect(annual).not.toBeChecked();
+
+    await userEvent.click(annual);
+    expect(monthly).not.toBeChecked();
+    expect(annual).toBeChecked();
+  });
+});

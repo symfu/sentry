@@ -1,37 +1,58 @@
-import datetime
+"""
+Adapted from https://github.com/adamchainz/django-jsonfield/blob/0.9.13/jsonfield/fields.py
 
-from decimal import Decimal
+Copyright (c) 2012, Matthew Schinckel.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * The names of its contributors may not be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL MATTHEW SCHINCKEL BE LIABLE FOR ANY DIRECT,
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import ValidationError
-from django.conf import settings
 from django.db import models
-from django.db.models.lookups import Exact, IExact, In, Contains, IContains
-from django.utils.translation import ugettext_lazy as _
+from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.models.lookups import Contains, Exact, IContains, IExact, In, Lookup
+from django.utils.translation import gettext_lazy as _
 
-from sentry.utils import json
 from sentry.db.models.utils import Creator
+from sentry.utils import json
+
+if TYPE_CHECKING:
+    _Lookup = Lookup[Any]
+    _Exact = Exact[Any]
+    _IExact = IExact[Any]
+    _In = In[Any]
+else:
+    _Lookup = Lookup
+    _Exact = Exact
+    _IExact = IExact
+    _In = In
 
 
-def default(o):
-    if hasattr(o, "to_json"):
-        return o.to_json()
-    if isinstance(o, Decimal):
-        return str(o)
-    if isinstance(o, datetime.datetime):
-        if o.tzinfo:
-            return o.strftime("%Y-%m-%dT%H:%M:%S%z")
-        return o.strftime("%Y-%m-%dT%H:%M:%S")
-    if isinstance(o, datetime.date):
-        return o.strftime("%Y-%m-%d")
-    if isinstance(o, datetime.time):
-        if o.tzinfo:
-            return o.strftime("%H:%M:%S%z")
-        return o.strftime("%H:%M:%S")
-
-    raise TypeError(repr(o) + " is not JSON serializable")
-
-
-class JSONField(models.TextField):
+class JSONField(models.TextField[Any, Any]):
     """
     A field that will ensure the data entered into it is valid JSON.
 
@@ -41,54 +62,62 @@ class JSONField(models.TextField):
     - always using a text field
     - being able to serialize dates/decimals
     - not emitting deprecation warnings
+
+    By default, this field will also invoke the Creator descriptor when setting the attribute.
+    This can make it difficult to use json fields that receive raw strings, so optionally setting no_creator_hook=True
+    surpresses this behavior.
     """
 
     default_error_messages = {"invalid": _("'%s' is not a valid JSON string.")}
     description = "JSON object"
+    no_creator_hook = False
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self, *args: Any, json_dumps: Callable[[Any], str] = json.dumps, **kwargs: Any
+    ) -> None:
+        self.json_dumps = json_dumps
         if not kwargs.get("null", False):
             kwargs["default"] = kwargs.get("default", dict)
-        self.encoder_kwargs = {
-            "indent": kwargs.pop("indent", getattr(settings, "JSONFIELD_INDENT", None))
-        }
         super().__init__(*args, **kwargs)
         self.validate(self.get_default(), None)
 
-    def contribute_to_class(self, cls, name):
+    def contribute_to_class(
+        self, cls: type[models.Model], name: str, private_only: bool = False
+    ) -> None:
         """
         Add a descriptor for backwards compatibility
         with previous Django behavior.
         """
-        super().contribute_to_class(cls, name)
-        setattr(cls, name, Creator(self))
+        super().contribute_to_class(cls, name, private_only=private_only)
+        if not self.no_creator_hook:
+            setattr(cls, name, Creator(self))
 
-    def validate(self, value, model_instance):
+    def validate(self, value: Any, model_instance: models.Model | None) -> None:
         if not self.null and value is None:
             raise ValidationError(self.error_messages["null"])
         try:
             self.get_prep_value(value)
-        except BaseException:
+        except Exception:
             raise ValidationError(self.error_messages["invalid"] % value)
 
-    def get_default(self):
+    def get_default(self) -> Any:
         if self.has_default():
             default = self.default
             if callable(default):
                 default = default()
             if isinstance(default, str):
                 return json.loads(default)
-            return json.loads(json.dumps(default))
+            return json.loads(self.json_dumps(default))
         return super().get_default()
 
-    def get_internal_type(self):
+    def get_internal_type(self) -> str:
         return "TextField"
 
-    def db_type(self, connection):
+    def db_type(self, connection: BaseDatabaseWrapper) -> str:
         return "text"
 
-    def to_python(self, value):
-        if isinstance(value, str):
+    def to_python(self, value: Any) -> Any:
+        if isinstance(value, str) or self.no_creator_hook:
             if value == "":
                 if self.null:
                     return None
@@ -102,45 +131,47 @@ class JSONField(models.TextField):
         # TODO: Look for date/time/datetime objects within the structure?
         return value
 
-    def get_db_prep_value(self, value, connection=None, prepared=None):
+    def get_db_prep_value(
+        self, value: Any, connection: BaseDatabaseWrapper | None = None, prepared: bool = False
+    ) -> Any:
         return self.get_prep_value(value)
 
-    def get_prep_value(self, value):
+    def get_prep_value(self, value: Any) -> str | None:
         if value is None:
             if not self.null and self.blank:
                 return ""
             return None
-        return json.dumps(value, default=default, **self.encoder_kwargs)
+        return self.json_dumps(value)
 
-    def value_to_string(self, obj):
-        return self._get_val_from_obj(obj)
+    def value_to_string(self, obj: models.Model) -> Any:
+        return self.value_from_object(obj)
 
 
-class NoPrepareMixin:
-    def get_prep_lookup(self):
+class NoPrepareMixin(_Lookup):
+    def get_prep_lookup(self) -> Any:
         return self.rhs
 
 
-class JSONFieldExactLookup(NoPrepareMixin, Exact):
-    def get_prep_lookup(self):
+class JSONFieldExactLookup(NoPrepareMixin, _Exact):
+    def get_prep_lookup(self) -> Any:
         return self.lhs.output_field.to_python(self.lhs.output_field.get_prep_value(self.rhs))
 
 
-class JSONFieldIExactLookup(NoPrepareMixin, IExact):
-    def get_prep_lookup(self):
+class JSONFieldIExactLookup(NoPrepareMixin, _IExact):
+    def get_prep_lookup(self) -> Any:
         return self.lhs.output_field.to_python(self.lhs.output_field.get_prep_value(self.rhs))
 
 
-class JSONFieldInLookup(NoPrepareMixin, In):
-    def get_prep_lookup(self):
+class JSONFieldInLookup(NoPrepareMixin, _In):
+    def get_prep_lookup(self) -> Any:
         return [
             self.lhs.output_field.to_python(self.lhs.output_field.get_prep_value(v))
             for v in self.rhs
         ]
 
 
-class ContainsLookupMixin:
-    def get_prep_lookup(self):
+class ContainsLookupMixin(_Lookup):
+    def get_prep_lookup(self) -> Any:
         if isinstance(self.rhs, (list, tuple)):
             raise TypeError(
                 "Lookup type %r not supported with %s argument"
@@ -164,3 +195,22 @@ JSONField.register_lookup(JSONFieldIExactLookup)
 JSONField.register_lookup(JSONFieldInLookup)
 JSONField.register_lookup(JSONFieldContainsLookup)
 JSONField.register_lookup(JSONFieldIContainsLookup)
+
+
+class LegacyTextJSONField(models.JSONField):
+    """django JSONField but with `text` database backing
+
+    allows migration off of our JSONField without needing a data type
+    change for large tables
+
+    do not use me for new things!
+    """
+
+    def db_type(self, connection: BaseDatabaseWrapper) -> str:
+        # usually `jsonb`
+        return "text"
+
+    def get_db_prep_value(self, *args: Any, **kwargs: Any) -> Any:
+        jsonb = super().get_db_prep_value(*args, **kwargs)
+        # convert JSONField's ::jsonb back to plain text
+        return jsonb.dumps(jsonb.adapted)

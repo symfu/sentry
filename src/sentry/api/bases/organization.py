@@ -1,49 +1,127 @@
-from rest_framework.exceptions import PermissionDenied, ParseError
-from django.core.cache import cache
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, overload
 
 import sentry_sdk
+from django.conf import settings
+from django.core.cache import cache
+from django.db.models import Q
+from django.http.request import HttpRequest, QueryDict
+from rest_framework.exceptions import ParseError, PermissionDenied, ValidationError
+from rest_framework.permissions import BasePermission
+from rest_framework.request import Request
+from rest_framework.views import APIView
+from sentry_sdk import traces
 
+from sentry import features, options
+from sentry.api.authentication import UserAuthTokenAuthentication
 from sentry.api.base import Endpoint
-from sentry.api.exceptions import ResourceDoesNotExist
-from sentry.api.helpers.environments import get_environments
-from sentry.api.permissions import SentryPermission
-from sentry.api.utils import get_date_range_from_params, InvalidParams
-from sentry.auth.superuser import is_active_superuser
-from sentry.constants import ALL_ACCESS_PROJECTS
-from sentry.models import (
-    ApiKey,
-    Authenticator,
-    Organization,
-    Project,
-    ProjectStatus,
-    ReleaseProject,
+from sentry.api.exceptions import (
+    INSUFFICIENT_SCOPE_ATTR,
+    ResourceDoesNotExist,
+    SuperuserRequired,
 )
+from sentry.api.helpers.environments import get_environments
+from sentry.api.helpers.projects import (
+    ParsedProjectIdOrSlugParams,
+    ProjectIdOrSlugField,
+    filter_projects_by_permissions,
+    parse_id_or_slug_params,
+)
+from sentry.api.permissions import DemoSafePermission, StaffPermissionMixin
+from sentry.api.utils import get_date_range_from_params, is_member_disabled_from_limit
+from sentry.auth.principal import acting_user_id, require_user
+from sentry.auth.services.auth import AuthenticatedToken
+from sentry.auth.superuser import is_active_superuser
+from sentry.constants import ALL_ACCESS_PROJECT_ID, ALL_ACCESS_PROJECTS_SLUG, ObjectStatus
+from sentry.exceptions import InvalidParams
+from sentry.models.apikey import is_api_key_auth
+from sentry.models.apitoken import is_api_token_auth
+from sentry.models.environment import Environment
+from sentry.models.organization import Organization
+from sentry.models.orgauthtoken import is_org_auth_token_auth
+from sentry.models.project import Project
+from sentry.models.release import Release
+from sentry.models.releases.release_project import ReleaseProject
+from sentry.organizations.services.organization import (
+    RpcOrganization,
+    RpcUserOrganizationContext,
+    organization_service,
+)
+from sentry.seer.agent_token import is_agent_auth
+from sentry.service_accounts.auth import is_service_account_auth
+from sentry.types.cell import subdomain_is_locality
 from sentry.utils import auth
 from sentry.utils.hashlib import hash_values
+from sentry.utils.numbers import format_grouped_length
 from sentry.utils.sdk import bind_organization_context
-from sentry.utils.compat import map
+
+logger = logging.getLogger(__name__)
 
 
 class NoProjects(Exception):
     pass
 
 
-class OrganizationPermission(SentryPermission):
+class UnknownEnvironments(ResourceDoesNotExist):
+    pass
+
+
+class SingleProjectIdOrSlug(NamedTuple):
+    project_id: int | None
+    project_slug: str | None
+
+    @property
+    def project_ids(self) -> set[int] | None:
+        if self.project_id is None:
+            return None
+        return {self.project_id}
+
+    @property
+    def project_slugs(self) -> set[str] | None:
+        if self.project_slug is None:
+            return None
+        return {self.project_slug}
+
+
+class OrganizationPermission(DemoSafePermission):
     scope_map = {
         "GET": ["org:read", "org:write", "org:admin"],
         "POST": ["org:write", "org:admin"],
         "PUT": ["org:write", "org:admin"],
         "DELETE": ["org:admin"],
     }
+    # Stop accepting `settings.DEPRECATED_SCOPES` in orgs with granular scopes while the
+    # deprecated scope translation is enabled. Members get the replacements from the granular
+    # roles, and tokens holding a deprecated scope get them from the translation. Only opt in
+    # once every deprecated scope in `scope_map` has a translated replacement that the granular
+    # roles grant and this permission accepts.
+    rejects_deprecated_scopes = False
 
-    def is_not_2fa_compliant(self, request, organization):
-        return (
-            organization.flags.require_2fa
-            and not Authenticator.objects.user_has_2fa(request.user)
-            and not is_active_superuser(request)
-        )
+    def is_not_2fa_compliant(
+        self, request: Request, organization: RpcOrganization | Organization
+    ) -> bool:
+        if not organization.flags.require_2fa:
+            return False
 
-    def needs_sso(self, request, organization):
+        if request.user.is_authenticated and require_user(request).has_2fa():
+            return False
+
+        if request.user.is_authenticated and request.user.is_sentry_app:
+            return False
+
+        if request.user.is_anonymous:
+            return False
+
+        if is_active_superuser(request):
+            return False
+
+        return True
+
+    def needs_sso(self, request: Request, organization: Organization | RpcOrganization) -> bool:
         # XXX(dcramer): this is very similar to the server-rendered views
         # logic for checking valid SSO
         if not request.access.requires_sso:
@@ -54,14 +132,77 @@ class OrganizationPermission(SentryPermission):
             return True
         return False
 
-    def has_object_permission(self, request, view, organization):
+    def has_object_permission(
+        self,
+        request: Request,
+        view: APIView,
+        organization: Organization | RpcOrganization | RpcUserOrganizationContext,
+    ) -> bool:
         self.determine_access(request, organization)
-        allowed_scopes = set(self.scope_map.get(request.method, []))
+
+        org_slug = getattr(request, "_superuser_needs_org_auth", None)
+        if org_slug:
+            has_staff_perm = any(
+                isinstance(perm, StaffPermissionMixin) for perm in view.get_permissions()
+            )
+            delattr(request, "_superuser_needs_org_auth")
+            if not has_staff_perm:
+                raise SuperuserRequired(orgSlug=org_slug)
+
+        allowed_scopes = self.get_allowed_scopes(request, organization)
         return any(request.access.has_scope(s) for s in allowed_scopes)
+
+    def get_allowed_scopes(
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization | RpcUserOrganizationContext,
+    ) -> set[str]:
+        """The scopes that grant access to `organization` for the request's method."""
+        allowed_scopes = set(self.scope_map.get(request.method or "", []))
+        if self.rejects_deprecated_scopes and self._deprecated_scopes_retired(organization):
+            allowed_scopes -= settings.DEPRECATED_SCOPES
+        return allowed_scopes
+
+    def _deprecated_scopes_retired(
+        self, organization: Organization | RpcOrganization | RpcUserOrganizationContext
+    ) -> bool:
+        if isinstance(organization, RpcUserOrganizationContext):
+            organization = organization.organization
+        # TODO: Remove deprecated scopes from opted-in scope maps once the translation is
+        # enabled everywhere.
+        return options.get("auth.deprecated-scope-translation.enabled") and features.has(
+            "organizations:granular-permission-scopes", organization
+        )
+
+    def is_member_disabled_from_limit(
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization | RpcUserOrganizationContext,
+    ) -> bool:
+        return is_member_disabled_from_limit(request, organization)
+
+
+class OrganizationAndStaffPermission(StaffPermissionMixin, OrganizationPermission):
+    """Allows staff to to access organization endpoints."""
+
+    pass
 
 
 class OrganizationAuditPermission(OrganizationPermission):
     scope_map = {"GET": ["org:write"]}
+
+    def has_object_permission(
+        self,
+        request: Request,
+        view: APIView,
+        organization: Organization | RpcOrganization | RpcUserOrganizationContext,
+    ) -> bool:
+        if super().has_object_permission(request, view, organization):
+            return True
+
+        # the GET requires org:write, but we want both superuser read-only +
+        # write to be able to access this GET. read-only only has :read scopes
+        return is_active_superuser(request)
 
 
 class OrganizationEventPermission(OrganizationPermission):
@@ -78,9 +219,9 @@ class OrganizationEventPermission(OrganizationPermission):
 # associated with projects people have access to
 class OrganizationReleasePermission(OrganizationPermission):
     scope_map = {
-        "GET": ["project:read", "project:write", "project:admin", "project:releases"],
-        "POST": ["project:write", "project:admin", "project:releases"],
-        "PUT": ["project:write", "project:admin", "project:releases"],
+        "GET": ["project:read", "project:write", "project:admin", "project:releases", "org:ci"],
+        "POST": ["project:write", "project:admin", "project:releases", "org:ci"],
+        "PUT": ["project:write", "project:admin", "project:releases", "org:ci"],
         "DELETE": ["project:admin", "project:releases"],
     }
 
@@ -91,6 +232,22 @@ class OrganizationIntegrationsPermission(OrganizationPermission):
         "POST": ["org:write", "org:admin", "org:integrations"],
         "PUT": ["org:write", "org:admin", "org:integrations"],
         "DELETE": ["org:admin", "org:integrations"],
+    }
+
+
+class OrganizationIntegrationsLoosePermission(OrganizationPermission):
+    scope_map = {
+        "GET": ["org:read", "org:write", "org:admin", "org:integrations", "org:ci"],
+        "POST": ["org:read", "org:write", "org:admin", "org:integrations"],
+        "PUT": ["org:read", "org:write", "org:admin", "org:integrations"],
+        "DELETE": ["org:admin", "org:integrations"],
+    }
+
+
+class OrganizationCodeMappingsBulkPermission(OrganizationPermission):
+    scope_map = {
+        "GET": ["org:read", "org:write", "org:admin", "org:integrations", "org:ci"],
+        "POST": ["org:read", "org:write", "org:admin", "org:integrations", "org:ci"],
     }
 
 
@@ -116,22 +273,6 @@ class OrganizationUserReportsPermission(OrganizationPermission):
     scope_map = {"GET": ["project:read", "project:write", "project:admin"]}
 
 
-class OrganizationPinnedSearchPermission(OrganizationPermission):
-    scope_map = {
-        "PUT": ["org:read", "org:write", "org:admin"],
-        "DELETE": ["org:read", "org:write", "org:admin"],
-    }
-
-
-class OrganizationSearchPermission(OrganizationPermission):
-    scope_map = {
-        "GET": ["org:read", "org:write", "org:admin"],
-        "POST": ["org:write", "org:admin"],
-        "PUT": ["org:write", "org:admin"],
-        "DELETE": ["org:write", "org:admin"],
-    }
-
-
 class OrganizationDataExportPermission(OrganizationPermission):
     scope_map = {
         "GET": ["event:read", "event:write", "event:admin"],
@@ -141,36 +282,218 @@ class OrganizationDataExportPermission(OrganizationPermission):
 
 class OrganizationAlertRulePermission(OrganizationPermission):
     scope_map = {
-        "GET": ["org:read", "org:write", "org:admin", "alert_rule:read"],
-        "POST": ["org:write", "org:admin", "alert_rule:write"],
-        "PUT": ["org:write", "org:admin", "alert_rule:write"],
-        "DELETE": ["org:write", "org:admin", "alert_rule:write"],
+        "GET": ["org:read", "org:write", "org:admin", "alerts:read"],
+        # grant org:read permission, but raise permission denied if the members aren't allowed
+        # to create alerts and the user isn't a team admin
+        "POST": ["org:read", "org:write", "org:admin", "alerts:write"],
+        "PUT": ["org:write", "org:admin", "alerts:write"],
+        "DELETE": ["org:write", "org:admin", "alerts:write"],
     }
 
 
+class OrganizationDetectorPermission(OrganizationPermission):
+    scope_map = {
+        "GET": ["org:read", "org:write", "org:admin", "alerts:read"],
+        # grant org:read permission, but raise permission denied if the members aren't allowed
+        # to create alerts and the user isn't a team admin
+        "POST": ["org:read", "org:write", "org:admin", "alerts:write"],
+        "PUT": ["org:read", "org:write", "org:admin", "alerts:write"],
+        "DELETE": ["org:read", "org:write", "org:admin", "alerts:write"],
+    }
+
+
+class OrgAuthTokenPermission(OrganizationPermission):
+    """
+    Org auth tokens can be managed from a browser session, or by an OAuth application
+    token (e.g. the Sentry CLI) acting for a member who consented to `org:tokens`.
+
+    Every other token type is rejected: personal tokens cannot hold token-only scopes
+    like `org:tokens`, and org auth / integration tokens must never mint new tokens.
+    """
+
+    scope_map = {
+        "GET": ["org:read", "org:write", "org:admin"],
+        "POST": ["org:read", "org:write", "org:admin"],
+        "PUT": ["org:read", "org:write", "org:admin"],
+        "DELETE": ["org:write", "org:admin"],
+    }
+
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        if request.auth is not None:
+            if not self._is_oauth_application_token(request):
+                return False
+            if not request.auth.has_scope("org:tokens"):
+                setattr(request, INSUFFICIENT_SCOPE_ATTR, {"org:tokens"})
+                return False
+        return super().has_permission(request, view)
+
+    @staticmethod
+    def _is_oauth_application_token(request: Request) -> bool:
+        return (
+            isinstance(request.successful_authenticator, UserAuthTokenAuthentication)
+            and is_api_token_auth(request.auth)
+            and request.auth.application_id is not None
+            and not getattr(request.user, "is_sentry_app", False)
+        )
+
+
+def get_issuing_token_audit_log_data(request: Request) -> dict[str, int]:
+    """
+    Record which OAuth application and token managed an org auth token, so tokens minted by
+    a compromised OAuth grant can be traced back to it.
+    """
+    if not is_api_token_auth(request.auth) or request.auth.application_id is None:
+        return {}
+    issuing_token = AuthenticatedToken.from_token(request.auth)
+    assert issuing_token is not None and issuing_token.entity_id is not None
+    return {
+        "application_id": request.auth.application_id,
+        "api_token_id": issuing_token.entity_id,
+    }
+
+
+class OrganizationFlagWebHookSigningSecretPermission(OrganizationPermission):
+    scope_map = {
+        "GET": ["org:read", "org:write", "org:admin"],
+        "POST": ["org:read", "org:write", "org:admin"],
+        "DELETE": ["org:write", "org:admin"],
+    }
+
+
+class ControlSiloOrganizationEndpoint(Endpoint):
+    """
+    A base class for endpoints that use an organization scoping but lives in the control silo
+    """
+
+    permission_classes: tuple[type[BasePermission], ...] = (OrganizationPermission,)
+
+    # Control silo endpoints fetch the organization over RPC from the cell silo.
+    # Including projects/teams serializes every row into the response body, which is
+    # expensive for large organizations. Set these to False when the endpoint does not
+    # need them.
+    include_organization_projects: bool = True
+    include_organization_teams: bool = True
+
+    def convert_args(
+        self,
+        request: Request,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        organization_id_or_slug: int | str | None = None
+        if args and args[0] is not None:
+            organization_id_or_slug = args[0]
+            # Required so it behaves like the original convert_args, where organization_id_or_slug was another parameter
+            # TODO: Remove this once we remove the old `organization_slug` parameter from getsentry
+            args = args[1:]
+        else:
+            organization_id_or_slug = kwargs.pop("organization_id_or_slug", None) or kwargs.pop(
+                "organization_slug", None
+            )
+
+        if not organization_id_or_slug:
+            raise ResourceDoesNotExist
+
+        if not subdomain_is_locality(request):
+            subdomain = getattr(request, "subdomain", None)
+            if subdomain is not None and subdomain != organization_id_or_slug:
+                raise ResourceDoesNotExist
+
+        if str(organization_id_or_slug).isdecimal():
+            # It is ok that `get_organization_by_id` doesn't check for visibility as we
+            # don't check the visibility in `get_organization_by_slug` either (only_active=False).
+            organization_context = organization_service.get_organization_by_id(
+                id=int(organization_id_or_slug),
+                user_id=acting_user_id(request.user),
+                include_projects=self.include_organization_projects,
+                include_teams=self.include_organization_teams,
+            )
+        else:
+            organization_context = organization_service.get_organization_by_slug(
+                slug=str(organization_id_or_slug),
+                only_visible=False,
+                user_id=acting_user_id(request.user),
+                include_projects=self.include_organization_projects,
+                include_teams=self.include_organization_teams,
+            )
+        if organization_context is None:
+            raise ResourceDoesNotExist
+
+        with traces.start_span(
+            name="check_object_permissions_on_organization",
+            attributes={"sentry.op": "check_object_permissions_on_organization"},
+        ):
+            self.check_object_permissions(request, organization_context)
+
+        bind_organization_context(organization_context.organization)
+
+        # Track the 'active' organization when the request came from
+        # a cookie based agent (react app)
+        # Never track any org (regardless of whether the user does or doesn't have
+        # membership in that org) when the user is in active superuser mode
+        if request.auth is None and request.user and not is_active_superuser(request):
+            auth.set_active_org(request, organization_context.organization.slug)
+
+        kwargs["organization_context"] = organization_context
+        kwargs["organization"] = organization_context.organization
+
+        # Used for API access logs
+        request._request.organization = organization_context.organization
+
+        return (args, kwargs)
+
+
+class FilterParams(TypedDict):
+    start: datetime | None
+    end: datetime | None
+    project_id: list[int]
+    project_objects: list[Project]
+    organization_id: int
+    environment: NotRequired[list[str]]
+    environment_objects: NotRequired[list[Environment]]
+
+
+class FilterParamsDateNotNull(TypedDict):
+    start: datetime
+    end: datetime
+    project_id: list[int]
+    project_objects: list[Project]
+    organization_id: int
+    environment: NotRequired[list[str]]
+    environment_objects: NotRequired[list[Environment]]
+
+
+def _validate_fetched_projects(
+    filtered_projects: Sequence[Project],
+    slugs: set[str] | None,
+    ids: set[int] | None,
+) -> None:
+    """
+    Validates that user has access to the specific projects they are requesting.
+    """
+    fetched_ids = {p.id for p in filtered_projects}
+    fetched_slugs = {p.slug for p in filtered_projects}
+
+    missing_project_ids = ids and not ids.issubset(fetched_ids)
+    missing_project_slugs = slugs and not slugs.issubset(fetched_slugs)
+
+    if missing_project_ids or missing_project_slugs:
+        raise PermissionDenied
+
+
 class OrganizationEndpoint(Endpoint):
-    permission_classes = (OrganizationPermission,)
-
-    def get_requested_project_ids(self, request):
-        """
-        Returns the project ids that were requested by the request.
-
-        To determine the projects to filter this endpoint by with full
-        permission checking, use ``get_projects``, instead.
-        """
-        try:
-            return set(map(int, request.GET.getlist("project")))
-        except ValueError:
-            raise ParseError(detail="Invalid project parameter. Values must be numbers.")
+    permission_classes: tuple[type[BasePermission], ...] = (OrganizationPermission,)
 
     def get_projects(
         self,
-        request,
-        organization,
-        force_global_perms=False,
-        include_all_accessible=False,
-        project_ids=None,
-    ):
+        request: Request,
+        organization: Organization | RpcOrganization,
+        *,
+        force_global_perms: bool = False,
+        include_all_accessible: bool = False,
+        project_ids: set[int] | None = None,
+        project_slugs: set[str] | None = None,
+    ) -> list[Project]:
         """
         Determines which project ids to filter the endpoint by. If a list of
         project ids is passed in via the `project` querystring argument then
@@ -180,80 +503,220 @@ class OrganizationEndpoint(Endpoint):
 
         :param request:
         :param organization: Organization to fetch projects for
-        :param force_global_perms: Permission override. Allows subclasses to
-        perform their own validation and allow the user to access any project
-        in the organization. This is a hack to support the old
-        `request.auth.has_scope` way of checking permissions, don't use it
-        for anything else, we plan to remove this once we remove uses of
-        `auth.has_scope`.
-        :param include_all_accessible: Whether to factor the organization
-        allow_joinleave flag into permission checks. We should ideally
-        standardize how this is used and remove this parameter.
-        :param project_ids: Projects if they were passed via request
-        data instead of get params
-        :return: A list of Project objects, or raises PermissionDenied.
+        :param force_global_perms: Permission override. Allows subclasses to perform their own validation
+        and allow the user to access any project in the organization. This is a hack to support the old
+        `request.auth.has_scope` way of checking permissions, don't use it for anything else, we plan to
+        remove this once we remove uses of `auth.has_scope`.
+        :param include_all_accessible: Whether to factor the organization allow_joinleave flag into
+        permission checks. We should ideally standardize how this is used and remove this parameter.
+        :param project_ids: Projects if they were passed via request data instead of get params
+        :param project_slugs: Project slugs if they were passed via request  data instead of get params
+        :return: A list of Project objects, or raises PermissionDenied. When project_ids or project_slugs
+        are explicitly provided, the returned list is guaranteed non-empty (or PermissionDenied is raised).
+
         """
-        if project_ids is None:
-            project_ids = self.get_requested_project_ids(request)
-        return self._get_projects_by_id(
-            project_ids, request, organization, force_global_perms, include_all_accessible
+        qs = Project.objects.filter(organization_id=organization.id, status=ObjectStatus.ACTIVE)
+        if project_ids or project_slugs:
+            requested_projects = ParsedProjectIdOrSlugParams(
+                ids=project_ids or set(), slugs=set(project_slugs or ())
+            )
+        else:
+            requested_projects = self.get_requested_project_params_unchecked(request)
+        ids = requested_projects.ids
+        slugs = requested_projects.slugs
+
+        if requested_projects.has_all_projects_sentinel:
+            include_all_accessible = True
+        elif ids and slugs:
+            qs = qs.filter(Q(id__in=ids) | Q(slug__in=slugs))
+        elif slugs:
+            qs = qs.filter(slug__in=slugs)
+        elif ids:
+            qs = qs.filter(id__in=ids)
+        # No project ids or slugs === `all projects I am a member of`
+
+        with traces.start_span(
+            name="fetch_organization_projects",
+            attributes={"sentry.op": "fetch_organization_projects"},
+        ) as span:
+            projects = list(qs)
+            span.set_attribute("Project Count", len(projects))
+
+        filter_by_membership = not bool(ids) and not bool(slugs)
+        filtered_projects = self._filter_projects_by_permissions(
+            projects=projects,
+            request=request,
+            filter_by_membership=filter_by_membership,
+            force_global_perms=force_global_perms,
+            include_all_accessible=include_all_accessible,
         )
 
-    def _get_projects_by_id(
+        requesting_specific_projects = not include_all_accessible and not filter_by_membership
+        if requesting_specific_projects:
+            _validate_fetched_projects(filtered_projects, slugs, ids)
+
+        return filtered_projects
+
+    def _filter_projects_by_permissions(
         self,
-        project_ids,
-        request,
-        organization,
-        force_global_perms=False,
-        include_all_accessible=False,
-    ):
-        qs = Project.objects.filter(organization=organization, status=ProjectStatus.VISIBLE)
-        user = getattr(request, "user", None)
+        projects: list[Project],
+        request: HttpRequest,
+        filter_by_membership: bool = False,
+        force_global_perms: bool = False,
+        include_all_accessible: bool = False,
+    ) -> list[Project]:
+        return filter_projects_by_permissions(
+            projects=projects,
+            request=request,
+            filter_by_membership=filter_by_membership,
+            force_global_perms=force_global_perms,
+            include_all_accessible=include_all_accessible,
+        )
 
-        # A project_id of -1 means 'all projects I have access to'
-        # While no project_ids means 'all projects I am a member of'.
-        if project_ids == ALL_ACCESS_PROJECTS:
-            include_all_accessible = True
-            project_ids = set()
+    def get_requested_project_ids_unchecked(self, request: HttpRequest) -> set[int]:
+        """
+        Returns the numeric project ids that were requested by the request.
+        Non-numeric values (slugs) are silently ignored.
 
-        requested_projects = project_ids.copy()
-        if project_ids:
-            qs = qs.filter(id__in=project_ids)
+        To determine the projects to filter this endpoint by with full
+        permission checking, use ``get_projects``, instead.
+        """
+        return self.get_requested_project_ids_and_slugs_unchecked(request).ids
 
-        with sentry_sdk.start_span(op="fetch_organization_projects") as span:
-            projects = list(qs)
-            span.set_data("Project Count", len(projects))
-        with sentry_sdk.start_span(op="apply_project_permissions") as span:
-            span.set_data("Project Count", len(projects))
-            if force_global_perms:
-                span.set_tag("mode", "force_global_perms")
-            else:
-                if (
-                    user
-                    and is_active_superuser(request)
-                    or requested_projects
-                    or include_all_accessible
-                ):
-                    span.set_tag("mode", "has_project_access")
-                    func = request.access.has_project_access
-                else:
-                    span.set_tag("mode", "has_project_membership")
-                    func = request.access.has_project_membership
-                projects = [p for p in qs if func(p)]
+    def get_requested_project_ids_and_slugs_unchecked(
+        self, request: HttpRequest
+    ) -> ParsedProjectIdOrSlugParams:
+        """
+        Returns the project ids and slugs requested via the project query param.
 
-        project_ids = {p.id for p in projects}
+        To determine the projects to filter this endpoint by with full
+        permission checking, use ``get_projects``, instead.
+        """
+        return parse_id_or_slug_params(request.GET.getlist("project"))
 
-        if requested_projects and project_ids != requested_projects:
-            raise PermissionDenied
+    def get_requested_project_params_unchecked(
+        self, request: HttpRequest
+    ) -> ParsedProjectIdOrSlugParams:
+        """
+        Returns requested project ids and slugs from projectSlug or project query params.
 
-        return projects
+        To determine the projects to filter this endpoint by with full
+        permission checking, use ``get_projects``, instead.
+        """
+        project_slugs = set(filter(None, request.GET.getlist("projectSlug")))
+        if project_slugs:
+            return ParsedProjectIdOrSlugParams(ids=set(), slugs=project_slugs)
+        return self.get_requested_project_ids_and_slugs_unchecked(request)
 
-    def get_environments(self, request, organization):
+    def get_query_params_without_empty_project_params(self, request: HttpRequest) -> QueryDict:
+        """
+        Return query params with blank project filters treated as absent.
+        """
+        query_params = request.GET.copy()
+        if "project" in query_params:
+            query_params.setlist(
+                "project", [project for project in query_params.getlist("project") if project]
+            )
+        return query_params
+
+    def get_query_params_with_project_slug_precedence(self, request: HttpRequest) -> QueryDict:
+        """
+        Return query params for serializers that accept project and projectSlug.
+
+        This mirrors get_projects() precedence: non-empty legacy projectSlug
+        filters win over project filters, and blank project filters are treated
+        as absent.
+        """
+        query_params = self.get_query_params_without_empty_project_params(request)
+        project_slug_params = [slug for slug in query_params.getlist("projectSlug") if slug]
+        if "projectSlug" in query_params:
+            query_params.setlist("projectSlug", project_slug_params)
+        if project_slug_params:
+            query_params.pop("project", None)
+        return query_params
+
+    def get_single_project_id_or_slug(
+        self,
+        project_id_or_slug: object,
+        *,
+        error_detail: str = "Invalid project",
+    ) -> SingleProjectIdOrSlug | None:
+        """
+        Parse one project ID-or-slug value for single-project endpoints.
+
+        Unlike get_projects(), this rejects all-project sentinels because callers
+        use the result to scope a lookup to exactly one project.
+        """
+        if project_id_or_slug is None or project_id_or_slug == "":
+            return None
+
+        try:
+            project = ProjectIdOrSlugField().run_validation(project_id_or_slug)
+        except ValidationError:
+            raise ParseError(detail=error_detail)
+
+        if project in (ALL_ACCESS_PROJECT_ID, ALL_ACCESS_PROJECTS_SLUG):
+            raise ParseError(detail=error_detail)
+        if isinstance(project, int):
+            return SingleProjectIdOrSlug(project_id=project, project_slug=None)
+        return SingleProjectIdOrSlug(project_id=None, project_slug=project)
+
+    def get_single_project_id_or_slug_from_request(
+        self,
+        request: HttpRequest,
+        *,
+        error_detail: str = "Invalid project",
+    ) -> SingleProjectIdOrSlug | None:
+        """
+        Parse single-project filters from projectSlug or project query params.
+
+        projectSlug keeps its legacy precedence over project. Empty filters are
+        treated as absent, matching get_query_params_with_project_slug_precedence().
+        """
+        project_slug = request.GET.get("projectSlug")
+        if project_slug:
+            if project_slug in (str(ALL_ACCESS_PROJECT_ID), ALL_ACCESS_PROJECTS_SLUG):
+                raise ParseError(detail=error_detail)
+            return SingleProjectIdOrSlug(project_id=None, project_slug=project_slug)
+
+        return self.get_single_project_id_or_slug(
+            request.GET.get("project"), error_detail=error_detail
+        )
+
+    def get_environments(
+        self, request: Request, organization: Organization | RpcOrganization
+    ) -> list[Environment]:
         return get_environments(request, organization)
 
+    @overload
     def get_filter_params(
-        self, request, organization, date_filter_optional=False, project_ids=None
-    ):
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization,
+        project_ids: list[int] | set[int] | None = None,
+        project_slugs: list[str] | set[str] | None = None,
+    ) -> FilterParamsDateNotNull: ...
+
+    @overload
+    def get_filter_params(
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization,
+        project_ids: list[int] | set[int] | None = None,
+        project_slugs: list[str] | set[str] | None = None,
+        *,
+        date_filter_optional: Literal[True],
+    ) -> FilterParams: ...
+
+    def get_filter_params(
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization,
+        project_ids: list[int] | set[int] | None = None,
+        project_slugs: list[str] | set[str] | None = None,
+        *,
+        date_filter_optional: bool = False,
+    ) -> FilterParams | FilterParamsDateNotNull:
         """
         Extracts common filter parameters from the request and returns them
         in a standard format.
@@ -274,10 +737,21 @@ class OrganizationEndpoint(Endpoint):
         # get the top level params -- projects, time range, and environment
         # from the request
         try:
-            start, end = get_date_range_from_params(request.GET, optional=date_filter_optional)
+            data = (
+                request.data if len(request.GET) == 0 and hasattr(request, "data") else request.GET
+            )
+            # For some reason we use range in saved queries
+            if "range" in data and "statsPeriod" not in data:
+                if not isinstance(data, QueryDict):
+                    logger.warning("deprecated range parameter used")
+                    data["statsPeriod"] = data["range"]
+                else:
+                    raise ParseError(detail="range is not a supported parameter")
+            start, end = get_date_range_from_params(data, optional=date_filter_optional)
             if start and end:
                 total_seconds = (end - start).total_seconds()
                 sentry_sdk.set_tag("query.period", total_seconds)
+                sentry_sdk.set_attribute("query.period", total_seconds)
                 one_day = 86400
                 grouped_period = ">30d"
                 if total_seconds <= one_day:
@@ -289,11 +763,18 @@ class OrganizationEndpoint(Endpoint):
                 elif total_seconds <= one_day * 30:
                     grouped_period = "<=30d"
                 sentry_sdk.set_tag("query.period.grouped", grouped_period)
+                sentry_sdk.set_attribute("query.period.grouped", grouped_period)
         except InvalidParams as e:
             raise ParseError(detail=f"Invalid date range: {e}")
 
         try:
-            projects = self.get_projects(request, organization, project_ids)
+            if isinstance(project_ids, list):
+                project_ids = set(project_ids)
+            if isinstance(project_slugs, list):
+                project_slugs = set(project_slugs)
+            projects = self.get_projects(
+                request, organization, project_ids=project_ids, project_slugs=project_slugs
+            )
         except ValueError:
             raise ParseError(detail="Invalid project ids")
 
@@ -302,32 +783,72 @@ class OrganizationEndpoint(Endpoint):
 
         len_projects = len(projects)
         sentry_sdk.set_tag("query.num_projects", len_projects)
-        sentry_sdk.set_tag(
-            "query.num_projects.grouped",
-            "<10" if len_projects < 10 else "<100" if len_projects < 100 else ">100",
-        )
+        sentry_sdk.set_attribute("query.num_projects", len_projects)
+        sentry_sdk.set_tag("query.num_projects.grouped", format_grouped_length(len_projects))
+        sentry_sdk.set_attribute("query.num_projects.grouped", format_grouped_length(len_projects))
+        span = traces.get_current_span()
+        if span:
+            span.set_attribute("query.num_projects", len_projects)
 
-        environments = self.get_environments(request, organization)
-        params = {
+        params: FilterParams = {
             "start": start,
             "end": end,
             "project_id": [p.id for p in projects],
+            "project_objects": projects,
             "organization_id": organization.id,
         }
+
+        try:
+            environments = self.get_environments(request, organization)
+        except ResourceDoesNotExist:
+            raise UnknownEnvironments("Unknown environments selected")
+
         if environments:
             params["environment"] = [env.name for env in environments]
             params["environment_objects"] = environments
 
         return params
 
-    def convert_args(self, request, organization_slug, *args, **kwargs):
+    def convert_args(
+        self,
+        request: Request,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """
+        We temporarily allow the organization_id_or_slug to be an integer as it actually can be both slug or id
+        Eventually, we will rename this method to organization_id_or_slug
+        """
+        organization_id_or_slug: int | str | None = None
+        if args and args[0] is not None:
+            organization_id_or_slug = args[0]
+            # Required so it behaves like the original convert_args, where organization_id_or_slug was another parameter
+            # TODO: Remove this once we remove the old `organization_slug` parameter from getsentry
+            args = args[1:]
+        else:
+            organization_id_or_slug = kwargs.pop("organization_id_or_slug", None) or kwargs.pop(
+                "organization_slug", None
+            )
+
+        if not organization_id_or_slug:
+            raise ResourceDoesNotExist
+
+        if not subdomain_is_locality(request):
+            subdomain = getattr(request, "subdomain", None)
+            if subdomain is not None and subdomain != organization_id_or_slug:
+                raise ResourceDoesNotExist
+
         try:
-            organization = Organization.objects.get_from_cache(slug=organization_slug)
+            if str(organization_id_or_slug).isdecimal():
+                organization = Organization.objects.get_from_cache(id=organization_id_or_slug)
+            else:
+                organization = Organization.objects.get_from_cache(slug=organization_id_or_slug)
         except Organization.DoesNotExist:
             raise ResourceDoesNotExist
 
-        with sentry_sdk.start_span(
-            op="check_object_permissions_on_organization", description=organization_slug
+        with traces.start_span(
+            name="check_object_permissions_on_organization",
+            attributes={"sentry.op": "check_object_permissions_on_organization"},
         ):
             self.check_object_permissions(request, organization)
 
@@ -340,7 +861,7 @@ class OrganizationEndpoint(Endpoint):
         # Never track any org (regardless of whether the user does or doesn't have
         # membership in that org) when the user is in active superuser mode
         if request.auth is None and request.user and not is_active_superuser(request):
-            request.session["activeorg"] = organization.slug
+            auth.set_active_org(request, organization.slug)
 
         kwargs["organization"] = organization
         return (args, kwargs)
@@ -349,22 +870,55 @@ class OrganizationEndpoint(Endpoint):
 class OrganizationReleasesBaseEndpoint(OrganizationEndpoint):
     permission_classes = (OrganizationReleasePermission,)
 
-    def get_projects(self, request, organization, project_ids=None):
+    def get_projects(
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization,
+        *,
+        force_global_perms: bool = False,
+        include_all_accessible: bool = True,
+        project_ids: set[int] | None = None,
+        project_slugs: set[str] | None = None,
+    ) -> list[Project]:
         """
         Get all projects the current user or API token has access to. More
         detail in the parent class's method of the same name.
         """
         has_valid_api_key = False
-        if isinstance(request.auth, ApiKey):
+        if is_api_key_auth(request.auth):
             if request.auth.organization_id != organization.id:
                 return []
             has_valid_api_key = request.auth.has_scope(
                 "project:releases"
             ) or request.auth.has_scope("project:write")
 
+        if is_org_auth_token_auth(request.auth):
+            if request.auth.organization_id != organization.id:
+                return []
+            has_valid_api_key = request.auth.has_scope("org:ci")
+
+        # Check if authenticated via API token (used by Sentry CLI) with appropriate release scopes.
+        # This ensures consistency with the project releases endpoint which allows
+        # API tokens with project:releases scope to create releases even if the user
+        # is not a direct team member of the project.
+        has_valid_api_key = has_valid_api_key or (
+            is_api_token_auth(request.auth) and request.access.has_scope("project:releases")
+        )
+
+        agent_auth = request.auth if is_agent_auth(request.auth) else None
+        has_valid_agent_auth = (
+            agent_auth is not None and agent_auth.organization_id == organization.id
+        )
+        has_valid_service_account_auth = (
+            is_service_account_auth(request.auth)
+            and request.auth.organization_id == organization.id
+        )
+
         if not (
             has_valid_api_key
-            or (getattr(request, "user", None) and request.user.is_authenticated())
+            or has_valid_agent_auth
+            or has_valid_service_account_auth
+            or (getattr(request, "user", None) and request.user.is_authenticated)
         ):
             return []
 
@@ -372,36 +926,73 @@ class OrganizationReleasesBaseEndpoint(OrganizationEndpoint):
             request,
             organization,
             force_global_perms=has_valid_api_key,
-            include_all_accessible=True,
+            include_all_accessible=include_all_accessible,
             project_ids=project_ids,
+            project_slugs=project_slugs,
         )
 
-    def has_release_permission(self, request, organization, release):
+    def has_release_permission(
+        self,
+        request: Request,
+        organization: Organization | RpcOrganization,
+        release: Release | None = None,
+        project_ids: set[int] | None = None,
+        require_all_projects: bool = False,
+    ) -> bool:
         """
         Does the given request have permission to access this release, based
         on the projects to which the release is attached?
 
-        If the given request has an actor (user or ApiKey), cache the results
-        for a minute on the unique combination of actor,org,release, and project
-        ids.
+        By default, access is granted if the user has access to *any* project
+        on the release (suitable for reads). When require_all_projects=True,
+        the user must have access to *all* projects on the release (use for
+        mutations). Without this, a user with access to one project on a
+        multi-project release could modify or delete it, affecting projects
+        they cannot access. The all-projects check respects Open Membership
+        via has_global_access.
+
+        Results are cached for 60s per actor/org/release/effective-project-scope/mode.
+        Agent requests bypass the cache so every call rechecks live project membership.
+        Service accounts bypass it too. With no user, they'd fall into the
+        `apikey:<entity_id>` key below, where a service account ID can match an
+        API key ID.
         """
         actor_id = None
         has_perms = None
-        if getattr(request, "user", None) and request.user.id:
-            actor_id = "user:%s" % request.user.id
-        if getattr(request, "auth", None) and request.auth.id:
-            actor_id = "apikey:%s" % request.auth.id
+        key = None
+        if not is_agent_auth(request.auth) and not is_service_account_auth(request.auth):
+            if request.user.is_authenticated:
+                actor_id = "user:%s" % require_user(request).id
+            elif request.auth is not None:
+                actor_id = "apikey:%s" % request.auth.entity_id
         if actor_id is not None:
-            project_ids = sorted(self.get_requested_project_ids(request))
+            if project_ids:
+                requested_projects = ParsedProjectIdOrSlugParams(ids=project_ids, slugs=set())
+            else:
+                requested_projects = self.get_requested_project_params_unchecked(request)
             key = "release_perms:1:%s" % hash_values(
-                [actor_id, organization.id, release.id] + project_ids
+                [
+                    actor_id,
+                    organization.id,
+                    release.id if release is not None else 0,
+                    int(require_all_projects),
+                ]
+                + sorted(requested_projects.ids)
+                + sorted(requested_projects.slugs)
             )
             has_perms = cache.get(key)
         if has_perms is None:
-            has_perms = ReleaseProject.objects.filter(
-                release=release, project__in=self.get_projects(request, organization)
-            ).exists()
-            if actor_id is not None:
+            projects = self.get_projects(request, organization, project_ids=project_ids)
+            if release is not None:
+                has_perms = ReleaseProject.objects.filter(
+                    release=release, project__in=projects
+                ).exists()
+                if has_perms and require_all_projects:
+                    has_perms = request.access.has_projects_access(list(release.projects.all()))
+            else:
+                has_perms = len(projects) > 0
+
+            if key is not None and actor_id is not None:
                 cache.set(key, has_perms, 60)
 
         return has_perms

@@ -1,0 +1,315 @@
+import {Fragment, useMemo} from 'react';
+import {useTheme} from '@emotion/react';
+import styled from '@emotion/styled';
+import {IconStack} from '@sentry/icons/stack';
+
+import {DropdownMenu, type MenuItemProps} from '@sentry/scraps/dropdownMenu';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {OverlayTrigger} from '@sentry/scraps/overlayTrigger';
+import {Pagination} from '@sentry/scraps/pagination';
+import {COL_WIDTH_UNDEFINED} from '@sentry/scraps/table';
+
+import {normalizeDateTimeParams} from 'sentry/components/pageFilters/parse';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {DataGrid} from 'sentry/components/tables/dataGrid';
+import {t} from 'sentry/locale';
+import {parseCursor} from 'sentry/utils/cursor';
+import {defined} from 'sentry/utils/defined';
+import type {TableDataRow} from 'sentry/utils/discover/discoverQuery';
+import {parseFunction, prettifyParsedFunction} from 'sentry/utils/discover/fields';
+import {FieldValueType, prettifyTagKey} from 'sentry/utils/fields';
+import {isRateLimitError} from 'sentry/utils/requestError/requestError';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {CellAction, updateQuery} from 'sentry/views/discover/table/cellAction';
+import type {TableColumn} from 'sentry/views/discover/table/types';
+import {ALLOWED_CELL_ACTIONS} from 'sentry/views/explore/components/cellActions';
+import type {RendererExtra} from 'sentry/views/explore/logs/fieldRenderers';
+import {LogFieldRenderer} from 'sentry/views/explore/logs/fieldRenderers';
+import {getTargetWithReadableQueryParams} from 'sentry/views/explore/logs/logsQueryParams';
+import {getLogColors} from 'sentry/views/explore/logs/styles';
+import {addValidatedFieldTypesToLogsMeta} from 'sentry/views/explore/logs/tables/logsInfiniteTable';
+import {LogsRateLimitError} from 'sentry/views/explore/logs/tables/logsRateLimitError';
+import {OurLogKnownFieldKey} from 'sentry/views/explore/logs/types';
+import {
+  LOGS_AGGREGATES_TIMESTAMP_FIELD,
+  LOGS_AGGREGATES_TRACE_FIELD,
+  type LogsAggregatesTableResult,
+} from 'sentry/views/explore/logs/useLogsAggregatesTable';
+import {
+  getLogSeverityLevel,
+  viewLogsSamplesTarget,
+} from 'sentry/views/explore/logs/utils';
+import {
+  useQueryParamsAggregateSortBys,
+  useQueryParamsAggregateCursor,
+  useQueryParamsFields,
+  useQueryParamsGroupBys,
+  useQueryParamsSearch,
+  useQueryParamsSortBys,
+  useQueryParamsTopEventsLimit,
+  useQueryParamsVisualizes,
+  useSetQueryParamsAggregateCursor,
+  useSetQueryParamsSearch,
+} from 'sentry/views/explore/queryParams/context';
+import {TraceViewSources} from 'sentry/views/performance/traceDetails/traceHeader/traceViewSources';
+import {getTraceDetailsUrl} from 'sentry/views/performance/traceDetails/traceUrl';
+
+export function LogsAggregateTable({
+  aggregatesTableResult,
+  validatedFieldTypes = {},
+}: {
+  aggregatesTableResult: LogsAggregatesTableResult;
+  validatedFieldTypes?: Partial<Record<string, FieldValueType>>;
+}) {
+  const {data, pageLinks, isLoading, error, refetch, eventView} = aggregatesTableResult;
+  const meta = useMemo(
+    () =>
+      addValidatedFieldTypesToLogsMeta({
+        meta: data?.meta,
+        validatedFieldTypes,
+      }),
+    [data?.meta, validatedFieldTypes]
+  );
+
+  const columns = useMemo(() => {
+    return eventView
+      ?.getColumns(meta)
+      ?.reduce<Record<string, TableColumn<string>>>((acc, col) => {
+        acc[col.key] = col;
+        return acc;
+      }, {});
+  }, [eventView, meta]);
+
+  const groupBys = useQueryParamsGroupBys();
+  const visualizes = useQueryParamsVisualizes();
+  const setAggregateCursor = useSetQueryParamsAggregateCursor();
+  const aggregateSortBys = useQueryParamsAggregateSortBys();
+  const aggregateCursor = useQueryParamsAggregateCursor();
+  const topEventsLimit = useQueryParamsTopEventsLimit();
+  const search = useQueryParamsSearch();
+  const setSearch = useSetQueryParamsSearch();
+  const fields = useQueryParamsFields();
+  const sorts = useQueryParamsSortBys();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const theme = useTheme();
+  const organization = useOrganization();
+  const {projects} = useProjects();
+  const {selection} = usePageFilters();
+
+  if (isRateLimitError(error)) {
+    return (
+      <Flex justify="center" align="center" padding="3xl" minHeight="200px">
+        <LogsRateLimitError onRetry={refetch} />
+      </Flex>
+    );
+  }
+
+  const allFields: string[] = [];
+  allFields.push(
+    ...groupBys.filter(Boolean),
+    ...visualizes.map(visualize => visualize.yAxis)
+  );
+
+  const numberOfRowsNeedingColor = Math.min(data?.data?.length ?? 0, topEventsLimit ?? 0);
+
+  const palette = theme.chart.getColorPalette(numberOfRowsNeedingColor - 1);
+
+  return (
+    <Stack>
+      <DataGrid
+        aria-label={t('Aggregates')}
+        isLoading={isLoading}
+        error={error}
+        data={data?.data ?? []}
+        columnOrder={allFields.map(field => ({
+          key: field,
+          name: field,
+          width: COL_WIDTH_UNDEFINED,
+        }))}
+        grid={{
+          getColumnSort: column => {
+            const func = parseFunction(column.name);
+            const direction =
+              aggregateSortBys?.[0]?.field === column.key
+                ? aggregateSortBys?.[0]?.kind
+                : undefined;
+            const nextSort = (() => {
+              switch (direction) {
+                case 'asc':
+                  return {
+                    field: visualizes[0]?.yAxis ?? allFields[0]!,
+                    kind: 'desc' as const,
+                  };
+                case 'desc':
+                  return {field: column.key, kind: 'asc' as const};
+                default:
+                  return {field: column.key, kind: 'desc' as const};
+              }
+            })();
+
+            return {
+              align: func ? 'right' : 'left',
+              direction,
+              to: getTargetWithReadableQueryParams(location, {
+                aggregateSortBys: [nextSort],
+              }),
+            };
+          },
+          renderHeadCell: column => {
+            const func = parseFunction(column.name);
+            return func ? prettifyParsedFunction(func) : prettifyTagKey(column.name);
+          },
+          renderBodyCell: (column, row) => {
+            const value = row[column.key] === undefined ? null : row[column.key]!;
+            const level = getLogSeverityLevel(
+              typeof row?.[OurLogKnownFieldKey.SEVERITY_NUMBER] === 'number'
+                ? row?.[OurLogKnownFieldKey.SEVERITY_NUMBER]
+                : null,
+              typeof row?.[OurLogKnownFieldKey.SEVERITY] === 'string'
+                ? row?.[OurLogKnownFieldKey.SEVERITY]
+                : null
+            );
+            const extra: RendererExtra = {
+              attributes: row,
+              attributeTypes: meta.fields,
+              caseSensitiveHighlighting: false,
+              datetime: selection.datetime,
+              highlightTerms: [],
+              logColors: getLogColors(level, theme),
+              location,
+              navigate,
+              organization,
+              theme,
+              unit: data?.meta?.units?.[column.key],
+            };
+
+            let rendered = (
+              <LogFieldRenderer
+                key={column.key}
+                extra={extra}
+                meta={meta}
+                item={{
+                  fieldKey: column.key,
+                  value,
+                }}
+              />
+            );
+
+            const cellActionColumn = columns?.[column.key];
+            if (cellActionColumn) {
+              rendered = (
+                <CellAction
+                  column={cellActionColumn}
+                  dataRow={row as TableDataRow}
+                  handleCellAction={(actions, newValue) => {
+                    const newSearch = search.copy();
+                    updateQuery(newSearch, actions, cellActionColumn, newValue);
+                    setSearch(newSearch);
+                  }}
+                  allowActions={ALLOWED_CELL_ACTIONS}
+                >
+                  {rendered}
+                </CellAction>
+              );
+            }
+
+            return rendered;
+          },
+          prependColumnWidths: ['min-content'],
+          renderPrependColumns: (isHeader, dataRow, rowIndex) => {
+            // rowIndex is only defined when `isHeader=false`
+            if (isHeader || !defined(rowIndex)) {
+              return [<span key="header-icon" />];
+            }
+
+            const row = dataRow || {};
+            const menuItems: MenuItemProps[] = [
+              {
+                key: 'view-samples',
+                label: t('View Samples'),
+                to: viewLogsSamplesTarget({
+                  location,
+                  search,
+                  fields: fields.slice(),
+                  groupBys,
+                  visualizes,
+                  sorts: sorts.slice(),
+                  row,
+                  projects,
+                }),
+              },
+            ];
+
+            const traceSlug = row[LOGS_AGGREGATES_TRACE_FIELD];
+            const timestamp = row[LOGS_AGGREGATES_TIMESTAMP_FIELD];
+            if (
+              typeof traceSlug === 'string' &&
+              traceSlug &&
+              (typeof timestamp === 'string' || typeof timestamp === 'number')
+            ) {
+              menuItems.push({
+                key: 'view-random-trace',
+                label: t('View Random Trace'),
+                to: getTraceDetailsUrl({
+                  organization,
+                  traceSlug,
+                  timestamp,
+                  targetId: undefined,
+                  eventId: undefined,
+                  location,
+                  source: TraceViewSources.LOGS,
+                  dateSelection: normalizeDateTimeParams(selection.datetime),
+                }),
+              });
+            }
+
+            return [
+              <Fragment key={`sample-${rowIndex}`}>
+                {topEventsLimit &&
+                  rowIndex < topEventsLimit &&
+                  !parseCursor(aggregateCursor)?.offset && (
+                    <TopResultsIndicator
+                      data-test-id="top-results-indicator"
+                      color={palette[rowIndex]!}
+                    />
+                  )}
+                <DropdownMenu
+                  items={menuItems}
+                  usePortal
+                  strategy="fixed"
+                  size="sm"
+                  offset={4}
+                  minMenuWidth={0}
+                  trigger={triggerProps => (
+                    <OverlayTrigger.IconButton
+                      {...triggerProps}
+                      aria-label={t('View Samples')}
+                      icon={<IconStack />}
+                      variant="transparent"
+                      size="zero"
+                    />
+                  )}
+                />
+              </Fragment>,
+            ];
+          },
+        }}
+      />
+      <Pagination pageLinks={pageLinks} onCursor={cursor => setAggregateCursor(cursor)} />
+    </Stack>
+  );
+}
+
+const TopResultsIndicator = styled('div')<{color: string}>`
+  position: absolute;
+  left: -1px;
+  width: 9px;
+  height: 16px;
+  border-radius: 0 3px 3px 0;
+
+  background-color: ${p => p.color};
+`;

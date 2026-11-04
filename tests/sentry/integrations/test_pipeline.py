@@ -1,41 +1,54 @@
-from sentry.utils.compat.mock import patch
+from __future__ import annotations
 
-from sentry.models import IdentityProvider, Identity, Integration, OrganizationIntegration
-from sentry.testutils import IntegrationTestCase
-from sentry.integrations.example import ExampleIntegrationProvider, AliasedIntegrationProvider
+from collections.abc import Generator
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from django.http.response import HttpResponse
+
+from sentry.integrations.example import AliasedIntegrationProvider, ExampleIntegrationProvider
 from sentry.integrations.gitlab.integration import GitlabIntegrationProvider
-from sentry.models import Repository
-from sentry.plugins.base import plugins
-from sentry.plugins.bases.issue2 import IssuePlugin2
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.pipeline import IntegrationPipeline
+from sentry.integrations.types import EventLifecycleOutcome
+from sentry.models.organizationmember import OrganizationMember
+from sentry.organizations.absolute_url import generate_organization_url
+from sentry.organizations.services.organization.serial import serialize_rpc_organization
+from sentry.pipeline.types import PipelineStepAction
+from sentry.shared_integrations.exceptions import IntegrationError
+from sentry.silo.base import SiloMode
+from sentry.testutils.asserts import assert_count_of_metric, assert_success_metric
+from sentry.testutils.cases import IntegrationTestCase
+from sentry.testutils.helpers import override_options
+from sentry.testutils.outbox import outbox_runner
+from sentry.testutils.silo import assume_test_silo_mode, assume_test_silo_mode_of, control_silo_test
+from sentry.users.models.identity import Identity
 
 
-class ExamplePlugin(IssuePlugin2):
-    slug = "example"
-
-
-plugins.register(ExamplePlugin)
-
-
-def naive_build_integration(data):
+def naive_build_integration(data: Any) -> Any:
     return data
 
 
+@control_silo_test
 @patch(
     "sentry.integrations.example.ExampleIntegrationProvider.build_integration",
     side_effect=naive_build_integration,
 )
 class FinishPipelineTestCase(IntegrationTestCase):
     provider = ExampleIntegrationProvider
+    external_id = "dummy_id-123"
 
-    def setUp(self):
-        super().setUp()
-        self.external_id = "dummy_id-123"
-        self.provider.needs_default_identity = False
+    @pytest.fixture(autouse=True)
+    def _modify_provider(self) -> Generator[None]:
+        with patch.multiple(
+            self.provider,
+            needs_default_identity=False,
+        ):
+            yield
 
-    def tearDown(self):
-        super().tearDown()
-
-    def test_with_data(self, *args):
+    def test_with_data(self, *args: Any) -> None:
         data = {
             "external_id": self.external_id,
             "name": "Name",
@@ -44,7 +57,9 @@ class FinishPipelineTestCase(IntegrationTestCase):
         self.pipeline.state.data = data
         resp = self.pipeline.finish_pipeline()
 
+        assert isinstance(resp, HttpResponse)
         self.assertDialogSuccess(resp)
+        assert b"document.origin);" in resp.content
 
         integration = Integration.objects.get(
             provider=self.provider.key, external_id=self.external_id
@@ -55,7 +70,33 @@ class FinishPipelineTestCase(IntegrationTestCase):
             organization_id=self.organization.id, integration_id=integration.id
         ).exists()
 
-    def test_aliased_integration_key(self, *args):
+    def test_with_customer_domain(self, *args: Any) -> None:
+        with self.feature({"system:multi-region": True}):
+            data = {
+                "external_id": self.external_id,
+                "name": "Name",
+                "metadata": {"url": "https://example.com"},
+            }
+            self.pipeline.state.data = data
+            resp = self.pipeline.finish_pipeline()
+
+            assert isinstance(resp, HttpResponse)
+            self.assertDialogSuccess(resp)
+            assert (
+                f', "{generate_organization_url(self.organization.slug)}");'.encode()
+                in resp.content
+            )
+
+            integration = Integration.objects.get(
+                provider=self.provider.key, external_id=self.external_id
+            )
+            assert integration.name == data["name"]
+            assert integration.metadata == data["metadata"]
+            assert OrganizationIntegration.objects.filter(
+                organization_id=self.organization.id, integration_id=integration.id
+            ).exists()
+
+    def test_aliased_integration_key(self, *args: Any) -> None:
         self.provider = AliasedIntegrationProvider
         self.setUp()
 
@@ -74,8 +115,8 @@ class FinishPipelineTestCase(IntegrationTestCase):
             provider=self.provider.integration_key, external_id=self.external_id
         ).exists()
 
-    def test_with_expect_exists(self, *args):
-        old_integration = Integration.objects.create(
+    def test_with_expect_exists(self, *args: Any) -> None:
+        old_integration = self.create_provider_integration(
             provider=self.provider.key, external_id=self.external_id, name="Tester"
         )
         self.pipeline.state.data = {"expect_exists": True, "external_id": self.external_id}
@@ -90,8 +131,8 @@ class FinishPipelineTestCase(IntegrationTestCase):
             organization_id=self.organization.id, integration_id=integration.id
         ).exists()
 
-    def test_expect_exists_does_not_update(self, *args):
-        old_integration = Integration.objects.create(
+    def test_expect_exists_does_not_update(self, *args: Any) -> None:
+        old_integration = self.create_provider_integration(
             provider=self.provider.key,
             external_id=self.external_id,
             name="Tester",
@@ -115,7 +156,7 @@ class FinishPipelineTestCase(IntegrationTestCase):
             organization_id=self.organization.id, integration_id=integration.id
         ).exists()
 
-    def test_with_default_id(self, *args):
+    def test_with_default_id(self, *args: Any) -> None:
         self.provider.needs_default_identity = True
         data = {
             "external_id": self.external_id,
@@ -147,16 +188,19 @@ class FinishPipelineTestCase(IntegrationTestCase):
         assert org_integration.default_auth_id is not None
         assert Identity.objects.filter(id=org_integration.default_auth_id).exists()
 
-    def test_default_identity_does_update(self, *args):
+    @patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_default_identity_does_update(self, mock_record: MagicMock, *args: Any) -> None:
         self.provider.needs_default_identity = True
         old_identity_id = 234567
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider=self.provider.key,
             external_id=self.external_id,
             metadata={"url": "https://example.com"},
         )
-        OrganizationIntegration.objects.create(
-            organization=self.organization, integration=integration, default_auth_id=old_identity_id
+        self.create_organization_integration(
+            organization_id=self.organization.id,
+            integration=integration,
+            default_auth_id=old_identity_id,
         )
         self.pipeline.state.data = {
             "external_id": self.external_id,
@@ -184,17 +228,27 @@ class FinishPipelineTestCase(IntegrationTestCase):
         identity = Identity.objects.get(external_id="AccountId")
         assert org_integration.default_auth_id == identity.id
 
-    def test_existing_identity_becomes_default_auth_on_new_orgintegration(self, *args):
+        # SLO assertions
+        assert_success_metric(mock_record)
+
+        assert_count_of_metric(
+            mock_record=mock_record, outcome=EventLifecycleOutcome.STARTED, outcome_count=1
+        )
+        assert_count_of_metric(
+            mock_record=mock_record, outcome=EventLifecycleOutcome.SUCCESS, outcome_count=1
+        )
+
+    def test_existing_identity_becomes_default_auth_on_new_orgintegration(self, *args: Any) -> None:
         # The reinstall flow will result in an existing identity provider, identity
         # and integration records. Ensure that the new organizationintegration gets
         # a default_auth_id set.
         self.provider.needs_default_identity = True
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider=self.provider.key,
             external_id=self.external_id,
             metadata={"url": "https://example.com"},
         )
-        identity_provider = IdentityProvider.objects.create(
+        identity_provider = self.create_identity_provider(
             external_id=self.external_id, type="plugin"
         )
         identity = Identity.objects.create(
@@ -224,16 +278,16 @@ class FinishPipelineTestCase(IntegrationTestCase):
         )
         assert org_integration.default_auth_id == identity.id
 
-    def test_new_external_id_same_user(self, *args):
+    def test_new_external_id_same_user(self, *args: Any) -> None:
         # we need to make sure any other org_integrations have the same
         # identity that we use for the new one
         self.provider.needs_default_identity = True
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider=self.provider.key,
             external_id=self.external_id,
             metadata={"url": "https://example.com"},
         )
-        identity_provider = IdentityProvider.objects.create(
+        identity_provider = self.create_identity_provider(
             external_id=self.external_id, type="plugin"
         )
         identity = Identity.objects.create(
@@ -265,14 +319,14 @@ class FinishPipelineTestCase(IntegrationTestCase):
         for org_integration in org_integrations:
             assert org_integration.default_auth_id == identity.id
 
-    def test_different_user_same_external_id_no_default_needed(self, *args):
+    def test_different_user_same_external_id_no_default_needed(self, *args: Any) -> None:
         new_user = self.create_user()
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider=self.provider.key,
             external_id=self.external_id,
             metadata={"url": "https://example.com"},
         )
-        identity_provider = IdentityProvider.objects.create(
+        identity_provider = self.create_identity_provider(
             external_id=self.external_id, type=self.provider.key
         )
         Identity.objects.create(
@@ -292,53 +346,411 @@ class FinishPipelineTestCase(IntegrationTestCase):
         resp = self.pipeline.finish_pipeline()
         self.assertDialogSuccess(resp)
         assert OrganizationIntegration.objects.filter(
-            integration_id=integration.id, organization=self.organization.id
+            integration_id=integration.id, organization_id=self.organization.id
         ).exists()
 
-    @patch("sentry.mediators.plugins.Migrator.call")
-    def test_disabled_plugin_when_fully_migrated(self, call, *args):
-        Repository.objects.create(
-            organization_id=self.organization.id,
-            name="user/repo",
-            url="https://example.org/user/repo",
-            provider=self.provider.key,
-            external_id=self.external_id,
-        )
+    @patch("sentry.integrations.pipeline.logger")
+    def test_disallow_with_no_permission(self, mock_logger: MagicMock, *args: Any) -> None:
+        member_user = self.create_user()
+        self.create_member(user=member_user, organization=self.organization, role="member")
+        self.login_as(member_user)
 
-        self.pipeline.state.data = {
+        # partially copied from IntegrationTestCase.setUp()
+        # except the user is not an owner
+        with assume_test_silo_mode(SiloMode.CELL):
+            rpc_organization = serialize_rpc_organization(self.organization)
+
+        self.request = self.make_request(member_user)
+
+        self.pipeline = IntegrationPipeline(
+            request=self.request,
+            organization=rpc_organization,
+            provider_key=self.provider.key,
+        )
+        self.pipeline.initialize()
+        self.save_session()
+
+        data = {
             "external_id": self.external_id,
             "name": "Name",
             "metadata": {"url": "https://example.com"},
         }
+        self.pipeline.state.data = data
 
-        self.pipeline.finish_pipeline()
+        # attempt to finish pipeline with no 'org:integrations' scope
+        resp = self.pipeline.finish_pipeline()
+        assert isinstance(resp, HttpResponse)
+        assert (
+            "You must be an organization owner, manager or admin to install this integration."
+            in resp.content.decode()
+        )
 
-        assert call.called
+        extra = {
+            "error_message": "You must be an organization owner, manager or admin to install this integration.",
+            "organization_id": self.organization.id,
+            "user_id": member_user.id,
+            "provider_key": "example",
+        }
+        mock_logger.info.assert_called_with("build-integration.permission_error", extra=extra)
+
+    def test_allow_with_superuser(self, *args: Any) -> None:
+        member_user = self.create_user(is_superuser=True)
+        self.create_member(user=member_user, organization=self.organization, role="member")
+        self.login_as(member_user, superuser=True)
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            rpc_organization = serialize_rpc_organization(self.organization)
+
+        self.request = self.make_request(member_user, is_superuser=True)
+
+        self.pipeline = IntegrationPipeline(
+            request=self.request,
+            organization=rpc_organization,
+            provider_key=self.provider.key,
+        )
+        self.pipeline.initialize()
+        self.save_session()
+
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+
+        # should be allowed to install integration because of superuser
+        resp = self.pipeline.finish_pipeline()
+        self.assertDialogSuccess(resp)
+
+    @override_options({"superuser.read-write.ga-rollout": True})
+    def test_allow_with_superuser_su_split(self, *args: Any) -> None:
+        member_user = self.create_user(is_superuser=True)
+        self.create_member(user=member_user, organization=self.organization, role="member")
+        self.login_as(member_user, superuser=True)
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            rpc_organization = serialize_rpc_organization(self.organization)
+
+        self.request = self.make_request(member_user, is_superuser=True)
+
+        self.pipeline = IntegrationPipeline(
+            request=self.request,
+            organization=rpc_organization,
+            provider_key=self.provider.key,
+        )
+        self.pipeline.initialize()
+        self.save_session()
+
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+
+        # should be allowed to install integration because of superuser
+        resp = self.pipeline.finish_pipeline()
+        self.assertDialogSuccess(resp)
+
+    @patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    @patch("sentry.integrations.pipeline.logger")
+    def test_disallow_with_removed_membership(
+        self, mock_logger: MagicMock, mock_record: MagicMock, *args: Any
+    ) -> None:
+        member_user = self.create_user()
+        om = self.create_member(user=member_user, organization=self.organization, role="manager")
+        self.login_as(member_user)
+
+        # partially copied from IntegrationTestCase.setUp()
+        # except the user is not an owner
+        with assume_test_silo_mode(SiloMode.CELL):
+            rpc_organization = serialize_rpc_organization(self.organization)
+
+        self.request = self.make_request(member_user)
+
+        self.pipeline = IntegrationPipeline(
+            request=self.request,
+            organization=rpc_organization,
+            provider_key=self.provider.key,
+        )
+        self.pipeline.initialize()
+        self.save_session()
+
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+        with outbox_runner(), assume_test_silo_mode_of(OrganizationMember):
+            om.delete()
+
+        # attempt to finish pipeline without org membership
+        resp = self.pipeline.finish_pipeline()
+        assert isinstance(resp, HttpResponse)
+        assert (
+            "You must be an organization owner, manager or admin to install this integration."
+            in resp.content.decode()
+        )
+
+        extra = {
+            "error_message": "You must be an organization owner, manager or admin to install this integration.",
+            "organization_id": self.organization.id,
+            "user_id": member_user.id,
+            "provider_key": "example",
+        }
+        mock_logger.info.assert_called_with("build-integration.permission_error", extra=extra)
+
+        # SLO assertions
+        assert_success_metric(mock_record)
+
+        assert_count_of_metric(
+            mock_record=mock_record, outcome=EventLifecycleOutcome.STARTED, outcome_count=1
+        )
+        assert_count_of_metric(
+            mock_record=mock_record, outcome=EventLifecycleOutcome.SUCCESS, outcome_count=1
+        )
 
 
+@control_silo_test
 @patch(
-    "sentry.integrations.gitlab.GitlabIntegrationProvider.build_integration",
+    "sentry.integrations.example.ExampleIntegrationProvider.build_integration",
     side_effect=naive_build_integration,
 )
-class GitlabFinishPipelineTest(IntegrationTestCase):
-    provider = GitlabIntegrationProvider
+class ApiFinishPipelineTestCase(IntegrationTestCase):
+    provider = ExampleIntegrationProvider
+    external_id = "dummy_id-123"
 
-    def setUp(self):
-        super().setUp()
-        self.external_id = "dummy_id-123"
+    @pytest.fixture(autouse=True)
+    def _modify_provider(self) -> Generator[None]:
+        with patch.multiple(
+            self.provider,
+            needs_default_identity=False,
+        ):
+            yield
 
-    def tearDown(self):
-        super().tearDown()
+    def test_api_finish_pipeline_success(self, *args: Any) -> None:
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+        result = self.pipeline.api_finish_pipeline()
 
-    def test_different_user_same_external_id(self, *args):
+        assert result.action == PipelineStepAction.COMPLETE
+        assert result.data["id"] is not None
+
+        integration = Integration.objects.get(
+            provider=self.provider.key, external_id=self.external_id
+        )
+        assert integration.name == data["name"]
+        assert OrganizationIntegration.objects.filter(
+            organization_id=self.organization.id, integration_id=integration.id
+        ).exists()
+
+    def test_api_finish_pipeline_disallow_with_no_permission(self, *args: Any) -> None:
+        member_user = self.create_user()
+        self.create_member(user=member_user, organization=self.organization, role="member")
+        self.login_as(member_user)
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            rpc_organization = serialize_rpc_organization(self.organization)
+
+        self.request = self.make_request(member_user)
+
+        self.pipeline = IntegrationPipeline(
+            request=self.request,
+            organization=rpc_organization,
+            provider_key=self.provider.key,
+        )
+        self.pipeline.initialize()
+        self.save_session()
+
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+
+        result = self.pipeline.api_finish_pipeline()
+        assert result.action == PipelineStepAction.ERROR
+        assert (
+            result.data["detail"]
+            == "You must be an organization owner, manager or admin to install this integration."
+        )
+
+    def test_api_finish_pipeline_disallow_with_removed_membership(self, *args: Any) -> None:
+        member_user = self.create_user()
+        om = self.create_member(user=member_user, organization=self.organization, role="manager")
+        self.login_as(member_user)
+
+        with assume_test_silo_mode(SiloMode.CELL):
+            rpc_organization = serialize_rpc_organization(self.organization)
+
+        self.request = self.make_request(member_user)
+
+        self.pipeline = IntegrationPipeline(
+            request=self.request,
+            organization=rpc_organization,
+            provider_key=self.provider.key,
+        )
+        self.pipeline.initialize()
+        self.save_session()
+
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+        with outbox_runner(), assume_test_silo_mode_of(OrganizationMember):
+            om.delete()
+
+        result = self.pipeline.api_finish_pipeline()
+        assert result.action == PipelineStepAction.ERROR
+        assert (
+            result.data["detail"]
+            == "You must be an organization owner, manager or admin to install this integration."
+        )
+
+    def test_api_finish_pipeline_disallow_with_no_org_context(self, *args: Any) -> None:
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+
+        with patch(
+            "sentry.integrations.pipeline.organization_service.get_organization_by_id",
+            return_value=None,
+        ):
+            result = self.pipeline.api_finish_pipeline()
+
+        assert result.action == PipelineStepAction.ERROR
+        assert (
+            result.data["detail"]
+            == "You must be an organization owner, manager or admin to install this integration."
+        )
+
+    def test_api_finish_pipeline_identity_conflict(self, *args: Any) -> None:
+        self.provider.needs_default_identity = True
         new_user = self.create_user()
-        self.setUp()
-        integration = Integration.objects.create(
+        integration = self.create_provider_integration(
             provider=self.provider.key,
             external_id=self.external_id,
             metadata={"url": "https://example.com"},
         )
-        identity_provider = IdentityProvider.objects.create(
+        identity_provider = self.create_identity_provider(
+            external_id=self.external_id, type="slack"
+        )
+        Identity.objects.create(
+            idp_id=identity_provider.id, external_id="AccountId", user_id=new_user.id
+        )
+        self.pipeline.state.data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+            "user_identity": {
+                "type": "slack",
+                "external_id": "AccountId",
+                "scopes": [],
+                "data": {},
+            },
+        }
+
+        result = self.pipeline.api_finish_pipeline()
+        assert result.action == PipelineStepAction.ERROR
+        assert (
+            result.data["detail"]
+            == "The provided Slack account is linked to a different Sentry user. To continue linking the current Sentry user, please use a different Slack account."
+        )
+        assert not OrganizationIntegration.objects.filter(integration_id=integration.id).exists()
+
+    def test_api_finish_pipeline_add_organization_integrity_error(self, *args: Any) -> None:
+        data = {
+            "external_id": self.external_id,
+            "name": "Name",
+            "metadata": {"url": "https://example.com"},
+        }
+        self.pipeline.state.data = data
+
+        with patch.object(Integration, "add_organization", return_value=None):
+            result = self.pipeline.api_finish_pipeline()
+
+        assert result.action == PipelineStepAction.ERROR
+        assert result.data["detail"] == "Could not create the integration for this organization."
+
+
+@control_silo_test
+@patch(
+    "sentry.integrations.gitlab.integration.GitlabIntegrationProvider.build_integration",
+    side_effect=naive_build_integration,
+)
+class GitlabFinishPipelineTest(IntegrationTestCase):
+    provider = GitlabIntegrationProvider
+    external_id = "dummy_id-123"
+
+    def test_install_schedules_repo_sync_and_webhook_update(self, *args: Any) -> None:
+        self.pipeline.state.data = {
+            "external_id": self.external_id,
+            "name": "GitLab",
+            "metadata": {},
+            "user_identity": {
+                "type": self.provider.key,
+                "external_id": "AccountId",
+                "scopes": [],
+                "data": {},
+            },
+        }
+        with (
+            patch("sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay") as schedule,
+            patch(
+                "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+            ) as sync,
+        ):
+            response = self.pipeline.finish_pipeline()
+
+        self.assertDialogSuccess(response)
+        integration = Integration.objects.get(
+            provider=self.provider.key, external_id=self.external_id
+        )
+        schedule.assert_called_once_with(
+            organization_id=self.organization.id, integration_id=integration.id, force=True
+        )
+        org_integration = OrganizationIntegration.objects.get(
+            organization_id=self.organization.id, integration=integration
+        )
+        sync.assert_called_once_with(organization_integration_id=org_integration.id)
+
+    def test_failed_install_does_not_schedule_repo_sync_or_webhook_update(self, *args: Any) -> None:
+        with (
+            patch.object(
+                self.pipeline, "_install_integration", side_effect=IntegrationError("Deleting")
+            ),
+            patch("sentry.integrations.gitlab.tasks.update_all_project_webhooks.delay") as schedule,
+            patch(
+                "sentry.integrations.source_code_management.sync_repos.sync_repos_for_org.delay"
+            ) as sync,
+        ):
+            response = self.pipeline.finish_pipeline()
+
+        assert isinstance(response, HttpResponse)
+        assert b"Deleting" in response.content
+        schedule.assert_not_called()
+        sync.assert_not_called()
+
+    def test_different_user_same_external_id(self, *args: Any) -> None:
+        new_user = self.create_user()
+        self.setUp()
+        integration = self.create_provider_integration(
+            provider=self.provider.key,
+            external_id=self.external_id,
+            metadata={"url": "https://example.com"},
+        )
+        identity_provider = self.create_identity_provider(
             external_id=self.external_id, type=self.provider.key
         )
         Identity.objects.create(
@@ -356,5 +768,6 @@ class GitlabFinishPipelineTest(IntegrationTestCase):
             },
         }
         resp = self.pipeline.finish_pipeline()
+        assert isinstance(resp, HttpResponse)
         assert not OrganizationIntegration.objects.filter(integration_id=integration.id)
-        assert "account is linked to a different Sentry user" in str(resp.content)
+        assert "account is linked to a different Sentry user" in resp.content.decode()

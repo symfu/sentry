@@ -1,0 +1,562 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {PageFiltersFixture} from 'sentry-fixture/pageFilters';
+import {TimeSeriesFixture} from 'sentry-fixture/timeSeries';
+import {WidgetFixture} from 'sentry-fixture/widget';
+
+import {renderHookWithProviders, waitFor} from 'sentry-test/reactTestingLibrary';
+
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import {DiscoverDatasets} from 'sentry/utils/discover/types';
+import {DisplayType} from 'sentry/views/dashboards/types';
+
+import {useErrorsSeriesQuery, useErrorsTableQuery} from './useErrorsWidgetQuery';
+
+jest.mock('sentry/views/dashboards/utils/widgetQueryQueue', () => ({
+  useWidgetQueryQueue: () => ({queue: null}),
+}));
+
+describe('useErrorsSeriesQuery', () => {
+  const organization = OrganizationFixture();
+  const pageFilters = PageFiltersFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(pageFilters);
+  });
+
+  it('makes a request to the errors dataset', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            dataset: DiscoverDatasets.ERRORS,
+          }),
+        })
+      );
+    });
+  });
+
+  it('excludes the Other series for grouped widgets with multiple aggregates', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: '',
+          fields: [],
+          aggregates: ['count()', 'count_unique(user)'],
+          columns: ['transaction'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: []},
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsSeriesQuery({widget, organization, pageFilters, enabled: true})
+    );
+
+    await waitFor(() =>
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({query: expect.objectContaining({excludeOther: '1'})})
+      )
+    );
+  });
+
+  it('returns the transformed series', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: '',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    const {result} = renderHookWithProviders(() =>
+      useErrorsSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/organizations/org-slug/events-timeseries/',
+      expect.objectContaining({
+        query: expect.objectContaining({
+          yAxis: ['count()'],
+          dataset: DiscoverDatasets.ERRORS,
+        }),
+      })
+    );
+    expect(result.current.timeseriesResults?.map(({seriesName}) => seriesName)).toEqual([
+      'count()',
+    ]);
+  });
+
+  it('formats Date objects in query parameters', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const startDate = new Date('2026-01-14T00:00:00.000Z');
+    const endDate = new Date('2026-01-21T00:00:00.000Z');
+
+    const pageFiltersWithDates = PageFiltersFixture({
+      datetime: {
+        start: startDate,
+        end: endDate,
+        period: null,
+        utc: true,
+      },
+    });
+
+    PageFiltersStore.onInitializeUrlState(pageFiltersWithDates);
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsSeriesQuery({
+        widget,
+        organization,
+        pageFilters: pageFiltersWithDates,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            start: '2026-01-14T00:00:00',
+            end: '2026-01-21T00:00:00',
+          }),
+        })
+      );
+    });
+  });
+
+  it('applies dashboard filters correctly', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: 'browser.name:chrome',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        dashboardFilters: {
+          release: ['1.0.0'],
+        },
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events-timeseries/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            query: expect.stringContaining('release:"1.0.0"'),
+          }),
+        })
+      );
+    });
+  });
+
+  it('handles multiple widget queries', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: 'query1',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+        {
+          name: 'query2',
+          fields: ['count_unique(user)'],
+          aggregates: ['count_unique(user)'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest1 = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          const yAxis = Array.isArray(options.query.yAxis)
+            ? options.query.yAxis[0]
+            : options.query.yAxis;
+          return yAxis === 'count()';
+        },
+      ],
+    });
+
+    const mockRequest2 = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count_unique(user)'})]},
+      match: [
+        function (_url: string, options: Record<string, any>) {
+          const yAxis = Array.isArray(options.query.yAxis)
+            ? options.query.yAxis[0]
+            : options.query.yAxis;
+          return yAxis === 'count_unique(user)';
+        },
+      ],
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsSeriesQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest1).toHaveBeenCalled();
+    });
+    expect(mockRequest2).toHaveBeenCalled();
+  });
+
+  it('keeps rawData referentially stable across rerenders', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.LINE,
+      queries: [
+        {
+          name: '',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events-timeseries/',
+      body: {timeSeries: [TimeSeriesFixture({yAxis: 'count()'})]},
+    });
+
+    const {result, rerender} = renderHookWithProviders(useErrorsSeriesQuery, {
+      initialProps: {widget, organization, pageFilters, enabled: true},
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const {rawData} = result.current;
+    expect(rawData).toHaveLength(1);
+
+    rerender({widget: {...widget}, organization, pageFilters, enabled: true});
+
+    expect(result.current.rawData).toBe(rawData);
+  });
+});
+
+describe('useErrorsTableQuery', () => {
+  const organization = OrganizationFixture();
+  const pageFilters = PageFiltersFixture();
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    PageFiltersStore.init();
+    PageFiltersStore.onInitializeUrlState(pageFilters);
+  });
+
+  it('makes a request to the errors dataset', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{count: 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            dataset: DiscoverDatasets.ERRORS,
+          }),
+        })
+      );
+    });
+  });
+
+  it('adds timestamp field when trace column is present', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['trace', 'count()'],
+          aggregates: ['count()'],
+          columns: ['trace'],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{trace: 'abc123', count: 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            field: expect.arrayContaining(['trace', 'count()', 'max(timestamp)']),
+          }),
+        })
+      );
+    });
+  });
+
+  it('applies dashboard filters correctly', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: 'browser.name:chrome',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{count: 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        dashboardFilters: {
+          release: ['1.0.0'],
+        },
+        enabled: true,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            query: expect.stringContaining('release:"1.0.0"'),
+          }),
+        })
+      );
+    });
+  });
+
+  it('handles cursor pagination', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: 'test',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    const mockRequest = MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {
+        data: [{count: 100}],
+      },
+    });
+
+    renderHookWithProviders(() =>
+      useErrorsTableQuery({
+        widget,
+        organization,
+        pageFilters,
+        enabled: true,
+        cursor: '0:10:0',
+        limit: 50,
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockRequest).toHaveBeenCalledWith(
+        '/organizations/org-slug/events/',
+        expect.objectContaining({
+          query: expect.objectContaining({
+            cursor: '0:10:0',
+            per_page: 50,
+          }),
+        })
+      );
+    });
+  });
+
+  it('keeps rawData referentially stable across rerenders', async () => {
+    const widget = WidgetFixture({
+      displayType: DisplayType.TABLE,
+      queries: [
+        {
+          name: '',
+          fields: ['count()'],
+          aggregates: ['count()'],
+          columns: [],
+          conditions: '',
+          orderby: '',
+        },
+      ],
+    });
+
+    MockApiClient.addMockResponse({
+      url: '/organizations/org-slug/events/',
+      body: {data: [{'count()': 100}], meta: {fields: {'count()': 'integer'}}},
+    });
+
+    const {result, rerender} = renderHookWithProviders(useErrorsTableQuery, {
+      initialProps: {widget, organization, pageFilters, enabled: true},
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const {rawData} = result.current;
+    expect(rawData).toHaveLength(1);
+
+    rerender({widget: {...widget}, organization, pageFilters, enabled: true});
+
+    expect(result.current.rawData).toBe(rawData);
+  });
+});

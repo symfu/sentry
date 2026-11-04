@@ -1,0 +1,283 @@
+import {createContext, useContext, type ReactNode} from 'react';
+
+import {Checkbox} from '@sentry/scraps/checkbox';
+
+import {unreachable} from 'sentry/utils/unreachable';
+
+import {
+  DefaultTag,
+  DefaultBlockquote,
+  DefaultCodeBlock,
+  DefaultEmphasis,
+  DefaultHeading,
+  DefaultHorizontalRule,
+  DefaultHtmlBlock,
+  DefaultInlineCode,
+  DefaultLineBreak,
+  DefaultLink,
+  DefaultListItem,
+  DefaultOrderedList,
+  DefaultParagraph,
+  DefaultStrikethrough,
+  DefaultStrong,
+  DefaultTable,
+  DefaultTaskList,
+  DefaultTaskListItem,
+  DefaultText,
+  DefaultUnorderedList,
+} from './defaultComponents';
+import type {MarkdownComponents} from './markdown';
+import type {ExtendedToken, Token as TokenType} from './marked';
+import {isSafeHref, isInternalHref, sanitizeHtml} from './marked';
+
+const TAG_START_RE = /\{%\s+[\w-]/;
+
+/**
+ * Whether the document is still streaming in. Only then can an unclosed `{% name`
+ * be the start of a tag whose closing marker has not arrived yet; in settled
+ * content it is text the author wrote and must render as written.
+ */
+export const MarkdownStreamingContext = createContext(false);
+
+function stripPartialTag(text: string): string {
+  const idx = text.lastIndexOf('{%');
+  if (idx === -1) {
+    return text;
+  }
+  if (TAG_START_RE.test(text.slice(idx))) {
+    return text.slice(0, idx);
+  }
+  return text;
+}
+
+function hasInlineHtml(tokens: TokenType[]): boolean {
+  return tokens.some(t => t.type === 'html');
+}
+
+function renderInline(
+  tokens: TokenType[] | undefined,
+  components: MarkdownComponents
+): ReactNode {
+  if (!tokens) {
+    return null;
+  }
+  // When inline HTML tags are present (e.g. <sub>, <sup>), they get split
+  // into separate tokens that can't render in isolation. Fall back to
+  // concatenating raw text and rendering as sanitized HTML.
+  if (hasInlineHtml(tokens)) {
+    const raw = tokens.map(t => t.raw).join('');
+    const sanitized = sanitizeHtml(raw);
+    return <span dangerouslySetInnerHTML={{__html: sanitized}} />;
+  }
+  return tokens.map((token, i) => (
+    <Token token={token as ExtendedToken} key={i} components={components} />
+  ));
+}
+
+export function Token({
+  components,
+  token,
+}: {
+  components: MarkdownComponents;
+  token: ExtendedToken;
+}): ReactNode {
+  const isStreaming = useContext(MarkdownStreamingContext);
+
+  switch (token.type) {
+    case 'space':
+      // Blank-line tokens — layout gap is handled by the parent flex container
+      return null;
+
+    case 'paragraph': {
+      const P = components.Paragraph ?? DefaultParagraph;
+      return <P Default={DefaultParagraph}>{renderInline(token.tokens, components)}</P>;
+    }
+
+    case 'heading': {
+      const H = components.Heading ?? DefaultHeading;
+      return (
+        <H Default={DefaultHeading} level={token.depth as 1 | 2 | 3 | 4 | 5 | 6}>
+          {renderInline(token.tokens, components)}
+        </H>
+      );
+    }
+
+    case 'code': {
+      const Code = components.CodeBlock ?? DefaultCodeBlock;
+      return (
+        <Code Default={DefaultCodeBlock} lang={token.lang ?? undefined}>
+          {token.text}
+        </Code>
+      );
+    }
+
+    case 'codespan': {
+      const Code = components.InlineCode ?? DefaultInlineCode;
+      return <Code Default={DefaultInlineCode}>{token.text}</Code>;
+    }
+
+    case 'blockquote': {
+      const Blockquote = components.Blockquote ?? DefaultBlockquote;
+      return (
+        <Blockquote Default={DefaultBlockquote}>
+          {renderInline(token.tokens, components)}
+        </Blockquote>
+      );
+    }
+
+    case 'list': {
+      const isTaskList = token.items.some(item => item.task);
+      if (isTaskList) {
+        const List = components.TaskList ?? DefaultTaskList;
+        return (
+          <List Default={DefaultTaskList}>
+            {token.items.map((item, i) => (
+              <Token key={i} token={item} components={components} />
+            ))}
+          </List>
+        );
+      }
+      if (token.ordered) {
+        const List = components.OrderedList ?? DefaultOrderedList;
+        return (
+          <List Default={DefaultOrderedList}>
+            {token.items.map((item, i) => (
+              <Token key={i} token={item} components={components} />
+            ))}
+          </List>
+        );
+      }
+      const List = components.UnorderedList ?? DefaultUnorderedList;
+      return (
+        <List Default={DefaultUnorderedList}>
+          {token.items.map((item, i) => (
+            <Token key={i} token={item} components={components} />
+          ))}
+        </List>
+      );
+    }
+
+    case 'list_item': {
+      if (token.task) {
+        const TaskLi = components.TaskListItem ?? DefaultTaskListItem;
+        return (
+          <TaskLi Default={DefaultTaskListItem} checked={token.checked ?? false}>
+            {renderInline(token.tokens, components)}
+          </TaskLi>
+        );
+      }
+      const Li = components.ListItem ?? DefaultListItem;
+      return <Li Default={DefaultListItem}>{renderInline(token.tokens, components)}</Li>;
+    }
+
+    case 'checkbox':
+      return <Checkbox checked={token.checked} readOnly />;
+
+    case 'table': {
+      const TableComp = components.Table ?? DefaultTable;
+      return (
+        <TableComp
+          Default={DefaultTable}
+          columns={token.align.map(align => ({align: align ?? undefined}))}
+          header={token.header.map(cell => renderInline(cell.tokens, components))}
+          rows={token.rows.map(row =>
+            row.map(cell => renderInline(cell.tokens, components))
+          )}
+        />
+      );
+    }
+
+    case 'hr': {
+      const Hr = components.HorizontalRule ?? DefaultHorizontalRule;
+      return <Hr Default={DefaultHorizontalRule} />;
+    }
+
+    case 'html': {
+      const Html = components.Html ?? DefaultHtmlBlock;
+      return <Html Default={DefaultHtmlBlock} html={sanitizeHtml(token.text)} />;
+    }
+
+    case 'strong': {
+      const Strong = components.Strong ?? DefaultStrong;
+      return (
+        <Strong Default={DefaultStrong}>{renderInline(token.tokens, components)}</Strong>
+      );
+    }
+
+    case 'em': {
+      const Em = components.Emphasis ?? DefaultEmphasis;
+      return <Em Default={DefaultEmphasis}>{renderInline(token.tokens, components)}</Em>;
+    }
+
+    case 'del': {
+      const Del = components.Strikethrough ?? DefaultStrikethrough;
+      return (
+        <Del Default={DefaultStrikethrough}>{renderInline(token.tokens, components)}</Del>
+      );
+    }
+
+    case 'link': {
+      if (!isSafeHref(token.href) && !isInternalHref(token.href)) {
+        return <span>{renderInline(token.tokens, components)}</span>;
+      }
+      const A = components.Link ?? DefaultLink;
+      return (
+        <A Default={DefaultLink} href={token.href} title={token.title}>
+          {renderInline(token.tokens, components)}
+        </A>
+      );
+    }
+
+    case 'image': {
+      const Img = components.Image;
+      if (!Img) {
+        // No default <img> to avoid uncontrolled network requests
+        return null;
+      }
+      // marked stores the image URL in `href`
+      return <Img src={token.href} alt={token.text} title={token.title} />;
+    }
+
+    case 'text': {
+      if (token.tokens) {
+        return renderInline(token.tokens, components);
+      }
+      const text = isStreaming ? stripPartialTag(token.text) : token.text;
+      const TextComponent = components.Text;
+      if (TextComponent) {
+        return <TextComponent Default={DefaultText}>{text}</TextComponent>;
+      }
+      return text;
+    }
+
+    case 'escape':
+      return token.text;
+
+    case 'br': {
+      const Br = components.LineBreak ?? DefaultLineBreak;
+      return <Br Default={DefaultLineBreak} />;
+    }
+
+    case 'def':
+      return null;
+
+    case 'tag': {
+      const TagComp = components.Tag ?? DefaultTag;
+      return (
+        <TagComp
+          Default={DefaultTag}
+          name={token.name}
+          level={token.level}
+          attrs={token.attrs}
+          data={token.data}
+          raw={token.raw}
+          index={token.index}
+        />
+      );
+    }
+
+    default:
+      unreachable(token);
+      return null;
+  }
+}

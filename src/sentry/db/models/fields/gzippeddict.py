@@ -1,51 +1,49 @@
-import logging
-import pickle
+from __future__ import annotations
 
-from django.db.models import TextField
+from typing import cast
+
+from django.db.models import Model, TextField
 
 from sentry.db.models.utils import Creator
-from sentry.utils.strings import decompress, compress
+from sentry.utils import json
 
 __all__ = ("GzippedDictField",)
 
-logger = logging.getLogger("sentry")
 
-
-class GzippedDictField(TextField):
+class GzippedDictField(TextField[dict[str, object] | None, dict[str, object] | None]):
     """
     Slightly different from a JSONField in the sense that the default
     value is a dictionary.
     """
 
-    def contribute_to_class(self, cls, name):
+    def contribute_to_class(self, cls: type[Model], name: str, private_only: bool = False) -> None:
         """
         Add a descriptor for backwards compatibility
         with previous Django behavior.
         """
-        super().contribute_to_class(cls, name)
+        super().contribute_to_class(cls, name, private_only=private_only)
         setattr(cls, name, Creator(self))
 
-    def to_python(self, value):
-        if isinstance(value, str) and value:
-            try:
-                value = pickle.loads(decompress(value))
-            except Exception as e:
-                logger.exception(e)
+    def to_python(self, value: object) -> object:
+        try:
+            if not value:
                 return {}
-        elif not value:
-            return {}
-        return value
+            return json.loads(cast(str | bytes, value))
+        except (ValueError, TypeError):
+            return value
 
-    def get_prep_value(self, value):
+    def from_db_value(self, value: object, expression: object, connection: object) -> object:
+        return self.to_python(value)
+
+    def get_prep_value(self, value: object) -> str | None:
         if not value and self.null:
             # save ourselves some storage
             return None
-        # enforce strings to guarantee consistency
-        if isinstance(value, bytes):
-            value = str(value)
-        # db values need to be in unicode
-        return compress(pickle.dumps(value))
+        elif isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if value is None and self.null:
+            return None
+        return json.dumps(value)
 
-    def value_to_string(self, obj):
-        value = self._get_val_from_obj(obj)
-        return self.get_prep_value(value)
+    def value_to_string(self, obj: Model) -> str:
+        return cast(str, self.get_prep_value(self.value_from_object(obj)))

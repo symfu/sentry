@@ -1,37 +1,38 @@
-import pytz
+from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Mapping, MutableMapping
+from typing import TYPE_CHECKING, Any
+
 from django import forms
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
-from django.utils.text import capfirst, mark_safe
-from django.utils.translation import ugettext_lazy as _
+from django.core.files.uploadedfile import UploadedFile
+from django.db.models import Field
+from django.forms.renderers import BaseRenderer
+from django.forms.utils import ErrorList
+from django.http.request import HttpRequest
+from django.utils.datastructures import MultiValueDict
+from django.utils.safestring import mark_safe
+from django.utils.text import capfirst
+from django.utils.translation import gettext_lazy as _
 
 from sentry import newsletter, options
-from sentry.auth import password_validation
-from sentry.app import ratelimiter
-from sentry.utils.auth import find_users, logger
-from sentry.models import User
-from sentry.web.forms.fields import CustomTypedChoiceField, AllowedEmailField
+from sentry import ratelimits as ratelimiter
+from sentry.users.models.user import User
+from sentry.utils.auth import logger, record_suspended_user_rejection
+from sentry.utils.dates import get_timezone_choices
+from sentry.web.forms.fields import AllowedEmailField, CustomTypedChoiceField
 
+TIMEZONE_CHOICES = get_timezone_choices()
 
-def _get_timezone_choices():
-    results = []
-    for tz in pytz.common_timezones:
-        now = datetime.now(pytz.timezone(tz))
-        offset = now.strftime("%z")
-        results.append((int(offset), tz, f"(UTC{offset}) {tz}"))
-    results.sort()
-
-    for i in range(len(results)):
-        results[i] = results[i][1:]
-    return results
-
-
-TIMEZONE_CHOICES = _get_timezone_choices()
+if TYPE_CHECKING:
+    _UserModelForm = forms.ModelForm[User]
+else:
+    _UserModelForm = forms.ModelForm
 
 
 class AuthenticationForm(forms.Form):
+    username_field: Field[Any, Any]
     username = forms.CharField(
         label=_("Account"),
         max_length=128,
@@ -48,16 +49,17 @@ class AuthenticationForm(forms.Form):
             "Note that both fields may be case-sensitive."
         ),
         "rate_limited": _(
-            "You have made too many failed authentication " "attempts. Please try again later."
+            "You have made too many failed authentication attempts. Please try again later."
         ),
         "no_cookies": _(
             "Your Web browser doesn't appear to have cookies "
             "enabled. Cookies are required for logging in."
         ),
         "inactive": _("This account is inactive."),
+        "suspended": _("Your account has been suspended."),
     }
 
-    def __init__(self, request=None, *args, **kwargs):
+    def __init__(self, request: HttpRequest, *args: Any, **kwargs: Any) -> None:
         """
         If request is passed in, the form will validate that cookies are
         enabled. Note that the request (a HttpRequest object) must have set a
@@ -65,7 +67,7 @@ class AuthenticationForm(forms.Form):
         running this validation.
         """
         self.request = request
-        self.user_cache = None
+        self.user_cache: User | None = None
         super().__init__(*args, **kwargs)
 
         # Set the label for the "username" field.
@@ -74,30 +76,30 @@ class AuthenticationForm(forms.Form):
         if not self.fields["username"].label:
             self.fields["username"].label = capfirst(self.username_field.verbose_name)
 
-    def clean_username(self, value=None):
+    def clean_username(self, value: str | None = None) -> str | None:
         if not value:
             value = self.cleaned_data.get("username") or ""
         value = value.strip(" \n\t\r\0")
         if not value:
-            return
+            return None
         return value.lower()
 
-    def is_rate_limited(self):
+    def is_rate_limited(self) -> bool:
         if self._is_ip_rate_limited():
             return True
         if self._is_user_rate_limited():
             return True
         return False
 
-    def _is_ip_rate_limited(self):
+    def _is_ip_rate_limited(self) -> bool:
         limit = options.get("auth.ip-rate-limit")
         if not limit:
             return False
 
         ip_address = self.request.META["REMOTE_ADDR"]
-        return ratelimiter.is_limited(f"auth:ip:{ip_address}", limit)
+        return ratelimiter.backend.is_limited(f"auth:ip:{ip_address}", limit)
 
-    def _is_user_rate_limited(self):
+    def _is_user_rate_limited(self) -> bool:
         limit = options.get("auth.user-rate-limit")
         if not limit:
             return False
@@ -106,9 +108,9 @@ class AuthenticationForm(forms.Form):
         if not username:
             return False
 
-        return ratelimiter.is_limited(f"auth:username:{username}", limit)
+        return ratelimiter.backend.is_limited(f"auth:username:{username}", limit)
 
-    def clean(self):
+    def clean(self) -> dict[str, Any] | None:
         username = self.cleaned_data.get("username")
         password = self.cleaned_data.get("password")
 
@@ -132,26 +134,38 @@ class AuthenticationForm(forms.Form):
                 % {"username": self.username_field.verbose_name}
             )
 
+        if getattr(self.user_cache, "is_suspended", False):
+            record_suspended_user_rejection("web_login")
+            raise forms.ValidationError(self.error_messages["suspended"])
+
         self.check_for_test_cookie()
         return self.cleaned_data
 
-    def check_for_test_cookie(self):
-        if self.request and not self.request.session.test_cookie_worked():
+    def check_for_test_cookie(self) -> None:
+        if not self.request.session.test_cookie_worked():
+            logger.info(
+                "user.auth.no-cookies",
+                extra={"ip_address": self.request.META["REMOTE_ADDR"]},
+            )
             raise forms.ValidationError(self.error_messages["no_cookies"])
+        # Note: We intentionally don't call delete_test_cookie() here.
+        # Deleting it causes a race condition when users have multiple login
+        # tabs open - the first successful login would delete the cookie,
+        # causing subsequent tabs to fail with a "cookies not enabled" error.
 
-    def get_user_id(self):
+    def get_user_id(self) -> int | None:
         if self.user_cache:
             return self.user_cache.id
         return None
 
-    def get_user(self):
+    def get_user(self) -> User | None:
         return self.user_cache
 
 
-class PasswordlessRegistrationForm(forms.ModelForm):
+class PasswordlessRegistrationForm(_UserModelForm):
     name = forms.CharField(
         label=_("Name"),
-        max_length=30,
+        max_length=200,
         widget=forms.TextInput(attrs={"placeholder": "Jane Bloggs"}),
         required=True,
     )
@@ -172,10 +186,38 @@ class PasswordlessRegistrationForm(forms.ModelForm):
         required=True,
         initial=False,
     )
+    timezone = forms.CharField(widget=forms.HiddenInput(), required=False)
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if not newsletter.is_enabled():
+    def __init__(
+        self,
+        data: Mapping[str, object] | None = None,
+        files: MultiValueDict[str, UploadedFile] | None = None,
+        auto_id: bool | str = "id_%s",
+        prefix: str | None = None,
+        initial: MutableMapping[str, object] | None = None,
+        error_class: type[ErrorList] = ErrorList,
+        label_suffix: str | None = None,
+        empty_permitted: bool = False,
+        instance: User | None = None,
+        use_required_attribute: bool | None = None,
+        renderer: BaseRenderer | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(
+            data=data,
+            files=files,
+            auto_id=auto_id,
+            prefix=prefix,
+            initial=initial,
+            error_class=error_class,
+            label_suffix=label_suffix,
+            empty_permitted=empty_permitted,
+            instance=instance,
+            use_required_attribute=use_required_attribute,
+            renderer=renderer,
+            **kwargs,
+        )
+        if not newsletter.backend.is_enabled():
             del self.fields["subscribe"]
         else:
             # NOTE: the text here is duplicated within the ``NewsletterConsent`` component
@@ -195,130 +237,23 @@ class PasswordlessRegistrationForm(forms.ModelForm):
         fields = ("username", "name")
         model = User
 
-    def clean_username(self):
+    def clean_username(self) -> str | None:
         value = (self.cleaned_data.get("username") or "").strip()
         if not value:
-            return
+            return None
         if User.objects.filter(username__iexact=value).exists():
             raise forms.ValidationError(
                 _("An account is already registered with that email address.")
             )
         return value.lower()
 
-    def save(self, commit=True):
+    def save(self, commit: bool = True) -> User:
         user = super().save(commit=False)
         user.email = user.username
         if commit:
             user.save()
             if self.cleaned_data.get("subscribe"):
-                newsletter.create_or_update_subscriptions(
-                    user, list_ids=newsletter.get_default_list_ids()
+                newsletter.backend.create_or_update_subscriptions(
+                    user, list_ids=newsletter.backend.get_default_list_ids()
                 )
         return user
-
-
-class RegistrationForm(PasswordlessRegistrationForm):
-    password = forms.CharField(
-        required=True, widget=forms.PasswordInput(attrs={"placeholder": "something super secret"})
-    )
-
-    def clean_password(self):
-        password = self.cleaned_data["password"]
-        password_validation.validate_password(password)
-        return password
-
-    def save(self, commit=True):
-        user = super().save(commit=False)
-        user.set_password(self.cleaned_data["password"])
-        if commit:
-            user.save()
-            if self.cleaned_data.get("subscribe"):
-                newsletter.create_or_update_subscriptions(
-                    user, list_ids=newsletter.get_default_list_ids()
-                )
-        return user
-
-
-class RecoverPasswordForm(forms.Form):
-    user = forms.CharField(
-        label=_("Account"),
-        max_length=128,
-        widget=forms.TextInput(attrs={"placeholder": _("username or email")}),
-    )
-
-    def clean_user(self):
-        value = (self.cleaned_data.get("user") or "").strip()
-        if not value:
-            return
-        users = find_users(value, with_valid_password=False)
-        if not users:
-            return
-
-        # If we find more than one user, we likely matched on email address.
-        # We silently bail here as we emailing the 'wrong' person isn't great.
-        # They will have to retry with their username which is guaranteed
-        # to be unique
-        if len(users) > 1:
-            return
-
-        users = [u for u in users if not u.is_managed]
-        if not users:
-            raise forms.ValidationError(
-                _(
-                    "The account you are trying to recover is managed and does not support password recovery."
-                )
-            )
-        return users[0]
-
-
-class ChangePasswordRecoverForm(forms.Form):
-    password = forms.CharField(widget=forms.PasswordInput())
-
-    def clean_password(self):
-        password = self.cleaned_data["password"]
-        password_validation.validate_password(password)
-        return password
-
-
-class EmailForm(forms.Form):
-    alt_email = AllowedEmailField(
-        label=_("New Email"),
-        required=False,
-        help_text="Designate an alternative email for this account",
-    )
-
-    password = forms.CharField(
-        label=_("Current password"),
-        widget=forms.PasswordInput(),
-        help_text=_("You will need to enter your current account password to make changes."),
-        required=True,
-    )
-
-    def __init__(self, user, *args, **kwargs):
-        self.user = user
-        super().__init__(*args, **kwargs)
-
-        needs_password = user.has_usable_password()
-
-        if not needs_password:
-            del self.fields["password"]
-
-    def clean_password(self):
-        value = self.cleaned_data.get("password")
-        if value and not self.user.check_password(value):
-            raise forms.ValidationError(_("The password you entered is not correct."))
-        elif not value:
-            raise forms.ValidationError(
-                _("You must confirm your current password to make changes.")
-            )
-        return value
-
-
-class TwoFactorForm(forms.Form):
-    otp = forms.CharField(
-        label=_("Authenticator code"),
-        max_length=20,
-        widget=forms.TextInput(
-            attrs={"placeholder": _("Authenticator or recovery code"), "autofocus": True}
-        ),
-    )

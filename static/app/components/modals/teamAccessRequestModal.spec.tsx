@@ -1,0 +1,65 @@
+import type {PropsWithChildren} from 'react';
+import styled from '@emotion/styled';
+import {MemberFixture} from 'sentry-fixture/member';
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {TeamFixture} from 'sentry-fixture/team';
+
+import {render, screen, userEvent} from 'sentry-test/reactTestingLibrary';
+
+import {makeCloseButton} from '@sentry/scraps/modal';
+
+import type {CreateTeamAccessRequestModalProps} from 'sentry/components/modals/teamAccessRequestModal';
+import TeamAccessRequestModal from 'sentry/components/modals/teamAccessRequestModal';
+
+describe('TeamAccessRequestModal', () => {
+  let createMock: any;
+
+  const closeModal = jest.fn();
+  const orgId = OrganizationFixture().slug;
+  const memberId = MemberFixture().id;
+  const teamId = TeamFixture().slug;
+
+  const styledWrapper = styled((c: PropsWithChildren) => c.children);
+  const modalRenderProps: CreateTeamAccessRequestModalProps = {
+    Body: styledWrapper(),
+    Footer: styledWrapper(),
+    Header: p => <span>{p.children}</span>,
+    closeModal,
+    orgId,
+    teamId,
+    memberId,
+    CloseButton: makeCloseButton(() => {}),
+    api: new MockApiClient(),
+  };
+
+  beforeEach(() => {
+    MockApiClient.clearMockResponses();
+    createMock = MockApiClient.addMockResponse({
+      url: `/organizations/${orgId}/members/${memberId}/teams/${teamId}/`,
+      method: 'POST',
+    });
+  });
+
+  it('renders', () => {
+    const {container} = render(<TeamAccessRequestModal {...modalRenderProps} />);
+
+    expect(container).toHaveTextContent(
+      `You do not have permission to add members to the #${teamId} team, but we will send a request to your organization admins for approval.`
+    );
+  });
+
+  it('creates access request on continue', async () => {
+    render(<TeamAccessRequestModal {...modalRenderProps} />);
+
+    await userEvent.click(screen.getByRole('button', {name: 'Continue'}));
+    expect(createMock).toHaveBeenCalled();
+  });
+
+  it('closes modal on cancel', async () => {
+    render(<TeamAccessRequestModal {...modalRenderProps} />);
+
+    await userEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+    expect(createMock).not.toHaveBeenCalled();
+    expect(closeModal).toHaveBeenCalled();
+  });
+});

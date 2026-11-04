@@ -1,0 +1,133 @@
+import {css} from '@emotion/react';
+import styled from '@emotion/styled';
+
+import {Flex} from '@sentry/scraps/layout';
+import {Link} from '@sentry/scraps/link';
+import {Tooltip} from '@sentry/scraps/tooltip';
+
+import {CopyToClipboardButton} from 'sentry/components/copyToClipboardButton';
+import {t} from 'sentry/locale';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {formatVersion} from 'sentry/utils/versions/formatVersion';
+import {makeReleaseDrawerPathname} from 'sentry/views/explore/releases/utils/pathnames';
+
+type Props = {
+  /**
+   * Raw version (canonical release identifier)
+   */
+  version: string;
+  /**
+   * Should the version be a link to the release page
+   */
+  anchor?: boolean;
+  className?: string;
+  /**
+   * Will add project ID to the linked url.
+   */
+  projectId?: string;
+  /**
+   * Should the version be formatted or not
+   */
+  shouldFormatVersion?: boolean;
+  /**
+   * Should the release text break and wrap onto the next line
+   */
+  shouldWrapText?: boolean;
+  /**
+   * Should there be a tooltip with raw version on hover
+   */
+  tooltipRawVersion?: boolean;
+  /**
+   * Ellipsis on overflow
+   */
+  truncate?: boolean;
+};
+
+export function Version({
+  version,
+  anchor = true,
+  tooltipRawVersion,
+  projectId,
+  truncate,
+  shouldWrapText = false,
+  className,
+  shouldFormatVersion = true,
+}: Props) {
+  const location = useLocation();
+  const organization = useOrganization();
+  const versionToDisplay = shouldFormatVersion ? formatVersion(version) : version;
+  const isHashVersion = /\b[a-f0-9]{40}\b|\b[a-f0-9]{64}\b/.test(version);
+
+  let releaseDetailProjectId: null | undefined | string | string[];
+  if (projectId) {
+    releaseDetailProjectId = projectId;
+  }
+
+  return (
+    <Tooltip
+      title={
+        <Flex as="span" align="center">
+          <TooltipVersionWrapper>{version}</TooltipVersionWrapper>
+          <CopyToClipboardButton
+            variant="transparent"
+            text={version}
+            size="zero"
+            aria-label={t('Copy version to clipboard')}
+          />
+        </Flex>
+      }
+      disabled={!tooltipRawVersion}
+      containerDisplayMode={truncate ? 'block' : 'inline-block'}
+      maxWidth={isHashVersion ? undefined : 400}
+    >
+      {anchor && organization?.slug ? (
+        <Link
+          to={makeReleaseDrawerPathname({
+            location,
+            release: version,
+            projectId: releaseDetailProjectId,
+            source: 'release-version-link',
+          })}
+          className={className}
+        >
+          <VersionText truncate={truncate} shouldWrapText={shouldWrapText}>
+            {versionToDisplay}
+          </VersionText>
+        </Link>
+      ) : (
+        <VersionText
+          className={className}
+          truncate={truncate}
+          shouldWrapText={shouldWrapText}
+        >
+          {versionToDisplay}
+        </VersionText>
+      )}
+    </Tooltip>
+  );
+}
+
+const truncateStyles = css`
+  max-width: 100%;
+  display: block;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+`;
+
+const VersionText = styled('span')<{
+  shouldWrapText?: boolean;
+  truncate?: boolean;
+}>`
+  ${p => p.truncate && truncateStyles}
+  white-space: ${p => (p.shouldWrapText ? 'normal' : 'nowrap')};
+`;
+
+const TooltipVersionWrapper = styled('span')`
+  display: block;
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+`;

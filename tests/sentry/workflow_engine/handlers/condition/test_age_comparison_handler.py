@@ -1,0 +1,89 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from jsonschema import ValidationError
+
+from sentry.models.group import Group
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.workflow_engine.handlers.condition.age_comparison_handler import (
+    AgeComparisonConditionHandler,
+)
+from sentry.workflow_engine.handlers.condition.utils.age import AgeComparisonType
+from sentry.workflow_engine.models import DataConditionGroup
+from sentry.workflow_engine.models.data_condition import Condition
+from sentry.workflow_engine.preview import ActionFilterPreviewPlan
+from sentry.workflow_engine.types import WorkflowEventData
+from tests.sentry.workflow_engine.handlers.condition.test_base import ConditionTestCase
+
+
+@freeze_time(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
+class TestAgeComparisonCondition(ConditionTestCase):
+    condition = Condition.AGE_COMPARISON
+
+    def setup_group_event_and_job(self) -> None:
+        self.group_event = self.event.for_group(self.group)
+        self.event_data = WorkflowEventData(event=self.group_event, group=self.group)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.event_data = WorkflowEventData(event=self.group_event, group=self.group)
+        self.dc = self.create_data_condition(
+            type=self.condition,
+            comparison={"comparison_type": AgeComparisonType.OLDER, "value": 10, "time": "hour"},
+            condition_result=True,
+        )
+
+    def test_preview_filters_groups_by_age(self) -> None:
+        plan = ActionFilterPreviewPlan(DataConditionGroup.Type.ALL)
+        AgeComparisonConditionHandler.preview_behavior.filter_preview(
+            plan,
+            {"comparison_type": AgeComparisonType.OLDER, "value": 10, "time": "hour"},
+        )
+
+        self.group.update(first_seen=datetime.now(timezone.utc) - timedelta(hours=11))
+        assert Group.objects.filter(id=self.group.id).filter(*plan.group_filters).exists()
+
+        self.group.update(first_seen=datetime.now(timezone.utc) - timedelta(hours=3))
+        assert not Group.objects.filter(id=self.group.id).filter(*plan.group_filters).exists()
+
+    def test_json_schema(self) -> None:
+        self.dc.comparison.update({"comparison_type": AgeComparisonType.NEWER})
+        self.dc.save()
+
+        self.dc.comparison.update({"time": "asdf"})
+        with pytest.raises(ValidationError):
+            self.dc.save()
+
+        self.dc.comparison.update({"value": "bad_value"})
+        with pytest.raises(ValidationError):
+            self.dc.save()
+
+        self.dc.comparison.update({"comparison_type": "bad_value"})
+        with pytest.raises(ValidationError):
+            self.dc.save()
+
+    def test_older_applies_correctly(self) -> None:
+        self.dc.comparison.update(
+            {"comparison_type": AgeComparisonType.OLDER, "value": 10, "time": "hour"}
+        )
+        self.dc.save()
+
+        self.group.update(first_seen=datetime.now(timezone.utc) - timedelta(hours=3))
+        self.assert_does_not_pass(self.dc, self.event_data)
+
+        self.group.update(
+            first_seen=datetime.now(timezone.utc) - timedelta(hours=10, milliseconds=1)
+        )
+        self.assert_passes(self.dc, self.event_data)
+
+    def test_newer_applies_correctly(self) -> None:
+        self.dc.comparison.update(
+            {"comparison_type": AgeComparisonType.NEWER, "value": 10, "time": "hour"}
+        )
+        self.dc.save()
+
+        self.group.update(first_seen=datetime.now(timezone.utc) - timedelta(hours=3))
+        self.assert_passes(self.dc, self.event_data)
+
+        self.group.update(first_seen=datetime.now(timezone.utc) - timedelta(hours=10))
+        self.assert_does_not_pass(self.dc, self.event_data)

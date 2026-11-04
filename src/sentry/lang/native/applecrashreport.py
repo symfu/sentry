@@ -1,35 +1,98 @@
 import posixpath
+from collections.abc import Mapping
+from typing import Any
+
+from sentry_sdk import traces
+from symbolic.common import parse_addr
 
 from sentry.constants import NATIVE_UNKNOWN_STRING
 from sentry.interfaces.exception import upgrade_legacy_mechanism
+from sentry.lang.native.registers import (
+    REGISTERS_ARM,
+    REGISTERS_ARM64,
+    REGISTERS_X86,
+    REGISTERS_X86_64,
+)
 from sentry.lang.native.utils import image_name
 from sentry.utils.safe import get_path
-
-from symbolic import parse_addr
-from sentry.utils.compat import map
 
 REPORT_VERSION = "104"
 
 
 class AppleCrashReport:
     def __init__(
-        self, threads=None, context=None, debug_images=None, symbolicated=False, exceptions=None
-    ):
-        self.threads = threads
-        self.context = context
-        self.debug_images = debug_images
-        self.symbolicated = symbolicated
-        self.exceptions = exceptions
+        self,
+        threads: list[dict[str, Any]] | None = None,
+        context: Mapping[str, Any] | None = None,
+        debug_images: list[dict[str, Any]] | None = None,
+        symbolicated: bool = False,
+        exceptions: list[dict[str, Any]] | None = None,
+        prioritized_thread_id: int | str | None = None,
+    ) -> None:
+        """
+        Create an Apple crash report from the provided data.
 
-    def __str__(self):
+        This constructor can modify the passed structures in place.
+        """
+        self.threads = threads if threads else []
+        self.context = context
+        self.symbolicated = symbolicated
+        self.exceptions = exceptions if exceptions else []
+        self.prioritized_thread_id = (
+            str(prioritized_thread_id) if prioritized_thread_id is not None else None
+        )
+        self.image_addrs_to_vmaddrs: dict[int, int] = {}
+
+        # Remove frames that don't have an `instruction_addr` and convert
+        # sundry addresses into numbers.
+        ts = self.exceptions + self.threads
+        frame_keys = ["instruction_addr", "image_addr", "symbol_addr"]
+        for t in ts:
+            if stacktrace := t.get("stacktrace"):
+                if frames := stacktrace.pop("frames", []):
+                    new_frames = []
+                    for frame in frames:
+                        if frame.get("instruction_addr", None) is None:
+                            continue
+                        new_frame = {
+                            key: parse_addr(frame[key]) if key in frame_keys else value
+                            for key, value in frame.items()
+                        }
+                        new_frames.append(new_frame)
+                    stacktrace["frames"] = new_frames
+
+        # Remove debug images that don't have an `image_addr` and convert
+        # `image_addr` and `image_vmaddr` to numbers.
+        self.debug_images = []
+        image_keys = ["image_addr", "image_vmaddr"]
+        for image in debug_images or []:
+            if image.get("image_addr", None) is None:
+                continue
+            new_image = {
+                key: parse_addr(image[key]) if key in image_keys else value
+                for key, value in image.items()
+            }
+            self.debug_images.append(new_image)
+
+            # If the image has an `image_vmaddr`, save the mapping from
+            # `image_addr` to `image_vmaddr`. This will be used in
+            # `_get_slide_value`.
+            if new_image.get("image_vmaddr") is not None:
+                self.image_addrs_to_vmaddrs[new_image["image_addr"]] = new_image["image_vmaddr"]
+
+    @traces.trace
+    def __str__(self) -> str:
         rv = []
         rv.append(self._get_meta_header())
         rv.append(self._get_exception_info())
         rv.append(self.get_threads_apple_string())
+        rv.append(self._get_crashed_thread_registers())
         rv.append(self.get_binary_images_apple_string())
+
         return "\n\n".join(rv) + "\n\nEOF"
 
-    def _get_meta_header(self):
+    @traces.trace
+    def _get_meta_header(self) -> str:
         return "OS Version: {} {} ({})\nReport Version: {}".format(
             get_path(self.context, "os", "name"),
             get_path(self.context, "os", "version"),
@@ -37,7 +100,87 @@ class AppleCrashReport:
             REPORT_VERSION,
         )
 
-    def _get_exception_info(self):
+    def _get_register_index(self, register: str, register_map: Mapping[str, int]) -> int:
+        return register_map.get(register[1:] if register.startswith("$") else register, -1)
+
+    def _get_sorted_registers(
+        self, registers: Mapping[str, str | None], register_map: Mapping[str, int]
+    ) -> list[tuple[str, str | None]]:
+        return [
+            (register_name, registers.get(register_name))
+            for register_name in sorted(
+                registers.keys(), key=lambda name: self._get_register_index(name, register_map)
+            )
+        ]
+
+    def _get_register_map_for_arch(self) -> tuple[str, bool, Mapping[str, int]]:
+        arch = get_path(self.context, "device", "arch")
+
+        if not isinstance(arch, str):
+            return (NATIVE_UNKNOWN_STRING, False, {})
+
+        if arch.startswith("x86_64"):
+            return ("x86", True, REGISTERS_X86_64)
+        if arch.startswith("x86"):
+            return ("x86", False, REGISTERS_X86)
+        if arch.startswith("arm64"):
+            return ("ARM", True, REGISTERS_ARM64)
+        if arch.startswith("arm"):
+            return ("ARM", False, REGISTERS_ARM)
+        return (arch, False, {})
+
+    def _get_padded_hex_value(self, value: str) -> str:
+        try:
+            num_value = int(value, 16)
+            padded_hex_value = f"{num_value:x}".rjust(16, "0")
+            return "0x" + padded_hex_value
+        except Exception:
+            return value
+
+    @traces.trace
+    def _get_crashed_thread_registers(self) -> str:
+        rv = []
+        exception = get_path(self.exceptions, 0)
+        if not exception:
+            return ""
+
+        thread_id = exception.get("thread_id")
+        crashed_thread_info = next(
+            filter(lambda t: t.get("id") == thread_id, self.threads or []), None
+        )
+        crashed_thread_registers = get_path(crashed_thread_info, "stacktrace", "registers")
+
+        if not isinstance(crashed_thread_registers, Mapping):
+            return ""
+
+        arch_label, is_64_bit, register_map = self._get_register_map_for_arch()
+
+        rv.append(
+            "Thread {} crashed with {} Thread State ({}-bit):".format(
+                thread_id, arch_label, "64" if is_64_bit else "32"
+            )
+        )
+
+        line = " "
+        for i, register in enumerate(
+            self._get_sorted_registers(crashed_thread_registers, register_map)
+        ):
+            if i != 0 and (i % 4 == 0):
+                rv.append(line)
+                line = " "
+
+            register_name, register_value = register
+            line += "{}: {}".format(
+                register_name.rjust(5), self._get_padded_hex_value(register_value or "0x0")
+            )
+
+        if line != " ":
+            rv.append(line)
+
+        return "\n".join(rv)
+
+    @traces.trace
+    def _get_exception_info(self) -> str:
         rv = []
 
         # We only have one exception at a time
@@ -74,17 +217,39 @@ class AppleCrashReport:
 
         return "\n".join(rv)
 
-    def get_threads_apple_string(self):
+    @traces.trace
+    def get_threads_apple_string(self) -> str:
         rv = []
-        exception = self.exceptions or []
+        exceptions = self.exceptions or []
         threads = self.threads or []
-        for thread_info in exception + threads:
+
+        # Process threads first, tracking which ones produced output.
+        # When an exception's thread_id matches a thread that produced
+        # output, we skip the exception to avoid duplication (the thread
+        # carries richer metadata like name/crashed state).
+        output_thread_ids = set()
+        for thread_info in threads:
             thread_string = self.get_thread_apple_string(thread_info)
             if thread_string is not None:
-                rv.append(thread_string)
-        return "\n\n".join(rv)
+                thread_id = thread_info.get("id")
+                rv.append((thread_id, thread_string))
+                if thread_id is not None:
+                    output_thread_ids.add(thread_id)
 
-    def get_thread_apple_string(self, thread_info):
+        for exception_info in exceptions:
+            thread_id = exception_info.get("thread_id")
+            if thread_id in output_thread_ids:
+                continue
+            thread_string = self.get_thread_apple_string(exception_info)
+            if thread_string is not None:
+                rv.append((thread_id, thread_string))
+
+        if self.prioritized_thread_id is not None:
+            rv.sort(key=lambda output: str(output[0]) != self.prioritized_thread_id)
+
+        return "\n\n".join(thread_string for _, thread_string in rv)
+
+    def get_thread_apple_string(self, thread_info: Mapping[str, Any]) -> str | None:
         rv = []
         stacktrace = get_path(thread_info, "stacktrace")
         if stacktrace is None:
@@ -114,20 +279,24 @@ class AppleCrashReport:
         thread_string = f"Thread {thread_id}{thread_name_string}{thread_crashed_thread}\n"
         return thread_string + "\n".join(rv)
 
-    def _convert_frame_to_apple_string(self, frame, next=None, number=0):
-        if frame.get("instruction_addr") is None:
-            return None
-        slide_value = self._get_slide_value(frame.get("image_addr"))
-        instruction_addr = slide_value + parse_addr(frame.get("instruction_addr"))
-        image_addr = slide_value + parse_addr(frame.get("image_addr"))
+    def _convert_frame_to_apple_string(
+        self,
+        frame: Mapping[str, Any],
+        next: Mapping[str, Any] | None = None,
+        number: int = 0,
+    ) -> str:
+        frame_instruction_addr = frame["instruction_addr"]
+        frame_image_addr = frame.get("image_addr", 0)
+        slide_value = self._get_slide_value(frame_image_addr)
+        instruction_addr = slide_value + frame_instruction_addr
+        image_addr = slide_value + frame_image_addr
         offset = ""
         if frame.get("image_addr") is not None and (
             not self.symbolicated
             or (frame.get("function") or NATIVE_UNKNOWN_STRING) == NATIVE_UNKNOWN_STRING
         ):
-            offset = " + %s" % (
-                instruction_addr - slide_value - parse_addr(frame.get("symbol_addr"))
-            )
+            offset_value = instruction_addr - slide_value - frame.get("symbol_addr", 0)
+            offset = f" + {offset_value}"
         symbol = hex(image_addr)
         if self.symbolicated:
             file = ""
@@ -137,9 +306,7 @@ class AppleCrashReport:
                     frame["lineno"],
                 )
             symbol = "{}{}".format(frame.get("function") or NATIVE_UNKNOWN_STRING, file)
-            if next and parse_addr(frame.get("instruction_addr")) == parse_addr(
-                next.get("instruction_addr")
-            ):
+            if next and frame_instruction_addr == next.get("instruction_addr", 0):
                 symbol = "[inlined] " + symbol
         return "{}{}{}{}{}".format(
             str(number).ljust(4, " "),
@@ -149,31 +316,32 @@ class AppleCrashReport:
             offset,
         )
 
-    def _get_slide_value(self, image_addr):
-        if self.debug_images:
-            for debug_image in self.debug_images:
-                if parse_addr(debug_image.get("image_addr")) == parse_addr(image_addr):
-                    return parse_addr(debug_image.get("image_vmaddr", 0))
-        return 0
+    def _get_slide_value(self, image_addr: int) -> int:
+        return self.image_addrs_to_vmaddrs.get(image_addr, 0)
 
-    def get_binary_images_apple_string(self):
-        # We dont need binary images on symbolicated crashreport
-        if self.symbolicated or self.debug_images is None:
+    @traces.trace
+    def get_binary_images_apple_string(self) -> str:
+        # We don't need binary images on symbolicated crashreport
+        if self.symbolicated or not self.debug_images:
             return ""
         binary_images = map(
             lambda i: self._convert_debug_meta_to_binary_image_row(debug_image=i),
-            sorted(self.debug_images, key=lambda i: parse_addr(i["image_addr"])),
+            sorted(
+                self.debug_images,
+                key=lambda i: i["image_addr"],
+            ),
         )
         return "Binary Images:\n" + "\n".join(binary_images)
 
-    def _convert_debug_meta_to_binary_image_row(self, debug_image):
-        slide_value = parse_addr(debug_image.get("image_vmaddr", 0))
-        image_addr = parse_addr(debug_image["image_addr"]) + slide_value
+    def _convert_debug_meta_to_binary_image_row(self, debug_image: Mapping[str, Any]) -> str:
+        slide_value = debug_image.get("image_vmaddr", 0)
+        image_addr = debug_image["image_addr"] + slide_value
+        image_size = debug_image.get("image_size")
         return "{} - {} {} {}  <{}> {}".format(
             hex(image_addr),
-            hex(image_addr + debug_image["image_size"] - 1),
+            hex(image_addr + image_size - 1) if image_size else NATIVE_UNKNOWN_STRING,
             image_name(debug_image.get("code_file") or NATIVE_UNKNOWN_STRING),
             get_path(self.context, "device", "arch") or NATIVE_UNKNOWN_STRING,
-            debug_image.get("debug_id").replace("-", "").lower(),
+            (debug_image.get("debug_id") or "").replace("-", "").lower() or NATIVE_UNKNOWN_STRING,
             debug_image.get("code_file") or NATIVE_UNKNOWN_STRING,
         )

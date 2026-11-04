@@ -7,7 +7,7 @@
 {% block title %}{% trans "Confirm Identity" %} | {{ block.super }}{% endblock %}
 
 {% block auth_main %}
-  <form class="form-stacked" action="" method="post">
+  <form class="form-stacked" action="{{ confirmation_url }}" method="post">
     {% csrf_token %}
 
     <div class="sso-link">
@@ -37,7 +37,7 @@
       </div>
     </div>
 
-    <div class="align-center">
+    <div class="align-center p-b-1">
       {% if force_link or existing_user.email == identity.email %}
         <p>We're going to associate this {{ provider }} account with your Sentry account, which means all of your existing settings will stay intact.</p>
 

@@ -1,0 +1,40 @@
+export const NAVIGATION_SIDEBAR_SECONDARY_WIDTH_LOCAL_STORAGE_KEY =
+  'secondary-sidebar-width';
+export const NAVIGATION_SIDEBAR_COLLAPSED_LOCAL_STORAGE_KEY =
+  'navigation-sidebar-is-collapsed';
+export const NAVIGATION_PRIMARY_LINK_DATA_ATTRIBUTE = 'data-primary-navigation-link';
+export const NAVIGATION_SECONDARY_SIDEBAR_DATA_ATTRIBUTE =
+  'data-secondary-navigation-sidebar';
+
+export const PRIMARY_SIDEBAR_WIDTH = 74;
+export const PRIMARY_HEADER_HEIGHT = 49;
+export const PRIMARY_HEADER_TITLE_MIN_WIDTH = 120;
+export const SUPERUSER_MARQUEE_HEIGHT = 24;
+
+export const SECONDARY_SIDEBAR_WIDTH = 190;
+export const SECONDARY_SIDEBAR_MIN_WIDTH = 150;
+export const SECONDARY_SIDEBAR_MAX_WIDTH = 450;
+
+export const NAVIGATION_SIDEBAR_COLLAPSE_DELAY_MS = 200;
+export const NAVIGATION_SIDEBAR_OPEN_DELAY_MS = 250;
+export const NAVIGATION_SIDEBAR_RESET_DELAY_MS = 300;
+
+export const NAVIGATION_MOBILE_TOPBAR_HEIGHT = 40;
+
+export const TOP_BAR_HEIGHT_CSS_VAR = '--top-bar-height';
+
+// To be passed as the `source` parameter in router navigation state
+// e.g. {pathname: '/issues/', state: {source: `sidebar`}}
+export const SIDEBAR_NAVIGATION_SOURCE = 'sidebar';
+
+// Settings has its own navigation, so "Back to app" returns to the last page
+// visited outside of this path prefix.
+export const SETTINGS_PATH_PREFIX = '/settings';
+
+// Scoped by organization so "Back to app" never returns to another organization.
+export const getSettingsReturnPathKey = (organizationSlug: string) =>
+  `settings-return-path:${organizationSlug}`;
+
+// The project the settings rail links to after the user leaves project settings.
+export const getSettingsLastProjectKey = (organizationSlug: string) =>
+  `settings-last-project:${organizationSlug}`;

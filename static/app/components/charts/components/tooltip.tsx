@@ -1,0 +1,526 @@
+import 'echarts/lib/component/tooltip';
+
+import type {Theme} from '@emotion/react';
+import {useTheme} from '@emotion/react';
+import type {TooltipComponentFormatterCallback} from 'echarts';
+import type {CallbackDataParams} from 'echarts/types/dist/shared';
+import moment from 'moment-timezone';
+
+import type {BaseChart, BaseChartProps} from 'sentry/components/charts/baseChart';
+import {truncationFormatter} from 'sentry/components/charts/utils';
+import {t} from 'sentry/locale';
+import type {DataPoint} from 'sentry/types/echarts';
+import {toArray} from 'sentry/utils/array/toArray';
+import {getFormattedDate, getTimeFormat} from 'sentry/utils/dates';
+
+export const CHART_TOOLTIP_VIEWPORT_OFFSET = 20;
+
+type ChartProps = React.ComponentProps<typeof BaseChart>;
+
+export function defaultFormatAxisLabel(
+  value: number,
+  isTimestamp: boolean,
+  utc: boolean,
+  showTimeInTooltip: boolean,
+  addSecondsToTimeFormat: boolean,
+  bucketSize?: number
+) {
+  if (!isTimestamp) {
+    return value;
+  }
+
+  const formatOptions = {local: !utc};
+
+  const timeFormat = showTimeInTooltip
+    ? getTimeFormat({seconds: addSecondsToTimeFormat})
+    : '';
+
+  if (!bucketSize) {
+    const format = `MMM D, YYYY ${timeFormat} z`.trim();
+    return getFormattedDate(value, format, formatOptions);
+  }
+
+  const now = moment();
+  const bucketStart = moment(value);
+  const bucketEnd = moment(value + bucketSize);
+
+  const showYear = now.year() !== bucketStart.year() || now.year() !== bucketEnd.year();
+  const showEndDate = bucketStart.date() !== bucketEnd.date();
+
+  const formatStart = `MMM D${showYear ? ', YYYY' : ''} ${timeFormat}`.trim();
+
+  const formatEndDate = showEndDate ? `MMM D${showYear ? ', YYYY' : ''} ` : '';
+  const formatEnd = `${formatEndDate} ${timeFormat}`.trim();
+
+  const start = getFormattedDate(bucketStart, formatStart, formatOptions);
+  const end = getFormattedDate(bucketEnd, formatEnd, formatOptions);
+  const timezone = getFormattedDate(bucketEnd, 'z', formatOptions);
+
+  return `${start} — ${end} (${timezone})`;
+}
+
+function defaultValueFormatter(value: string | number) {
+  if (typeof value === 'number') {
+    return value.toLocaleString();
+  }
+
+  return value;
+}
+
+function defaultNameFormatter(value: string) {
+  return value;
+}
+
+function defaultMarkerFormatter(value: string) {
+  return value;
+}
+
+function getSeriesValue(series: any, offset: number) {
+  if (!series.data) {
+    return;
+  }
+  if (Array.isArray(series.data)) {
+    return series.data[offset];
+  }
+  if (Array.isArray(series.data.value)) {
+    return series.data.value[offset];
+  }
+
+  return;
+}
+
+/**
+ * Orders tooltip series from the highest value to the lowest. Zero values go
+ * last, since they carry the least information, followed by series without a
+ * numeric value.
+ */
+function sortSeriesParamsByValue(
+  seriesParams: CallbackDataParams[]
+): CallbackDataParams[] {
+  const rank = (value: unknown) =>
+    typeof value !== 'number' || Number.isNaN(value) ? 2 : value === 0 ? 1 : 0;
+
+  return [...seriesParams].sort((a, b) => {
+    const aValue = getSeriesValue(a, 1);
+    const bValue = getSeriesValue(b, 1);
+    const rankDifference = rank(aValue) - rank(bValue);
+    if (rankDifference !== 0 || rank(aValue) !== 0) {
+      return rankDifference;
+    }
+    return bValue - aValue;
+  });
+}
+
+type NeededChartProps = 'isGroupedByDate' | 'showTimeInTooltip' | 'utc' | 'bucketSize';
+
+type TooltipFormatters =
+  | 'truncate'
+  | 'filter'
+  | 'formatAxisLabel'
+  | 'valueFormatter'
+  | 'nameFormatter'
+  | 'markerFormatter';
+
+export type TooltipSubLabel = {
+  data: DataPoint[];
+  label: string;
+  parentLabel: string;
+};
+
+export type FormatterOptions = Pick<
+  NonNullable<ChartProps['tooltip']>,
+  TooltipFormatters
+> &
+  Pick<ChartProps, NeededChartProps> & {
+    /**
+     * If true seconds will be added to the Axis label time format
+     */
+    addSecondsToTimeFormat?: boolean;
+    /**
+     * Limit the number of series rendered in the tooltip and display "+X more".
+     * Series are listed from the highest value to the lowest, with zero values
+     * last, so the limit drops zeros before anything else.
+     */
+    limit?: number;
+    /**
+     * Extra HTML appended to the series block, e.g. a legend for abbreviated series
+     * names. Receives the names of the series in the tooltip. Called on each tooltip
+     * render, so it can render a React tree to a string.
+     */
+    renderSeriesDetails?: (seriesNames: string[], timestamp: number) => string;
+    /**
+     * If true does not display sublabels with a value of 0.
+     */
+    skipZeroValuedSubLabels?: boolean;
+    /**
+     * Array containing data that is used to display indented sublabels.
+     */
+    subLabels?: TooltipSubLabel[];
+  };
+
+export function getFormatter({
+  filter,
+  isGroupedByDate,
+  showTimeInTooltip,
+  truncate,
+  formatAxisLabel,
+  utc,
+  bucketSize,
+  valueFormatter = defaultValueFormatter,
+  nameFormatter = defaultNameFormatter,
+  markerFormatter = defaultMarkerFormatter,
+  subLabels = [],
+  addSecondsToTimeFormat = false,
+  limit,
+  renderSeriesDetails,
+  skipZeroValuedSubLabels,
+}: FormatterOptions): TooltipComponentFormatterCallback<any> {
+  const getFilter = (seriesParam: any) => {
+    // Series do not necessarily have `data` defined, e.g. releases don't have `data`, but rather
+    // has a series using strictly `markLine`s.
+    // However, real series will have `data` as a tuple of (label, value) or be
+    // an object with value/label keys.
+    const value = getSeriesValue(seriesParam, 0);
+    if (typeof filter === 'function') {
+      return filter(value, seriesParam);
+    }
+
+    return true;
+  };
+
+  return seriesParamsOrParam => {
+    // If this is a tooltip for the axis, it will include all series for that axis item.
+    // In this case seriesParamsOrParam will be of type `Object[]`
+    //
+    // Otherwise, it will be an `Object`, and is a tooltip for a single item
+    const axisFormatterOrDefault = formatAxisLabel || defaultFormatAxisLabel;
+
+    // Special tooltip if component is a `markPoint`
+    if (
+      !Array.isArray(seriesParamsOrParam) &&
+      // TODO(ts): The EChart types suggest that this can _only_ be `series`,
+      //           but assuming this code is correct (which I have not
+      //           verified) their types may be wrong.
+      (seriesParamsOrParam.componentType as unknown) === 'markPoint'
+    ) {
+      const timestamp = seriesParamsOrParam.data.coord[0] as number;
+      const label = axisFormatterOrDefault(
+        timestamp,
+        !!isGroupedByDate,
+        !!utc,
+        !!showTimeInTooltip,
+        addSecondsToTimeFormat,
+        bucketSize,
+        seriesParamsOrParam
+      );
+      // eCharts sets seriesName as null when `componentType` !== 'series'
+      const truncatedName = truncationFormatter(
+        seriesParamsOrParam.data.labelForValue,
+        truncate
+      );
+      const formattedValue = valueFormatter(
+        seriesParamsOrParam.data.coord[1],
+        seriesParamsOrParam.name
+      );
+
+      return [
+        '<div class="tooltip-series">',
+        `<div>
+          <span class="tooltip-label"><strong>${seriesParamsOrParam.name}</strong></span>
+          ${truncatedName}: ${formattedValue}
+        </div>`,
+        '</div>',
+        `<div class="tooltip-footer">${label}</div>`,
+        '</div>',
+      ].join('');
+    }
+
+    let seriesParams: CallbackDataParams[] = toArray(seriesParamsOrParam);
+
+    // If axis, timestamp comes from axis, otherwise for a single item it is defined in the data attribute.
+    // The data attribute is usually a list of [name, value] but can also be an object of {name, value} when
+    // there is item specific formatting being used.
+    const timestamp = getSeriesValue(seriesParams[0], 0);
+
+    const date =
+      seriesParams.length &&
+      axisFormatterOrDefault(
+        timestamp,
+        !!isGroupedByDate,
+        !!utc,
+        !!showTimeInTooltip,
+        addSecondsToTimeFormat,
+        bucketSize,
+        seriesParamsOrParam
+      );
+
+    let hiddenSeriesCount = 0;
+    if (limit) {
+      hiddenSeriesCount = Math.max(seriesParams.length - limit, 0);
+      seriesParams = sortSeriesParamsByValue(seriesParams).slice(0, limit);
+    }
+
+    const visibleSeriesParams = seriesParams.filter(getFilter);
+
+    const {series, total} = visibleSeriesParams.reduce<{series: string[]; total: number}>(
+      (acc, serie) => {
+        const formattedLabel = nameFormatter(
+          truncationFormatter(serie.seriesName ?? '', truncate),
+          serie
+        );
+
+        const value = valueFormatter(getSeriesValue(serie, 1), serie.seriesName, serie);
+
+        // `marker` is HTML in the default render mode, an object in rich text mode.
+        const marker = markerFormatter(
+          typeof serie.marker === 'string' ? serie.marker : '',
+          serie.seriesName
+        );
+
+        const filteredSubLabels = subLabels.filter(
+          subLabel => subLabel.parentLabel === serie.seriesName
+        );
+
+        if (filteredSubLabels.length) {
+          const labelWithSubLabels = [
+            `<div><span class="tooltip-label">${marker} <strong>${formattedLabel}</strong></span> <strong>${value}</strong></div>`,
+          ];
+
+          for (const subLabel of filteredSubLabels) {
+            const serieValue = subLabel.data[serie.dataIndex]?.value ?? 0;
+
+            if (skipZeroValuedSubLabels && serieValue === 0) {
+              continue;
+            }
+
+            labelWithSubLabels.push(
+              `<div><span class="tooltip-label tooltip-label-indent"><strong>${
+                subLabel.label
+              }</strong></span> ${valueFormatter(serieValue)}</div>`
+            );
+
+            acc.total = acc.total + serieValue;
+          }
+
+          acc.series.push(labelWithSubLabels.join(''));
+          return acc;
+        }
+
+        acc.total = acc.total + getSeriesValue(serie, 1);
+
+        if (subLabels.length > 0) {
+          acc.series.push(
+            `<div><span class="tooltip-label">${marker} <strong>${formattedLabel}</strong></span> <strong>${value}</strong></div>`
+          );
+        } else {
+          acc.series.push(
+            `<div><span class="tooltip-label">${marker} <strong>${formattedLabel}</strong></span> ${value}</div>`
+          );
+        }
+
+        return acc;
+      },
+      {
+        series: [],
+        total: 0,
+      }
+    );
+
+    if (hiddenSeriesCount > 0) {
+      // Rendered as its own row rather than as a series, so the value and name
+      // formatters never see a series that doesn't exist on the chart.
+      series.push(
+        `<div><span class="tooltip-label"><strong>${t('+%s more', hiddenSeriesCount)}</strong></span></div>`
+      );
+    }
+
+    const seriesDetails =
+      renderSeriesDetails?.(
+        visibleSeriesParams.map(serie => serie.seriesName ?? ''),
+        timestamp
+      ) ?? '';
+
+    if (subLabels.length > 0) {
+      return [
+        `<div class="tooltip-series">${series.join('')}${seriesDetails}</div>`,
+        '<div class="tooltip-footer">',
+        `<div><strong>${t('Date')}:</strong> ${date}</div>`,
+        `<div><strong>${t('Total')}:</strong> ${valueFormatter(total)}</div>`,
+        '</div>',
+        '<div class="tooltip-arrow"></div>',
+      ].join('');
+    }
+
+    return [
+      `<div class="tooltip-series">${series.join('')}${seriesDetails}</div>`,
+      '<div class="tooltip-footer tooltip-footer-centered">',
+      date,
+      '</div>',
+      '<div class="tooltip-arrow"></div>',
+    ].join('');
+  };
+}
+
+interface HorizontalTooltipPositionParams {
+  anchorX: number;
+  chartLeft: number;
+  tipWidth: number;
+}
+
+/**
+ * Centres the tooltip on `anchorX`, pinning it inside the viewport when it
+ * would overflow. `left` is relative to the chart, and `arrowLeft` keeps the
+ * arrow pointing at the anchor when the tooltip is pinned.
+ */
+export function horizontalTooltipPosition({
+  anchorX,
+  chartLeft,
+  tipWidth,
+}: HorizontalTooltipPositionParams): {arrowLeft: string; left: number} {
+  const left = anchorX - tipWidth / 2;
+  const rightEdge = chartLeft + anchorX + tipWidth / 2;
+
+  if (rightEdge >= window.innerWidth - CHART_TOOLTIP_VIEWPORT_OFFSET) {
+    const pinnedLeft =
+      left - (rightEdge - window.innerWidth + CHART_TOOLTIP_VIEWPORT_OFFSET);
+    return {left: pinnedLeft, arrowLeft: `${anchorX - pinnedLeft}px`};
+  }
+
+  if (left + chartLeft - CHART_TOOLTIP_VIEWPORT_OFFSET <= 0) {
+    const pinnedLeft = CHART_TOOLTIP_VIEWPORT_OFFSET - chartLeft;
+    return {left: pinnedLeft, arrowLeft: `${anchorX - pinnedLeft}px`};
+  }
+
+  return {left, arrowLeft: '50%'};
+}
+
+type Props = ChartProps['tooltip'] &
+  Pick<ChartProps, NeededChartProps> &
+  Pick<FormatterOptions, 'addSecondsToTimeFormat'> & {
+    /**
+     * An ID for the chart when using renderToBody to portal the tooltip.
+     * A reference to the chart is needed to calculate the tooltip position.
+     */
+    chartId?: string;
+  };
+
+export function computeChartTooltip(
+  {
+    filter,
+    isGroupedByDate,
+    showTimeInTooltip,
+    addSecondsToTimeFormat,
+    formatter,
+    truncate,
+    utc,
+    bucketSize,
+    formatAxisLabel,
+    valueFormatter,
+    nameFormatter,
+    markerFormatter,
+    hideDelay,
+    renderSeriesDetails,
+    subLabels,
+    chartId,
+    skipZeroValuedSubLabels,
+    ...props
+  }: Props,
+  theme: Theme
+): BaseChartProps['tooltip'] {
+  formatter =
+    formatter ||
+    getFormatter({
+      filter,
+      isGroupedByDate,
+      showTimeInTooltip,
+      addSecondsToTimeFormat,
+      truncate,
+      utc,
+      bucketSize,
+      formatAxisLabel,
+      valueFormatter,
+      nameFormatter,
+      markerFormatter,
+      renderSeriesDetails,
+      subLabels,
+      skipZeroValuedSubLabels,
+    });
+
+  return {
+    show: true,
+    trigger: 'item',
+    backgroundColor: theme.tokens.background.primary,
+    borderWidth: 0,
+    extraCssText: `box-shadow: 0 0 0 1px ${theme.tokens.border.transparent.neutral.muted}, ${theme.shadow.high}; z-index: ${theme.zIndex.tooltip} !important;`,
+    transitionDuration: 0,
+    padding: 0,
+    className: 'tooltip-container',
+    // Default hideDelay in echarts docs is 100ms
+    hideDelay: hideDelay || 100,
+    /**
+     * @link https://echarts.apache.org/en/option.html#tooltip.position
+     *
+     * @param pos mouse position
+     * @param _params same as formatter
+     * @param dom dom object of tooltip
+     * @param _rec graphic elements
+     * @param _size The size of dom echarts container.
+     */
+    position(pos, _params, dom, _rec, size) {
+      // Types seem to be broken on dom
+      dom = dom as HTMLDivElement;
+      // Center the tooltip slightly above the cursor.
+      const [tipWidth, tipHeight] = size.contentSize;
+
+      let parentNode: Element = document.body;
+      if (dom?.parentNode instanceof Element) {
+        parentNode = dom.parentNode;
+      }
+
+      const chartElement =
+        props.appendToBody && chartId
+          ? (document.getElementById(chartId) ?? parentNode)
+          : parentNode;
+
+      // Get the left offset of the tip container (the chart)
+      // so that we can estimate overflows
+      const chartBoundingRect = chartElement.getBoundingClientRect();
+      const chartLeft = chartBoundingRect.left ?? 0;
+
+      const {left: leftPos, arrowLeft: arrowPosition} = horizontalTooltipPosition({
+        anchorX: Number(pos[0]),
+        chartLeft,
+        tipWidth,
+      });
+
+      // Prefer rendering the tooltip above the cursor.
+      let topPos = Number(pos[1]) - tipHeight - 20;
+      let arrowOnTop = false;
+      // When the tooltip is too tall to fit above the cursor (e.g. a group-by
+      // chart with many series), render it below the cursor instead of pinning
+      // it to the top edge of the window, which detaches it from the chart.
+      if (topPos + chartBoundingRect.top < CHART_TOOLTIP_VIEWPORT_OFFSET) {
+        topPos = Number(pos[1]) + 20;
+        arrowOnTop = true;
+      }
+
+      const arrow = dom?.querySelector<HTMLDivElement>('.tooltip-arrow');
+      if (arrow) {
+        arrow.style.left = arrowPosition;
+        arrow.classList.toggle('arrow-top', arrowOnTop);
+      }
+
+      return {
+        left: leftPos,
+        top: topPos,
+      };
+    },
+    formatter,
+    ...props,
+  };
+}
+
+export function ChartTooltip(props: Props = {}): BaseChartProps['tooltip'] {
+  const theme = useTheme();
+  return computeChartTooltip(props, theme);
+}

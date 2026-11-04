@@ -1,0 +1,71 @@
+import orjson
+from django.utils import timezone
+
+from sentry.models.activity import Activity
+from sentry.models.deploy import Deploy
+from sentry.notifications.notifications.activity.release import ReleaseActivityNotification
+from sentry.testutils.cases import SlackActivityNotificationTest
+from sentry.types.activity import ActivityType
+
+
+class SlackDeployNotificationTest(SlackActivityNotificationTest):
+    def test_deploy_block(self) -> None:
+        """
+        Test that a Slack message is sent with the expected payload when a deploy happens.
+        and block kit is enabled.
+        """
+        release = self.create_release(
+            version="meow" * 10,
+            date_released=timezone.now(),
+        )
+
+        # The projects can appear out of order.
+        projects = (self.project, self.create_project(name="battlesnake"))
+        SLUGS_TO_PROJECT = {project.slug: project for project in projects}
+
+        for project in projects:
+            release.add_project(project)
+
+        deploy = Deploy.objects.create(
+            release=release,
+            organization_id=self.organization.id,
+            environment_id=self.environment.id,
+        )
+        notification = ReleaseActivityNotification(
+            Activity(
+                project=self.project,
+                user_id=self.user.id,
+                type=ActivityType.RELEASE.value,
+                data={"version": release.version, "deploy_id": deploy.id},
+            )
+        )
+        with self.tasks():
+            notification.send()
+
+        blocks = orjson.loads(self.mock_post.call_args.kwargs["blocks"])
+        fallback_text = self.mock_post.call_args.kwargs["text"]
+        assert (
+            fallback_text
+            == f"Release {release.version} was deployed to {self.environment.name} for these projects"
+        )
+        assert blocks[0]["text"]["text"] == fallback_text
+
+        actions = blocks[2]["elements"]
+        assert sorted(action["text"]["text"] for action in actions) == sorted(SLUGS_TO_PROJECT)
+        for action in actions:
+            project = SLUGS_TO_PROJECT[action["text"]["text"]]
+            assert (
+                action["url"]
+                == f"http://testserver/organizations/{self.organization.slug}/releases/"
+                f"{release.version}/?project={project.id}&unselectedSeries=Healthy&referrer=release_activity&notification_uuid={notification.notification_uuid}"
+            )
+            assert action["value"] == "link_clicked"
+
+        # The footer and the actions come from separate unordered queries, so the footer can
+        # name any of the release's projects, not necessarily the first action's.
+        footer_slug, footer_link = blocks[1]["elements"][0]["text"].split(" | ")
+        assert footer_slug in SLUGS_TO_PROJECT
+        assert (
+            footer_link
+            == f"<http://testserver/settings/account/notifications/deploy/?referrer=release_activity-slack-user&notification_uuid={notification.notification_uuid}|Notification Settings>"
+        )

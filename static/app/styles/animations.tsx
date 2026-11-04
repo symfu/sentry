@@ -1,0 +1,57 @@
+import {keyframes} from '@emotion/react';
+
+export const fadeIn = keyframes`
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+`;
+
+export const fadeOut = keyframes`
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+`;
+
+export const pulse = (size: number) => keyframes`
+  0% {
+    transform: scale(1,1);
+  }
+  50% {
+    transform: scale(${size}, ${size});
+  }
+  100% {
+    transform: scale(1, 1);
+  }
+`;
+
+const SHAKE_DISTANCE_PX = 3;
+
+export const makeShake = () => keyframes`
+${Array.from({length: 50})
+  .fill(0)
+  .map(
+    (_, i) => `${i * 2}% {
+  transform: translate(${Math.round(Math.random() * SHAKE_DISTANCE_PX)}px, ${Math.round(
+    Math.random() * SHAKE_DISTANCE_PX
+  )}px);
+}`
+  )
+  .join('\n')}
+`;
+
+export const makeOpacityJitter = () => keyframes`
+${Array.from({length: 50})
+  .fill(0)
+  .map(
+    (_, i) => `${i * 2}% {
+  opacity: ${Math.round(Math.random() * 10) / 10};
+}`
+  )
+  .join('\n')}
+`;

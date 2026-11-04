@@ -1,0 +1,84 @@
+import {useMatches, type UIMatch} from 'react-router';
+
+import type {Organization} from 'sentry/types/organization';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useParams} from 'sentry/utils/useParams';
+import {useGroupId} from 'sentry/views/issueDetails/groupIdContext';
+import {Tab, TabPaths} from 'sentry/views/issueDetails/types';
+
+function getCurrentTab({
+  matches,
+  params,
+}: {
+  matches: UIMatch[];
+  params: Record<string, string | undefined>;
+}) {
+  const currentMatch = matches[matches.length - 1];
+  const currentPath = (currentMatch?.handle as {path?: string} | undefined)?.path;
+
+  // If we're in the tag details page ("/distributions/:tagKey/")
+  if (params.tagKey) {
+    return Tab.DISTRIBUTIONS;
+  }
+  return Object.values(Tab).find(tab => currentPath === TabPaths[tab]) ?? Tab.DETAILS;
+}
+
+function getCurrentRouteInfo({
+  eventId,
+  groupId,
+  matches,
+  organization,
+  params,
+}: {
+  eventId: string | undefined;
+  groupId: string;
+  matches: UIMatch[];
+  organization: Organization;
+  params: Record<string, string | undefined>;
+}): {
+  baseUrl: string;
+  currentTab: Tab;
+} {
+  const currentTab = getCurrentTab({matches, params});
+
+  const baseUrl = normalizeUrl(
+    `/organizations/${organization.slug}/issues/${groupId}/${
+      params.eventId && eventId ? `events/${eventId}/` : ''
+    }`
+  );
+
+  return {baseUrl, currentTab};
+}
+
+/**
+ * The tab on its own, for components that only need to know where they are.
+ * Unlike `useGroupDetailsRoute()` this needs no `GroupIdProvider`, so it also
+ * works in the sidebar and other places mounted beside the group route.
+ */
+export function useCurrentTab(): Tab {
+  const params = useParams<{tagKey?: string}>();
+  const matches = useMatches();
+  return getCurrentTab({matches, params});
+}
+
+export function useGroupDetailsRoute(): {
+  baseUrl: string;
+  currentTab: Tab;
+} {
+  const organization = useOrganization();
+  const params = useParams<{
+    groupId: string;
+    eventId?: string;
+    tagKey?: string;
+  }>();
+  const matches = useMatches();
+  const groupId = useGroupId();
+  return getCurrentRouteInfo({
+    eventId: params.eventId,
+    groupId,
+    matches,
+    organization,
+    params,
+  });
+}

@@ -1,0 +1,120 @@
+import {useEffect} from 'react';
+import styled from '@emotion/styled';
+
+import {GroupPreviewHovercard} from 'sentry/components/groupPreviewTooltip/groupPreviewHovercard';
+import {
+  useDelayedLoadingState,
+  usePreviewEvent,
+} from 'sentry/components/groupPreviewTooltip/utils';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {
+  KeyValueTableCard,
+  KeyValueTableCardPanel,
+} from 'sentry/components/tables/keyValueTable';
+import {t} from 'sentry/locale';
+
+type SpanEvidencePreviewProps = {
+  children: React.ReactNode;
+  groupId: string;
+  query?: string;
+};
+
+type SpanEvidencePreviewBodyProps = {
+  groupId: string;
+  onRequestBegin: () => void;
+  onRequestEnd: () => void;
+  onUnmount: () => void;
+  query?: string;
+};
+
+function SpanEvidencePreviewBody({
+  onRequestBegin,
+  onRequestEnd,
+  onUnmount,
+  groupId,
+  query,
+}: SpanEvidencePreviewBodyProps) {
+  const {data, isPending, isError} = usePreviewEvent({groupId, query});
+
+  useEffect(() => {
+    if (isPending) {
+      onRequestBegin();
+    } else {
+      onRequestEnd();
+    }
+
+    return onUnmount;
+  }, [isPending, onRequestBegin, onRequestEnd, onUnmount]);
+
+  if (isPending) {
+    return (
+      <EmptyWrapper>
+        <LoadingIndicator size={32} />
+      </EmptyWrapper>
+    );
+  }
+
+  if (isError) {
+    return <EmptyWrapper>{t('Failed to load preview')}</EmptyWrapper>;
+  }
+
+  const evidenceDisplay = data?.occurrence?.evidenceDisplay;
+
+  if (evidenceDisplay?.length) {
+    return (
+      <PreviewBody data-test-id="evidence-preview-body">
+        <KeyValueTableCard
+          variant="label"
+          contentItems={evidenceDisplay.map(item => ({
+            item: {key: item.name, subject: item.name, value: item.value},
+          }))}
+        />
+      </PreviewBody>
+    );
+  }
+
+  return (
+    <EmptyWrapper>{t('There is no evidence available for this issue.')}</EmptyWrapper>
+  );
+}
+
+export function EvidencePreview({children, groupId, query}: SpanEvidencePreviewProps) {
+  const {shouldShowLoadingState, onRequestBegin, onRequestEnd, reset} =
+    useDelayedLoadingState();
+
+  return (
+    <GroupPreviewHovercard
+      hide={!shouldShowLoadingState}
+      body={
+        <SpanEvidencePreviewBody
+          onRequestBegin={onRequestBegin}
+          onRequestEnd={onRequestEnd}
+          onUnmount={reset}
+          groupId={groupId}
+          query={query}
+        />
+      }
+    >
+      {children}
+    </GroupPreviewHovercard>
+  );
+}
+
+const PreviewBody = styled('div')`
+  width: 700px;
+
+  > ${KeyValueTableCardPanel} {
+    border: none;
+    margin: 0;
+  }
+`;
+
+const EmptyWrapper = styled('div')`
+  color: ${p => p.theme.tokens.content.secondary};
+  padding: ${p => p.theme.space.lg};
+  font-size: ${p => p.theme.font.size.md};
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 56px;
+`;

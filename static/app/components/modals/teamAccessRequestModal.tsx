@@ -1,0 +1,69 @@
+import {Fragment, useState} from 'react';
+
+import {Button} from '@sentry/scraps/button';
+import {Grid} from '@sentry/scraps/layout';
+
+import {addErrorMessage, addSuccessMessage} from 'sentry/actionCreators/indicator';
+import type {
+  ModalRenderProps,
+  TeamAccessRequestModalOptions,
+} from 'sentry/actionCreators/modal';
+import type {Client} from 'sentry/api';
+import {t, tct} from 'sentry/locale';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {withApi} from 'sentry/utils/withApi';
+
+export interface CreateTeamAccessRequestModalProps
+  extends ModalRenderProps, TeamAccessRequestModalOptions {
+  api: Client;
+  memberId: string;
+  orgId: string;
+  teamId: string;
+}
+
+function CreateTeamAccessRequestModal(props: CreateTeamAccessRequestModalProps) {
+  const [createBusy, setCreateBusy] = useState(false);
+  const {api, memberId, orgId, teamId, closeModal, Body, Footer} = props;
+
+  const handleClick = async () => {
+    setCreateBusy(true);
+
+    try {
+      await api.requestPromise(
+        getApiUrl(
+          '/organizations/$organizationIdOrSlug/members/$memberId/teams/$teamIdOrSlug/',
+          {path: {organizationIdOrSlug: orgId, memberId, teamIdOrSlug: teamId}}
+        ),
+        {
+          method: 'POST',
+        }
+      );
+      addSuccessMessage(t('Team request sent for approval'));
+    } catch (err) {
+      addErrorMessage(t('Unable to send team request'));
+    }
+    setCreateBusy(false);
+    closeModal();
+  };
+
+  return (
+    <Fragment>
+      <Body>
+        {tct(
+          'You do not have permission to add members to the #[team] team, but we will send a request to your organization admins for approval.',
+          {team: teamId}
+        )}
+      </Body>
+      <Footer>
+        <Grid gap="md" columns="max-content max-content">
+          <Button onClick={closeModal}>{t('Cancel')}</Button>
+          <Button variant="primary" onClick={handleClick} busy={createBusy} autoFocus>
+            {t('Continue')}
+          </Button>
+        </Grid>
+      </Footer>
+    </Fragment>
+  );
+}
+
+export default withApi(CreateTeamAccessRequestModal);

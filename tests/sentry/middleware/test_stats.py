@@ -1,20 +1,53 @@
-from django.test import RequestFactory
-from exam import fixture
-from sentry.utils.compat.mock import patch
+from functools import cached_property
+from typing import Any
+from unittest.mock import MagicMock, Mock, call, patch, sentinel
 
-from sentry.middleware.stats import RequestTimingMiddleware, add_request_metric_tags
-from sentry.testutils import TestCase
-from sentry.testutils.helpers.faux import Mock
+from django.test import RequestFactory, override_settings
+from django.urls.base import resolve
+from rest_framework.permissions import AllowAny
+
+from sentry.api.api_owners import ApiOwner
+from sentry.api.base import Endpoint
+from sentry.middleware.ratelimit import RatelimitMiddleware
+from sentry.middleware.stats import RequestTimingMiddleware
+from sentry.ratelimits.config import RateLimitConfig
+from sentry.testutils.cases import TestCase
+from sentry.types.ratelimit import RateLimit, RateLimitCategory
+
+
+class RateLimitedEndpoint(Endpoint):
+    permission_classes = (AllowAny,)
+
+    enforce_rate_limit = True
+    rate_limits = RateLimitConfig(
+        limit_overrides={"GET": {RateLimitCategory.IP: RateLimit(limit=0, window=10)}}
+    )
+
+    def get(self) -> None:
+        raise NotImplementedError
+
+
+class BudgetedEndpoint(Endpoint):
+    owner = ApiOwner.ISSUES
+    max_acceptable_duration = 3.0
+
+
+class MethodBudgetedEndpoint(Endpoint):
+    max_acceptable_duration = {"GET": 3.0, "POST": 5.0}
 
 
 class RequestTimingMiddlewareTest(TestCase):
-    middleware = fixture(RequestTimingMiddleware)
-    factory = fixture(RequestFactory)
+    middleware = cached_property(RequestTimingMiddleware)
+
+    @cached_property
+    def factory(self) -> Any:
+        return RequestFactory()
 
     @patch("sentry.utils.metrics.incr")
-    def test_records_default_api_metrics(self, incr):
+    def test_records_default_api_metrics(self, incr: MagicMock) -> None:
         request = self.factory.get("/")
         request._view_path = "/"
+        request.resolver_match = resolve("/")
         response = Mock(status_code=200)
 
         self.middleware.process_response(request, response)
@@ -22,41 +55,133 @@ class RequestTimingMiddlewareTest(TestCase):
         incr.assert_called_with(
             "view.response",
             instance=request._view_path,
-            tags={"method": "GET", "status_code": 200},
+            tags={
+                "method": "GET",
+                "status_code": 200,
+                "ui_request": False,
+                "rate_limit_type": None,
+                "url_name": "sentry",
+            },
             skip_internal=False,
         )
 
     @patch("sentry.utils.metrics.incr")
-    def test_records_endpoint_specific_metrics(self, incr):
+    @override_settings(SENTRY_SELF_HOSTED=False)
+    def test_records_default_api_metrics_with_rate_limit_type(self, incr: MagicMock) -> None:
+        rate_limit_middleware = RatelimitMiddleware(sentinel.callback)
+        test_endpoint = RateLimitedEndpoint.as_view()
         request = self.factory.get("/")
         request._view_path = "/"
-        request._metric_tags = {"a": "b"}
+        request.resolver_match = resolve("/")
+        response = Mock(status_code=429)
 
+        rate_limit_middleware.process_view(request, test_endpoint, [], {})
+        self.middleware.process_response(request, response)
+
+        incr.assert_called_with(
+            "view.response",
+            instance=request._view_path,
+            tags={
+                "method": "GET",
+                "status_code": 429,
+                "ui_request": False,
+                "rate_limit_type": "fixed_window",
+                "url_name": "sentry",
+            },
+            skip_internal=False,
+        )
+
+    @patch("sentry.utils.metrics.incr")
+    def test_records_ui_request(self, incr: MagicMock) -> None:
+        request = self.factory.get("/")
+        request._view_path = "/"
+        # mypy says this is nullable so we test that path here too
+        # request.resolver_match = resolve("/")
         response = Mock(status_code=200)
+        request.COOKIES = {"foo": "bar"}
+        request.auth = None
 
         self.middleware.process_response(request, response)
 
         incr.assert_called_with(
             "view.response",
             instance=request._view_path,
-            tags={"method": "GET", "status_code": 200, "a": "b"},
+            tags={
+                "method": "GET",
+                "status_code": 200,
+                "ui_request": True,
+                "rate_limit_type": None,
+                "url_name": "unreachable-unknown",
+            },
             skip_internal=False,
         )
 
-    @patch("sentry.utils.metrics.incr")
-    def test_add_request_metric_tags(self, incr):
+    @patch("sentry.utils.metrics.distribution")
+    @patch("sentry.middleware.stats.time.monotonic", side_effect=[10.0, 14.0])
+    def test_records_duration_over_budget(
+        self, mock_time: MagicMock, distribution: MagicMock
+    ) -> None:
+        view = BudgetedEndpoint.as_view()
         request = self.factory.get("/")
-        request._view_path = "/"
+        request.resolver_match = resolve("/")
+        response = Mock(status_code=500)
 
-        add_request_metric_tags(request, foo="bar")
-
-        response = Mock(status_code=200)
-
+        with patch.object(RequestTimingMiddleware, "allowed_paths", (view.__module__,)):
+            self.middleware.process_view(request, view, [], {})
         self.middleware.process_response(request, response)
 
-        incr.assert_called_with(
-            "view.response",
-            instance=request._view_path,
-            tags={"method": "GET", "status_code": 200, "foo": "bar"},
-            skip_internal=False,
+        assert mock_time.call_count == 2
+        distribution.assert_has_calls(
+            [
+                call(
+                    "view.duration",
+                    4000,
+                    instance=request._view_path,
+                    tags={"method": "GET"},
+                    unit="millisecond",
+                ),
+                call(
+                    "view.duration_over_budget",
+                    1000.0,
+                    instance=request._view_path,
+                    tags={"method": "GET", "owner": "issues-feed", "ui_request": False},
+                    sample_rate=1.0,
+                    unit="millisecond",
+                ),
+            ]
         )
+
+    @patch("sentry.utils.metrics.distribution")
+    @patch("sentry.middleware.stats.time.monotonic", side_effect=[10.0, 13.0])
+    def test_does_not_record_duration_at_budget(
+        self, mock_time: MagicMock, distribution: MagicMock
+    ) -> None:
+        view = BudgetedEndpoint.as_view()
+        request = self.factory.get("/")
+        request.resolver_match = resolve("/")
+        response = Mock(status_code=200)
+
+        with patch.object(RequestTimingMiddleware, "allowed_paths", (view.__module__,)):
+            self.middleware.process_view(request, view, [], {})
+        self.middleware.process_response(request, response)
+
+        assert mock_time.call_count == 2
+        distribution.assert_called_once_with(
+            "view.duration",
+            3000,
+            instance=request._view_path,
+            tags={"method": "GET"},
+            unit="millisecond",
+        )
+
+    def test_resolves_method_specific_duration_budget(self) -> None:
+        view = MethodBudgetedEndpoint.as_view()
+        get_request = self.factory.get("/")
+        delete_request = self.factory.delete("/")
+
+        with patch.object(RequestTimingMiddleware, "allowed_paths", (view.__module__,)):
+            self.middleware.process_view(get_request, view, [], {})
+            self.middleware.process_view(delete_request, view, [], {})
+
+        assert get_request._max_acceptable_duration == 3.0
+        assert delete_request._max_acceptable_duration is None

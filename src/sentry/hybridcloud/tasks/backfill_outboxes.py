@@ -1,0 +1,358 @@
+"""
+Checks OutboxProducingModel classes and their replication_version.
+When the replication_version on any class is bumped, callers to process_outbox_backfill_batch
+will produce new outboxes incrementally to replicate those models.
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+from dataclasses import dataclass
+
+from django.apps import apps
+from django.db import router, transaction
+from django.db.models import Max, Min, Model
+
+from sentry import options
+from sentry.hybridcloud.models.outbox import outbox_context
+from sentry.hybridcloud.models.outboxbackfillwatermark import (
+    BaseOutboxBackfillWatermark,
+    CellOutboxBackfillWatermark,
+    ControlOutboxBackfillWatermark,
+)
+from sentry.hybridcloud.outbox.base import CellOutboxProducingModel, ControlOutboxProducingModel
+from sentry.silo.base import SiloMode
+from sentry.users.models.user import User
+from sentry.utils import metrics
+
+logger = logging.getLogger(__name__)
+
+WATERMARK_ROW_MISSING_METRIC = "backfill_outboxes.watermark_row_missing"
+
+
+@dataclass
+class BackfillBatch:
+    low: int
+    up: int
+    version: int
+    has_more: bool
+
+    @property
+    def count(self) -> int:
+        delta = self.up - self.low
+        if delta < 0:
+            return 0
+        return delta + 1
+
+    def __str__(self) -> str:
+        return f"BackfillBatch(low={self.low} up={self.up} version={self.version} has_more={self.has_more} count={self.count})"
+
+
+@functools.lru_cache(maxsize=1)
+def _control_backfill_tables() -> frozenset[str]:
+    control_only = frozenset({SiloMode.CONTROL})
+    tables = set()
+    for model in _backfill_models(SiloMode.MONOLITH):
+        silo_limit = getattr(model._meta, "silo_limit", None)
+        if silo_limit is not None and silo_limit.modes == control_only:
+            tables.add(model._meta.db_table)
+    return frozenset(tables)
+
+
+def _watermark_model(table_name: str) -> type[BaseOutboxBackfillWatermark]:
+    current_mode = SiloMode.get_current_mode()
+    if current_mode == SiloMode.CONTROL:
+        return ControlOutboxBackfillWatermark
+    if current_mode == SiloMode.CELL:
+        return CellOutboxBackfillWatermark
+
+    # for monolith deployments, pick the table that would be written to in prod w/ split deployments
+    if table_name in _control_backfill_tables():
+        return ControlOutboxBackfillWatermark
+    return CellOutboxBackfillWatermark
+
+
+def read_processing_state(table_name: str) -> tuple[int, int] | None:
+    row = _watermark_model(table_name).objects.filter(table_name=table_name).first()
+    if row is None:
+        return None
+    return row.low_bound, row.version
+
+
+def _write_processing_state(table_name: str, value: int, version: int) -> None:
+    _watermark_model(table_name).objects.update_or_create(
+        table_name=table_name,
+        defaults={"low_bound": value, "version": version},
+    )
+
+
+def get_processing_state(table_name: str) -> tuple[int, int]:
+    state = read_processing_state(table_name)
+    if state is not None:
+        return state
+
+    metrics.incr(
+        WATERMARK_ROW_MISSING_METRIC,
+        tags=dict(table_name=table_name),
+        skip_internal=True,
+        sample_rate=1.0,
+    )
+    state = (0, 1)
+    _write_processing_state(table_name, *state)
+    return state
+
+
+def set_processing_state(table_name: str, value: int, version: int) -> None:
+    _write_processing_state(table_name, value, version)
+    metrics.gauge(
+        "backfill_outboxes.low_bound",
+        value,
+        tags=dict(table_name=table_name, version=version),
+    )
+
+
+def find_replication_version(
+    model: type[ControlOutboxProducingModel] | type[CellOutboxProducingModel] | type[User],
+    force_synchronous: bool = False,
+) -> int:
+    """
+    :param model: Model for finding the current replication version
+    :param force_synchronous:  when False, returns the min(options.get(version_key), model.replication_version), else
+                                returns model.replication_version
+                               For self hosted, this is generally True, so that we synchronously flush all replication
+                               outboxes on every upgrade.  For SaaS, we wait for a sentry option to be set, bringing
+                               the version up to the model.replication_version.
+    """
+    coded_version = model.replication_version
+    if force_synchronous:
+        return coded_version
+
+    model_key = f"outbox_replication.{model._meta.db_table}.replication_version"
+    configured_version = options.get(model_key)
+    return min(configured_version, coded_version)
+
+
+def _chunk_processing_batch(
+    model: type[ControlOutboxProducingModel] | type[CellOutboxProducingModel] | type[User],
+    *,
+    batch_size: int,
+    force_synchronous: bool = False,
+) -> BackfillBatch | None:
+    lower, version = get_processing_state(model._meta.db_table)
+    target_version = find_replication_version(model, force_synchronous=force_synchronous)
+    if version > target_version:
+        return None
+    if version < target_version:
+        lower = 0
+        version = target_version
+    lower = max(model.objects.aggregate(Min("id"))["id__min"] or 0, lower)
+    upper = (
+        model.objects.filter(id__gte=lower)
+        .order_by("id")[: batch_size + 1]
+        .aggregate(Max("id"))["id__max"]
+        or 0
+    )
+    metrics.gauge(
+        "backfill_outboxes.low_bound",
+        lower,
+        tags=dict(table_name=model._meta.db_table, version=version),
+        sample_rate=1.0,
+    )
+
+    return BackfillBatch(low=lower, up=upper, version=version, has_more=upper > lower)
+
+
+def process_outbox_backfill_batch(
+    model: type[Model], batch_size: int, force_synchronous: bool = False
+) -> BackfillBatch | None:
+    if (
+        not issubclass(model, CellOutboxProducingModel)
+        and not issubclass(model, ControlOutboxProducingModel)
+        and not issubclass(model, User)
+    ):
+        return None
+
+    processing_state = _chunk_processing_batch(
+        model, batch_size=batch_size, force_synchronous=force_synchronous
+    )
+    if not processing_state:
+        logger.info("processing_state.missing", extra={"model": model.__name__})
+        return None
+
+    logger.info(
+        "processing_state.current",
+        extra={
+            "model": model.__name__,
+            "batch_low": processing_state.low,
+            "batch_up": processing_state.up,
+            "version": processing_state.version,
+        },
+    )
+
+    for inst in model.objects.filter(id__gte=processing_state.low, id__lte=processing_state.up):
+        with outbox_context(transaction.atomic(router.db_for_write(model)), flush=False):
+            if isinstance(inst, CellOutboxProducingModel):
+                inst.outbox_for_update().save()
+            if isinstance(inst, ControlOutboxProducingModel) or isinstance(inst, User):
+                target_cells: list[str] | None = None
+                try:
+                    target_cells = options.get(
+                        f"outbox_replication.{inst._meta.db_table}.backfill.target_cells"
+                    )
+                except options.UnknownOption:
+                    pass
+                for outbox in inst.outboxes_for_update():
+                    if target_cells and outbox.cell_name not in target_cells:
+                        continue
+                    outbox.save()
+
+    if not processing_state.has_more:
+        low_bound, version = 0, model.replication_version + 1
+    else:
+        low_bound, version = processing_state.up + 1, processing_state.version
+
+    set_processing_state(model._meta.db_table, low_bound, version)
+
+    return processing_state
+
+
+OUTBOX_BACKFILLS_PER_MINUTE = 10_000
+
+# stored low bound, emitted every cycle even if the backfill budget is exhausted
+WATERMARK_STATE_METRIC = "backfill_outboxes.watermark_state"
+
+# stored version (per-table)
+WATERMARK_VERSION_METRIC = "backfill_outboxes.watermark_version"
+
+# version the backfill is working towards (per-table)
+WATERMARK_TARGET_VERSION_METRIC = "backfill_outboxes.watermark_target_version"
+
+# reporting errors, debugging only
+WATERMARK_REPORT_ERROR_METRIC = "backfill_outboxes.watermark_report_error"
+
+
+def _backfill_models(
+    silo_mode: SiloMode,
+) -> list[type[ControlOutboxProducingModel] | type[CellOutboxProducingModel] | type[User]]:
+    """
+    The models the backfill loop processes in this silo mode.
+    """
+    found: list[
+        type[ControlOutboxProducingModel] | type[CellOutboxProducingModel] | type[User]
+    ] = []
+    for app_models in apps.all_models.values():
+        for model in app_models.values():
+            if not hasattr(model._meta, "silo_limit"):
+                continue
+
+            if silo_mode is not SiloMode.MONOLITH and silo_mode not in model._meta.silo_limit.modes:
+                continue
+
+            if not (
+                issubclass(model, CellOutboxProducingModel)
+                or issubclass(model, ControlOutboxProducingModel)
+                or issubclass(model, User)
+            ):
+                continue
+
+            found.append(model)
+    return found
+
+
+def _report_watermark_for_model(
+    model: type[ControlOutboxProducingModel] | type[CellOutboxProducingModel] | type[User],
+    *,
+    force_synchronous: bool,
+) -> None:
+    table_name = model._meta.db_table
+    target_version = find_replication_version(model, force_synchronous=force_synchronous)
+    metrics.gauge(
+        WATERMARK_TARGET_VERSION_METRIC,
+        target_version,
+        tags=dict(table_name=table_name),
+        sample_rate=1.0,
+    )
+
+    state = read_processing_state(table_name)
+    if state is None:
+        logger.warning(
+            "backfill_outboxes.watermark_absent",
+            extra={"table_name": table_name, "target_version": target_version},
+        )
+        return
+
+    lower, version = state
+    metrics.gauge(WATERMARK_STATE_METRIC, lower, tags=dict(table_name=table_name), sample_rate=1.0)
+    metrics.gauge(
+        WATERMARK_VERSION_METRIC, version, tags=dict(table_name=table_name), sample_rate=1.0
+    )
+
+
+def report_backfill_watermarks(silo_mode: SiloMode, force_synchronous: bool = False) -> None:
+    """
+    Read every backfill watermark once, and report what it holds.
+    """
+    try:
+        for model in _backfill_models(silo_mode):
+            table_name = model._meta.db_table
+            try:
+                _report_watermark_for_model(model, force_synchronous=force_synchronous)
+            except Exception:
+                # One bad table must not stop the rest of the walk.
+                metrics.incr(
+                    WATERMARK_REPORT_ERROR_METRIC,
+                    tags=dict(table_name=table_name),
+                    skip_internal=True,
+                    sample_rate=1.0,
+                )
+                logger.exception(
+                    "backfill_outboxes.watermark_report_failed",
+                    extra={"table_name": table_name},
+                )
+    except Exception:
+        metrics.incr(WATERMARK_REPORT_ERROR_METRIC, skip_internal=True, sample_rate=1.0)
+        logger.exception("backfill_outboxes.watermark_report_failed")
+
+
+def backfill_outboxes_for(
+    silo_mode: SiloMode,
+    scheduled_count: int = 0,
+    max_batch_rate: int = OUTBOX_BACKFILLS_PER_MINUTE,
+    force_synchronous: bool = False,
+) -> bool:
+    # Maintain a steady state of outbox processing by subtracting any regularly scheduled rows
+    # from an expected rate.
+    remaining_to_backfill = max_batch_rate - scheduled_count
+    backfilled = 0
+    logger.info(
+        "backfill_outboxes.start",
+        extra={"remaining": remaining_to_backfill, "scheduled": scheduled_count},
+    )
+
+    try:
+        if remaining_to_backfill > 0:
+            for model in _backfill_models(silo_mode):
+                # If we find some backfill work to perform, do it.
+                batch = process_outbox_backfill_batch(
+                    model, batch_size=remaining_to_backfill, force_synchronous=force_synchronous
+                )
+                if batch is None:
+                    continue
+
+                remaining_to_backfill -= batch.count
+                backfilled += batch.count
+                if remaining_to_backfill <= 0:
+                    break
+    finally:
+        # report the newest values from this cycle
+        report_backfill_watermarks(silo_mode, force_synchronous=force_synchronous)
+
+    metrics.incr(
+        "backfill_outboxes.backfilled",
+        amount=backfilled,
+        tags=dict(silo_mode=silo_mode.name, force_synchronous=force_synchronous),
+        skip_internal=True,
+        sample_rate=1.0,
+    )
+    return backfilled > 0

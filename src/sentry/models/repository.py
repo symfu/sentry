@@ -1,60 +1,206 @@
-from django.db import models
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
+
+from django.contrib.postgres.fields.array import ArrayField
+from django.db import models, router, transaction
 from django.db.models.signals import pre_delete
 from django.utils import timezone
 
-from sentry.constants import ObjectStatus
-from sentry.db.models import BoundedPositiveIntegerField, JSONField, Model, sane_repr
-from sentry.db.mixin import PendingDeletionMixin, delete_pending_deletion_option
+from sentry.backup.dependencies import NormalizedModelName, get_model_name
+from sentry.backup.sanitize import SanitizableField, Sanitizer
+from sentry.backup.scopes import RelocationScope
+from sentry.constants import DEFAULT_CODE_REVIEW_TRIGGERS, ObjectStatus
+from sentry.db.models import (
+    BoundedBigIntegerField,
+    BoundedPositiveIntegerField,
+    Model,
+    cell_silo_model,
+    sane_repr,
+)
+from sentry.db.models.fields.jsonfield import LegacyTextJSONField
+from sentry.db.models.manager.base import BaseManager
+from sentry.db.pending_deletion import (
+    delete_pending_deletion_option,
+    rename_on_pending_deletion,
+    reset_pending_deletion_field_names,
+)
+from sentry.models.options.organization_option import OrganizationOption
+from sentry.models.repositorysettings import RepositorySettings
+from sentry.organizations.services.organization.service import organization_service
 from sentry.signals import pending_delete
+from sentry.users.services.user import RpcUser
+from sentry.utils.email import MessageBuilder
+
+if TYPE_CHECKING:
+    from sentry.plugins.providers import IntegrationRepositoryProvider
+
+REPOSITORY_NAME_LENGTH = 500
+REPOSITORY_URL_LENGTH = 512
 
 
-class Repository(Model, PendingDeletionMixin):
-    __core__ = True
+RepoResolution = Literal["resolved", "not_found", "ambiguous"]
 
-    organization_id = BoundedPositiveIntegerField(db_index=True)
-    name = models.CharField(max_length=200)
-    url = models.URLField(null=True)
+# Which reported identity resolved the repo.
+RepoLookup = Literal["external_id", "name"]
+
+
+class RepositoryManager(BaseManager["Repository"]):
+    def provider_match(self, provider: str) -> models.Q:
+        """Match a provider against both stored shapes.
+
+        Sentry stores the ``integrations:``-prefixed provider (e.g. ``integrations:github``)
+        while many callers carry the bare form (``github``). Normalize either input shape
+        here so provider lookups stay consistent across SCM-reporting paths.
+        """
+        normalized_provider = provider.removeprefix("integrations:").lower()
+        return models.Q(provider=normalized_provider) | models.Q(
+            provider=f"integrations:{normalized_provider}"
+        )
+
+    def _resolve_active_unique(
+        self, *, organization_id: int, normalized_provider: str | None, **identity: str | int
+    ) -> tuple[Repository | None, RepoResolution]:
+        """Resolve to the single active org repo matching ``identity``, or say why not.
+
+        Refusing to guess between several matches is deliberate: picking one risks
+        attaching a PR to the wrong repository. ``normalized_provider`` is the bare,
+        lowercased form (no ``integrations:`` prefix); None skips provider narrowing.
+
+        Returns ``(repository, "resolved" | "not_found" | "ambiguous")``.
+        """
+        candidates = self.filter(
+            organization_id=organization_id,
+            status=ObjectStatus.ACTIVE,
+            **identity,
+        )
+        if normalized_provider is not None:
+            candidates = candidates.filter(self.provider_match(normalized_provider))
+
+        # Two is enough: we only need to know whether there is exactly one.
+        matches = list(candidates.order_by("id")[:2])
+        if len(matches) == 1:
+            return matches[0], "resolved"
+        return None, "ambiguous" if matches else "not_found"
+
+    def resolve_active(
+        self, *, organization_id: int, name: str, normalized_provider: str | None
+    ) -> tuple[Repository | None, RepoResolution]:
+        """Resolve the org-scoped active repository named ``name`` for a reported PR.
+
+        Names aren't unique, and a provider only sometimes separates duplicates —
+        re-installing an integration mints a row with the same name and provider. Prefer
+        :meth:`resolve_active_by_external_id` wherever the reporter has the external id.
+        """
+        return self._resolve_active_unique(
+            organization_id=organization_id,
+            normalized_provider=normalized_provider,
+            name=name,
+        )
+
+    def resolve_active_by_external_id(
+        self, *, organization_id: int, external_id: str, normalized_provider: str | None
+    ) -> tuple[Repository | None, RepoResolution]:
+        """Resolve the org-scoped active repository whose provider-side id is ``external_id``.
+
+        The identity Sentry handed the reporter, so it round-trips exactly, and
+        ``(organization_id, provider, external_id)`` is unique. A name does neither:
+        GitLab reporters carry ``path_with_namespace`` while ``name`` holds
+        ``name_with_namespace``.
+        """
+        return self._resolve_active_unique(
+            organization_id=organization_id,
+            normalized_provider=normalized_provider,
+            external_id=external_id,
+        )
+
+    def resolve_active_by_reference(
+        self,
+        *,
+        organization_id: int,
+        repository_id: int | None = None,
+        provider: str | None = None,
+        external_id: str | None = None,
+        name: str | None = None,
+    ) -> tuple[Repository | None, RepoResolution]:
+        """Resolve one active repository using the strongest supplied identity.
+
+        Repository IDs take precedence over provider-side external IDs, which take
+        precedence over names. A failed lookup never falls back to a weaker identity:
+        doing so could silently resolve a different repository than the caller specified.
+        """
+        normalized_provider = (
+            provider.removeprefix("integrations:").lower() if provider is not None else None
+        )
+        if repository_id is not None:
+            return self._resolve_active_unique(
+                organization_id=organization_id,
+                normalized_provider=None,
+                id=repository_id,
+            )
+        if external_id is not None:
+            return self.resolve_active_by_external_id(
+                organization_id=organization_id,
+                external_id=external_id,
+                normalized_provider=normalized_provider,
+            )
+        if name is not None:
+            return self.resolve_active(
+                organization_id=organization_id,
+                name=name,
+                normalized_provider=normalized_provider,
+            )
+        return None, "not_found"
+
+
+@cell_silo_model
+class Repository(Model):
+    __relocation_scope__ = RelocationScope.Global
+
+    organization_id = BoundedBigIntegerField(db_index=True)
+    name = models.CharField(max_length=REPOSITORY_NAME_LENGTH)
+    url = models.URLField(null=True, max_length=REPOSITORY_URL_LENGTH)
     provider = models.CharField(max_length=64, null=True)
+    # The external_id is the id of the repo in the provider's system. (e.g. GitHub's repo id)
     external_id = models.CharField(max_length=64, null=True)
-    config = JSONField(default=dict)
+    config = LegacyTextJSONField(default=dict)
     status = BoundedPositiveIntegerField(
-        default=ObjectStatus.VISIBLE, choices=ObjectStatus.as_choices(), db_index=True
+        default=ObjectStatus.ACTIVE, choices=ObjectStatus.as_choices(), db_index=True
     )
     date_added = models.DateTimeField(default=timezone.now)
     integration_id = BoundedPositiveIntegerField(db_index=True, null=True)
+    languages = ArrayField(models.TextField(), default=list)
+
+    objects: ClassVar[RepositoryManager] = RepositoryManager()
 
     class Meta:
         app_label = "sentry"
         db_table = "sentry_repository"
-        unique_together = (
-            ("organization_id", "name"),
-            ("organization_id", "provider", "external_id"),
-        )
+        unique_together = (("organization_id", "provider", "external_id"),)
+        indexes = (models.Index(fields=("organization_id", "status", "name")),)
 
     __repr__ = sane_repr("organization_id", "name", "provider")
 
-    _rename_fields_on_pending_delete = frozenset(["name", "external_id"])
+    def has_integration_provider(self) -> bool:
+        return bool(self.provider and self.provider.startswith("integrations:"))
 
-    def has_integration_provider(self):
-        return self.provider and self.provider.startswith("integrations:")
-
-    def get_provider(self):
+    def get_provider(self) -> IntegrationRepositoryProvider | None:
         from sentry.plugins.base import bindings
 
-        if self.has_integration_provider():
-            provider_cls = bindings.get("integration-repository.provider").get(self.provider)
-            return provider_cls(self.provider)
+        if not self.has_integration_provider():
+            return None
 
-        provider_cls = bindings.get("repository.provider").get(self.provider)
-        return provider_cls(self.provider)
+        provider = self.provider
+        assert provider is not None
+        provider_cls = bindings.get("integration-repository.provider").get(provider)
+        return provider_cls(provider)
 
-    def generate_delete_fail_email(self, error_message):
-        from sentry.utils.email import MessageBuilder
-
+    def generate_delete_fail_email(self, error_message: str) -> MessageBuilder:
+        provider = self.get_provider()
         new_context = {
             "repo": self,
             "error_message": error_message,
-            "provider_name": self.get_provider().name,
+            "provider_name": provider.name if provider else self.provider,
         }
 
         return MessageBuilder(
@@ -64,25 +210,117 @@ class Repository(Model, PendingDeletionMixin):
             html_template="sentry/emails/unable-to-delete-repo.html",
         )
 
-    def rename_on_pending_deletion(self, fields=None):
+    def send_delete_fail_email(self, error_message: str, actor_email: str) -> None:
+        from sentry.notifications.platform.service import NotificationService
+        from sentry.notifications.platform.target import GenericNotificationTarget
+        from sentry.notifications.platform.templates.repository import UnableToDeleteRepository
+        from sentry.notifications.platform.types import (
+            NotificationProviderKey,
+            NotificationTargetResourceType,
+        )
+
+        data = UnableToDeleteRepository(
+            organization_id=self.organization_id,
+            repository_name=self.name,
+            provider_name=provider.name if (provider := self.get_provider()) else self.provider,
+            error_message=error_message,
+        )
+
+        organization_context = organization_service.get_organization_by_id(id=self.organization_id)
+        if organization_context is not None and NotificationService.has_access(
+            organization_context.organization, data.source
+        ):
+            NotificationService(data=data).notify_async(
+                targets=[
+                    GenericNotificationTarget(
+                        provider_key=NotificationProviderKey.EMAIL,
+                        resource_type=NotificationTargetResourceType.EMAIL,
+                        resource_id=actor_email,
+                    )
+                ]
+            )
+        else:
+            msg = self.generate_delete_fail_email(error_message)
+            msg.send_async([actor_email])
+
+    # pending deletion implementation
+    _pending_fields = ("name", "external_id")
+
+    def rename_on_pending_deletion(self) -> None:
         # Due to the fact that Repository is shown to the user
         # as it is pending deletion, this is added to display the fields
         # correctly to the user.
         self.config["pending_deletion_name"] = self.name
-        super().rename_on_pending_deletion(fields, ["config"])
+        rename_on_pending_deletion(
+            self.organization_id, self, self._pending_fields, extra_fields_to_save=("config",)
+        )
 
-    def reset_pending_deletion_field_names(self):
+    def reset_pending_deletion_field_names(self) -> bool:
         del self.config["pending_deletion_name"]
-        super().reset_pending_deletion_field_names(["config"])
+        return reset_pending_deletion_field_names(
+            self.organization_id, self, self._pending_fields, extra_fields_to_save=("config",)
+        )
+
+    def delete_pending_deletion_option(self) -> None:
+        delete_pending_deletion_option(self.organization_id, self)
+
+    @classmethod
+    def sanitize_relocation_json(
+        cls, json: Any, sanitizer: Sanitizer, model_name: NormalizedModelName | None = None
+    ) -> None:
+        model_name = get_model_name(cls) if model_name is None else model_name
+        super().sanitize_relocation_json(json, sanitizer, model_name)
+
+        sanitizer.set_json(json, SanitizableField(model_name, "config"), {})
+        sanitizer.set_string(json, SanitizableField(model_name, "external_id"))
+        sanitizer.set_string(json, SanitizableField(model_name, "provider"))
+        json["fields"]["languages"] = "[]"
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        is_new = self.pk is None
+        with transaction.atomic(router.db_for_write(Repository)):
+            super().save(*args, **kwargs)
+            if is_new:
+                self._handle_auto_enable_code_review()
+
+    def _handle_auto_enable_code_review(self) -> None:
+        """
+        When a new repository is created, auto enable code review if applicable.
+        """
+        SUPPORTED_PROVIDERS = {"integrations:github"}
+
+        if self.provider not in SUPPORTED_PROVIDERS:
+            return
+
+        enabled_code_review = OrganizationOption.objects.get_value(
+            organization=self.organization_id,
+            key="sentry:auto_enable_code_review",
+            default=False,
+        )
+        triggers = OrganizationOption.objects.get_value(
+            organization=self.organization_id,
+            key="sentry:default_code_review_triggers",
+            default=DEFAULT_CODE_REVIEW_TRIGGERS,
+        )
+        if not isinstance(triggers, list):
+            triggers = DEFAULT_CODE_REVIEW_TRIGGERS
+
+        RepositorySettings.objects.get_or_create(
+            repository_id=self.id,
+            defaults={"enabled_code_review": enabled_code_review, "code_review_triggers": triggers},
+        )
 
 
-def on_delete(instance, actor=None, **kwargs):
+def on_delete(instance: Repository, actor: RpcUser | None = None, **kwargs: object) -> None:
+    """
+    Remove webhooks for repository providers that use repository level webhooks.
+    This is called from sentry.deletions.tasks.run_deletion()
+    """
     # If there is no provider, we don't have any webhooks, etc to delete
     if not instance.provider:
         return
 
-    # TODO(lb): I'm assuming that this is used by integrations... is it?
-    def handle_exception(e):
+    def handle_exception(e: Exception) -> None:
         from sentry.exceptions import InvalidIdentity, PluginError
         from sentry.shared_integrations.exceptions import IntegrationError
 
@@ -91,20 +329,20 @@ def on_delete(instance, actor=None, **kwargs):
         else:
             error = "An unknown error occurred"
         if actor is not None:
-            msg = instance.generate_delete_fail_email(error)
-            msg.send_async(to=[actor.email])
+            instance.send_delete_fail_email(error, actor.email)
 
     if instance.has_integration_provider():
         try:
-            instance.get_provider().on_delete_repository(repo=instance)
-        except Exception as exc:
-            handle_exception(exc)
-    else:
-        try:
-            instance.get_provider().delete_repository(repo=instance, actor=actor)
+            provider = instance.get_provider()
+            assert provider is not None
+            provider.on_delete_repository(repo=instance)
         except Exception as exc:
             handle_exception(exc)
 
 
 pending_delete.connect(on_delete, sender=Repository, weak=False)
-pre_delete.connect(delete_pending_deletion_option, sender=Repository, weak=False)
+pre_delete.connect(
+    lambda instance, **k: instance.delete_pending_deletion_option(),
+    sender=Repository,
+    weak=False,
+)

@@ -1,0 +1,427 @@
+import {Fragment, useMemo, useState} from 'react';
+import {css} from '@emotion/react';
+import {IconChevron} from '@sentry/icons/chevron';
+import {IconFix} from '@sentry/icons/fix';
+import {IconRefresh} from '@sentry/icons/refresh';
+import classNames from 'classnames';
+
+import {Tag} from '@sentry/scraps/badge';
+import {Button} from '@sentry/scraps/button';
+import {Container, Flex, Grid} from '@sentry/scraps/layout';
+import {useModal} from '@sentry/scraps/modal';
+import {Text} from '@sentry/scraps/text';
+
+import {ErrorBoundary} from 'sentry/components/errorBoundary';
+import {analyzeFrameForRootCause} from 'sentry/components/events/interfaces/analyzeFrames';
+import {LeadHint} from 'sentry/components/events/interfaces/frame/leadHint';
+import {StacktraceLink} from 'sentry/components/events/interfaces/frame/stacktraceLink';
+import type {FrameSourceMapDebuggerData} from 'sentry/components/events/interfaces/sourceMapsDebuggerModal';
+import {SourceMapsDebuggerModal} from 'sentry/components/events/interfaces/sourceMapsDebuggerModal';
+import {useStacktraceContext} from 'sentry/components/events/interfaces/stackTraceContext';
+import {getThreadById} from 'sentry/components/events/interfaces/utils';
+import InteractionStateLayer from 'sentry/components/interactionStateLayer';
+import {StrictClick} from 'sentry/components/strictClick';
+import {t, tn} from 'sentry/locale';
+import type {Event, Frame} from 'sentry/types/event';
+import type {SentryAppSchemaStacktraceLink} from 'sentry/types/integrations';
+import type {PlatformKey} from 'sentry/types/platform';
+import type {StacktraceType} from 'sentry/types/stacktrace';
+import {trackAnalytics} from 'sentry/utils/analytics';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {useProjects} from 'sentry/utils/useProjects';
+import {useSentryAppComponents} from 'sentry/utils/useSentryAppComponents';
+import {SectionKey} from 'sentry/views/issueDetails/context';
+
+import {Context} from './context';
+import {DefaultTitle} from './defaultTitle';
+import {OpenInContextLine} from './openInContextLine';
+import {
+  getPlatform,
+  hasAssembly,
+  hasContextRegisters,
+  hasContextSource,
+  hasContextVars,
+  hasPotentialSourceContext,
+  isPotentiallyThirdPartyFrame,
+} from './utils';
+
+const VALID_SOURCE_MAP_DEBUGGER_FILE_ENDINGS = [
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.jsbundle', // React Native iOS file ending
+  '.bundle', // React Native Android file ending
+  '.hbc', // Hermes Bytecode (from Expo updates) file ending
+  '.js.gz', // file ending idiomatic for Ember.js
+];
+
+export interface DeprecatedLineProps {
+  data: Frame;
+  emptySourceNotation: boolean;
+  event: Event;
+  frameMeta: Record<any, any>;
+  frameSourceResolutionResults: FrameSourceMapDebuggerData | undefined;
+  hiddenFrameCount: number | undefined;
+  hideSourceMapDebugger: boolean;
+  isANR: boolean;
+  isExpanded: boolean;
+  /**
+   * Is the stack trace being previewed in a hovercard?
+   */
+  isHoverPreviewed: boolean;
+  lockAddress: string | undefined;
+  nextFrame: Frame | undefined;
+  platform: PlatformKey;
+  registers: StacktraceType['registers'];
+  threadId: number | undefined;
+  timesRepeated: number;
+  isShowFramesToggleExpanded?: boolean;
+  /**
+   * Frames that are hidden under the most recent non-InApp frame
+   */
+  isSubFrame?: boolean;
+  onShowFramesToggle?: (event: React.MouseEvent<HTMLElement>) => void;
+  registersMeta?: Record<any, any>;
+}
+
+export function DeprecatedLine({
+  data,
+  emptySourceNotation,
+  event,
+  frameMeta,
+  frameSourceResolutionResults,
+  hiddenFrameCount,
+  hideSourceMapDebugger,
+  isANR,
+  isExpanded: initialExpanded,
+  isHoverPreviewed,
+  lockAddress,
+  nextFrame,
+  platform: propPlatform,
+  registers,
+  threadId,
+  timesRepeated,
+  isShowFramesToggleExpanded,
+  isSubFrame,
+  onShowFramesToggle,
+  registersMeta,
+}: DeprecatedLineProps) {
+  const {projects} = useProjects();
+  // Projects aren't loaded on the shared issue page, which can't make
+  // authenticated requests
+  const hasProject = projects.some(p => p.id === event.projectID);
+  const components = useSentryAppComponents<SentryAppSchemaStacktraceLink>({
+    componentType: 'stacktrace-link',
+    enabled: hasProject,
+  });
+  const {openModal} = useModal();
+
+  const organization = useOrganization();
+  const {hasScmSourceContext} = useStacktraceContext();
+  const [isHovering, setIsHovering] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(initialExpanded ?? false);
+  const platform = getPlatform(data.platform, propPlatform ?? 'other');
+  const leadsToApp = !data.inApp && (nextFrame?.inApp || !nextFrame);
+
+  const isExpandable = useMemo((): boolean => {
+    return !!(
+      (hasContextSource(data) && data.context) ||
+      hasContextVars(data) ||
+      hasContextRegisters(registers) ||
+      hasAssembly(data, platform) ||
+      (hasScmSourceContext && hasPotentialSourceContext(data))
+    );
+  }, [data, registers, platform, hasScmSourceContext]);
+
+  const toggleContext = (evt?: React.MouseEvent) => {
+    evt?.preventDefault();
+    setIsExpanded(!isExpanded);
+  };
+
+  const handleMouseEnter = () => {
+    setIsHovering(true);
+  };
+
+  const handleMouseLeave = () => {
+    setIsHovering(false);
+  };
+
+  const scrollToSuspectRootCause = (e: React.MouseEvent) => {
+    e.stopPropagation(); // to prevent collapsing if collapsible
+    document
+      .getElementById(SectionKey.SUSPECT_ROOT_CAUSE)
+      ?.scrollIntoView({block: 'start', behavior: 'smooth'});
+  };
+
+  const anrCulprit =
+    isANR && analyzeFrameForRootCause(data, getThreadById(event, threadId), lockAddress);
+
+  const frameHasValidFileEndingForSourceMapDebugger =
+    VALID_SOURCE_MAP_DEBUGGER_FILE_ENDINGS.some(
+      ending =>
+        (data.absPath ?? '').endsWith(ending) || (data.filename ?? '').endsWith(ending)
+    );
+
+  // If context is available (non-empty), users can already see the source code
+  // This means they have a "good stack trace" with readable source lines
+  // In this case, we want to hide the 'unminify code' button since the
+  // user already has sufficient debugging information
+  const shouldShowSourceMapDebuggerButton =
+    !hasContextSource(data) &&
+    !hideSourceMapDebugger &&
+    data.inApp &&
+    frameHasValidFileEndingForSourceMapDebugger &&
+    frameSourceResolutionResults &&
+    !frameSourceResolutionResults.frameIsResolved;
+
+  const sourceMapDebuggerAmplitudeData = {
+    organization: organization ?? null,
+    project_id: event.projectID,
+    event_id: event.id,
+    event_platform: event.platform,
+    sdk_name: event.sdk?.name,
+    sdk_version: event.sdk?.version,
+  };
+
+  const activeLineNumber = data.lineNo;
+  const contextLine = (data?.context || []).find((l: any) => l[0] === activeLineNumber);
+  // InApp or .NET because of: https://learn.microsoft.com/en-us/dotnet/standard/library-guidance/sourcelink
+  const hasStacktraceLink =
+    (data.inApp || event.platform === 'csharp') &&
+    !!data.filename &&
+    (isHovering || isExpanded);
+  const showSentryAppStacktraceLinkInFrame = hasStacktraceLink && components.length > 0;
+
+  const className = classNames({
+    frame: true,
+    'is-expandable': isExpandable,
+    expanded: isExpanded,
+    collapsed: !isExpanded,
+    'system-frame': !data.inApp,
+    'leads-to-app': leadsToApp,
+  });
+
+  return (
+    <li data-test-id="line" className={className}>
+      <StrictClick onClick={isExpandable ? toggleContext : undefined}>
+        <DefaultLine
+          data-test-id="title"
+          isSubFrame={!!isSubFrame}
+          onMouseEnter={handleMouseEnter}
+          onMouseLeave={handleMouseLeave}
+          isExpandable={isExpandable}
+        >
+          {isExpandable ? <InteractionStateLayer /> : null}
+          <Text italic={!data.inApp} variant={data.inApp ? 'inherit' : 'muted'}>
+            {textProps => (
+              <Flex {...textProps} align="center" minWidth={0}>
+                <Container>
+                  <LeadHint
+                    nextFrame={nextFrame}
+                    event={event}
+                    isExpanded={isExpanded}
+                    leadsToApp={leadsToApp}
+                  />
+                  <DefaultTitle
+                    frame={data}
+                    platform={propPlatform ?? 'other'}
+                    isHoverPreviewed={isHoverPreviewed}
+                    meta={frameMeta}
+                    isPotentiallyThirdParty={isPotentiallyThirdPartyFrame(data, event)}
+                  />
+                </Container>
+              </Flex>
+            )}
+          </Text>
+          <Flex align="center" gap="xs md" justify="end" wrap="wrap">
+            <RepeatsIndicator timesRepeated={timesRepeated} />
+            {anrCulprit ? (
+              <Tag variant="warning" onClick={scrollToSuspectRootCause}>
+                {t('Suspect Frame')}
+              </Tag>
+            ) : null}
+            {hasStacktraceLink && !shouldShowSourceMapDebuggerButton && (
+              <ErrorBoundary>
+                <StacktraceLink
+                  frame={data}
+                  line={contextLine ? contextLine[1] : ''}
+                  event={event}
+                  disableSetup={isHoverPreviewed}
+                />
+              </ErrorBoundary>
+            )}
+            {showSentryAppStacktraceLinkInFrame && (
+              <ErrorBoundary mini>
+                <OpenInContextLine
+                  lineNo={data.lineNo}
+                  filename={data.filename || ''}
+                  components={components}
+                />
+              </ErrorBoundary>
+            )}
+            {hiddenFrameCount ? (
+              <Button
+                analyticsEventName="Stacktrace Frames: toggled"
+                analyticsEventKey="stacktrace_frames.toggled"
+                analyticsParams={{
+                  frame_count: hiddenFrameCount,
+                  is_frame_expanded: isShowFramesToggleExpanded,
+                }}
+                size="zero"
+                variant="transparent"
+                onClick={e => {
+                  onShowFramesToggle?.(e);
+                }}
+              >
+                <Text as="span" bold={false} italic size="sm" variant="secondary">
+                  {isShowFramesToggleExpanded
+                    ? tn('Hide %s more frame', 'Hide %s more frames', hiddenFrameCount)
+                    : tn('Show %s more frame', 'Show %s more frames', hiddenFrameCount)}
+                </Text>
+              </Button>
+            ) : null}
+            {shouldShowSourceMapDebuggerButton ? (
+              <Fragment>
+                <Button
+                  size="zero"
+                  variant="secondary"
+                  icon={<IconFix size="xs" />}
+                  tooltipProps={{
+                    title: t(
+                      'Click to learn how to show the original source code for this stack frame.'
+                    ),
+                  }}
+                  onClick={e => {
+                    e.stopPropagation();
+
+                    trackAnalytics(
+                      'source_map_debug_blue_thunder.modal_opened',
+                      sourceMapDebuggerAmplitudeData
+                    );
+
+                    openModal(
+                      modalProps => (
+                        <SourceMapsDebuggerModal
+                          analyticsParams={sourceMapDebuggerAmplitudeData}
+                          sourceResolutionResults={frameSourceResolutionResults}
+                          organization={organization}
+                          projectId={event.projectID}
+                          {...modalProps}
+                        />
+                      ),
+                      {
+                        modalCss: css`
+                          max-width: 800px;
+                          width: 100%;
+                        `,
+                        onClose: () => {
+                          trackAnalytics(
+                            'source_map_debug_blue_thunder.modal_closed',
+                            sourceMapDebuggerAmplitudeData
+                          );
+                        },
+                      }
+                    );
+                  }}
+                >
+                  <Text as="span" size="sm" variant="inherit">
+                    {t('Unminify Code')}
+                  </Text>
+                </Button>
+              </Fragment>
+            ) : null}
+            {data.inApp ? <Tag variant="info">{t('In App')}</Tag> : null}
+            {isExpandable ? (
+              <Button
+                data-test-id={`toggle-button-${isExpanded ? 'expanded' : 'collapsed'}`}
+                size="zero"
+                aria-label={t('Toggle Context')}
+                onClick={toggleContext}
+                variant="transparent"
+              >
+                <IconChevron
+                  direction={isExpanded ? 'up' : 'down'}
+                  size="sm"
+                  variant="secondary"
+                />
+              </Button>
+            ) : (
+              <Container height="20px" width="26px" />
+            )}
+          </Flex>
+        </DefaultLine>
+      </StrictClick>
+      <Context
+        frame={data}
+        event={event}
+        registers={registers}
+        components={components}
+        hasContextSource={hasContextSource(data)}
+        hasContextVars={hasContextVars(data)}
+        hasContextRegisters={hasContextRegisters(registers)}
+        emptySourceNotation={emptySourceNotation}
+        hasAssembly={hasAssembly(data, platform)}
+        hasScmSourceContext={hasScmSourceContext}
+        isExpanded={isExpanded}
+        registersMeta={registersMeta}
+        frameMeta={frameMeta}
+        platform={propPlatform}
+      />
+    </li>
+  );
+}
+
+function RepeatsIndicator({timesRepeated}: {timesRepeated: number}) {
+  if (!timesRepeated || timesRepeated <= 0) {
+    return null;
+  }
+
+  return (
+    <Container
+      display="inline-block"
+      title={`Frame repeated ${timesRepeated} time${timesRepeated === 1 ? '' : 's'}`}
+    >
+      <Flex align="center" gap="2xs" justify="center" minWidth={0}>
+        <IconRefresh />
+        <Text as="span">{timesRepeated}</Text>
+      </Flex>
+    </Container>
+  );
+}
+
+type DefaultLineProps = React.ComponentProps<typeof Grid> & {
+  isExpandable: boolean;
+  isSubFrame: boolean;
+};
+
+function DefaultLine({isExpandable, isSubFrame, ...props}: DefaultLineProps) {
+  return (
+    <Grid
+      align="center"
+      columns="var(--default-line-columns, minmax(0, 1fr) max-content)"
+      css={theme => css`
+        background: ${
+          isSubFrame ? theme.colors.surface200 : theme.tokens.background.tertiary
+        };
+        word-break: break-word;
+        font-size: ${theme.font.size.sm};
+        line-height: 16px;
+        cursor: ${isExpandable ? 'pointer' : 'default'};
+        code {
+          font-family: ${theme.font.family.sans};
+        }
+
+        @container (max-width: ${theme.container.xl}) {
+          &:has([data-has-setup]) {
+            --default-line-columns: 1fr;
+            row-gap: ${theme.space.xs};
+          }
+        }
+      `}
+      minHeight="40px"
+      padding="sm lg"
+      position="relative"
+      {...props}
+    />
+  );
+}

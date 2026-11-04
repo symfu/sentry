@@ -1,0 +1,452 @@
+import {Fragment} from 'react';
+import {useIsMutating} from '@tanstack/react-query';
+import {z} from 'zod';
+
+import {AutoSaveForm} from '@sentry/scraps/form';
+import {Stack} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+import {Text} from '@sentry/scraps/text';
+
+import {Access} from 'sentry/components/acl/access';
+import {TextCopyInput} from 'sentry/components/textCopyInput';
+import {t, tct} from 'sentry/locale';
+import type {Project, ProjectKey} from 'sentry/types/project';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {fetchMutation} from 'sentry/utils/queryClient';
+
+const loaderSchema = z.object({
+  browserSdkVersion: z.string(),
+  hasDebug: z.boolean(),
+  hasFeedback: z.boolean(),
+  hasLogsAndMetrics: z.boolean(),
+  hasPerformance: z.boolean(),
+  hasReplay: z.boolean(),
+});
+
+type Props = {
+  data: ProjectKey;
+  keyId: string;
+  orgSlug: string;
+  project: Project;
+  updateData: (data: ProjectKey) => void;
+};
+
+export function LoaderSettings({keyId, orgSlug, project, data, updateData}: Props) {
+  const endpoint = getApiUrl(
+    '/projects/$organizationIdOrSlug/$projectIdOrSlug/keys/$keyId/',
+    {
+      path: {
+        organizationIdOrSlug: orgSlug,
+        projectIdOrSlug: project.slug,
+        keyId,
+      },
+    }
+  );
+
+  // Every form on this page shares one mutation key, so any in-flight save
+  // disables all fields. This prevents editing an option while a (possibly
+  // version-changing) save is in flight, which could otherwise toggle an option
+  // against a state that's about to change.
+  const mutationKey = ['projectKeyLoaderSettings', keyId];
+  const isMutating = useIsMutating({mutationKey}) > 0;
+
+  const sdkVersionChoices = data.browserSdk
+    ? data.browserSdk.choices.filter(([value]) => value !== 'latest')
+    : [];
+
+  const loaderLink = data.dsn.cdn;
+
+  // Changing the SDK version can make some options unsupported, so we send the
+  // full set of loader options (forcing the unsupported ones to false) alongside
+  // the new version. Individual option toggles only send their own field and
+  // rely on the backend merging them into the stored options.
+  function buildVersionPayload(browserSdkVersion: string) {
+    if (sdkVersionSupportsPerformanceAndReplay(browserSdkVersion)) {
+      return {
+        browserSdkVersion,
+        dynamicSdkLoaderOptions: {
+          hasDebug: data.dynamicSdkLoaderOptions.hasDebug,
+          hasLogsAndMetrics: sdkVersionSupportsLogsAndMetrics(browserSdkVersion)
+            ? data.dynamicSdkLoaderOptions.hasLogsAndMetrics
+            : false,
+          hasFeedback: data.dynamicSdkLoaderOptions.hasFeedback,
+          hasPerformance: data.dynamicSdkLoaderOptions.hasPerformance,
+          hasReplay: data.dynamicSdkLoaderOptions.hasReplay,
+        },
+      };
+    }
+
+    return {
+      browserSdkVersion,
+      dynamicSdkLoaderOptions: {
+        hasDebug: data.dynamicSdkLoaderOptions.hasDebug,
+        hasLogsAndMetrics: false,
+        hasFeedback: false,
+        hasPerformance: false,
+        hasReplay: false,
+      },
+    };
+  }
+
+  const supportsPerformance = sdkVersionSupportsPerformanceAndReplay(
+    data.browserSdkVersion
+  );
+  const supportsLogs = sdkVersionSupportsLogsAndMetrics(data.browserSdkVersion);
+  const logsHint =
+    data.browserSdkVersion === '11.x'
+      ? tct(
+          'Logs are sent when you call [codeLogger:Sentry.logger] or add a logging integration. [configDocs:Read the docs] to learn how to configure this.',
+          {
+            codeLogger: <code />,
+            configDocs: (
+              <ExternalLink href="https://docs.sentry.io/platforms/javascript/logs" />
+            ),
+          }
+        )
+      : tct(
+          'The default config is [codeEnableLogs:enableLogs: true]. [configDocs:Read the docs] to learn how to configure this.',
+          {
+            codeEnableLogs: <code />,
+            configDocs: (
+              <ExternalLink href="https://docs.sentry.io/platforms/javascript/logs" />
+            ),
+          }
+        );
+
+  return (
+    <Access access={['project:write']} project={project}>
+      {({hasAccess}) => (
+        <Fragment>
+          <Stack gap="lg">
+            <Text variant="muted" size="sm">
+              {tct(
+                'Copy this script into your website to setup your JavaScript SDK without any additional configuration. [link]',
+                {
+                  link: (
+                    <ExternalLink href="https://docs.sentry.io/platforms/javascript/install/lazy-load-sentry/">
+                      {t(' What does the script provide?')}
+                    </ExternalLink>
+                  ),
+                }
+              )}
+            </Text>
+            <TextCopyInput aria-label={t('Loader Script')}>
+              {`<script src="${loaderLink}" crossorigin="anonymous"></script>`}
+            </TextCopyInput>
+          </Stack>
+
+          <AutoSaveForm
+            name="browserSdkVersion"
+            schema={loaderSchema}
+            initialValue={
+              data.browserSdkVersion === 'latest' ? '7.x' : data.browserSdkVersion
+            }
+            mutationOptions={{
+              mutationKey,
+              mutationFn: (submitData: {browserSdkVersion: string}) =>
+                fetchMutation<ProjectKey>({
+                  url: endpoint,
+                  method: 'PUT',
+                  data: buildVersionPayload(submitData.browserSdkVersion),
+                }),
+              onSuccess: updateData,
+            }}
+          >
+            {field => (
+              <field.Layout.Row
+                label={t('SDK Version')}
+                hintText={
+                  sdkVersionChoices.length === 1
+                    ? t(
+                        'At the moment, only the shown SDK version is available. New versions of the SDK will appear here as soon as they are released, and you will be able to upgrade by selecting them.'
+                      )
+                    : undefined
+                }
+              >
+                <field.Select
+                  value={field.state.value}
+                  onChange={field.handleChange}
+                  options={sdkVersionChoices.map(([value, label]) => ({
+                    value,
+                    label,
+                  }))}
+                  disabled={!hasAccess || sdkVersionChoices.length === 1 || isMutating}
+                />
+              </field.Layout.Row>
+            )}
+          </AutoSaveForm>
+
+          <AutoSaveForm
+            name="hasPerformance"
+            key={`hasPerformance-${supportsPerformance}`}
+            schema={loaderSchema}
+            initialValue={
+              supportsPerformance ? data.dynamicSdkLoaderOptions.hasPerformance : false
+            }
+            mutationOptions={{
+              mutationKey,
+              mutationFn: (submitData: {hasPerformance: boolean}) =>
+                fetchMutation<ProjectKey>({
+                  url: endpoint,
+                  method: 'PUT',
+                  data: {dynamicSdkLoaderOptions: submitData},
+                }),
+              onSuccess: updateData,
+            }}
+          >
+            {field => (
+              <field.Layout.Row
+                label={t('Enable Tracing')}
+                hintText={
+                  supportsPerformance
+                    ? data.dynamicSdkLoaderOptions.hasPerformance
+                      ? tct(
+                          'The default config is [codeTracesSampleRate:tracesSampleRate: 1.0] and distributed tracing to same-origin requests. [configDocs:Read the docs] to learn how to configure this.',
+                          {
+                            codeTracesSampleRate: <code />,
+                            configDocs: (
+                              <ExternalLink href="https://docs.sentry.io/platforms/javascript/install/loader/#custom-configuration" />
+                            ),
+                          }
+                        )
+                      : undefined
+                    : t('Only available in SDK version 7.x and above')
+                }
+              >
+                <field.Switch
+                  checked={field.state.value}
+                  onChange={field.handleChange}
+                  disabled={
+                    isMutating
+                      ? true
+                      : hasAccess
+                        ? supportsPerformance
+                          ? undefined
+                          : t('Only available in SDK version 7.x and above')
+                        : t('You do not have permission to edit this setting')
+                  }
+                />
+              </field.Layout.Row>
+            )}
+          </AutoSaveForm>
+
+          <AutoSaveForm
+            name="hasReplay"
+            key={`hasReplay-${supportsPerformance}`}
+            schema={loaderSchema}
+            initialValue={
+              supportsPerformance ? data.dynamicSdkLoaderOptions.hasReplay : false
+            }
+            mutationOptions={{
+              mutationKey,
+              mutationFn: (submitData: {hasReplay: boolean}) =>
+                fetchMutation<ProjectKey>({
+                  url: endpoint,
+                  method: 'PUT',
+                  data: {dynamicSdkLoaderOptions: submitData},
+                }),
+              onSuccess: updateData,
+            }}
+          >
+            {field => (
+              <field.Layout.Row
+                label={t('Enable Session Replay')}
+                hintText={
+                  supportsPerformance
+                    ? data.dynamicSdkLoaderOptions.hasReplay
+                      ? tct(
+                          '[es5Warning]The default config is [codeReplay:replaysSessionSampleRate: 0.1] and [codeError:replaysOnErrorSampleRate: 1]. [configDocs:Read the docs] to learn how to configure this.',
+                          {
+                            es5Warning:
+                              data.browserSdkVersion === '7.x' ||
+                              data.browserSdkVersion === 'latest'
+                                ? t(
+                                    'When using Replay, the loader will load the ES6 bundle instead of the ES5 bundle.'
+                                  ) + ' '
+                                : '',
+                            codeReplay: <code />,
+                            codeError: <code />,
+                            configDocs: (
+                              <ExternalLink href="https://docs.sentry.io/platforms/javascript/install/loader/#custom-configuration" />
+                            ),
+                          }
+                        )
+                      : undefined
+                    : t('Only available in SDK version 7.x and above')
+                }
+              >
+                <field.Switch
+                  checked={field.state.value}
+                  onChange={field.handleChange}
+                  disabled={
+                    isMutating
+                      ? true
+                      : hasAccess
+                        ? supportsPerformance
+                          ? undefined
+                          : t('Only available in SDK version 7.x and above')
+                        : t('You do not have permission to edit this setting')
+                  }
+                />
+              </field.Layout.Row>
+            )}
+          </AutoSaveForm>
+
+          <AutoSaveForm
+            name="hasLogsAndMetrics"
+            key={`hasLogsAndMetrics-${supportsLogs}`}
+            schema={loaderSchema}
+            initialValue={
+              supportsLogs ? data.dynamicSdkLoaderOptions.hasLogsAndMetrics : false
+            }
+            mutationOptions={{
+              mutationKey,
+              mutationFn: (submitData: {hasLogsAndMetrics: boolean}) =>
+                fetchMutation<ProjectKey>({
+                  url: endpoint,
+                  method: 'PUT',
+                  data: {dynamicSdkLoaderOptions: submitData},
+                }),
+              onSuccess: updateData,
+            }}
+          >
+            {field => (
+              <field.Layout.Row
+                label={t('Enable Logs and Metrics')}
+                hintText={
+                  supportsLogs
+                    ? data.dynamicSdkLoaderOptions.hasLogsAndMetrics
+                      ? logsHint
+                      : undefined
+                    : t('Only available in SDK version 10.x and above')
+                }
+              >
+                <field.Switch
+                  checked={field.state.value}
+                  onChange={field.handleChange}
+                  disabled={
+                    isMutating
+                      ? true
+                      : hasAccess
+                        ? supportsLogs
+                          ? undefined
+                          : t('Only available in SDK version 10.x and above')
+                        : t('You do not have permission to edit this setting')
+                  }
+                />
+              </field.Layout.Row>
+            )}
+          </AutoSaveForm>
+
+          <AutoSaveForm
+            name="hasFeedback"
+            key={`hasFeedback-${supportsPerformance}`}
+            schema={loaderSchema}
+            initialValue={
+              supportsPerformance ? data.dynamicSdkLoaderOptions.hasFeedback : false
+            }
+            mutationOptions={{
+              mutationKey,
+              mutationFn: (submitData: {hasFeedback: boolean}) =>
+                fetchMutation<ProjectKey>({
+                  url: endpoint,
+                  method: 'PUT',
+                  data: {dynamicSdkLoaderOptions: submitData},
+                }),
+              onSuccess: updateData,
+            }}
+          >
+            {field => (
+              <field.Layout.Row
+                label={t('Enable User Feedback')}
+                hintText={
+                  supportsPerformance
+                    ? data.dynamicSdkLoaderOptions.hasFeedback
+                      ? tct(
+                          '[es6Warning]The default config is [codeAutoInject:autoInject: true]. [configDocs:Read the docs] to learn how to configure this.',
+                          {
+                            es6Warning:
+                              data.browserSdkVersion === '7.x' ||
+                              data.browserSdkVersion === 'latest'
+                                ? t(
+                                    'When using User Feedback, the loader will load the ES6 bundle instead of the ES5 bundle.'
+                                  ) + ' '
+                                : '',
+                            codeAutoInject: <code />,
+                            configDocs: (
+                              <ExternalLink href="https://docs.sentry.io/platforms/javascript/install/loader/#custom-configuration" />
+                            ),
+                          }
+                        )
+                      : undefined
+                    : t('Only available in SDK version 7.x and above')
+                }
+              >
+                <field.Switch
+                  checked={field.state.value}
+                  onChange={field.handleChange}
+                  disabled={
+                    isMutating
+                      ? true
+                      : hasAccess
+                        ? supportsPerformance
+                          ? undefined
+                          : t('Only available in SDK version 7.x and above')
+                        : t('You do not have permission to edit this setting')
+                  }
+                />
+              </field.Layout.Row>
+            )}
+          </AutoSaveForm>
+
+          <AutoSaveForm
+            name="hasDebug"
+            schema={loaderSchema}
+            initialValue={data.dynamicSdkLoaderOptions.hasDebug}
+            mutationOptions={{
+              mutationKey,
+              mutationFn: (submitData: {hasDebug: boolean}) =>
+                fetchMutation<ProjectKey>({
+                  url: endpoint,
+                  method: 'PUT',
+                  data: {dynamicSdkLoaderOptions: submitData},
+                }),
+              onSuccess: updateData,
+            }}
+          >
+            {field => (
+              <field.Layout.Row label={t('Enable SDK debugging')}>
+                <field.Switch
+                  checked={field.state.value}
+                  onChange={field.handleChange}
+                  disabled={
+                    isMutating
+                      ? true
+                      : hasAccess
+                        ? undefined
+                        : t('You do not have permission to edit this setting')
+                  }
+                />
+              </field.Layout.Row>
+            )}
+          </AutoSaveForm>
+        </Fragment>
+      )}
+    </Access>
+  );
+}
+
+function sdkVersionSupportsPerformanceAndReplay(sdkVersion: string): boolean {
+  return (
+    sdkVersion === 'latest' ||
+    sdkVersion === '7.x' ||
+    sdkVersion === '8.x' ||
+    sdkVersion === '9.x' ||
+    sdkVersion === '10.x' ||
+    sdkVersion === '11.x'
+  );
+}
+
+function sdkVersionSupportsLogsAndMetrics(sdkVersion: string): boolean {
+  return sdkVersion === '10.x' || sdkVersion === '11.x';
+}

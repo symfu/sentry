@@ -1,82 +1,251 @@
+from typing import cast
+
+from django.db.models import F, Q
+from django.utils import timezone
+from drf_spectacular.utils import extend_schema
+from rest_framework.exceptions import ParseError
+from rest_framework.request import Request
 from rest_framework.response import Response
-from sentry.api.serializers import serialize
-from sentry.api.exceptions import ResourceDoesNotExist
-from sentry.api.bases import OrganizationEndpoint
+
 from sentry import features
+from sentry.api.api_owners import ApiOwner
+from sentry.api.api_publish_status import ApiPublishStatus
+from sentry.api.base import cell_silo_endpoint
+from sentry.api.bases import NoProjects, OrganizationEndpoint
+from sentry.api.exceptions import ResourceDoesNotExist
+from sentry.api.serializers import serialize
+from sentry.api.serializers.models.discoversavedquery import (
+    DiscoverSavedQueryModelSerializer,
+    DiscoverSavedQueryResponse,
+)
+from sentry.api.utils import to_valid_int_id
+from sentry.apidocs.constants import (
+    RESPONSE_BAD_REQUEST,
+    RESPONSE_FORBIDDEN,
+    RESPONSE_NO_CONTENT,
+    RESPONSE_NOT_FOUND,
+    RESPONSE_UNAUTHORIZED,
+)
+from sentry.apidocs.examples.discover_saved_query_examples import DiscoverExamples
+from sentry.apidocs.parameters import DiscoverSavedQueryParams, GlobalParams
+from sentry.apidocs.response_types import ValidationErrorResponse, as_validation_errors
+from sentry.auth.principal import acting_user_id
 from sentry.discover.endpoints.bases import DiscoverSavedQueryPermission
-from sentry.discover.models import DiscoverSavedQuery
 from sentry.discover.endpoints.serializers import DiscoverSavedQuerySerializer
+from sentry.discover.models import (
+    DatasetSourcesTypes,
+    DiscoverSavedQuery,
+    DiscoverSavedQueryLastVisited,
+    DiscoverSavedQueryTypes,
+)
+from sentry.models.organization import Organization
 
 
-class DiscoverSavedQueryDetailEndpoint(OrganizationEndpoint):
+class DiscoverSavedQueryBase(OrganizationEndpoint):
+    owner = ApiOwner.DATA_BROWSING
     permission_classes = (DiscoverSavedQueryPermission,)
 
-    def has_feature(self, organization, request):
-        return features.has(
-            "organizations:discover", organization, actor=request.user
-        ) or features.has("organizations:discover-query", organization, actor=request.user)
+    def convert_args(
+        self,
+        request: Request,
+        organization_id_or_slug: int | str,
+        query_id: int | str,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
+        args, kwargs = super().convert_args(request, organization_id_or_slug, *args, **kwargs)
 
-    def get(self, request, organization, query_id):
+        try:
+            kwargs["query"] = DiscoverSavedQuery.objects.get(
+                Q(is_homepage=False) | Q(is_homepage__isnull=True),
+                id=to_valid_int_id("query_id", query_id, raise_404=True),
+                organization=cast(Organization, kwargs["organization"]),
+            )
+        except DiscoverSavedQuery.DoesNotExist:
+            raise ResourceDoesNotExist
+
+        return (args, kwargs)
+
+
+@extend_schema(tags=["Discover"])
+@cell_silo_endpoint
+class DiscoverSavedQueryDetailEndpoint(DiscoverSavedQueryBase):
+    publish_status = {
+        "DELETE": ApiPublishStatus.PUBLIC,
+        "GET": ApiPublishStatus.PUBLIC,
+        "PUT": ApiPublishStatus.PUBLIC,
+    }
+    idempotent_methods = frozenset({"PUT"})
+
+    def has_feature(self, organization: Organization, request: Request) -> bool:
+        return features.has("organizations:discover-query", organization, actor=request.user)
+
+    @extend_schema(
+        operation_id="getOrganizationDiscoverSavedQuery",
+        summary="Retrieve an Organization's Discover Saved Query",
+        parameters=[
+            GlobalParams.ORG_ID_OR_SLUG,
+            DiscoverSavedQueryParams.DISCOVER_SAVED_QUERY_ID,
+        ],
+        request=None,
+        responses={
+            200: DiscoverSavedQueryModelSerializer,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+        examples=DiscoverExamples.DISCOVER_SAVED_QUERY_GET_RESPONSE,
+    )
+    def get(
+        self, request: Request, organization: Organization, query: DiscoverSavedQuery
+    ) -> Response[DiscoverSavedQueryResponse]:
         """
-        Get a saved query
+        Retrieve a saved query.
         """
         if not self.has_feature(organization, request):
             return self.respond(status=404)
 
-        try:
-            query = DiscoverSavedQuery.objects.get(id=query_id, organization=organization)
-        except DiscoverSavedQuery.DoesNotExist:
-            raise ResourceDoesNotExist
+        self.check_object_permissions(request, query)
 
-        return Response(serialize(query), status=200)
+        return Response(
+            serialize(query, request.user, serializer=DiscoverSavedQueryModelSerializer()),
+            status=200,
+        )
 
-    def put(self, request, organization, query_id):
+    @extend_schema(
+        operation_id="updateOrganizationDiscoverSavedQuery",
+        summary="Edit an Organization's Discover Saved Query",
+        parameters=[GlobalParams.ORG_ID_OR_SLUG, DiscoverSavedQueryParams.DISCOVER_SAVED_QUERY_ID],
+        request=DiscoverSavedQuerySerializer,
+        responses={
+            200: DiscoverSavedQueryModelSerializer,
+            400: RESPONSE_BAD_REQUEST,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+        examples=DiscoverExamples.DISCOVER_SAVED_QUERY_GET_RESPONSE,
+    )
+    def put(
+        self, request: Request, organization: Organization, query: DiscoverSavedQuery
+    ) -> Response[DiscoverSavedQueryResponse] | Response[ValidationErrorResponse]:
         """
-        Modify a saved query
+        Modify a saved query.
         """
         if not self.has_feature(organization, request):
             return self.respond(status=404)
 
+        self.check_object_permissions(request, query)
+
         try:
-            model = DiscoverSavedQuery.objects.get(id=query_id, organization=organization)
-        except DiscoverSavedQuery.DoesNotExist:
-            raise ResourceDoesNotExist
+            params = self.get_filter_params(
+                request, organization, project_ids=request.data.get("projects")
+            )
+        except NoProjects:
+            raise ParseError(detail="No Projects found, join a Team")
 
         serializer = DiscoverSavedQuerySerializer(
             data=request.data,
-            context={
-                "params": self.get_filter_params(
-                    request, organization, project_ids=request.data.get("projects")
-                )
-            },
+            context={"params": params, "organization": organization, "user": request.user},
         )
         if not serializer.is_valid():
-            return Response(serializer.errors, status=400)
+            return Response(as_validation_errors(serializer), status=400)
 
         data = serializer.validated_data
-        model.update(
+        user_selected_dataset = data["query_dataset"] != DiscoverSavedQueryTypes.DISCOVER
+
+        query.update(
             organization=organization,
             name=data["name"],
             query=data["query"],
             version=data["version"],
+            dataset=data["query_dataset"],
+            dataset_source=(
+                DatasetSourcesTypes.USER.value
+                if user_selected_dataset
+                else DatasetSourcesTypes.UNKNOWN.value
+            ),
         )
 
-        model.set_projects(data["project_ids"])
+        query.set_projects(data["project_ids"])
 
-        return Response(serialize(model), status=200)
+        return Response(
+            serialize(query, serializer=DiscoverSavedQueryModelSerializer()), status=200
+        )
 
-    def delete(self, request, organization, query_id):
+    @extend_schema(
+        operation_id="deleteOrganizationDiscoverSavedQuery",
+        summary="Delete an Organization's Discover Saved Query",
+        parameters=[GlobalParams.ORG_ID_OR_SLUG, DiscoverSavedQueryParams.DISCOVER_SAVED_QUERY_ID],
+        responses={
+            204: RESPONSE_NO_CONTENT,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+    )
+    def delete(
+        self, request: Request, organization: Organization, query: DiscoverSavedQuery
+    ) -> Response[None]:
         """
-        Delete a saved query
+        Delete a saved query.
         """
         if not self.has_feature(organization, request):
             return self.respond(status=404)
 
-        try:
-            model = DiscoverSavedQuery.objects.get(id=query_id, organization=organization)
-        except DiscoverSavedQuery.DoesNotExist:
-            raise ResourceDoesNotExist
+        self.check_object_permissions(request, query)
 
-        model.delete()
+        query.delete()
+
+        return Response(status=204)
+
+
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+
+@extend_schema(tags=["Discover"])
+@cell_silo_endpoint
+class DiscoverSavedQueryVisitEndpoint(DiscoverSavedQueryBase):
+    publish_status = {
+        "POST": ApiPublishStatus.PRIVATE,
+    }
+
+    def has_feature(self, organization: Organization, request: Request) -> bool:
+        return features.has("organizations:discover-query", organization, actor=request.user)
+
+    @extend_schema(
+        operation_id="visitOrganizationDiscoverSavedQuery",
+        summary="Record a Visit to an Organization's Discover Saved Query",
+        parameters=[GlobalParams.ORG_ID_OR_SLUG, DiscoverSavedQueryParams.DISCOVER_SAVED_QUERY_ID],
+        request=None,
+        responses={
+            204: RESPONSE_NO_CONTENT,
+            401: RESPONSE_UNAUTHORIZED,
+            403: RESPONSE_FORBIDDEN,
+            404: RESPONSE_NOT_FOUND,
+        },
+    )
+    def post(
+        self, request: Request, organization: Organization, query: DiscoverSavedQuery
+    ) -> Response[None]:
+        """
+        Record that the requesting user visited a saved query. Increments the query's
+        visit count and updates its last visited time.
+        """
+        if not self.has_feature(organization, request):
+            return self.respond(status=404)
+
+        self.check_object_permissions(request, query)
+
+        query.visits = cast(int, F("visits") + 1)
+        query.last_visited = timezone.now()
+        query.save(update_fields=["visits", "last_visited"])
+
+        user_id = acting_user_id(request.user)
+        if user_id is not None:
+            DiscoverSavedQueryLastVisited.objects.update_or_create(
+                organization=organization,
+                user_id=user_id,
+                discover_saved_query=query,
+                defaults={"last_visited": timezone.now()},
+            )
 
         return Response(status=204)

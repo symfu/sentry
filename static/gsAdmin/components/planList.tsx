@@ -1,0 +1,241 @@
+import {useEffect, useMemo} from 'react';
+import styled from '@emotion/styled';
+
+import {Container} from '@sentry/scraps/layout';
+
+import {CheckboxField} from 'sentry/components/forms/fields/checkboxField';
+import {InputField} from 'sentry/components/forms/fields/inputField';
+import {RadioField} from 'sentry/components/forms/fields/radioField';
+import {SelectField} from 'sentry/components/forms/fields/selectField';
+import {TextField} from 'sentry/components/forms/fields/textField';
+import {Form} from 'sentry/components/forms/form';
+import type {FormModel} from 'sentry/components/forms/model';
+import type {Data, OnSubmitCallback} from 'sentry/components/forms/types';
+import {defined} from 'sentry/utils/defined';
+import {toTitleCase} from 'sentry/utils/string/toTitleCase';
+
+import {ANNUAL} from 'getsentry/constants';
+import {
+  AddOnCategory,
+  type BillingConfig,
+  type Plan,
+  type Subscription,
+} from 'getsentry/types';
+import {
+  getPlanCategoryName,
+  isByteCategory,
+  isCheckoutCategory,
+} from 'getsentry/utils/dataCategory';
+import {formatCurrency} from 'getsentry/utils/formatCurrency';
+
+type Props = {
+  activePlan: Plan | null;
+  formModel: FormModel;
+  onCancel: () => void;
+  onPlanChange: (plan: Plan) => void;
+  onSubmit: OnSubmitCallback;
+  onSubmitError: (error: any) => void;
+  onSubmitSuccess: (data: Data) => void;
+  subscription: Subscription;
+  tierPlans: BillingConfig['planList'];
+};
+
+export function PlanList({
+  activePlan,
+  subscription,
+  onSubmit,
+  onCancel,
+  onSubmitSuccess,
+  onSubmitError,
+  formModel,
+  tierPlans,
+  onPlanChange,
+}: Props) {
+  const availableAddOns = useMemo(
+    () =>
+      Object.values(activePlan?.addOnCategories || {})
+        .filter(
+          productInfo => subscription.addOns?.[productInfo.apiName]?.isAvailable ?? false
+        )
+        .map(productInfo => {
+          return productInfo;
+        }),
+    [activePlan?.addOnCategories, subscription.addOns]
+  );
+
+  useEffect(() => {
+    availableAddOns.forEach(productInfo => {
+      const addOnKey = `addOn${toTitleCase(productInfo.apiName, {allowInnerUpperCase: true})}`;
+      const enabled = subscription.addOns?.[productInfo.apiName]?.enabled;
+      formModel.setValue(addOnKey, enabled);
+    });
+  }, [availableAddOns, subscription.addOns, formModel]);
+
+  return (
+    <Form
+      onSubmit={onSubmit}
+      onCancel={onCancel}
+      submitLabel="Change Plan"
+      submitVariant="danger"
+      model={formModel}
+      onSubmitSuccess={onSubmitSuccess}
+      onSubmitError={onSubmitError}
+    >
+      <StyledFormSection>
+        <RadioField
+          name="plan"
+          required
+          choices={tierPlans.map(plan => [
+            plan.id,
+            <PlanLabel key={plan.id} data-test-id={`change-plan-label-${plan.id}`}>
+              <div>
+                <strong>{plan.name}</strong> <SubText>— {plan.id}</SubText>
+                <br />
+                <small>
+                  {formatCurrency(plan.totalPrice)} /{' '}
+                  {plan.billingInterval === ANNUAL ? 'annually' : 'monthly'}
+                </small>
+              </div>
+            </PlanLabel>,
+          ])}
+          onChange={value => {
+            const plan = tierPlans.find(p => p.id === value);
+            if (plan) {
+              onPlanChange(plan);
+            }
+          }}
+          value={activePlan?.id ?? null}
+        />
+      </StyledFormSection>
+      {activePlan &&
+        (
+          activePlan?.planCategories.transactions ||
+          activePlan?.planCategories.spans ||
+          []
+        ).length > 1 && (
+          <StyledFormSection>
+            <h4>Reserved Volumes</h4>
+            {activePlan.categories
+              .filter(category => isCheckoutCategory(category, activePlan))
+              .map(category => {
+                const titleCategory = getPlanCategoryName({
+                  plan: activePlan,
+                  category,
+                });
+                const reservedKey = `reserved${toTitleCase(category, {
+                  allowInnerUpperCase: true,
+                })}`;
+                const label = isByteCategory(category)
+                  ? `${titleCategory} (GB)`
+                  : titleCategory;
+                const reservedValue = subscription.categories?.[category]?.reserved;
+                const currentValueDisplay = defined(reservedValue) ? (
+                  <CurrentValueText>
+                    Current: {reservedValue.toLocaleString()}{' '}
+                    {isByteCategory(category) ? 'GB' : ''}
+                  </CurrentValueText>
+                ) : (
+                  <CurrentValueText>Current: None</CurrentValueText>
+                );
+                return (
+                  <Container position="relative" key={`test-${category}`}>
+                    <SelectField
+                      inline={false}
+                      stacked
+                      name={reservedKey}
+                      label={label}
+                      options={(activePlan.planCategories[category] || []).map(
+                        (level: {events: {toLocaleString: () => any}}) => ({
+                          label: level.events.toLocaleString(),
+                          value: level.events,
+                        })
+                      )}
+                      required
+                    />
+                    {currentValueDisplay}
+                  </Container>
+                );
+              })}
+          </StyledFormSection>
+        )}
+      {availableAddOns.length > 0 && (
+        <StyledFormSection>
+          <h4>Available Products</h4>
+          {availableAddOns.map(productInfo => {
+            const addOnKey = `addOn${toTitleCase(productInfo.apiName, {allowInnerUpperCase: true})}`;
+            const titleCaseName = toTitleCase(productInfo.productName, {
+              allowInnerUpperCase: true,
+            });
+            const label =
+              productInfo.apiName === AddOnCategory.LEGACY_SEER
+                ? `${titleCaseName} (Legacy)`
+                : titleCaseName;
+            return (
+              <CheckboxField
+                key={productInfo.apiName}
+                data-test-id={`checkbox-${productInfo.productName}`}
+                label={label}
+                name={addOnKey}
+                onChange={(value: any) => {
+                  formModel.setValue(addOnKey, value.target.checked);
+                }}
+              />
+            );
+          })}
+        </StyledFormSection>
+      )}
+      <Container marginTop="xl">
+        <InputField
+          data-test-id="url-field"
+          name="ticket-url"
+          type="url"
+          label="TicketUrl"
+          inline={false}
+          stacked
+          flexibleControlStateSize
+        />
+        <TextField
+          data-test-id="notes-field"
+          name="notes"
+          label="Notes"
+          inline={false}
+          stacked
+          flexibleControlStateSize
+          maxLength={500}
+        />
+      </Container>
+    </Form>
+  );
+}
+
+const StyledFormSection = styled('div')`
+  margin: ${p => p.theme.space.md} 0;
+
+  & > h4 {
+    margin: ${p => p.theme.space.xl} 0;
+  }
+`;
+
+const PlanLabel = styled('label')`
+  margin-bottom: 0;
+
+  display: flex;
+  align-items: flex-start;
+
+  & > div {
+    margin-right: ${p => p.theme.space['2xl']};
+  }
+`;
+
+const SubText = styled('small')`
+  font-weight: normal;
+  color: #999;
+`;
+
+const CurrentValueText = styled('div')`
+  color: #666;
+  font-size: 0.9em;
+  margin-top: -${p => p.theme.space.md};
+  margin-bottom: ${p => p.theme.space.lg};
+  font-style: italic;
+`;

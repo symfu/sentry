@@ -1,23 +1,33 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
 import boto3
+import orjson
 
 from sentry import options
-from sentry.utils import json
 
 
 class ConfigurationError(Exception):
     pass
 
 
-def gen_aws_client(account_number, region, aws_external_id, service_name="lambda"):
+logger = logging.getLogger(__name__)
+
+
+def gen_aws_client(
+    account_number: str, region: str, aws_external_id: str, service_name: str = "lambda"
+) -> Any:
     """
-    account_number - acccount number in AWS
-    regon - region in AWS
+    account_number - account ID in AWS
+    region - region in AWS
     aws_external_id - the external_id used to assume the role
 
     Returns an aws_lambda_client
     """
 
-    role_arn = "arn:aws:iam::%s:role/SentryRole" % (account_number)
+    role_arn = f"arn:aws:iam::{account_number}:role/SentryRole"
 
     aws_access_key_id = options.get("aws-lambda.access-key-id")
     aws_secret_access_key = options.get("aws-lambda.secret-access-key")
@@ -38,7 +48,7 @@ def gen_aws_client(account_number, region, aws_external_id, service_name="lambda
         RoleSessionName="Sentry",
         RoleArn=role_arn,
         ExternalId=aws_external_id,
-        Policy=json.dumps(
+        Policy=orjson.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
@@ -51,6 +61,7 @@ def gen_aws_client(account_number, region, aws_external_id, service_name="lambda
                         "Effect": "Allow",
                         "Action": [
                             "lambda:ListFunctions",
+                            "lambda:ListLayerVersions",
                             "lambda:GetLayerVersion",
                             "organizations:DescribeAccount",
                         ],
@@ -58,7 +69,7 @@ def gen_aws_client(account_number, region, aws_external_id, service_name="lambda
                     },
                 ],
             }
-        ),
+        ).decode(),
     )
 
     credentials = assumed_role_object["Credentials"]

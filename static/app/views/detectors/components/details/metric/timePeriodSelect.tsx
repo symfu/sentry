@@ -1,0 +1,120 @@
+import {Fragment, useEffect, useMemo} from 'react';
+import moment from 'moment-timezone';
+import {parseAsString, useQueryStates} from 'nuqs';
+
+import {CompactSelect} from '@sentry/scraps/compactSelect';
+
+import {DateTime} from 'sentry/components/dateTime';
+import {t} from 'sentry/locale';
+import {
+  useDetectorResolvedStatsPeriod,
+  useDetectorTimePeriodOptions,
+} from 'sentry/views/detectors/components/details/metric/utils/useDetectorTimePeriods';
+import type {DetectorDataset} from 'sentry/views/detectors/datasetConfig/types';
+import {
+  getTimePeriodLabel,
+  MetricDetectorTimePeriod,
+} from 'sentry/views/detectors/datasetConfig/utils/timePeriods';
+
+type BaseOption = {label: React.ReactNode; value: string};
+
+const CUSTOM_TIME_VALUE = '__custom_time__';
+
+interface TimePeriodSelectProps {
+  dataset: DetectorDataset;
+  interval: number | undefined;
+}
+
+export function MetricTimePeriodSelect({dataset, interval}: TimePeriodSelectProps) {
+  const [{start, end, statsPeriod}, setTimeParams] = useQueryStates({
+    start: parseAsString,
+    end: parseAsString,
+    statsPeriod: parseAsString,
+  });
+  const urlStatsPeriod = statsPeriod ?? undefined;
+
+  const hasCustomRange = Boolean(start && end);
+
+  const options: BaseOption[] = useDetectorTimePeriodOptions({
+    dataset,
+    intervalSeconds: interval,
+  });
+
+  // Determine selected period from query or fallback to largest option
+  const selected = useDetectorResolvedStatsPeriod({
+    dataset,
+    intervalSeconds: interval,
+    urlStatsPeriod,
+  });
+
+  const hasCustomStatsPeriod = Boolean(
+    !hasCustomRange &&
+    urlStatsPeriod &&
+    !options.some(option => option.value === urlStatsPeriod)
+  );
+
+  // If there is no time selection in the URL, sync the resolved default period
+  // into the query params so that the rest of the page (chart, links, etc.)
+  // has a consistent source of truth.
+  useEffect(() => {
+    if (!hasCustomRange && !urlStatsPeriod && selected) {
+      setTimeParams({statsPeriod: selected, start: null, end: null});
+    }
+  }, [hasCustomRange, selected, setTimeParams, urlStatsPeriod]);
+
+  const selectOptions = useMemo(() => {
+    if (hasCustomRange) {
+      const custom = {
+        label: (
+          <Fragment>
+            {t('Custom time')}: <DateTime date={moment.utc(start)} /> {' — '}
+            <DateTime date={moment.utc(end)} />
+          </Fragment>
+        ),
+        value: CUSTOM_TIME_VALUE,
+        textValue: t('Custom time'),
+        disabled: true,
+      };
+      return [custom, ...options];
+    }
+
+    if (hasCustomStatsPeriod && urlStatsPeriod) {
+      const customStatsPeriodLabel = getTimePeriodLabel(
+        urlStatsPeriod as MetricDetectorTimePeriod
+      );
+      const custom = {
+        label: (
+          <Fragment>
+            {t('Custom time')}: {customStatsPeriodLabel}
+          </Fragment>
+        ),
+        value: CUSTOM_TIME_VALUE,
+        textValue: `${t('Custom time')}: ${customStatsPeriodLabel}`,
+        disabled: true,
+      };
+      return [custom, ...options];
+    }
+
+    return options;
+  }, [hasCustomRange, start, end, options, hasCustomStatsPeriod, urlStatsPeriod]);
+
+  const value = hasCustomRange || hasCustomStatsPeriod ? CUSTOM_TIME_VALUE : selected;
+
+  return (
+    <CompactSelect
+      size="sm"
+      options={selectOptions}
+      value={value}
+      onChange={opt => {
+        // Ignore clicks on the custom option; only propagate real TimePeriod values
+        if (opt.value === CUSTOM_TIME_VALUE) {
+          return;
+        }
+        setTimeParams(
+          {statsPeriod: opt.value, start: null, end: null},
+          {history: 'push'}
+        );
+      }}
+    />
+  );
+}

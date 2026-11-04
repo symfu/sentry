@@ -1,67 +1,26 @@
-from collections import OrderedDict
+from __future__ import annotations
 
-from django import forms
-from sentry.constants import LOG_LEVELS, LOG_LEVELS_MAP
+from collections.abc import Callable
 
+from sentry.constants import LOG_LEVELS
 from sentry.rules.conditions.base import EventCondition
-
-LEVEL_CHOICES = OrderedDict(
-    [(f"{k}", v) for k, v in sorted(LOG_LEVELS.items(), key=lambda x: x[0], reverse=True)]
+from sentry.workflow_engine.handlers.condition.utils.match import (
+    LEVEL_MATCH_CHOICES as MATCH_CHOICES,
 )
 
-
-class MatchType:
-    EQUAL = "eq"
-    LESS_OR_EQUAL = "lte"
-    GREATER_OR_EQUAL = "gte"
-
-
-MATCH_CHOICES = OrderedDict(
-    [
-        (MatchType.EQUAL, "equal to"),
-        (MatchType.LESS_OR_EQUAL, "less than or equal to"),
-        (MatchType.GREATER_OR_EQUAL, "greater than or equal to"),
-    ]
-)
-
-
-class LevelEventForm(forms.Form):
-    level = forms.ChoiceField(choices=list(LEVEL_CHOICES.items()))
-    match = forms.ChoiceField(choices=list(MATCH_CHOICES.items()))
+key: Callable[[tuple[int, str]], int] = lambda x: x[0]
+LEVEL_CHOICES = {f"{k}": v for k, v in sorted(LOG_LEVELS.items(), key=key, reverse=True)}
 
 
 class LevelCondition(EventCondition):
-    form_cls = LevelEventForm
+    id = "sentry.rules.conditions.level.LevelCondition"
     label = "The event's level is {match} {level}"
     form_fields = {
         "level": {"type": "choice", "choices": list(LEVEL_CHOICES.items())},
         "match": {"type": "choice", "choices": list(MATCH_CHOICES.items())},
     }
 
-    def passes(self, event, state, **kwargs):
-        desired_level = self.get_option("level")
-        desired_match = self.get_option("match")
-
-        if not (desired_level and desired_match):
-            return False
-
-        desired_level = int(desired_level)
-        # Fetch the event level from the tags since event.level is
-        # event.group.level which may have changed
-        try:
-            level = LOG_LEVELS_MAP[event.get_tag("level")]
-        except KeyError:
-            return False
-
-        if desired_match == MatchType.EQUAL:
-            return level == desired_level
-        elif desired_match == MatchType.GREATER_OR_EQUAL:
-            return level >= desired_level
-        elif desired_match == MatchType.LESS_OR_EQUAL:
-            return level <= desired_level
-        return False
-
-    def render_label(self):
+    def render_label(self) -> str:
         data = {
             "level": LEVEL_CHOICES[self.data["level"]],
             "match": MATCH_CHOICES[self.data["match"]],

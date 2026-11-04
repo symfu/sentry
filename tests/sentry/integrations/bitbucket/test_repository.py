@@ -1,23 +1,33 @@
 import datetime
-import responses
-import pytest
+from collections.abc import Mapping, MutableMapping
+from datetime import timezone
+from functools import cached_property
 
-from django.utils import timezone
-from exam import fixture
-from sentry.models import Integration, Repository
-from sentry.testutils import TestCase, IntegrationRepositoryTestCase
+import pytest
+import responses
+from requests import PreparedRequest
+
+from fixtures.bitbucket import COMMIT_DIFF_PATCH, COMPARE_COMMITS_EXAMPLE, REPO
+from sentry.constants import ObjectStatus
 from sentry.integrations.bitbucket.repository import BitbucketRepositoryProvider
+from sentry.integrations.services.repository.serial import serialize_repository
+from sentry.models.repository import Repository
+from sentry.organizations.services.organization.serial import serialize_rpc_organization
 from sentry.shared_integrations.exceptions import IntegrationError
-from .testutils import COMPARE_COMMITS_EXAMPLE, COMMIT_DIFF_PATCH, REPO
+from sentry.silo.base import SiloMode
+from sentry.testutils.cases import IntegrationRepositoryTestCase, TestCase
+from sentry.testutils.silo import assume_test_silo_mode
 
 
 class BitbucketRepositoryProviderTest(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.base_url = "https://api.bitbucket.org"
         self.shared_secret = "234567890"
         self.subject = "connect:1234567"
-        self.integration = Integration.objects.create(
+        self.integration, _ = self.create_provider_integration_for(
+            self.organization,
+            self.user,
             provider="bitbucket",
             external_id=self.subject,
             name="MyBitBucket",
@@ -27,7 +37,6 @@ class BitbucketRepositoryProviderTest(TestCase):
                 "subject": self.subject,
             },
         )
-        self.integration.add_organization(self.organization, self.user)
         self.repo = Repository.objects.create(
             provider="bitbucket",
             name="sentryuser/newsdiffs",
@@ -36,11 +45,11 @@ class BitbucketRepositoryProviderTest(TestCase):
             integration_id=self.integration.id,
         )
 
-    @fixture
-    def provider(self):
+    @cached_property
+    def provider(self) -> BitbucketRepositoryProvider:
         return BitbucketRepositoryProvider("bitbucket")
 
-    def test_get_client(self):
+    def test_get_client(self) -> None:
         installation = self.integration.get_installation(self.repo.organization_id)
         client = installation.get_client()
         assert client.base_url == self.base_url
@@ -48,7 +57,7 @@ class BitbucketRepositoryProviderTest(TestCase):
         assert client.subject == self.subject
 
     @responses.activate
-    def test_compare_commits(self):
+    def test_compare_commits(self) -> None:
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/sentryuser/newsdiffs/commits/e18e4e72de0d824edfbe0d73efe34cbd0d01d301",
@@ -76,35 +85,108 @@ class BitbucketRepositoryProviderTest(TestCase):
             }
         ]
 
+    def _on_create_repository_discards_hook_when_repository_disabled(
+        self, delete_status: int
+    ) -> None:
+        def create(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            Repository.objects.filter(id=self.repo.id).update(status=ObjectStatus.DISABLED)
+            return 201, {}, '{"uuid": "hook-uuid"}'
+
+        responses.add_callback(
+            responses.POST,
+            "https://api.bitbucket.org/2.0/repositories/sentryuser/newsdiffs/hooks",
+            callback=create,
+        )
+        responses.add(
+            responses.DELETE,
+            "https://api.bitbucket.org/2.0/repositories/sentryuser/newsdiffs/hooks/hook-uuid",
+            status=delete_status,
+        )
+
+        self.provider.on_create_repository(
+            serialize_repository(self.repo), serialize_rpc_organization(self.organization)
+        )
+
+        assert [call.request.method for call in responses.calls] == ["POST", "DELETE"]
+        self.repo.refresh_from_db()
+        assert self.repo.status == ObjectStatus.DISABLED
+        assert "webhook_id" not in self.repo.config
+
     @responses.activate
-    def test_build_repository_config(self):
+    def test_on_create_repository_discards_hook_when_repository_disabled(self) -> None:
+        self._on_create_repository_discards_hook_when_repository_disabled(delete_status=204)
+
+    @responses.activate
+    def test_on_create_repository_discards_hook_when_repository_disabled_and_cleanup_fails(
+        self,
+    ) -> None:
+        self._on_create_repository_discards_hook_when_repository_disabled(delete_status=500)
+
+    @responses.activate
+    def test_on_create_repository_preserves_concurrent_changes(self) -> None:
+        def create(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            Repository.objects.filter(id=self.repo.id).update(name="renamed")
+            return 201, {}, '{"uuid": "hook-uuid"}'
+
+        responses.add_callback(
+            responses.POST,
+            "https://api.bitbucket.org/2.0/repositories/sentryuser/newsdiffs/hooks",
+            callback=create,
+        )
+
+        self.provider.on_create_repository(
+            serialize_repository(self.repo), serialize_rpc_organization(self.organization)
+        )
+
+        self.repo.refresh_from_db()
+        assert self.repo.name == "renamed"
+        assert self.repo.config == {"name": "sentryuser/newsdiffs", "webhook_id": "hook-uuid"}
+
+    @responses.activate
+    def test_build_repository_config(self) -> None:
         full_repo_name = "laurynsentry/helloworld"
         webhook_id = "web-hook-id"
+
+        organization = self.create_organization()
+
         responses.add(
             responses.GET,
             "https://api.bitbucket.org/2.0/repositories/%s" % full_repo_name,
             json=REPO,
         )
+        expected_post_payload = {
+            "active": True,
+            "description": "sentry-bitbucket-repo-hook",
+            "events": ["repo:push", "pullrequest:fulfilled"],
+            "secret": "supersecret",
+            "url": f"http://testserver/extensions/bitbucket/organizations/{organization.id}/webhook/",
+        }
         responses.add(
             responses.POST,
             "https://api.bitbucket.org/2.0/repositories/%s/hooks" % full_repo_name,
             json={"uuid": webhook_id},
             status=201,
+            match=[responses.matchers.json_params_matcher(expected_post_payload)],
         )
 
-        organization = self.create_organization()
-        integration = Integration.objects.create(
-            provider="bitbucket",
-            external_id="bitbucket_external_id",
-            name="Hello world",
-            metadata={"base_url": "https://api.bitbucket.org", "shared_secret": "23456789"},
-        )
-        integration.add_organization(organization)
-        data = {
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            integration = self.create_provider_integration(
+                provider="bitbucket",
+                external_id="bitbucket_external_id",
+                name="Hello world",
+                metadata={
+                    "base_url": "https://api.bitbucket.org",
+                    "shared_secret": "23456789",
+                    "webhook_secret": "supersecret",
+                },
+            )
+            integration.add_organization(organization)
+        data: MutableMapping[str, object] = {
             "provider": "integrations:bitbucket",
             "identifier": full_repo_name,
             "installation": integration.id,
         }
+        rpc_organization = serialize_rpc_organization(organization)
         data = self.provider.get_repository_data(organization, data)
         assert data == {
             "provider": "integrations:bitbucket",
@@ -113,46 +195,47 @@ class BitbucketRepositoryProviderTest(TestCase):
             "external_id": REPO["uuid"],
             "name": full_repo_name,
         }
-        data = self.provider.build_repository_config(organization, data)
+        repository_config = self.provider.build_repository_config(rpc_organization, data)
 
-        assert data == {
+        assert repository_config == {
             "name": full_repo_name,
             "external_id": REPO["uuid"],
             "url": "https://bitbucket.org/laurynsentry/helloworld",
             "integration_id": integration.id,
-            "config": {"name": full_repo_name, "webhook_id": webhook_id},
+            "config": {"name": full_repo_name},
         }
 
-    def test_repository_external_slug(self):
+    def test_repository_external_slug(self) -> None:
         result = self.provider.repository_external_slug(self.repo)
         assert result == self.repo.name
 
-    def test_get_repository_data_no_installation_id(self):
+    def test_get_repository_data_no_installation_id(self) -> None:
         with pytest.raises(IntegrationError) as e:
             self.provider.get_repository_data(self.organization, {})
-            assert "requires an integration id" in str(e)
+        assert "requires an integration id" in str(e.value)
 
 
 class BitbucketCreateRepositoryTestCase(IntegrationRepositoryTestCase):
     provider_name = "integrations:bitbucket"
 
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.base_url = "https://api.bitbucket.org"
         self.shared_secret = "234567890"
         self.subject = "connect:1234567"
-        self.integration = Integration.objects.create(
-            provider="bitbucket",
-            external_id=self.subject,
-            name="MyBitBucket",
-            metadata={
-                "base_url": self.base_url,
-                "shared_secret": self.shared_secret,
-                "subject": self.subject,
-            },
-        )
-        self.integration.get_provider().setup()
-        self.integration.add_organization(self.organization, self.user)
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.integration = self.create_provider_integration(
+                provider="bitbucket",
+                external_id=self.subject,
+                name="MyBitBucket",
+                metadata={
+                    "base_url": self.base_url,
+                    "shared_secret": self.shared_secret,
+                    "subject": self.subject,
+                },
+            )
+            self.integration.get_provider().setup()
+            self.integration.add_organization(self.organization, self.user)
         self.repo = Repository.objects.create(
             provider="bitbucket",
             name="sentryuser/newsdiffs",
@@ -162,7 +245,7 @@ class BitbucketCreateRepositoryTestCase(IntegrationRepositoryTestCase):
         )
         self.default_repository_config = {"full_name": "getsentry/example-repo", "id": "123"}
 
-    def add_create_repository_responses(self, repository_config):
+    def add_create_repository_responses(self, repository_config: Mapping[str, object]) -> None:
         responses.add(
             responses.GET,
             f"{self.base_url}/2.0/repositories/{self.repo.name}",
@@ -174,14 +257,15 @@ class BitbucketCreateRepositoryTestCase(IntegrationRepositoryTestCase):
             json={"uuid": "99"},
         )
 
-    def test_create_repository_data_no_installation_id(self):
+    def test_create_repository_data_no_installation_id(self) -> None:
         response = self.create_repository(self.default_repository_config, None)
         assert response.status_code == 400
         self.assert_error_message(response, "validation", "requires an integration id")
 
-    def test_create_repository_data_integration_does_not_exist(self):
+    def test_create_repository_data_integration_does_not_exist(self) -> None:
         integration_id = self.integration.id
-        self.integration.delete()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.integration.delete()
 
         response = self.create_repository(self.default_repository_config, integration_id)
         assert response.status_code == 404

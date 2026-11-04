@@ -1,0 +1,297 @@
+from typing import Any
+from unittest import mock
+
+import responses
+
+from sentry.constants import ObjectStatus
+from sentry.integrations.models.integration import Integration
+from sentry.integrations.services.integration import integration_service
+from sentry.testutils.cases import TestCase
+from sentry.testutils.helpers.datetime import freeze_time
+from sentry.testutils.silo import all_silo_test, assume_test_silo_mode_of
+
+
+@all_silo_test
+@freeze_time("2025-01-01T05:22:00Z")
+class IntegrationServiceTest(TestCase):
+    jwt = "my_cool_jwt"
+
+    def generate_integration(self, metadata: dict[str, Any] | None = None) -> Integration:
+        integration = self.create_integration(
+            organization=self.organization,
+            provider="github",
+            external_id="github:1",
+        )
+
+        with assume_test_silo_mode_of(Integration):
+            if metadata is not None:
+                integration.metadata.update(metadata)
+                integration.save()
+
+        return integration
+
+    @responses.activate
+    @mock.patch("sentry.integrations.github.client.get_jwt", return_value=jwt)
+    def test_refresh_expired_token(self, mock_jwt: mock.MagicMock) -> None:
+        integration = self.generate_integration(
+            metadata={
+                "access_token": "token_1",
+                "expires_at": "2025-01-01T05:21:59Z",
+                "permissions": {
+                    "administration": "read",
+                    "contents": "read",
+                    "issues": "write",
+                    "metadata": "read",
+                    "pull_requests": "read",
+                },
+            }
+        )
+
+        responses.add(
+            responses.POST,
+            "https://api.github.com/app/installations/github:1/access_tokens",
+            json={
+                "token": "token_2",
+                "expires_at": "2025-01-01T06:22:00Z",
+                "permissions": {
+                    "administration": "read",
+                },
+            },
+            status=200,
+            content_type="application/json",
+        )
+
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is not None
+        assert rpc_integration.metadata["access_token"] == "token_2"
+        assert rpc_integration.metadata["expires_at"] == "2025-01-01T06:22:00"
+        assert rpc_integration.metadata["permissions"] == {
+            "administration": "read",
+        }
+
+    @responses.activate
+    @mock.patch("sentry.integrations.github.client.get_jwt", return_value=jwt)
+    def test_refresh_token_within_grace_period(self, mock_jwt: mock.MagicMock) -> None:
+        integration = self.generate_integration(
+            metadata={
+                "access_token": "token_1",
+                "expires_at": "2025-01-01T05:31:59Z",
+                "permissions": {
+                    "contents": "read",
+                },
+            }
+        )
+
+        responses.add(
+            responses.POST,
+            "https://api.github.com/app/installations/github:1/access_tokens",
+            json={
+                "token": "token_refreshed",
+                "expires_at": "2025-01-01T06:32:00Z",
+                "permissions": {
+                    "contents": "write",
+                },
+            },
+            status=200,
+            content_type="application/json",
+        )
+
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is not None
+        assert rpc_integration.metadata["access_token"] == "token_refreshed"
+        assert rpc_integration.metadata["expires_at"] == "2025-01-01T06:32:00"
+        assert rpc_integration.metadata["permissions"] == {
+            "contents": "write",
+        }
+
+    @responses.activate
+    @mock.patch("sentry.integrations.github.client.get_jwt", return_value=jwt)
+    def test_no_refresh_token_outside_grace_period(self, mock_jwt: mock.MagicMock) -> None:
+        integration = self.generate_integration(
+            metadata={
+                "access_token": "token_valid",
+                "expires_at": "2025-01-01T05:32:01Z",
+                "permissions": {
+                    "issues": "write",
+                },
+            }
+        )
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is not None
+        assert rpc_integration.metadata["access_token"] == "token_valid"
+        assert rpc_integration.metadata["expires_at"] == "2025-01-01T05:32:01Z"
+        assert rpc_integration.metadata["permissions"] == {
+            "issues": "write",
+        }
+
+    @responses.activate
+    @mock.patch("sentry.integrations.github.client.get_jwt", return_value=jwt)
+    def test_refresh_token_missing_expiration_time(self, mock_jwt: mock.MagicMock) -> None:
+        integration = self.generate_integration(
+            metadata={
+                "access_token": "token_no_expiry",
+                "permissions": {
+                    "metadata": "read",
+                },
+            }
+        )
+
+        responses.add(
+            responses.POST,
+            "https://api.github.com/app/installations/github:1/access_tokens",
+            json={
+                "token": "token_new",
+                "expires_at": "2025-01-01T06:22:00Z",
+                "permissions": {
+                    "metadata": "write",
+                    "pull_requests": "read",
+                },
+            },
+            status=200,
+            content_type="application/json",
+        )
+
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is not None
+        assert rpc_integration.metadata["access_token"] == "token_new"
+        assert rpc_integration.metadata["expires_at"] == "2025-01-01T06:22:00"
+        assert rpc_integration.metadata["permissions"] == {
+            "metadata": "write",
+            "pull_requests": "read",
+        }
+
+    def test_missing_integration(self) -> None:
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=12345,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is None
+
+    def test_disabled_integration(self) -> None:
+        integration = self.generate_integration()
+        with assume_test_silo_mode_of(Integration):
+            integration.status = ObjectStatus.DISABLED
+            integration.save()
+
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is None
+
+    def test_missing_installation(self) -> None:
+        # Generate a new integration with an installation on a different org.
+        integration = self.create_integration(
+            organization=self.create_organization(owner=self.create_user()),
+            provider="github",
+            external_id="github:1",
+        )
+
+        rpc_integration = integration_service.refresh_github_access_token(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is None
+
+    @responses.activate
+    @mock.patch("sentry.integrations.github.client.get_jwt", return_value=jwt)
+    def test_refresh_permissions_reads_without_minting_a_token(
+        self, mock_jwt: mock.MagicMock
+    ) -> None:
+        """The point of this call is the permissions, not the token.
+
+        GitHub reports an installation's current permissions on the
+        installation itself, so the stored token is left alone.
+        """
+        integration = self.generate_integration(
+            metadata={
+                "access_token": "token_valid",
+                "expires_at": "2025-01-01T05:32:01Z",
+                "permissions": {"contents": "read"},
+            }
+        )
+
+        responses.add(
+            responses.GET,
+            "https://api.github.com/app/installations/github:1",
+            json={"id": 1, "permissions": {"contents": "write"}},
+            status=200,
+            content_type="application/json",
+        )
+
+        rpc_integration = integration_service.refresh_github_permissions(
+            integration_id=integration.id,
+            organization_id=self.organization.id,
+        )
+
+        assert rpc_integration is not None
+        assert rpc_integration.metadata["permissions"] == {"contents": "write"}
+        assert rpc_integration.metadata["last_refresh_at"] == "2025-01-01T05:22:00+00:00"
+        assert rpc_integration.metadata["access_token"] == "token_valid"
+        assert rpc_integration.metadata["expires_at"] == "2025-01-01T05:32:01Z"
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.headers["Authorization"] == f"Bearer {self.jwt}"
+
+    def test_refresh_permissions_for_an_install_on_another_organization(self) -> None:
+        """An integration id alone is not enough to reach an installation.
+
+        The org has to actually have it installed, or a caller anywhere in the
+        codebase could mint tokens against someone else's install.
+        """
+        integration = self.create_integration(
+            organization=self.create_organization(owner=self.create_user()),
+            provider="github",
+            external_id="github:1",
+        )
+
+        assert (
+            integration_service.refresh_github_permissions(
+                integration_id=integration.id,
+                organization_id=self.organization.id,
+            )
+            is None
+        )
+
+    def test_refresh_permissions_for_an_unknown_integration(self) -> None:
+        integration = self.generate_integration()
+
+        assert (
+            integration_service.refresh_github_permissions(
+                integration_id=integration.id + 1000,
+                organization_id=self.organization.id,
+            )
+            is None
+        )
+
+    def test_refresh_permissions_for_a_disabled_integration(self) -> None:
+        integration = self.generate_integration()
+        with assume_test_silo_mode_of(Integration):
+            integration.status = ObjectStatus.DISABLED
+            integration.save()
+
+        assert (
+            integration_service.refresh_github_permissions(
+                integration_id=integration.id,
+                organization_id=self.organization.id,
+            )
+            is None
+        )

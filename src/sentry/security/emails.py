@@ -1,18 +1,53 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Protocol
+
 from django.utils import timezone
 
+from sentry.auth.principal import RequestPrincipal
+from sentry.users.services.user.model import RpcUser
 from sentry.utils.email import MessageBuilder
 
+if TYPE_CHECKING:
+    from sentry.users.models.user import User
 
-def generate_security_email(account, type, actor, ip_address, context=None, current_datetime=None):
+
+class SecurityEmailAccount(Protocol):
+    """The minimal account shape a security email needs.
+
+    Hard deletion removes the User row before the email is sent, so that flow has
+    no User or RpcUser left to pass. It supplies a stand-in instead. Only `id`
+    (logging) and `email` (recipient and template body) are ever read.
+    """
+
+    @property
+    def id(self) -> int: ...
+
+    @property
+    def email(self) -> str: ...
+
+
+def generate_security_email(
+    account: User | RpcUser | SecurityEmailAccount,
+    type: str,
+    actor: RequestPrincipal,
+    ip_address: str,
+    context: Mapping[str, Any] | None = None,
+    current_datetime: datetime | None = None,
+) -> MessageBuilder:
     if current_datetime is None:
         current_datetime = timezone.now()
 
     subject = "Security settings changed"
     if type == "mfa-removed":
+        assert context is not None
         assert "authenticator" in context
         template = "sentry/emails/mfa-removed.txt"
         html_template = "sentry/emails/mfa-removed.html"
     elif type == "mfa-added":
+        assert context is not None
         assert "authenticator" in context
         template = "sentry/emails/mfa-added.txt"
         html_template = "sentry/emails/mfa-added.html"
@@ -25,6 +60,17 @@ def generate_security_email(account, type, actor, ip_address, context=None, curr
     elif type == "api-token-generated":
         template = "sentry/emails/api-token-generated.txt"
         html_template = "sentry/emails/api-token-generated.html"
+    elif type == "org-auth-token-created":
+        template = "sentry/emails/org-auth-token-created.txt"
+        html_template = "sentry/emails/org-auth-token-created.html"
+    elif type == "user.removed":
+        subject = "Your Sentry account has been deleted"
+        template = "sentry/emails/user-deleted.txt"
+        html_template = "sentry/emails/user-deleted.html"
+    elif type == "user.deactivated":
+        subject = "Your Sentry account has been deactivated"
+        template = "sentry/emails/user-deactivated.txt"
+        html_template = "sentry/emails/user-deactivated.html"
     else:
         raise ValueError(f"unknown type: {type}")
 

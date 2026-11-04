@@ -1,0 +1,904 @@
+import * as Sentry from '@sentry/react';
+import type {Location} from 'history';
+import * as qs from 'query-string';
+
+import {Expression} from 'sentry/components/arithmeticBuilder/expression';
+import {isTokenFunction} from 'sentry/components/arithmeticBuilder/token';
+import {openConfirmModal} from 'sentry/components/confirm';
+import {getTooltipText as getAnnotatedTooltipText} from 'sentry/components/events/meta/annotatedText/utils';
+import {normalizeDateTimeString} from 'sentry/components/pageFilters/parse';
+import type {CaseInsensitive} from 'sentry/components/searchQueryBuilder/hooks';
+import {t} from 'sentry/locale';
+import type {PageFilters} from 'sentry/types/core';
+import type {Tag, TagCollection} from 'sentry/types/group';
+import type {Confidence, Organization} from 'sentry/types/organization';
+import type {DetailedProject, Project} from 'sentry/types/project';
+import {defined} from 'sentry/utils/defined';
+import {EventView} from 'sentry/utils/discover/eventView';
+import type {Sort} from 'sentry/utils/discover/fields';
+import {
+  isEquation,
+  parseFunction,
+  prettifyParsedFunction,
+  stripEquationPrefix,
+} from 'sentry/utils/discover/fields';
+import {FieldValueType} from 'sentry/utils/fields';
+import {decodeSorts, encodeSort} from 'sentry/utils/queryString';
+import {determineTimeSeriesConfidence} from 'sentry/utils/timeSeries/determineSeriesConfidence';
+import {determineSeriesSampleCountAndIsSampled} from 'sentry/utils/timeSeries/determineSeriesSampleCount';
+import {MutableSearch} from 'sentry/utils/tokenizeSearch';
+import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
+import type {TimeSeries} from 'sentry/views/dashboards/widgets/common/types';
+import type {ChartSelectionQueryParam} from 'sentry/views/explore/components/attributeBreakdowns/chartSelectionContext';
+import type {GroupBy} from 'sentry/views/explore/contexts/pageParamsContext/aggregateFields';
+import {isGroupBy} from 'sentry/views/explore/contexts/pageParamsContext/aggregateFields';
+import {Mode} from 'sentry/views/explore/contexts/pageParamsContext/mode';
+import type {BaseVisualize} from 'sentry/views/explore/contexts/pageParamsContext/visualizes';
+import {EXPLORE_AGENTS_SUB_PATH} from 'sentry/views/explore/conversations/settings';
+import type {
+  SavedQuery,
+  RawGroupBy,
+  RawVisualize,
+  CombinedSavedQuery,
+  DiscoverSavedQuery,
+} from 'sentry/views/explore/hooks/useGetSavedQueries';
+import {
+  getSavedQueryTraceItemDataset,
+  isExploreSavedQuery,
+  isRawVisualize,
+} from 'sentry/views/explore/hooks/useGetSavedQueries';
+import type {
+  TraceItemAttributeMeta,
+  TraceItemDetailsMeta,
+  TraceItemResponseAttribute,
+} from 'sentry/views/explore/hooks/useTraceItemDetails';
+import {getLogsUrlFromSavedQueryUrl} from 'sentry/views/explore/logs/utils';
+import {getMetricsUrlFromSavedQueryUrl} from 'sentry/views/explore/metrics/utils';
+import {
+  encodeCompareCaseInsensitive,
+  getFieldsForConstructedQuery,
+  normalizeCompareQueryParts,
+  type ReadableExploreQueryParts,
+} from 'sentry/views/explore/multiQueryMode/locationUtils';
+import type {CrossEvent} from 'sentry/views/explore/queryParams/crossEvent';
+import type {Visualize} from 'sentry/views/explore/queryParams/visualize';
+import {makeReplaysPathname} from 'sentry/views/explore/replays/pathnames';
+import {getTargetWithReadableQueryParams} from 'sentry/views/explore/spans/spansQueryParams';
+import {TraceItemDataset} from 'sentry/views/explore/types';
+import {withReadableConditionalFilter} from 'sentry/views/explore/utils/conditionalAggregate';
+import {parseConditionalAggregate} from 'sentry/views/explore/utils/parseConditionalAggregate';
+import {isChartType} from 'sentry/views/insights/common/components/chart';
+import type {SortedTimeSeries} from 'sentry/views/insights/common/queries/useSortedTimeSeries';
+import {makeTracesPathname} from 'sentry/views/traces/pathnames';
+
+export interface GetExploreUrlArgs {
+  organization: Organization;
+  aggregateField?: Array<GroupBy | BaseVisualize>;
+  aggregateSort?: string;
+  caseInsensitive?: CaseInsensitive;
+  chartSelection?: ChartSelectionQueryParam;
+  crossEvents?: CrossEvent[];
+  field?: string[];
+  groupBy?: string[];
+  id?: number;
+  interval?: string;
+  mode?: Mode;
+  query?: string;
+  referrer?: string;
+  selection?: PageFilters;
+  sort?: string;
+  table?: 'trace' | 'attribute_breakdowns';
+  title?: string;
+  visualize?: BaseVisualize[];
+}
+
+function encodeCaseInsensitive(caseInsensitive: CaseInsensitive | undefined) {
+  if (!defined(caseInsensitive)) {
+    return null;
+  }
+  return caseInsensitive ? '1' : '0';
+}
+
+export function getExploreUrl({
+  organization,
+  selection,
+  interval,
+  mode,
+  aggregateField,
+  chartSelection,
+  visualize,
+  query,
+  groupBy,
+  sort,
+  aggregateSort,
+  field,
+  id,
+  table,
+  title,
+  referrer,
+  caseInsensitive,
+  crossEvents,
+}: GetExploreUrlArgs) {
+  const {start, end, period: statsPeriod, utc} = selection?.datetime ?? {};
+  const {environments, projects} = selection ?? {};
+  const queryParams = {
+    // Pass empty string when projects is empty to preserve "My Projects" selection in URL
+    project: projects?.length === 0 ? '' : projects,
+    environment: environments,
+    statsPeriod,
+    start: normalizeDateTimeString(start),
+    end: normalizeDateTimeString(end),
+    interval,
+    mode,
+    query,
+    aggregateField: aggregateField?.map(v => JSON.stringify(v)),
+    visualize: visualize?.map(v => JSON.stringify(v)),
+    groupBy,
+    sort,
+    aggregateSort,
+    field,
+    utc,
+    id,
+    table,
+    title,
+    referrer,
+    caseInsensitive: encodeCaseInsensitive(caseInsensitive),
+    chartSelection: chartSelection ? JSON.stringify(chartSelection) : undefined,
+    crossEvents: crossEvents?.length ? JSON.stringify(crossEvents) : undefined,
+  };
+
+  return (
+    makeTracesPathname({
+      organization,
+      path: '/',
+    }) + `?${qs.stringify(queryParams, {skipNull: true})}`
+  );
+}
+
+function getExploreUrlFromSavedQueryUrl({
+  savedQuery,
+  organization,
+}: {
+  organization: Organization;
+  savedQuery: SavedQuery;
+}) {
+  if (savedQuery.query.length > 1) {
+    return getExploreMultiQueryUrl({
+      organization,
+      ...savedQuery,
+      queries: savedQuery.query.map(q => {
+        const groupBys: string[] | undefined =
+          q.aggregateField
+            ?.filter<RawGroupBy>(isGroupBy)
+            ?.map(groupBy => groupBy.groupBy) ?? q.groupby;
+        const visualize =
+          q.aggregateField?.find<RawVisualize>(isRawVisualize) ?? q.visualize?.[0];
+        const chartType = isChartType(visualize?.chartType)
+          ? visualize.chartType
+          : undefined;
+
+        const normalized = normalizeCompareQueryParts({
+          chartType,
+          yAxes: (visualize?.yAxes ?? []).slice(),
+          groupBys: groupBys ?? [],
+          query: q.query ?? '',
+          sortBys: decodeSorts(q.orderby),
+          caseInsensitive: q.caseInsensitive ? '1' : '0',
+        });
+        const yAxes = normalized.yAxes ?? [];
+
+        return {
+          chartType: normalized.chartType,
+          yAxes,
+          groupBys: [...(normalized.groupBys ?? groupBys ?? [])],
+          query: normalized.query ?? '',
+          sortBys: [...(normalized.sortBys ?? decodeSorts(q.orderby))],
+          fields: getFieldsForConstructedQuery(yAxes),
+          caseInsensitive: normalized.caseInsensitive,
+        } satisfies ReadableExploreQueryParts;
+      }),
+      title: savedQuery.name,
+      selection: {
+        datetime: {
+          end: savedQuery.end ?? null,
+          period: savedQuery.statsPeriod ?? null,
+          start: savedQuery.start ?? null,
+          utc: null,
+        },
+        environments: savedQuery.environment ?? [],
+        projects: savedQuery.projects,
+      },
+    });
+  }
+
+  return getExploreUrl({
+    organization,
+    ...savedQuery,
+    ...savedQuery.query[0],
+    groupBy:
+      (savedQuery.query[0].groupby?.length ?? 0) === 0
+        ? ['']
+        : savedQuery.query[0].groupby,
+    sort: savedQuery.query[0].orderby,
+    query: savedQuery.query[0].query,
+    caseInsensitive: savedQuery.query[0].caseInsensitive ?? false,
+    title: savedQuery.name,
+    mode: savedQuery.query[0].mode,
+    field: savedQuery.query[0].fields,
+    selection: {
+      datetime: {
+        end: savedQuery.end ?? null,
+        period: savedQuery.statsPeriod ?? null,
+        start: savedQuery.start ?? null,
+        utc: null,
+      },
+      environments: savedQuery.environment ?? [],
+      projects: savedQuery.projects,
+    },
+  });
+}
+
+export function getExploreMultiQueryUrl({
+  organization,
+  selection,
+  interval,
+  queries,
+  title,
+  id,
+  referrer,
+}: {
+  interval: string;
+  organization: Organization;
+  queries: ReadableExploreQueryParts[];
+  selection: PageFilters;
+  id?: number;
+  referrer?: string;
+  title?: string;
+}) {
+  const {start, end, period: statsPeriod, utc} = selection.datetime;
+  const {environments, projects} = selection;
+  const queryParams = {
+    // Pass empty string when projects is empty to preserve "My Projects" selection in URL
+    project: projects.length === 0 ? '' : projects,
+    environment: environments,
+    statsPeriod,
+    start: normalizeDateTimeString(start),
+    end: normalizeDateTimeString(end),
+    interval,
+    queries: queries.map(
+      ({chartType, fields, groupBys, query, sortBys, yAxes, caseInsensitive}) =>
+        JSON.stringify({
+          chartType,
+          fields,
+          groupBys,
+          query,
+          sortBys: sortBys[0] ? encodeSort(sortBys[0]) : undefined, // Explore only handles a single sort by
+          yAxes,
+          caseInsensitive: encodeCompareCaseInsensitive(caseInsensitive),
+        })
+    ),
+    title,
+    id,
+    utc,
+    referrer,
+  };
+
+  return `/organizations/${organization.slug}/explore/traces/compare/?${qs.stringify(queryParams, {skipNull: true})}`;
+}
+
+export function combineConfidenceForSeries(series: TimeSeries[]): Confidence {
+  let lows = 0;
+  let highs = 0;
+  let nulls = 0;
+
+  // We filter the series because there are cases where the series is a sparse array,
+  // meaning we have possible undefined values. This typically happens in multi-yaxis
+  // charts when we have a grouping so the data is positioned in such a way to make
+  // series colors consistent when rendering
+  for (const s of series.filter(defined)) {
+    const confidence = determineTimeSeriesConfidence(s);
+    if (confidence === 'low') {
+      lows += 1;
+    } else if (confidence === 'high') {
+      highs += 1;
+    } else {
+      nulls += 1;
+    }
+  }
+
+  if (lows <= 0 && highs <= 0 && nulls >= 0) {
+    return null;
+  }
+
+  if (lows / (lows + highs) > 0.5) {
+    return 'low';
+  }
+
+  return 'high';
+}
+
+import {generateTargetQuery} from 'sentry/views/explore/utils/generateTargetQuery';
+
+export function viewSamplesTarget({
+  location,
+  query,
+  fields,
+  groupBys,
+  visualizes,
+  sorts,
+  row,
+  projects,
+}: {
+  fields: readonly string[];
+  groupBys: readonly string[];
+  location: Location;
+  // needed to generate targets when `project` is in the group by
+  projects: Project[];
+  query: string;
+  row: Record<string, any>;
+  sorts: readonly Sort[];
+  visualizes: readonly Visualize[];
+}) {
+  const search = new MutableSearch(query);
+
+  const {
+    fields: newFields,
+    search: newSearch,
+    sortBys: newSortBys,
+  } = generateTargetQuery({
+    fields,
+    groupBys,
+    location,
+    projects,
+    search,
+    row,
+    sorts,
+    yAxes: visualizes.map(visualize => visualize.yAxis),
+  });
+
+  const target = getTargetWithReadableQueryParams(location, {
+    mode: Mode.SAMPLES,
+    fields: newFields,
+    query: newSearch.formatString(),
+    sortBys: newSortBys,
+  });
+
+  delete target.query.table;
+
+  return target;
+}
+
+export function getDefaultExploreRoute(organization: Organization) {
+  if (organization.features.includes('visibility-explore-view')) {
+    return 'traces';
+  }
+
+  if (organization.features.includes('ourlogs-enabled')) {
+    return 'logs';
+  }
+
+  if (organization.features.includes('discover-basic')) {
+    return 'discover/homepage';
+  }
+
+  if (organization.features.includes('performance-profiling')) {
+    return 'profiles';
+  }
+
+  if (organization.features.includes('session-replay-ui')) {
+    return 'replays';
+  }
+
+  return 'releases';
+}
+
+export function computeVisualizeSampleTotals(
+  yAxes: string[],
+  data: SortedTimeSeries['data'],
+  isTopN: boolean
+) {
+  return yAxes.map(yAxis => {
+    const series = data?.[yAxis]?.filter(defined) ?? [];
+    const {sampleCount} = determineSeriesSampleCountAndIsSampled(series, isTopN);
+    return sampleCount;
+  });
+}
+
+export function confirmDeleteSavedQuery({
+  handleDelete,
+  savedQuery,
+}: {
+  handleDelete: () => void;
+  // Only the name is shown, so this works for either kind of saved query.
+  savedQuery: Pick<CombinedSavedQuery, 'name'>;
+}) {
+  openConfirmModal({
+    message: t('Are you sure you want to delete the query "%s"?', savedQuery.name),
+    isDangerous: true,
+    confirmText: t('Delete Query'),
+    priority: 'danger',
+    onConfirm: handleDelete,
+  });
+}
+
+export function findSuggestedColumns(
+  newSearch: MutableSearch,
+  oldSearch: MutableSearch,
+  attributes: {
+    booleanAttributes: TagCollection;
+    numberAttributes: TagCollection;
+    stringAttributes: TagCollection;
+  }
+): string[] {
+  const oldFilters = oldSearch.filters;
+  const newFilters = newSearch.filters;
+
+  const keys = new Set<string>();
+
+  for (const [key, value] of Object.entries(newFilters)) {
+    if (key === 'has' || key === '!has') {
+      // special key to be handled last
+      continue;
+    }
+
+    const isStringAttribute = key.startsWith('!')
+      ? key.slice(1) in attributes.stringAttributes
+      : key in attributes.stringAttributes;
+    const isNumberAttribute = key.startsWith('!')
+      ? key.slice(1) in attributes.numberAttributes
+      : key in attributes.numberAttributes;
+    const isBooleanAttribute = key.startsWith('!')
+      ? key.slice(1) in attributes.booleanAttributes
+      : key in attributes.booleanAttributes;
+
+    // guard against unknown keys and aggregate keys
+    if (!isStringAttribute && !isNumberAttribute && !isBooleanAttribute) {
+      continue;
+    }
+
+    if (isSimpleFilter(key, value, attributes)) {
+      continue;
+    }
+
+    if (
+      !Object.hasOwn(oldFilters, key) || // new filter key
+      isSimpleFilter(key, oldFilters[key] || [], attributes) // existing filter key turned complex
+    ) {
+      keys.add(normalizeKey(key));
+      break;
+    }
+  }
+
+  const oldHas = new Set(oldFilters.has);
+  for (const key of newFilters.has || []) {
+    if (Object.hasOwn(oldFilters, key) || oldHas.has(key)) {
+      // old condition, don't add column
+      continue;
+    }
+
+    // if there's a simple filter on the key, don't add column
+    if (
+      Object.hasOwn(newFilters, key) &&
+      isSimpleFilter(key, newFilters[key] || [], attributes)
+    ) {
+      continue;
+    }
+
+    keys.add(normalizeKey(key));
+  }
+
+  return [...keys];
+}
+
+const PREFIX_WILDCARD_PATTERN = /^(\\\\)*\*/;
+const INFIX_WILDCARD_PATTERN = /[^\\](\\\\)*\*/;
+
+function isSimpleFilter(
+  key: string,
+  value: string[],
+  attributes: {
+    booleanAttributes: TagCollection;
+    numberAttributes: TagCollection;
+    stringAttributes: TagCollection;
+  }
+): boolean {
+  // negation filters are always considered non trivial
+  // because it matches on multiple values
+  if (key.startsWith('!')) {
+    return false;
+  }
+
+  // all number attributes are considered non trivial because they
+  // almost always match on a range of values
+  if (key in attributes.numberAttributes) {
+    return false;
+  }
+
+  // boolean attributes are always considered trivial because they almost match on a
+  // single value, so there's no value in adding a column
+  if (key in attributes.booleanAttributes) {
+    return true;
+  }
+
+  if (value.length === 1) {
+    const v = value[0]!;
+    // if the value is wrapped in `[...]`, then it's an array value
+    if (v.startsWith('[') && v.endsWith(']')) {
+      return false;
+    }
+
+    // if is wild card search, return false
+    if (v.startsWith('*')) {
+      return false;
+    }
+
+    if (PREFIX_WILDCARD_PATTERN.test(v) || INFIX_WILDCARD_PATTERN.test(v)) {
+      return false;
+    }
+  }
+
+  // if there is more than 1 possible value
+  if (value.length > 1) {
+    return false;
+  }
+
+  return true;
+}
+
+function normalizeKey(key: string): string {
+  return key.startsWith('!') ? key.slice(1) : key;
+}
+
+export function prettifyAggregation(aggregation: string): string | null {
+  if (isEquation(aggregation)) {
+    const expression = new Expression(stripEquationPrefix(aggregation));
+    return expression.tokens
+      .map(token => {
+        if (isTokenFunction(token)) {
+          const func = parseFunction(withReadableConditionalFilter(token.text));
+          if (func) {
+            return prettifyParsedFunction(func);
+          }
+        }
+        return token.text;
+      })
+      .join(' ');
+  }
+
+  const func = parseFunction(withReadableConditionalFilter(aggregation));
+  if (func) {
+    return prettifyParsedFunction(func);
+  }
+
+  return null;
+}
+
+// The hidden lists target Sentry-defined fields. A user-sent attribute is kept
+// even when its name collides with a reserved field (e.g. a custom
+// `organization.id`), so it stays selectable in search and the column editor.
+export const isHiddenAttribute = (tag: Tag, hiddenKeys: Set<string>): boolean => {
+  if (tag.attributeSource === 'user') {
+    return false;
+  }
+  // Hide by both the raw key and the display name. Explicitly-typed keys such as
+  // `tags[project_id,number]` carry a display name (`project_id`) that is what
+  // appears in the hidden lists.
+  return hiddenKeys.has(tag.key) || (!!tag.name && hiddenKeys.has(tag.name));
+};
+
+export const removeHiddenKeys = (
+  tagCollection: TagCollection,
+  hiddenKeys: Set<string>
+): TagCollection => {
+  const result: TagCollection = {};
+  for (const key in tagCollection) {
+    const tag = tagCollection[key];
+    if (!key || !tag) {
+      continue;
+    }
+    if (isHiddenAttribute(tag, hiddenKeys)) {
+      continue;
+    }
+    result[key] = tag;
+  }
+  return result;
+};
+
+export function getSavedQueryTraceItemUrl({
+  savedQuery,
+  organization,
+}: {
+  organization: Organization;
+  savedQuery: CombinedSavedQuery;
+}) {
+  if (!isExploreSavedQuery(savedQuery)) {
+    return getDiscoverSavedQueryUrl({savedQuery, organization});
+  }
+
+  if (savedQuery.dataset === 'ai_conversations') {
+    return getConversationsUrlFromSavedQueryUrl({savedQuery, organization});
+  }
+  const traceItemDataset = getSavedQueryTraceItemDataset(savedQuery.dataset);
+  const urlFunction = TRACE_ITEM_TO_URL_FUNCTION[traceItemDataset];
+  if (urlFunction) {
+    return urlFunction({savedQuery, organization});
+  }
+  // Invariant, only spans, logs, and metrics are currently supported.
+  Sentry.captureMessage(
+    `Saved query ${savedQuery.id} has an invalid dataset: ${savedQuery.dataset}`
+  );
+  return getExploreUrlFromSavedQueryUrl({savedQuery, organization});
+}
+
+function getConversationsUrlFromSavedQueryUrl({
+  savedQuery,
+  organization,
+}: {
+  organization: Organization;
+  savedQuery: SavedQuery;
+}) {
+  const firstQuery = savedQuery.query[0];
+  const queryParams = {
+    query: firstQuery?.query,
+    project: savedQuery.projects,
+    environment: savedQuery.environment,
+    start: normalizeDateTimeString(savedQuery.start),
+    end: normalizeDateTimeString(savedQuery.end),
+    statsPeriod: savedQuery.statsPeriod,
+    errorsOnly: savedQuery.errorsOnly ? true : undefined,
+    id: savedQuery.id,
+    title: savedQuery.name,
+  };
+
+  let queryString = qs.stringify(queryParams, {skipNull: true});
+  if (savedQuery.agent?.length) {
+    queryString += `&agent=${savedQuery.agent.map(encodeURIComponent).join(',')}`;
+  }
+  const basePath = normalizeUrl(
+    `/organizations/${organization.slug}/explore/${EXPLORE_AGENTS_SUB_PATH}/`
+  );
+  return `${basePath}?${queryString}`;
+}
+
+function getReplayUrlFromSavedQueryUrl({
+  savedQuery,
+  organization,
+}: {
+  organization: Organization;
+  savedQuery: SavedQuery;
+}) {
+  const firstQuery = savedQuery.query[0];
+  const queryParams = {
+    query: firstQuery?.query,
+    project: savedQuery.projects,
+    environment: savedQuery.environment,
+    start: normalizeDateTimeString(savedQuery.start),
+    end: normalizeDateTimeString(savedQuery.end),
+    statsPeriod: savedQuery.statsPeriod,
+    id: savedQuery.id,
+    title: savedQuery.name,
+  };
+
+  const queryString = qs.stringify(queryParams, {skipNull: true});
+  return `${makeReplaysPathname({organization, path: '/'})}?${queryString}`;
+}
+
+const TRACE_ITEM_TO_URL_FUNCTION: Record<
+  TraceItemDataset,
+  | (({
+      savedQuery,
+      organization,
+    }: {
+      organization: Organization;
+      savedQuery: SavedQuery;
+    }) => string)
+  | undefined
+> = {
+  [TraceItemDataset.LOGS]: getLogsUrlFromSavedQueryUrl,
+  [TraceItemDataset.SPANS]: getExploreUrlFromSavedQueryUrl,
+  [TraceItemDataset.UPTIME_RESULTS]: undefined,
+  [TraceItemDataset.TRACEMETRICS]: getMetricsUrlFromSavedQueryUrl,
+  [TraceItemDataset.PREPROD]: undefined,
+  [TraceItemDataset.REPLAYS]: getReplayUrlFromSavedQueryUrl,
+  [TraceItemDataset.PROCESSING_ERRORS]: undefined,
+  [TraceItemDataset.ERRORS]: undefined,
+};
+
+/**
+ * The value type an attribute was stored with, for when no field definition
+ * describes it more precisely.
+ */
+export const ATTRIBUTE_VALUE_TYPES: Record<
+  TraceItemResponseAttribute['type'],
+  FieldValueType
+> = {
+  bool: FieldValueType.BOOLEAN,
+  float: FieldValueType.NUMBER,
+  int: FieldValueType.INTEGER,
+  str: FieldValueType.STRING,
+  array: FieldValueType.ARRAY,
+};
+
+/**
+ * Metadata about trace item attributes.
+ *
+ * This can be used to extract additional information about attributes
+ * like remarks (e.g. why a value was redacted).
+ */
+export class TraceItemMetaInfo {
+  private static readonly META_PATH_CURRENT = '';
+
+  private meta: TraceItemDetailsMeta;
+
+  constructor(meta: TraceItemDetailsMeta) {
+    this.meta = meta;
+  }
+
+  getAttributeMeta(attribute: string): TraceItemAttributeMeta | undefined {
+    return this.meta?.[attribute]?.meta?.value?.[TraceItemMetaInfo.META_PATH_CURRENT];
+  }
+
+  getRemarks(attribute: string): RemarkObject[] {
+    const attributeMeta = this.getAttributeMeta(attribute);
+    if (!attributeMeta?.rem?.length) {
+      return [];
+    }
+
+    const properlyFormedRemarks = attributeMeta.rem.filter(r => r.length >= 2); // Defensive against unexpected length remarks.
+
+    return properlyFormedRemarks.map((rem): RemarkObject => {
+      const [ruleId, type, rangeStart, rangeEnd] = rem;
+      return {
+        ruleId: String(ruleId),
+        type: String(type),
+        rangeStart: Number(rangeStart),
+        rangeEnd: Number(rangeEnd),
+      };
+    });
+  }
+
+  hasRemarks(attribute: string): boolean {
+    const attributeMeta = this.getAttributeMeta(attribute);
+    return (attributeMeta?.rem?.length ?? 0) > 0;
+  }
+
+  static getTooltipText(
+    attribute: string,
+    meta: TraceItemDetailsMeta,
+    organization?: Organization,
+    project?: DetailedProject
+  ): string | React.ReactNode | null {
+    const metaInfo = new TraceItemMetaInfo(meta);
+    const remarks = metaInfo.getRemarks(attribute);
+
+    const firstRemark = remarks[0];
+    if (!firstRemark) {
+      return null;
+    }
+
+    return getAnnotatedTooltipText({
+      remark: firstRemark.type,
+      rule_id: firstRemark.ruleId,
+      organization,
+      project,
+    });
+  }
+}
+
+interface RemarkObject {
+  rangeEnd: number;
+  rangeStart: number;
+  ruleId: string;
+  type: string;
+}
+
+/**
+ * Whether a PII rule redacted the attribute's value.
+ */
+export function hasScrubbedValue(
+  meta: TraceItemDetailsMeta | undefined,
+  attribute: string
+): boolean {
+  return meta === undefined ? false : new TraceItemMetaInfo(meta).hasRemarks(attribute);
+}
+
+const SAMPLING_SENSITIVE_AGGREGATES = new Set(['count_unique', 'max', 'min']);
+const LOW_SAMPLE_RATE_THRESHOLD = 0.1;
+
+export type SamplingWarningReason = 'partialData' | 'lowSampleRate';
+
+export function getSamplingWarningReason(
+  yAxis: string,
+  series: TimeSeries[],
+  dataScanned: 'full' | 'partial' | undefined
+): SamplingWarningReason | null {
+  if (!isSamplingSensitiveAggregate(yAxis)) {
+    return null;
+  }
+  if (!series.some(seriesItem => defined(seriesItem) && seriesItem.values.length > 0)) {
+    return null;
+  }
+  if (dataScanned === 'partial') {
+    return 'partialData';
+  }
+  if (shouldWarnSamplingSensitive(yAxis, series)) {
+    return 'lowSampleRate';
+  }
+  return null;
+}
+
+export function getFirstSamplingWarning(
+  yAxes: string[],
+  seriesByYAxis: Record<string, TimeSeries[]>,
+  dataScanned: 'full' | 'partial' | undefined
+): {reason: SamplingWarningReason; yAxis: string} | null {
+  for (const yAxis of yAxes) {
+    const reason = getSamplingWarningReason(
+      yAxis,
+      seriesByYAxis[yAxis] ?? [],
+      dataScanned
+    );
+    if (reason) {
+      return {reason, yAxis};
+    }
+  }
+  return null;
+}
+
+export function shouldWarnSamplingSensitive(
+  yAxis: string,
+  series: TimeSeries[]
+): boolean {
+  if (!isSamplingSensitiveAggregate(yAxis)) {
+    return false;
+  }
+  const avgSampleRate = computeAvgSampleRate(series);
+  return defined(avgSampleRate) && avgSampleRate < LOW_SAMPLE_RATE_THRESHOLD;
+}
+
+export function isSamplingSensitiveAggregate(yAxis: string): boolean {
+  // Parse conditionally so `count_unique_if` is recognised as `count_unique`.
+  const parsed = parseConditionalAggregate(yAxis);
+  if (!parsed) {
+    return false;
+  }
+  return SAMPLING_SENSITIVE_AGGREGATES.has(parsed.name);
+}
+
+function computeAvgSampleRate(series: TimeSeries[]): number | undefined {
+  let total = 0;
+  let count = 0;
+
+  for (const seriesItem of series.filter(defined)) {
+    for (const item of seriesItem.values) {
+      if (defined(item.sampleRate)) {
+        total += item.sampleRate;
+        count += 1;
+      }
+    }
+  }
+
+  return count > 0 ? total / count : undefined;
+}
+
+function getDiscoverSavedQueryUrl({
+  savedQuery,
+  organization,
+}: {
+  organization: Organization;
+  savedQuery: DiscoverSavedQuery;
+}) {
+  const {pathname, query} =
+    EventView.fromSavedQuery(savedQuery).getResultsViewShortUrlTarget(organization);
+  const search = qs.stringify(query);
+  return search ? `${pathname}?${search}` : pathname;
+}
+
+export function getYAxisDiscoverSavedQuery(
+  savedQuery: DiscoverSavedQuery
+): BaseVisualize[] {
+  if (savedQuery.yAxis?.length) {
+    return [{yAxes: savedQuery.yAxis}];
+  }
+  return [{yAxes: [EventView.fromSavedQuery(savedQuery).getYAxis()]}];
+}

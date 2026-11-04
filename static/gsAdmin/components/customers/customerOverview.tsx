@@ -1,0 +1,1138 @@
+import {Fragment} from 'react';
+import styled from '@emotion/styled';
+import upperFirst from 'lodash/upperFirst';
+import moment from 'moment-timezone';
+
+import {Tag} from '@sentry/scraps/badge';
+import {Button} from '@sentry/scraps/button';
+import {DescriptionList} from '@sentry/scraps/descriptionList';
+import {InfoText} from '@sentry/scraps/info';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {ExternalLink} from '@sentry/scraps/link';
+
+import {ConfigStore} from 'sentry/stores/configStore';
+import {DataCategory} from 'sentry/types/core';
+import type {Organization} from 'sentry/types/organization';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {getLocalities} from 'sentry/utils/cells';
+import {defined} from 'sentry/utils/defined';
+import {useApiQuery} from 'sentry/utils/queryClient';
+import {toTitleCase} from 'sentry/utils/string/toTitleCase';
+
+import {openAdminConfirmModal} from 'admin/components/adminConfirmationModal';
+import {ChangeARRAction} from 'admin/components/changeARRAction';
+import {ChangeContractEndDateAction} from 'admin/components/changeContractEndDateAction';
+import {CustomerContact} from 'admin/components/customerContact';
+import {CustomerStatus} from 'admin/components/customerStatus';
+import {DetailLabel} from 'admin/components/detailLabel';
+import {DetailsContainer, DetailsHeading} from 'admin/components/detailsContainer';
+import {ExtendProductTrialAction} from 'admin/components/extendProductTrialAction';
+import {getLogQuery} from 'admin/utils';
+import {BILLED_DATA_CATEGORY_INFO, UNLIMITED} from 'getsentry/constants';
+import type {
+  AddOn,
+  Plan,
+  ReservedBudget,
+  ReservedBudgetMetricHistory,
+  Subscription,
+} from 'getsentry/types';
+import {
+  AddOnCategory,
+  BillingType,
+  OnDemandBudgetMode,
+  ReservedBudgetCategoryType,
+} from 'getsentry/types';
+import {
+  displayBudgetName,
+  displayPriceWithCents,
+  formatBalance,
+  formatReservedWithUnits,
+  getActiveProductTrial,
+  getBilledCategory,
+  getProductTrial,
+  isTrial,
+  normalizeMetricHistory,
+  RETENTION_SETTINGS_CATEGORIES,
+} from 'getsentry/utils/billing';
+import {
+  getPlanCategoryName,
+  getReservedBudgetDisplayName,
+  sortCategories,
+} from 'getsentry/utils/dataCategory';
+import {formatCurrency} from 'getsentry/utils/formatCurrency';
+import {getCountryByCode} from 'getsentry/utils/ISO3166codes';
+import {titleCase} from 'getsentry/utils/titleCase';
+
+type CustomerUpdateAction = (data: Record<string, unknown>) => Promise<unknown>;
+
+type SubscriptionSummaryProps = {
+  customer: Subscription;
+  onAction: CustomerUpdateAction;
+};
+
+function SoftCapTypeDetail({
+  categories,
+  plan,
+}: {
+  categories: Subscription['categories'];
+  plan: Plan;
+}) {
+  if (!categories) {
+    return <span>None</span>;
+  }
+  const shouldUseDsNames = plan.categories.includes(DataCategory.SPANS_INDEXED);
+  const softCapTypes = sortCategories(categories)
+    .map(categoryHistory => {
+      const softCapName = categoryHistory.softCapType
+        ? titleCase(categoryHistory.softCapType.replace(/_/g, ' '))
+        : null;
+      if (softCapName) {
+        return (
+          <Fragment key={`test-soft-cap-type-${categoryHistory.category}`}>
+            <small>
+              {`${getPlanCategoryName({
+                plan,
+                category: categoryHistory.category,
+                hadCustomDynamicSampling: shouldUseDsNames,
+              })}: `}
+              {softCapName}
+            </small>
+            <br />
+          </Fragment>
+        );
+      }
+      return null;
+    })
+    .filter(Boolean);
+  return <Fragment>{softCapTypes.length ? softCapTypes : <span>None</span>}</Fragment>;
+}
+
+function SubscriptionSummary({customer, onAction}: SubscriptionSummaryProps) {
+  return (
+    <div>
+      <DescriptionList gap="md">
+        <DetailLabel title="Balance">
+          {formatBalance(customer.accountBalance)}
+          {customer.type === BillingType.INVOICED && (
+            <Fragment>
+              <br />
+              <small>
+                Note: this is an invoiced account, please send any questions about this
+                balance to <a href="mailto:salesops@sentry.io">salesops@sentry.io</a>
+              </small>
+            </Fragment>
+          )}
+        </DetailLabel>
+        <DetailLabel title="Billing Period">
+          {`${moment(customer.billingPeriodStart).format('ll')} › ${moment(
+            customer.billingPeriodEnd
+          ).format('ll')}`}
+          <br />
+          <small>{customer.billingInterval}</small>
+        </DetailLabel>
+        {customer.billingPeriodStart && (
+          <DetailLabel title="Contract Period">
+            {`${moment(customer.billingPeriodStart).format('ll')} › `}
+            {(customer.billingInterval === 'annual' &&
+              customer.type === BillingType.INVOICED && (
+                <ChangeContractEndDateAction
+                  contractPeriodEnd={customer.billingPeriodEnd}
+                  onAction={onAction}
+                />
+              )) ||
+              moment(customer.billingPeriodEnd).format('ll')}
+
+            <br />
+            <small>{customer.billingInterval}</small>
+          </DetailLabel>
+        )}
+        {/* TODO(billing): Should we start calling On-Demand periods "Pay-as-you-go" periods? */}
+        <DetailLabel title="On-Demand">
+          <OnDemandSummary customer={customer} />
+        </DetailLabel>
+        <DetailLabel title="Can Trial" yesNo={customer.canTrial} />
+        <DetailLabel title="Soft Cap By Category">
+          <SoftCapTypeDetail
+            categories={customer.categories}
+            plan={customer.planDetails}
+          />
+        </DetailLabel>
+        {defined(customer.msaUpdatedForDataConsent) && (
+          <DetailLabel
+            title="MSA Updated for Data Consent"
+            yesNo={customer.msaUpdatedForDataConsent}
+          />
+        )}
+      </DescriptionList>
+    </div>
+  );
+}
+
+type ReservedDataProps = {
+  customer: Subscription;
+};
+
+function ReservedData({customer}: ReservedDataProps) {
+  const reservedBudgetMetricHistories: Record<string, ReservedBudgetMetricHistory> = {};
+  customer.reservedBudgets?.forEach(budget => {
+    Object.entries(budget.categories).forEach(([category, history]) => {
+      reservedBudgetMetricHistories[category] = history;
+    });
+  });
+
+  return (
+    <Fragment>
+      {sortCategories(customer.categories).map(categoryHistory => {
+        const category = categoryHistory.category;
+        const categoryName = getPlanCategoryName({
+          plan: customer.planDetails,
+          category: categoryHistory.category,
+          hadCustomDynamicSampling:
+            category === DataCategory.SPANS &&
+            DataCategory.SPANS_INDEXED in customer.categories,
+        });
+        return (
+          <Fragment key={category}>
+            <DetailsHeading>{categoryName}</DetailsHeading>
+            <DescriptionList gap="md">
+              <DetailLabel title={`Reserved ${categoryName}`}>
+                {formatReservedWithUnits(categoryHistory.reserved, category)}
+              </DetailLabel>
+              {reservedBudgetMetricHistories[category] && (
+                <Fragment>
+                  <DetailLabel title={`Reserved Cost-Per-Event ${categoryName}`}>
+                    {displayPriceWithCents({
+                      cents: reservedBudgetMetricHistories[category].reservedCpe,
+                      minimumFractionDigits: 8,
+                      maximumFractionDigits: 8,
+                    })}
+                  </DetailLabel>
+                  <DetailLabel title={`Reserved Spend ${categoryName}`}>
+                    {displayPriceWithCents({
+                      cents: reservedBudgetMetricHistories[category].reservedSpend,
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </DetailLabel>
+                </Fragment>
+              )}
+              <DetailLabel title={`Custom Price ${categoryName}`}>
+                {typeof categoryHistory.customPrice === 'number'
+                  ? displayPriceWithCents({cents: categoryHistory.customPrice})
+                  : 'None'}
+              </DetailLabel>
+              {customer.onDemandInvoicedManual && (
+                <DetailLabel
+                  title={`${displayBudgetName(customer.planDetails, {title: true})} Cost-Per-Event ${categoryName}`}
+                >
+                  {typeof categoryHistory.paygCpe === 'number'
+                    ? displayPriceWithCents({
+                        cents: categoryHistory.paygCpe,
+                        minimumFractionDigits: 8,
+                        maximumFractionDigits: 8,
+                      })
+                    : 'None'}
+                </DetailLabel>
+              )}
+              {
+                <DetailLabel title={`Gifted ${categoryName}`}>
+                  {formatReservedWithUnits(categoryHistory.free, category, {
+                    isGifted: true,
+                  })}
+                </DetailLabel>
+              }
+            </DescriptionList>
+          </Fragment>
+        );
+      })}
+    </Fragment>
+  );
+}
+
+function ReservedBudgetsData({customer}: ReservedDataProps) {
+  if (!customer.reservedBudgets) {
+    return null;
+  }
+
+  return (
+    <div data-test-id="reserved-budgets-data">
+      {customer.reservedBudgets.map(reservedBudget => {
+        return (
+          <Fragment key={reservedBudget.id}>
+            <ReservedBudgetData customer={customer} reservedBudget={reservedBudget} />
+          </Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+function ReservedBudgetData({
+  customer,
+  reservedBudget,
+}: {
+  customer: Subscription;
+  reservedBudget: ReservedBudget;
+}) {
+  const budgetName = getReservedBudgetDisplayName({
+    reservedBudget,
+    shouldTitleCase: true,
+    plan: customer.planDetails,
+    hadCustomDynamicSampling: customer.hadCustomDynamicSampling,
+  });
+
+  return (
+    <Fragment>
+      <DetailsHeading>{budgetName}</DetailsHeading>
+      <DescriptionList gap="md">
+        <DetailLabel title="Reserved Budget">
+          {displayPriceWithCents({cents: reservedBudget.reservedBudget})}
+        </DetailLabel>
+        <DetailLabel title="Gifted Budget">
+          {displayPriceWithCents({cents: reservedBudget.freeBudget})}
+        </DetailLabel>
+        <DetailLabel title="Total Used">
+          {displayPriceWithCents({cents: reservedBudget.totalReservedSpend})} /{' '}
+          {displayPriceWithCents({
+            cents: reservedBudget.reservedBudget + reservedBudget.freeBudget,
+          })}{' '}
+          ({(reservedBudget.percentUsed * 100).toFixed(2)}%)
+        </DetailLabel>
+      </DescriptionList>
+    </Fragment>
+  );
+}
+
+function seerAddOnStatus(
+  addOn: AddOn | undefined,
+  onTrial: boolean
+): {active: boolean; label: string; variant: 'success' | 'warning' | 'muted'} | null {
+  if (!addOn) {
+    return null;
+  }
+  if (addOn.enabled) {
+    return {label: 'Enabled', variant: 'success', active: true};
+  }
+  if (onTrial) {
+    return {label: 'Trial', variant: 'warning', active: true};
+  }
+  return {
+    label: addOn.isAvailable ? 'Available' : 'Unavailable',
+    variant: 'muted',
+    active: false,
+  };
+}
+
+function SeerPlanSummary({customer}: {customer: Subscription}) {
+  const seerAddOn = customer.addOns?.[AddOnCategory.SEER];
+  const legacySeerAddOn = customer.addOns?.[AddOnCategory.LEGACY_SEER];
+  const trials = customer.productTrials ?? null;
+
+  const onSeatTrial = !!getActiveProductTrial(trials, DataCategory.SEER_USER);
+  const onLegacyTrial = !!getActiveProductTrial(trials, DataCategory.SEER_AUTOFIX);
+  const seatStatus = seerAddOnStatus(seerAddOn, onSeatTrial);
+  const legacyStatus = seerAddOnStatus(legacySeerAddOn, onLegacyTrial);
+
+  const seerUsers = normalizeMetricHistory(
+    DataCategory.SEER_USER,
+    customer.categories?.[DataCategory.SEER_USER]
+  );
+  const legacyBudget = customer.reservedBudgets?.find(
+    budget => budget.apiName === ReservedBudgetCategoryType.SEER
+  );
+
+  return (
+    <div data-test-id="seer-plan-summary">
+      <DetailsHeading>Seer</DetailsHeading>
+      <DescriptionList gap="md">
+        {!seatStatus && !legacyStatus && (
+          <DetailLabel title="Plan">
+            <Tag variant="muted">
+              {customer.planDetails?.name
+                ? `Not available on the ${customer.planDetails.name} plan`
+                : 'Not available on this plan'}
+            </Tag>
+          </DetailLabel>
+        )}
+        {seatStatus && (
+          <Fragment>
+            <DetailLabel title="Seat-based">
+              <Tag variant={seatStatus.variant}>{seatStatus.label}</Tag>
+            </DetailLabel>
+            {seatStatus.active && (
+              <Fragment>
+                <DetailLabel title="Reserved Seats">
+                  {formatReservedWithUnits(seerUsers.reserved, DataCategory.SEER_USER)}
+                </DetailLabel>
+                <DetailLabel title="Active Contributors (billed this period)">
+                  {seerUsers.usage.toLocaleString()}
+                </DetailLabel>
+                <DetailLabel title="Gifted Seats">
+                  {formatReservedWithUnits(seerUsers.free, DataCategory.SEER_USER, {
+                    isGifted: true,
+                  })}
+                </DetailLabel>
+                {typeof seerUsers.customPrice === 'number' && (
+                  <DetailLabel title="Custom Price">
+                    {displayPriceWithCents({cents: seerUsers.customPrice})}
+                  </DetailLabel>
+                )}
+              </Fragment>
+            )}
+          </Fragment>
+        )}
+        {legacyStatus && (
+          <Fragment>
+            <DetailLabel title="Legacy (budget)">
+              <Tag variant={legacyStatus.variant}>{legacyStatus.label}</Tag>
+            </DetailLabel>
+            {legacyStatus.active &&
+              (legacyBudget ? (
+                <Fragment>
+                  <DetailLabel title="Reserved Budget">
+                    {displayPriceWithCents({cents: legacyBudget.reservedBudget})}
+                  </DetailLabel>
+                  <DetailLabel title="Budget Used">
+                    {displayPriceWithCents({cents: legacyBudget.totalReservedSpend})} /{' '}
+                    {displayPriceWithCents({
+                      cents: legacyBudget.reservedBudget + legacyBudget.freeBudget,
+                    })}{' '}
+                    ({(legacyBudget.percentUsed * 100).toFixed(2)}%)
+                  </DetailLabel>
+                </Fragment>
+              ) : legacySeerAddOn?.enabled ? (
+                <DetailLabel title="Budget">
+                  <Tag variant="danger">Enabled but no budget data found</Tag>
+                </DetailLabel>
+              ) : null)}
+          </Fragment>
+        )}
+      </DescriptionList>
+    </div>
+  );
+}
+
+type OnDemandSummaryProps = {
+  customer: Subscription;
+};
+
+function OnDemandSummary({customer}: OnDemandSummaryProps) {
+  const onDemandPeriod = `${moment(customer.onDemandPeriodStart).format('ll')} › ${moment(
+    customer.onDemandPeriodEnd
+  ).format('ll')}`;
+
+  if (
+    customer.supportsOnDemand &&
+    (customer.onDemandMaxSpend || customer.onDemandSpendUsed)
+  ) {
+    const {onDemandBudgets} = customer;
+
+    if (onDemandBudgets?.budgetMode === OnDemandBudgetMode.PER_CATEGORY) {
+      return (
+        <Fragment>
+          {onDemandPeriod}
+          <br />
+          <small>
+            <em>Per-category budget strategy</em>
+          </small>
+          <br />
+          {customer.planDetails.onDemandCategories.map(category => {
+            return (
+              <Fragment key={`test-ondemand-${category}`}>
+                <small>
+                  {`${getPlanCategoryName({
+                    plan: customer.planDetails,
+                    category,
+                  })}: `}
+                  {`${displayPriceWithCents({
+                    cents: onDemandBudgets.usedSpends[category] ?? 0,
+                  })} / ${displayPriceWithCents({
+                    cents: onDemandBudgets.budgets[category] ?? 0,
+                  })}`}
+                </small>
+                <br />
+              </Fragment>
+            );
+          })}
+
+          <small>
+            Total:{' '}
+            {customer.onDemandMaxSpend > 0
+              ? `${displayPriceWithCents({
+                  cents: customer.onDemandSpendUsed,
+                })} / ${displayPriceWithCents({cents: customer.onDemandMaxSpend})}`
+              : displayPriceWithCents({cents: customer.onDemandSpendUsed})}
+          </small>
+        </Fragment>
+      );
+    }
+
+    return (
+      <Fragment>
+        {onDemandPeriod}
+        <br />
+        <small>
+          <em>Shared budget strategy</em>
+        </small>
+        <br />
+        <small>
+          Total:{' '}
+          {customer.onDemandMaxSpend > 0
+            ? `${displayPriceWithCents({
+                cents: customer.onDemandSpendUsed,
+              })} / ${displayPriceWithCents({cents: customer.onDemandMaxSpend})}`
+            : displayPriceWithCents({cents: customer.onDemandSpendUsed})}
+        </small>
+      </Fragment>
+    );
+  }
+
+  return (
+    <Fragment>
+      {onDemandPeriod}
+      <br />
+      <small>
+        <em>Disabled</em>
+      </small>
+    </Fragment>
+  );
+}
+
+type Props = {
+  customer: Subscription;
+  onAction: CustomerUpdateAction;
+  organization: Organization;
+};
+
+function isWithinAcceptedMargin(
+  effectiveSampleRate: number,
+  desiredSampleRate: number
+): boolean {
+  const difference = Math.abs(effectiveSampleRate - desiredSampleRate);
+  return difference >= 0 && difference <= desiredSampleRate * 0.1;
+}
+
+const formatRate = (rate: number) => `${rate.toFixed(2)}%`;
+
+const SAMPLE_RATE_LABEL = 'Sample Rate (24h)';
+
+function SampleRateRow({
+  rate,
+  desiredSampleRate,
+}: {
+  desiredSampleRate: number | null;
+  rate: number | null;
+}) {
+  if (!defined(rate)) {
+    return (
+      <ThresholdLabel label={SAMPLE_RATE_LABEL} positive={false}>
+        n/a
+      </ThresholdLabel>
+    );
+  }
+
+  const effectiveSampleRate = rate * 100;
+
+  const getSampleRateValue = (): string => {
+    if (effectiveSampleRate && desiredSampleRate) {
+      // When rates match, show just the rate instead of "X% instead of X% (~0%)"
+      if (formatRate(effectiveSampleRate) === formatRate(desiredSampleRate)) {
+        return formatRate(effectiveSampleRate);
+      }
+      const diffSampleRate = Math.abs(effectiveSampleRate - desiredSampleRate);
+      return `${formatRate(effectiveSampleRate)} instead of ${formatRate(desiredSampleRate)} (~${formatRate(diffSampleRate)})`;
+    }
+    if (desiredSampleRate) {
+      return formatRate(desiredSampleRate);
+    }
+    return 'n/a';
+  };
+
+  return (
+    <ThresholdLabel
+      label={SAMPLE_RATE_LABEL}
+      positive={
+        effectiveSampleRate && desiredSampleRate
+          ? isWithinAcceptedMargin(effectiveSampleRate, desiredSampleRate)
+          : false
+      }
+    >
+      {getSampleRateValue()}
+    </ThresholdLabel>
+  );
+}
+
+function DynamicSampling({organization}: {organization: Organization}) {
+  const dynamicSamplingEnabled = organization.features?.includes('dynamic-sampling');
+
+  const {data, isPending, isError} = useApiQuery<{
+    eapEffectiveSampleRate: number | null;
+  }>(
+    [
+      getApiUrl('/organizations/$organizationIdOrSlug/sampling/effective-sample-rate/', {
+        path: {organizationIdOrSlug: organization.slug},
+      }),
+    ],
+    {
+      staleTime: Infinity,
+      enabled: dynamicSamplingEnabled,
+    }
+  );
+
+  if (!dynamicSamplingEnabled) {
+    return (
+      <ThresholdLabel label={SAMPLE_RATE_LABEL} positive={false}>
+        Disabled
+      </ThresholdLabel>
+    );
+  }
+  if (isError) {
+    return (
+      <ThresholdLabel label={SAMPLE_RATE_LABEL} positive={false}>
+        Error loading data
+      </ThresholdLabel>
+    );
+  }
+  if (isPending) {
+    return (
+      <ThresholdLabel label={SAMPLE_RATE_LABEL} positive={false}>
+        Loading...
+      </ThresholdLabel>
+    );
+  }
+
+  const desiredSampleRate = organization.desiredSampleRate
+    ? organization.desiredSampleRate * 100
+    : null;
+
+  return (
+    <SampleRateRow
+      rate={data.eapEffectiveSampleRate}
+      desiredSampleRate={desiredSampleRate}
+    />
+  );
+}
+
+function TrialManagementActions({
+  category,
+  apiName,
+  customer,
+  onAction,
+  trialName,
+  isAdminOnly = false,
+}: {
+  apiName: string;
+  category: DataCategory;
+  customer: Subscription;
+  onAction: (data: Record<string, unknown>) => void;
+  trialName: string;
+  isAdminOnly?: boolean;
+}) {
+  const formattedApiName = upperFirst(apiName);
+  const formattedTrialName = toTitleCase(trialName, {allowInnerUpperCase: true});
+  const activeProductTrial = getActiveProductTrial(
+    customer.productTrials ?? [],
+    category
+  );
+  const hasActiveProductTrial = !!activeProductTrial;
+  // NOTE: we add 1 day to the end date because the trial end date is inclusive
+  // and diff() can't return a value less than 0
+  const lessThanOneDayLeft =
+    moment(activeProductTrial?.endDate).add(1, 'day').diff(moment(), 'days') < 1;
+  const hasUsedProductTrial =
+    hasActiveProductTrial ||
+    getProductTrial(customer.productTrials ?? [], category)?.isStarted;
+  const isEnterprisePlan = !!customer.planDetails?.isEnterprise;
+  // Every Seer product trial (whether triggered via a plan category or the
+  // Seer/Legacy Seer add-on) resolves to one of these billed categories, so a
+  // single category check covers both entry points.
+  const isSeerProductTrial = [
+    DataCategory.SEER_USER,
+    DataCategory.SEER_AUTOFIX,
+    DataCategory.SEER_SCANNER,
+  ].includes(category);
+  // Enterprise plans: only Seer product trials can be started from _admin.
+  // Allow Trial and Stop/Extend stay available for any in-flight non-Seer trial.
+  const blockEnterpriseNonSeerStart = isEnterprisePlan && !isSeerProductTrial;
+  const enterpriseNonSeerStartTooltip =
+    'Starting a trial for this product is disabled for enterprise plans. Use gifts as needed to add reserved volume.';
+
+  const handleExtendTrial = () => {
+    if (!activeProductTrial) {
+      return;
+    }
+    openAdminConfirmModal({
+      header: <h4>Extend {formattedTrialName} Trial</h4>,
+      confirmText: 'Extend Trial',
+      renderModalSpecificContent: deps => (
+        <ExtendProductTrialAction
+          activeProductTrial={activeProductTrial}
+          apiName={apiName}
+          trialName={formattedTrialName}
+          {...deps}
+        />
+      ),
+      onConfirm: onAction,
+    });
+  };
+
+  return (
+    <DetailLabel key={apiName} title={formattedTrialName}>
+      <Stack gap="md" align="start">
+        <Tag
+          variant={
+            lessThanOneDayLeft
+              ? 'promotion'
+              : hasActiveProductTrial
+                ? 'success'
+                : hasUsedProductTrial
+                  ? 'warning'
+                  : 'info'
+          }
+        >
+          {hasActiveProductTrial
+            ? `Active (until ${moment.utc(activeProductTrial.endDate).format('MMM D, YYYY')} UTC)`
+            : hasUsedProductTrial
+              ? 'Used'
+              : 'Available'}
+        </Tag>
+        <Flex align="center" wrap="wrap" gap="md">
+          <Button
+            size="xs"
+            onClick={() => onAction({[`allowTrial${formattedApiName}`]: true})}
+            disabled={!hasUsedProductTrial || hasActiveProductTrial}
+            tooltipProps={{
+              title: hasActiveProductTrial
+                ? `A product trial is currently active for ${formattedTrialName}`
+                : hasUsedProductTrial
+                  ? isAdminOnly
+                    ? `Reset trial eligibility for ${formattedTrialName}`
+                    : `Allow customer to start a new trial for ${formattedTrialName}`
+                  : `A product trial is already available for ${formattedTrialName}`,
+            }}
+          >
+            Allow Trial
+          </Button>
+          <Button
+            size="xs"
+            onClick={() => onAction({[`startTrial${formattedApiName}`]: true})}
+            disabled={
+              blockEnterpriseNonSeerStart || hasActiveProductTrial || hasUsedProductTrial
+            }
+            tooltipProps={{
+              title: blockEnterpriseNonSeerStart
+                ? enterpriseNonSeerStartTooltip
+                : hasActiveProductTrial
+                  ? `A product trial is currently active for ${formattedTrialName}`
+                  : hasUsedProductTrial
+                    ? `No product trial is available for ${formattedTrialName}`
+                    : `Start the 14-day ${formattedTrialName} product trial`,
+            }}
+          >
+            Start Trial
+          </Button>
+          <Button
+            size="xs"
+            onClick={() => onAction({[`stopTrial${formattedApiName}`]: true})}
+            disabled={!hasActiveProductTrial || lessThanOneDayLeft}
+            tooltipProps={{
+              title: lessThanOneDayLeft
+                ? 'Current product trial will end in less than one day'
+                : hasActiveProductTrial
+                  ? `Stop the current product trial for ${formattedTrialName}`
+                  : `No product trial is active for ${formattedTrialName}`,
+            }}
+          >
+            Stop Trial
+          </Button>
+          <Button
+            size="xs"
+            onClick={handleExtendTrial}
+            disabled={!hasActiveProductTrial}
+            tooltipProps={{
+              title: hasActiveProductTrial
+                ? `Extend the current ${formattedTrialName} product trial`
+                : `No active product trial to extend for ${formattedTrialName}`,
+            }}
+          >
+            Extend Trial
+          </Button>
+        </Flex>
+      </Stack>
+    </DetailLabel>
+  );
+}
+
+export function CustomerOverview({customer, onAction, organization}: Props) {
+  const runAction = (data: Record<string, unknown>) => {
+    onAction(data).catch(() => {
+      // The mutation's onError callback surfaces the failure to the user.
+    });
+  };
+
+  let orgUrl = `/organizations/${organization.slug}/issues/`;
+  const configFeatures = ConfigStore.get('features');
+  if (configFeatures.has('system:multi-region')) {
+    orgUrl = `${organization.links.organizationUrl}/issues/`;
+  }
+
+  const localityMap = getLocalities().reduce<Record<string, string>>((acc, locality) => {
+    acc[locality.url] = locality.name;
+    return acc;
+  }, {});
+  // TODO(cells) We also should show the customer's cell.
+  const locality = localityMap[organization.links.regionUrl] ?? '??';
+
+  const productTrialCategories = Object.values(BILLED_DATA_CATEGORY_INFO).filter(
+    categoryInfo => {
+      // Category must be in the plan's categories
+      if (!customer.planDetails?.categories.includes(categoryInfo.plural)) {
+        return false;
+      }
+      // Include if regular product trial is enabled
+      if (categoryInfo.canProductTrial) {
+        return true;
+      }
+      // Include admin-only product trials if graduated (true) or feature flag is enabled
+      if (categoryInfo.adminOnlyProductTrialFeature === true) {
+        // Graduated flag - always include without feature flag check
+        return true;
+      }
+      if (
+        typeof categoryInfo.adminOnlyProductTrialFeature === 'string' &&
+        organization.features?.includes(categoryInfo.adminOnlyProductTrialFeature)
+      ) {
+        return true;
+      }
+      return false;
+    }
+  );
+
+  const productTrialAddOns = Object.values(customer.addOns || {}).filter(
+    // TODO(billing): Right now all our add-ons can use product trials, but in future we should distinguish this
+    // like we do for other product types
+    addOn => addOn.isAvailable
+  );
+
+  const updateCustomerStatus = (action: string) => {
+    const data = {
+      [action]: true,
+    };
+
+    runAction(data);
+  };
+
+  return (
+    <DetailsContainer>
+      <div>
+        <DescriptionList gap="md">
+          <DetailLabel title="Status">
+            <CustomerStatus customer={customer} />
+            {isTrial(customer) && (
+              <div>
+                <small>
+                  <strong>{moment(customer.trialEnd).fromNow(true)} remaining</strong>{' '}
+                  (ends on {moment(customer.trialEnd).format('MMMM Do YYYY')})
+                </small>
+              </div>
+            )}
+          </DetailLabel>
+          <DetailLabel title="Members">
+            {customer.totalMembers?.toLocaleString()}
+          </DetailLabel>
+          <DetailLabel title="Projects">
+            {customer.totalProjects?.toLocaleString()} / {UNLIMITED}{' '}
+          </DetailLabel>
+          <DetailLabel title="ARR">
+            {formatCurrency(customer.acv ?? 0)}
+            {customer.type === 'invoiced' && customer.billingInterval === 'annual' && (
+              <span>
+                {' | '}
+                <ChangeARRAction customer={customer} onAction={runAction} />
+              </span>
+            )}
+          </DetailLabel>
+        </DescriptionList>
+
+        <DetailsHeading>Subscription</DetailsHeading>
+        <SubscriptionSummary customer={customer} onAction={onAction} />
+        <ReservedData customer={customer} />
+        <ReservedBudgetsData customer={customer} />
+        <DetailsHeading>PCSS</DetailsHeading>
+        <DescriptionList gap="md">
+          <DetailLabel title="Custom Price PCSS">
+            {typeof customer.customPricePcss === 'number'
+              ? displayPriceWithCents({cents: customer.customPricePcss})
+              : 'None'}
+          </DetailLabel>
+        </DescriptionList>
+        <DetailsHeading>Total</DetailsHeading>
+        <DescriptionList gap="md">
+          <DetailLabel title="Custom Price (Total)">
+            {typeof customer.customPrice === 'number'
+              ? displayPriceWithCents({cents: customer.customPrice})
+              : 'None'}
+          </DetailLabel>
+        </DescriptionList>
+      </div>
+      <div>
+        <DescriptionList gap="md">
+          <DetailLabel title="Short name">
+            <ExternalLink href={orgUrl}>{customer.slug}</ExternalLink>
+          </DetailLabel>
+          <DetailLabel title="Internal ID">{customer.id}</DetailLabel>
+          <DetailLabel title="Data Storage Location">{locality}</DetailLabel>
+          <DetailLabel title="Data Retention">
+            {customer.orgRetention?.standard ??
+              customer.categories?.errors?.retention?.standard ??
+              90}
+            {' days'}
+          </DetailLabel>
+          <DetailLabel title="Joined">
+            {moment(customer.dateJoined).fromNow()}
+          </DetailLabel>
+          <DetailLabel title="Contact">
+            {customer.owner ? <CustomerContact owner={customer.owner} /> : 'n/a'}{' '}
+          </DetailLabel>
+          <DetailLabel title="Type">{customer.type || 'n/a'}</DetailLabel>
+          <DetailLabel title="Managed" yesNo={customer.isManaged} />
+          <DetailLabel
+            title="Billing Platform"
+            yesNo={customer.hasMigratedToBillingPlatform}
+          />
+          <DetailLabel title="Channel">{customer.channel || 'n/a'}</DetailLabel>
+          <DetailLabel title="Sponsored Type">
+            {customer.sponsoredType || 'n/a'}
+          </DetailLabel>
+          <DetailLabel title="Billing Country">
+            {customer.countryCode
+              ? (getCountryByCode(customer.countryCode)?.name ?? customer.countryCode)
+              : 'n/a'}
+          </DetailLabel>
+          <DetailLabel title="Payment Source">
+            {customer.paymentSource ? `··· ${customer.paymentSource.last4}` : 'n/a'}{' '}
+          </DetailLabel>
+          <DetailLabel title="Dynamic Sampling Mode">
+            {organization.samplingMode ?? 'n/a'}
+          </DetailLabel>
+          <DynamicSampling organization={organization} />
+        </DescriptionList>
+
+        <DetailsHeading>Linked Accounts</DetailsHeading>
+        <DescriptionList gap="md">
+          <DetailLabel title="Stripe ID">
+            {customer.stripeCustomerID ? (
+              <ExternalLink
+                href={`https://dashboard.stripe.com/customers/${customer.stripeCustomerID}`}
+              >
+                {customer.stripeCustomerID}
+              </ExternalLink>
+            ) : (
+              'n/a'
+            )}
+          </DetailLabel>
+          <DetailLabel
+            title={
+              <InfoText
+                variant="inherit"
+                title="A partner account is managed by a third-party (such as Heroku)."
+              >
+                <abbr>Partner</abbr>
+              </InfoText>
+            }
+          >
+            {customer.partner ? (
+              <Fragment>
+                {customer.partner.partnership.displayName}{' '}
+                {customer.partner.isActive ? (
+                  <Fragment>
+                    (active)
+                    <br />
+                    <Button
+                      variant="link"
+                      onClick={() => updateCustomerStatus('deactivatePartnerAccount')}
+                    >
+                      Deactivate Partner
+                    </Button>
+                  </Fragment>
+                ) : (
+                  <Fragment>
+                    (migrated)
+                    {customer.isPartner && customer.isManaged && (
+                      <Fragment>
+                        <br />
+                        <Button
+                          variant="link"
+                          onClick={() => updateCustomerStatus('deactivatePartnerAccount')}
+                        >
+                          Reset partner billing to self-serve
+                        </Button>
+                      </Fragment>
+                    )}
+                  </Fragment>
+                )}
+                <br />
+                <small>ID: {customer.partner.externalId}</small>
+                {customer.partner.partnership.id === 'HK' && (
+                  <span>
+                    <br />
+                    <small>Heroku ID: {customer.partner.name}</small>
+                  </span>
+                )}
+              </Fragment>
+            ) : (
+              'n/a'
+            )}
+          </DetailLabel>
+          <DetailLabel title="SFDC Account">
+            <ExternalLink
+              href={`https://getsentry.lightning.force.com/apex/redirectToAccountPage?organizationId=${customer.id}`}
+            >
+              {customer.id}
+            </ExternalLink>
+          </DetailLabel>
+        </DescriptionList>
+
+        <DetailsHeading>Queries</DetailsHeading>
+        <DescriptionList gap="md">
+          <DetailLabel title="Looker">
+            <ExternalLink
+              href={`https://sentryio.cloud.looker.com/dashboards/724?Organization%20ID=${customer.id}`}
+            >
+              Single Org Details Dashboard
+            </ExternalLink>
+          </DetailLabel>
+          <DetailLabel title="Google Cloud Logging">
+            <ExternalLink href={getLogQuery('api', {organizationId: customer.id})}>
+              API Logs
+            </ExternalLink>
+            {' | '}
+            <ExternalLink href={getLogQuery('audit', {organizationId: customer.id})}>
+              Audit
+            </ExternalLink>
+            {' | '}
+            <ExternalLink href={getLogQuery('email', {organizationId: customer.id})}>
+              Emails
+            </ExternalLink>
+            {' | '}
+            <ExternalLink href={getLogQuery('billing', {organizationId: customer.id})}>
+              Billing
+            </ExternalLink>
+            {' | '}
+            <ExternalLink href={getLogQuery('auth', {organizationId: customer.id})}>
+              Auth
+            </ExternalLink>
+          </DetailLabel>
+        </DescriptionList>
+        {productTrialCategories.length + productTrialAddOns.length > 0 && (
+          <Fragment>
+            <DetailsHeading>Product Trials</DetailsHeading>
+            <DescriptionList gap="md" role="group" aria-label="Product Trials">
+              {productTrialCategories.map(categoryInfo => {
+                const categoryName = getPlanCategoryName({
+                  plan: customer.planDetails,
+                  category: categoryInfo.plural,
+                  title: true,
+                });
+                return (
+                  <TrialManagementActions
+                    key={categoryInfo.plural}
+                    category={categoryInfo.plural}
+                    apiName={categoryInfo.plural}
+                    customer={customer}
+                    onAction={runAction}
+                    trialName={categoryName}
+                    isAdminOnly={!!categoryInfo.adminOnlyProductTrialFeature}
+                  />
+                );
+              })}
+              {productTrialAddOns.map(addOn => {
+                const category = getBilledCategory(customer, addOn.apiName);
+                if (category) {
+                  return (
+                    <TrialManagementActions
+                      key={addOn.apiName}
+                      category={category}
+                      apiName={addOn.apiName}
+                      customer={customer}
+                      onAction={runAction}
+                      trialName={
+                        addOn.apiName === AddOnCategory.LEGACY_SEER
+                          ? addOn.productName + ' (Legacy)'
+                          : addOn.productName
+                      }
+                    />
+                  );
+                }
+                return null;
+              })}
+            </DescriptionList>
+          </Fragment>
+        )}
+        <Fragment>
+          <DetailsHeading>Retention Settings</DetailsHeading>
+          <table style={{borderSpacing: '15px', borderCollapse: 'separate'}}>
+            <thead>
+              <tr>
+                <th>Category</th>
+                <th>Standard</th>
+                <th>
+                  <InfoText
+                    variant="inherit"
+                    title="Null means use the Downsample default"
+                  >
+                    Downsampled
+                  </InfoText>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortCategories(customer.categories || {})
+                .filter(bmh => RETENTION_SETTINGS_CATEGORIES.has(bmh.category))
+                .map(bmh => (
+                  <tr key={bmh.category}>
+                    <td>
+                      {getPlanCategoryName({
+                        plan: customer.planDetails,
+                        category: bmh.category,
+                      })}
+                    </td>
+                    <td>
+                      {bmh.retention?.standard === null
+                        ? 'null'
+                        : bmh.retention?.standard}
+                    </td>
+                    <td>
+                      {bmh.retention?.downsampled === null
+                        ? 'null'
+                        : bmh.retention?.downsampled}
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </Fragment>
+        <SeerPlanSummary customer={customer} />
+      </div>
+    </DetailsContainer>
+  );
+}
+
+type ThresholdLabelProps = {
+  children: React.ReactNode;
+  label: string;
+  positive: boolean;
+};
+
+function ThresholdLabel({label, positive, children}: ThresholdLabelProps) {
+  return (
+    <Fragment>
+      <DescriptionList.Term>{label}</DescriptionList.Term>
+      <ThresholdValue positive={positive}>{children}</ThresholdValue>
+    </Fragment>
+  );
+}
+
+const ThresholdValue = styled(DescriptionList.Details)<{positive: boolean}>`
+  color: ${p => (p.positive ? p.theme.colors.green500 : p.theme.colors.red500)};
+`;

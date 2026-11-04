@@ -1,0 +1,190 @@
+import {OrganizationFixture} from 'sentry-fixture/organization';
+import {PageFiltersFixture} from 'sentry-fixture/pageFilters';
+import {ProjectFixture} from 'sentry-fixture/project';
+
+import {
+  render,
+  screen,
+  waitFor,
+  waitForElementToBeRemoved,
+} from 'sentry-test/reactTestingLibrary';
+import {textWithMarkupMatcher} from 'sentry-test/utils';
+
+import {PageFiltersStore} from 'sentry/components/pageFilters/store';
+import {DatabaseSpanDescription} from 'sentry/views/insights/common/components/spanDescription';
+
+describe('DatabaseSpanDescription', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    PageFiltersStore.onInitializeUrlState(PageFiltersFixture());
+  });
+
+  afterEach(() => {
+    PageFiltersStore.reset();
+  });
+
+  const organization = OrganizationFixture();
+
+  const project = ProjectFixture();
+
+  const spanId = 'abfed2aabf';
+  const eventId = '65c7d8647b8a76ef8f4c05d41deb7860';
+
+  it('shows preliminary description if no more data is available', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: [],
+    });
+
+    render(
+      <DatabaseSpanDescription
+        spanId={spanId}
+        preliminaryDescription="SELECT USERS FRO*"
+      />,
+      {organization}
+    );
+
+    await waitForElementToBeRemoved(() => screen.queryByTestId('loading-indicator'));
+
+    expect(screen.getByText('SELECT USERS FRO*')).toBeInTheDocument();
+  });
+
+  it('removes isExpanded from the URL without adding a history entry when mounted', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: {data: []},
+    });
+
+    const {router} = render(
+      <DatabaseSpanDescription spanId={spanId} preliminaryDescription="SELECT 1" />,
+      {
+        organization,
+        initialRouterConfig: {
+          location: {
+            pathname: '/insights/backend/database/',
+            query: {isExpanded: 'true'},
+          },
+        },
+      }
+    );
+
+    await waitFor(() => expect(router.location.query.isExpanded).toBeUndefined());
+    expect(router.historyAction).toBe('REPLACE');
+  });
+
+  it('does not look up a span without an id', () => {
+    const request = MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: {data: []},
+    });
+
+    render(
+      <DatabaseSpanDescription spanId="" preliminaryDescription="SELECT * FROM users" />,
+      {organization}
+    );
+
+    expect(screen.getByText('SELECT * FROM users')).toBeInTheDocument();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('shows full query from indexed span', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: {
+        data: [
+          {
+            'transaction.id': eventId,
+            project: project.slug,
+            span_id: spanId,
+            'span.description': 'SELECT users FROM my_table LIMIT 1;',
+          },
+        ],
+      },
+    });
+
+    render(
+      <DatabaseSpanDescription
+        spanId={spanId}
+        preliminaryDescription="SELECT USERS FRO*"
+      />,
+      {organization}
+    );
+
+    await waitForElementToBeRemoved(() => screen.queryByTestId('loading-indicator'));
+
+    expect(
+      await screen.findByText('SELECT users FROM my_table LIMIT 1;')
+    ).toBeInTheDocument();
+  });
+
+  it('shows query source if available', async () => {
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: {
+        data: [
+          {
+            'transaction.id': eventId,
+            project: project.slug,
+            span_id: spanId,
+            'code.filepath': '/app/views/users.py',
+            'code.lineno': 78,
+            'span.description': 'SELECT users FROM my_table LIMIT 1;',
+          },
+        ],
+      },
+    });
+
+    render(
+      <DatabaseSpanDescription
+        spanId={spanId}
+        preliminaryDescription="SELECT USERS FRO*"
+      />,
+      {organization}
+    );
+
+    await waitForElementToBeRemoved(() => screen.queryByTestId('loading-indicator'));
+
+    expect(
+      await screen.findByText('SELECT users FROM my_table LIMIT 1;')
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(textWithMarkupMatcher('/app/views/users.py at line 78'))
+    ).toBeInTheDocument();
+  });
+
+  it('correctly formats and displays MongoDB queries', async () => {
+    const sampleMongoDBQuery = '{"a": "?", "insert": "documents"}';
+
+    MockApiClient.addMockResponse({
+      url: `/organizations/${organization.slug}/events/`,
+      body: {
+        data: [
+          {
+            'transaction.span_id': eventId,
+            project: project.slug,
+            span_id: spanId,
+            'span.description': sampleMongoDBQuery,
+            'db.system.name': 'mongodb',
+          },
+        ],
+      },
+    });
+
+    render(
+      <DatabaseSpanDescription
+        spanId={spanId}
+        preliminaryDescription={sampleMongoDBQuery}
+      />,
+      {organization}
+    );
+
+    await waitForElementToBeRemoved(() => screen.queryByTestId('loading-indicator'));
+
+    // expect(await screen.findBy).toBeInTheDocument();
+    const mongoQuerySnippet = await screen.findByText(
+      /\{ "a": "\?", "insert": "documents" \}/i
+    );
+    expect(mongoQuerySnippet).toBeInTheDocument();
+    expect(mongoQuerySnippet).toHaveClass('language-json');
+  });
+});

@@ -3,7 +3,7 @@ import pytest
 from sentry.utils.datastructures import BidirectionalMapping
 
 
-def test_bidirectional_mapping():
+def test_bidirectional_mapping() -> None:
     value = BidirectionalMapping({"a": 1, "b": 2})
 
     assert value["a"] == 1
@@ -23,7 +23,7 @@ def test_bidirectional_mapping():
         value.get_key(4)
 
     with pytest.raises(TypeError):
-        value["d"] = [1, 2, 3]  # not hashable
+        value["d"] = [1, 2, 3]  # type: ignore[assignment]  # not hashable
 
     assert len(value) == len(value.inverse()) == 3
 

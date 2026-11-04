@@ -1,0 +1,20 @@
+---
+source: tests/sentry/event_manager/interfaces/test_contexts.py::test_browser
+---
+errors: null
+tags:
+- - browser
+  - Chrome 132.0.6834.0
+- - browser.name
+  - Chrome
+to_json:
+  browser:
+    browser: Chrome 132.0.6834.0
+    name: Chrome
+    type: browser
+    version: 132.0.6834.0
+  trace:
+    span_id: d718bb6c40be4ac9
+    status: unknown
+    trace_id: d718bb6c40be4ac9a0c55c4df1640130
+    type: trace

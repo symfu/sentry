@@ -1,0 +1,388 @@
+import {Component} from 'react';
+import {useQuery, type UseQueryOptions} from '@tanstack/react-query';
+import type {Location} from 'history';
+
+import type {EventQuery} from 'sentry/actionCreators/events';
+import {Client} from 'sentry/api';
+import {t} from 'sentry/locale';
+import type {ResponseMeta} from 'sentry/types/api';
+import type {
+  EventView,
+  ImmutableEventView,
+  LocationQuery,
+} from 'sentry/utils/discover/eventView';
+import {isAPIPayloadSimilar} from 'sentry/utils/discover/eventView';
+import {useApi} from 'sentry/utils/useApi';
+
+interface DiscoverQueryExtras {
+  useOnDemandMetrics?: boolean;
+}
+
+interface _DiscoverQueryExtras {
+  queryExtras?: DiscoverQueryExtras;
+}
+export class QueryError extends Error {
+  private originalError: any; // For debugging in case parseError picks a value that doesn't make sense.
+  constructor(errorMessage: string, originalError?: any) {
+    super(errorMessage);
+    this.name = 'QueryError';
+    this.originalError = originalError;
+  }
+
+  getOriginalError() {
+    return this.originalError;
+  }
+}
+
+export type GenericChildrenProps<T> = {
+  /**
+   * Error, if not null.
+   */
+  error: null | QueryError;
+  /**
+   * Loading state of this query.
+   */
+  isLoading: boolean;
+  /**
+   * Pagelinks, if applicable. Can be provided to the Pagination component.
+   */
+  pageLinks: null | string;
+  /**
+   * Data / result.
+   */
+  tableData: T | null;
+};
+
+type BaseDiscoverQueryProps = {
+  /**
+   * Used as the default source for cursor values.
+   */
+  location: Location;
+  /**
+   * Explicit cursor value if you aren't using `location.query.cursor` because there are
+   * multiple paginated results on the page.
+   */
+  cursor?: string;
+  /**
+   * Record limit to get.
+   */
+  limit?: number;
+  /**
+   * Include this whenever pagination won't be used. Limit can still be used when this is
+   * passed, but cursor will be ignored.
+   */
+  noPagination?: boolean;
+  options?: Omit<
+    UseQueryOptions<[any, string | undefined, ResponseMeta | undefined], QueryError>,
+    'queryKey' | 'queryFn'
+  > & {additionalQueryKey?: UseQueryOptions['queryKey']};
+  /**
+   * Extra query parameters to be added.
+   */
+  queryExtras?: Record<string, string | string[] | undefined>;
+  /**
+   * Sets referrer parameter in the API Payload. Set of allowed referrers are defined
+   * on the OrganizationDiscoverEndpoint view.
+   */
+  referrer?: string;
+  /**
+   * A callback to set an error so that the error can be rendered in parent components
+   */
+  setError?: (errObject: QueryError | undefined) => void;
+  /**
+   * A flag to skip aborting the request when api.clear() is called, which happens
+   * frequently on component unmounts.
+   */
+  skipAbort?: boolean;
+};
+
+export type DiscoverQueryProps = BaseDiscoverQueryProps & {
+  eventView: EventView | ImmutableEventView;
+  orgSlug: string;
+};
+
+type ReactProps<T> = {
+  children?: (props: GenericChildrenProps<T>) => React.ReactNode;
+};
+
+type ComponentProps<T, P> = {
+  /**
+   * Route to the endpoint
+   */
+  route: string;
+  /**
+   * A hook to modify data into the correct output after data has been received
+   */
+  afterFetch?: (data: any, props?: Props<T, P>) => T;
+  /**
+   * A hook before fetch that can be used to do things like clearing the api
+   */
+  beforeFetch?: (api: Client) => void;
+  /**
+   * A hook for parent orchestrators to pass down data based on query results, unlike afterFetch it is not meant for specializations as it will not modify data.
+   */
+  didFetch?: (data: T) => void;
+  /**
+   * Allows components to modify the payload before it is set.
+   */
+  getRequestPayload?: (props: Props<T, P>) => any;
+  options?: BaseDiscoverQueryProps['options'];
+  /**
+   * An external hook to parse errors in case there are differences for a specific api.
+   */
+  parseError?: (error: any) => QueryError | null;
+  /**
+   * An external hook in addition to the event view check to check if data should be refetched
+   */
+  shouldRefetchData?: (prevProps: Props<T, P>, props: Props<T, P>) => boolean;
+};
+
+type Props<T, P> = DiscoverQueryProps & P & ReactProps<T> & ComponentProps<T, P>;
+
+type State<T> = {
+  api: Client;
+  tableFetchID: symbol | undefined;
+} & GenericChildrenProps<T>;
+
+/**
+ * Generic component for discover queries
+ */
+class _GenericDiscoverQuery<T, P> extends Component<Props<T, P>, State<T>> {
+  state: State<T> = {
+    isLoading: true,
+    tableFetchID: undefined,
+    error: null,
+
+    tableData: null,
+    pageLinks: null,
+    api: new Client(),
+  };
+
+  componentDidMount() {
+    this.fetchData();
+  }
+
+  componentDidUpdate(prevProps: Props<T, P>) {
+    // Reload data if the payload changes
+    const refetchCondition = this._shouldRefetchData(prevProps);
+
+    // or if we've moved from an invalid view state to a valid one,
+    const eventViewValidation =
+      !prevProps.eventView.isValid() && this.props.eventView.isValid();
+
+    const shouldRefetchExternal = this.props.shouldRefetchData
+      ? this.props.shouldRefetchData(prevProps, this.props)
+      : false;
+
+    if (refetchCondition || eventViewValidation || shouldRefetchExternal) {
+      this.fetchData();
+    }
+  }
+
+  _shouldRefetchData = (prevProps: Props<T, P>): boolean => {
+    const thisAPIPayload = getPayload(this.props);
+    const otherAPIPayload = getPayload(prevProps);
+
+    return (
+      !isAPIPayloadSimilar(thisAPIPayload, otherAPIPayload) ||
+      prevProps.limit !== this.props.limit ||
+      prevProps.route !== this.props.route ||
+      prevProps.cursor !== this.props.cursor
+    );
+  };
+
+  /**
+   * The error type isn't consistent across APIs. We see detail as just string some times, other times as an object.
+   */
+  _parseError = (error: any): QueryError | null => {
+    if (this.props.parseError) {
+      return this.props.parseError(error);
+    }
+
+    return parseError(error);
+  };
+
+  fetchData = async () => {
+    const {beforeFetch, afterFetch, didFetch, eventView, orgSlug, route, setError} =
+      this.props;
+    const {api} = this.state;
+
+    if (!eventView.isValid()) {
+      return;
+    }
+
+    const url = `/organizations/${orgSlug}/${route}/`;
+    const tableFetchID = Symbol('tableFetchID');
+    const apiPayload: Partial<EventQuery & LocationQuery> = getPayload(this.props);
+
+    this.setState({isLoading: true, tableFetchID});
+
+    setError?.(undefined);
+
+    beforeFetch?.(api);
+
+    // clear any inflight requests since they are now stale
+    api.clear();
+
+    try {
+      const [data, , resp] = await doDiscoverQuery<T>(api, url, apiPayload);
+
+      if (this.state.tableFetchID !== tableFetchID) {
+        // invariant: a different request was initiated after this request
+        return;
+      }
+
+      const tableData = afterFetch ? afterFetch(data, this.props) : data;
+      didFetch?.(tableData);
+      this.setState(prevState => ({
+        isLoading: false,
+        tableFetchID: undefined,
+        error: null,
+        pageLinks: resp?.getResponseHeader('Link') ?? prevState.pageLinks,
+        tableData,
+      }));
+    } catch (err) {
+      const error = this._parseError(err);
+      this.setState({
+        isLoading: false,
+        tableFetchID: undefined,
+        error,
+        tableData: null,
+      });
+      if (setError) {
+        setError(error ?? undefined);
+      }
+    }
+  };
+
+  render() {
+    const {isLoading, error, tableData, pageLinks} = this.state;
+
+    const childrenProps: GenericChildrenProps<T> = {
+      isLoading,
+      error,
+      tableData,
+      pageLinks,
+    };
+    const children = this.props.children; // Explicitly setting type due to issues with generics and React's children
+    return children?.(childrenProps);
+  }
+}
+
+export function GenericDiscoverQuery<T, P>(props: Props<T, P>) {
+  // TODO(any): HoC prop types not working w/ emotion https://github.com/emotion-js/emotion/issues/3261
+  return <_GenericDiscoverQuery<T, P> {...(props as any)} />;
+}
+
+export type DiscoverQueryRequestParams = Partial<
+  EventQuery & LocationQuery & _DiscoverQueryExtras
+>;
+
+export async function doDiscoverQuery<T>(
+  api: Client,
+  url: string,
+  params: DiscoverQueryRequestParams,
+  options: {
+    skipAbort?: boolean;
+  } = {}
+): Promise<[T, string | undefined, ResponseMeta<T> | undefined]> {
+  const {skipAbort} = options;
+
+  return api.requestPromise(url, {
+    method: 'GET',
+    includeAllArgs: true,
+    query: {
+      // marking params as any so as to not cause typescript errors
+      ...(params as any),
+    },
+    skipAbort,
+  });
+}
+
+function getPayload<T, P>(props: Props<T, P>) {
+  const {cursor, limit, noPagination, referrer, getRequestPayload, eventView, location} =
+    props;
+  const payload = getRequestPayload
+    ? getRequestPayload(props)
+    : eventView.getEventsAPIPayload(location);
+
+  if (cursor !== undefined) {
+    payload.cursor = cursor;
+  }
+  if (limit) {
+    payload.per_page = limit;
+  }
+  if (noPagination) {
+    payload.noPagination = noPagination;
+  }
+  if (referrer) {
+    payload.referrer = referrer;
+  }
+
+  Object.assign(payload, props.queryExtras ?? {});
+
+  return payload;
+}
+
+export function useGenericDiscoverQuery<T, P>(props: Props<T, P>) {
+  const api = useApi();
+  const {orgSlug, route, options} = props;
+  const url = `/organizations/${orgSlug}/${route}/`;
+  const apiPayload = getPayload<T, P>(props);
+  const additionalQueryKey = props.options?.additionalQueryKey ?? [];
+
+  // eslint-disable-next-line @tanstack/query/exhaustive-deps
+  const res = useQuery<[T, string | undefined, ResponseMeta<T> | undefined], QueryError>({
+    queryKey: [...additionalQueryKey, route, apiPayload],
+    queryFn: ({signal: _signal}) =>
+      doDiscoverQuery<T>(api, url, apiPayload, {
+        skipAbort: props.skipAbort,
+      }),
+    ...options,
+  });
+
+  return {
+    // eslint-disable-next-line @tanstack/query/no-rest-destructuring
+    ...res,
+    data: res.data?.[0] ?? undefined,
+    error: parseError(res.error),
+    statusCode: res.data?.[1] ?? undefined,
+    response: res.data?.[2] ?? undefined,
+  };
+}
+
+export const parseError = (error: any): QueryError | null => {
+  if (!error) {
+    return null;
+  }
+
+  const detail = error.responseJSON?.detail;
+  if (typeof detail === 'string') {
+    return new QueryError(detail, error);
+  }
+
+  const message = detail?.message;
+  if (typeof message === 'string') {
+    return new QueryError(message, error);
+  }
+
+  return new QueryError(t('An unknown error occurred.'), error);
+};
+
+export function getQueryErrorMessage(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('message' in error)) {
+    return undefined;
+  }
+
+  const {message} = error;
+  if (typeof message !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = message.trim();
+  if (!trimmed || trimmed === t('An unknown error occurred.')) {
+    return undefined;
+  }
+
+  return trimmed;
+}

@@ -1,42 +1,48 @@
+from __future__ import annotations
+
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
+
 import responses
-
 from django.test.utils import override_settings
-from django.core.urlresolvers import reverse
+from rest_framework import status
+from rest_framework.exceptions import MethodNotAllowed
+from rest_framework.response import Response
 
-from sentry.integrations.issues import IssueSyncMixin
-from sentry.models import Integration
-from sentry.testutils import APITestCase
-from sentry.utils.compat.mock import patch
-from tests.fixtures.integrations.mock_service import StubService
+from fixtures.integrations.stub_service import StubService
+from sentry.integrations.jira.utils import handle_issue_moved
+from sentry.integrations.jira.webhooks.base import JiraTokenError, JiraWebhookBase
+from sentry.integrations.mixins.issues import IssueSyncIntegration
+from sentry.integrations.models.external_issue import ExternalIssue
+from sentry.integrations.models.organization_integration import OrganizationIntegration
+from sentry.integrations.services.integration.serial import serialize_integration
+from sentry.integrations.types import EventLifecycleOutcome
+from sentry.integrations.utils.atlassian_connect import AtlassianConnectValidationError
+from sentry.integrations.utils.external_issue_key import PROVIDER_ISSUE_ID_KEY
+from sentry.models.group import Group
+from sentry.organizations.services.organization.serial import serialize_rpc_organization
+from sentry.shared_integrations.exceptions import ApiError
+from sentry.silo.base import SiloMode
+from sentry.testutils.asserts import assert_count_of_metric
+from sentry.testutils.cases import APITestCase, TestCase
+from sentry.testutils.helpers.features import with_feature
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.users.models.user import User
+from sentry.users.models.useremail import UserEmail
+from sentry.viewer_context import ActorType, ViewerContext, get_viewer_context
+
+TOKEN = "JWT anexampletoken"
 
 
-class JiraWebhooksTest(APITestCase):
-    @patch("sentry.integrations.jira.webhooks.sync_group_assignee_inbound")
-    def test_simple_assign(self, mock_sync_group_assignee_inbound):
-        org = self.organization
+class JiraIssueUpdatedWebhookTest(APITestCase):
+    endpoint = "sentry-extensions-jira-issue-updated"
+    method = "post"
 
-        integration = Integration.objects.create(provider="jira", name="Example Jira")
-        integration.add_organization(org, self.user)
-
-        path = reverse("sentry-extensions-jira-issue-updated")
-
-        with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
-        ):
-            data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
-            mock_sync_group_assignee_inbound.assert_called_with(
-                integration, "jess@sentry.io", "APP-123", assign=True
-            )
-
-    @override_settings(JIRA_USE_EMAIL_SCOPE=True)
-    @patch("sentry.integrations.jira.webhooks.sync_group_assignee_inbound")
-    @responses.activate
-    def test_assign_use_email_api(self, mock_sync_group_assignee_inbound):
-        org = self.organization
-
-        integration = Integration.objects.create(
+    def setUp(self) -> None:
+        super().setUp()
+        integration, _ = self.create_provider_integration_for(
+            organization=self.organization,
+            user=self.user,
             provider="jira",
             name="Example Jira",
             metadata={
@@ -46,100 +52,188 @@ class JiraWebhooksTest(APITestCase):
                 "domain_name": "example.atlassian.net",
             },
         )
-        integration.add_organization(org, self.user)
+        # Ensure this is region safe, and doesn't require the ORM integration model
+        self.rpc_integration = serialize_integration(integration=integration)
 
-        path = reverse("sentry-extensions-jira-issue-updated")
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    def test_simple_assign(self, mock_sync_group_assignee_inbound: MagicMock) -> None:
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+            mock_sync_group_assignee_inbound.assert_called_with(
+                self.rpc_integration,
+                "jess@sentry.io",
+                "APP-123",
+                assign=True,
+                provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+            )
 
+    @override_settings(JIRA_USE_EMAIL_SCOPE=True)
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    @responses.activate
+    def test_assign_use_email_api(self, mock_sync_group_assignee_inbound: MagicMock) -> None:
         responses.add(
             responses.GET,
             "https://example.atlassian.net/rest/api/3/user/email",
             json={"accountId": "deadbeef123", "email": self.user.email},
-            match_querystring=False,
         )
 
         with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
         ):
             data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
             data["issue"]["fields"]["assignee"]["emailAddress"] = ""
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
             assert mock_sync_group_assignee_inbound.called
             assert len(responses.calls) == 1
 
-    @patch("sentry.integrations.jira.webhooks.sync_group_assignee_inbound")
-    def test_assign_missing_email(self, mock_sync_group_assignee_inbound):
-        org = self.organization
-
-        integration = Integration.objects.create(provider="jira", name="Example Jira")
-        integration.add_organization(org, self.user)
-
-        path = reverse("sentry-extensions-jira-issue-updated")
+    @override_settings(JIRA_USE_EMAIL_SCOPE=True)
+    @responses.activate
+    def test_assign_use_email_api_error(self) -> None:
+        responses.add(
+            responses.GET,
+            "https://example.atlassian.net/rest/api/3/user/email",
+            status=500,
+        )
 
         with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
         ):
             data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
             data["issue"]["fields"]["assignee"]["emailAddress"] = ""
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
+            response = self.get_success_response(
+                **data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN)
+            )
+            assert "error_message" in response.data
+
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    def test_assign_missing_email(self, mock_sync_group_assignee_inbound: MagicMock) -> None:
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
+            data["issue"]["fields"]["assignee"]["emailAddress"] = ""
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
             assert not mock_sync_group_assignee_inbound.called
 
-    @patch("sentry.integrations.jira.webhooks.sync_group_assignee_inbound")
-    def test_simple_deassign(self, mock_sync_group_assignee_inbound):
-        org = self.organization
-
-        integration = Integration.objects.create(provider="jira", name="Example Jira")
-        integration.add_organization(org, self.user)
-
-        path = reverse("sentry-extensions-jira-issue-updated")
-
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    def test_simple_deassign(self, mock_sync_group_assignee_inbound: MagicMock) -> None:
         with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
         ):
             data = StubService.get_stub_data("jira", "edit_issue_no_assignee_payload.json")
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
             mock_sync_group_assignee_inbound.assert_called_with(
-                integration, None, "APP-123", assign=False
+                self.rpc_integration,
+                None,
+                "APP-123",
+                assign=False,
+                provider_event_updated_at="2023-01-01T00:00:00.000+0000",
             )
 
-    @patch("sentry.integrations.jira.webhooks.sync_group_assignee_inbound")
-    def test_simple_deassign_assignee_missing(self, mock_sync_group_assignee_inbound):
-        org = self.organization
-
-        integration = Integration.objects.create(provider="jira", name="Example Jira")
-        integration.add_organization(org, self.user)
-
-        path = reverse("sentry-extensions-jira-issue-updated")
-
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    def test_simple_deassign_assignee_missing(
+        self, mock_sync_group_assignee_inbound: MagicMock
+    ) -> None:
         with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
         ):
             data = StubService.get_stub_data("jira", "edit_issue_assignee_missing_payload.json")
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+            # The payload carries no `updated`, so the ordering guard stays inert.
             mock_sync_group_assignee_inbound.assert_called_with(
-                integration, None, "APP-123", assign=False
+                self.rpc_integration, None, "APP-123", assign=False, provider_event_updated_at=None
             )
 
-    @patch.object(IssueSyncMixin, "sync_status_inbound")
-    def test_simple_status_sync_inbound(self, mock_sync_status_inbound):
-        org = self.organization
+    def _linked_group_for_assignee_sync(self) -> Group:
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            OrganizationIntegration.objects.get(
+                organization_id=self.organization.id, integration_id=self.rpc_integration.id
+            ).update(config={"sync_reverse_assignment": True})
 
-        integration = Integration.objects.create(provider="jira", name="Example Jira")
-        integration.add_organization(org, self.user)
+        group = self.create_group(project=self.project)
+        self.create_integration_external_issue(
+            group=group, integration=self.rpc_integration, key="APP-123"
+        )
+        return group
 
-        path = reverse("sentry-extensions-jira-issue-updated")
+    def _create_jira_member(self, email: str) -> User:
+        member = self.create_user(email=email, is_superuser=False)
+        self.create_member(organization=self.organization, user=member, teams=[self.team])
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            UserEmail.objects.filter(user=member).update(is_verified=True)
+        return member
 
+    def _assignee_payload(self, email: str, updated: str) -> dict[str, Any]:
+        data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
+        data["issue"]["fields"]["assignee"]["emailAddress"] = email
+        data["issue"]["fields"]["updated"] = updated
+        return data
+
+    def _post_assignee_payload(self, data: dict[str, Any]) -> None:
         with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+    def test_assignment_delivered_out_of_order_keeps_newer_assignee(self) -> None:
+        # The reassignment to bob happened after the one to alice, so it wins even though
+        # it was delivered first.
+        group = self._linked_group_for_assignee_sync()
+        self._create_jira_member("alice@example.com")
+        bob = self._create_jira_member("bob@example.com")
+
+        with self.feature("organizations:integrations-issue-sync"):
+            self._post_assignee_payload(
+                self._assignee_payload("bob@example.com", "2023-01-01T00:00:03.000+0000")
+            )
+            self._post_assignee_payload(
+                self._assignee_payload("alice@example.com", "2023-01-01T00:00:00.000+0000")
+            )
+
+        assignee = group.get_assignee()
+        assert assignee is not None
+        assert assignee.id == bob.id
+
+    def test_unassignment_delivered_out_of_order_stays_unassigned(self) -> None:
+        # Jira deassigns via a null `assignee` snapshot, on the same code path.
+        group = self._linked_group_for_assignee_sync()
+        self._create_jira_member("alice@example.com")
+
+        unassigned = StubService.get_stub_data("jira", "edit_issue_no_assignee_payload.json")
+        unassigned["issue"]["fields"]["updated"] = "2023-01-01T00:00:03.000+0000"
+
+        with self.feature("organizations:integrations-issue-sync"):
+            self._post_assignee_payload(unassigned)
+            self._post_assignee_payload(
+                self._assignee_payload("alice@example.com", "2023-01-01T00:00:00.000+0000")
+            )
+
+        assert group.get_assignee() is None
+
+    @patch.object(IssueSyncIntegration, "sync_status_inbound")
+    def test_simple_status_sync_inbound(self, mock_sync_status_inbound: MagicMock) -> None:
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
         ) as mock_get_integration_from_jwt:
             data = StubService.get_stub_data("jira", "edit_issue_status_payload.json")
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
             mock_get_integration_from_jwt.assert_called_with(
-                "anexampletoken", "/extensions/jira/issue-updated/", "jira", {}, method="POST"
+                token="anexampletoken",
+                path="/extensions/jira/issue-updated/",
+                provider="jira",
+                query_params={},
+                method="POST",
             )
             mock_sync_status_inbound.assert_called_with(
                 "APP-123",
@@ -154,23 +248,407 @@ class JiraWebhooksTest(APITestCase):
                         "fieldId": "status",
                     },
                     "issue": {
-                        "fields": {"project": {"id": "10000", "key": "APP"}},
+                        "fields": {
+                            "project": {"id": "10000", "key": "APP"},
+                            "updated": "2023-01-01T00:00:00.000+0000",
+                        },
                         "key": "APP-123",
                     },
+                    "provider_event_time": "2023-01-01T00:00:00.000+0000",
                 },
             )
 
-    def test_missing_changelog(self):
-        org = self.organization
+    @override_settings(SENTRY_VIEWER_CONTEXT_ENABLED=True)
+    def test_status_sync_sets_viewer_context(self) -> None:
+        captured_contexts: list[ViewerContext] = []
 
-        integration = Integration.objects.create(provider="jira", name="Example Jira")
-        integration.add_organization(org, self.user)
+        def capture_viewer_context(*args: object, **kwargs: object) -> None:
+            captured_contexts.append(cast("ViewerContext", get_viewer_context()))
 
-        path = reverse("sentry-extensions-jira-issue-updated")
+        with (
+            patch(
+                "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+                return_value=self.rpc_integration,
+            ),
+            patch.object(
+                IssueSyncIntegration,
+                "sync_status_inbound",
+                side_effect=capture_viewer_context,
+            ),
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_status_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
 
+        assert len(captured_contexts) == 1
+        ctx = captured_contexts[0]
+        assert ctx is not None
+        assert ctx.organization_id == self.organization.id
+        assert ctx.actor.type == ActorType.INTEGRATION
+
+    @patch("sentry_sdk.set_tag")
+    @patch("sentry.integrations.utils.scope.bind_organization_context")
+    def test_adds_context_data(
+        self, mock_bind_org_context: MagicMock, mock_set_tag: MagicMock
+    ) -> None:
         with patch(
-            "sentry.integrations.jira.webhooks.get_integration_from_jwt", return_value=integration
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+            mock_set_tag.assert_any_call("integration_id", self.rpc_integration.id)
+            mock_bind_org_context.assert_called_with(serialize_rpc_organization(self.organization))
+
+    def test_missing_changelog(self) -> None:
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
         ):
             data = StubService.get_stub_data("jira", "changelog_missing.json")
-            resp = self.client.post(path, data=data, HTTP_AUTHORIZATION="JWT anexampletoken")
-            assert resp.status_code == 200
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+    def test_issue_moved_rekeys_external_issue(self) -> None:
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group, integration=self.rpc_integration, key="APP-123"
+        )
+
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "moved_issue_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+        external_issue.refresh_from_db()
+        assert external_issue.key == "PLATFORM-45"
+        assert external_issue.metadata[PROVIDER_ISSUE_ID_KEY] == "101"
+
+    @patch.object(IssueSyncIntegration, "sync_status_inbound")
+    def test_issue_moved_rekeys_before_status_sync(
+        self, mock_sync_status_inbound: MagicMock
+    ) -> None:
+        # A move that also transitions the issue arrives as a single webhook, and the
+        # status handler looks the issue up by its new key -- so the rename has to land
+        # first or the transition is dropped.
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group, integration=self.rpc_integration, key="APP-123"
+        )
+
+        keys_when_synced = []
+        mock_sync_status_inbound.side_effect = lambda *args, **kwargs: keys_when_synced.append(
+            ExternalIssue.objects.get(id=external_issue.id).key
+        )
+
+        data = StubService.get_stub_data("jira", "moved_issue_payload.json")
+        data["changelog"]["items"].append(
+            {
+                "field": "status",
+                "fieldtype": "jira",
+                "fieldId": "status",
+                "from": "10101",
+                "fromString": "In Progress",
+                "to": "10102",
+                "toString": "Done",
+            }
+        )
+
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+        assert mock_sync_status_inbound.call_args.args[0] == "PLATFORM-45"
+        assert keys_when_synced == ["PLATFORM-45"]
+
+    @patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_issue_moved_opens_no_lifecycle_without_a_key_change(
+        self, mock_record_event: MagicMock
+    ) -> None:
+        # `issue.updated` fires on every Jira edit, so the rekey lifecycle must only open
+        # for the payloads that actually carry a key change.
+        handle_issue_moved(
+            self.rpc_integration, {"changelog": {"items": [{"field": "status"}]}, "issue": {}}
+        )
+
+        assert mock_record_event.mock_calls == []
+
+    @patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_issue_moved_records_lifecycle_success(self, mock_record_event: MagicMock) -> None:
+        handle_issue_moved(
+            self.rpc_integration, StubService.get_stub_data("jira", "moved_issue_payload.json")
+        )
+
+        assert_count_of_metric(mock_record_event, EventLifecycleOutcome.STARTED, 1)
+        assert_count_of_metric(mock_record_event, EventLifecycleOutcome.SUCCESS, 1)
+
+    @patch("sentry.integrations.utils.metrics.EventLifecycle.record_event")
+    def test_issue_moved_halts_on_unusable_key_change(self, mock_record_event: MagicMock) -> None:
+        handle_issue_moved(
+            self.rpc_integration,
+            {
+                "changelog": {"items": [{"field": "Key", "fromString": None, "toString": None}]},
+                "issue": {"key": None},
+            },
+        )
+
+        assert_count_of_metric(mock_record_event, EventLifecycleOutcome.STARTED, 1)
+        assert_count_of_metric(mock_record_event, EventLifecycleOutcome.HALTED, 1)
+
+    def test_issue_not_moved_leaves_key_alone(self) -> None:
+        group = self.create_group()
+        external_issue = self.create_integration_external_issue(
+            group=group, integration=self.rpc_integration, key="APP-123"
+        )
+
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_status_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+        external_issue.refresh_from_db()
+        assert external_issue.key == "APP-123"
+
+    def test_changelog_without_items(self) -> None:
+        # The endpoint admits any truthy `changelog`, so one carrying no `items` reaches
+        # both handlers and must not blow them up.
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = {
+                "changelog": {"id": "10172"},
+                "issue": {"key": "APP-123", "fields": {}},
+            }
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+    @with_feature("organizations:jira-issue-updated-payload-logging")
+    @patch("sentry.integrations.jira.webhooks.issue_updated.sentry_sdk.capture_exception")
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    @patch("sentry.integrations.jira.webhooks.issue_updated.logger")
+    def test_payload_logging_failure_does_not_skip_handlers(
+        self,
+        mock_logger: MagicMock,
+        mock_sync_group_assignee_inbound: MagicMock,
+        mock_capture_exception: MagicMock,
+    ) -> None:
+        # The diagnostic payload-logging path can fail transiently (e.g. a
+        # broken `extra=` payload, or a flaky logging backend). Those failures
+        # must not prevent the real webhook handlers from running.
+        error = RuntimeError("simulated payload logging failure")
+
+        def raising_info(event_name: str, *args: object, **kwargs: object) -> None:
+            if event_name == "jira.issue-updated.payload":
+                raise error
+
+        mock_logger.info.side_effect = raising_info
+
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+        mock_sync_group_assignee_inbound.assert_called_with(
+            self.rpc_integration,
+            "jess@sentry.io",
+            "APP-123",
+            assign=True,
+            provider_event_updated_at="2023-01-01T00:00:00.000+0000",
+        )
+        mock_capture_exception.assert_called_once_with(error)
+
+    @with_feature("organizations:jira-issue-updated-payload-logging")
+    @patch("sentry.integrations.jira.webhooks.issue_updated.logger")
+    @patch("sentry.integrations.jira.utils.api.sync_group_assignee_inbound")
+    def test_payload_logging_logs_when_feature_enabled(
+        self,
+        mock_sync_group_assignee_inbound: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        with patch(
+            "sentry.integrations.jira.webhooks.issue_updated.get_integration_from_jwt",
+            return_value=self.rpc_integration,
+        ):
+            data = StubService.get_stub_data("jira", "edit_issue_assignee_payload.json")
+            self.get_success_response(**data, extra_headers=dict(HTTP_AUTHORIZATION=TOKEN))
+
+        info_event_names = [call.args[0] for call in mock_logger.info.call_args_list]
+        assert "jira.issue-updated.payload" in info_event_names
+
+
+class MockErroringJiraEndpoint(JiraWebhookBase):
+    permission_classes = ()
+    dummy_exception = Exception("whoops")
+    # In order to be able to use `as_view`'s `initkwargs` (in other words, in order to be able to
+    # pass kwargs to `as_view` and have `as_view` pass them onto the `__init__` method below), any
+    # kwarg we'd like to pass must already be an attibute of the class
+    error = BaseException("unreachable")
+
+    def __init__(self, error: Exception = dummy_exception, *args: object, **kwargs: object) -> None:
+        # We allow the error to be passed in so that we have access to it in the test for use
+        # in equality checks
+        self.error = error
+        super().__init__(*args, **kwargs)
+
+    def get(self, request: object) -> Response:
+        raise self.error
+
+
+class JiraWebhookBaseTest(TestCase):
+    @patch("sentry.utils.sdk.capture_exception")
+    def test_bad_request_errors(self, mock_capture_exception: MagicMock) -> None:
+        for error_type in [AtlassianConnectValidationError, JiraTokenError]:
+            mock_endpoint = MockErroringJiraEndpoint.as_view(error=error_type())
+
+            request = self.make_request(method="GET")
+            response = mock_endpoint(request)
+
+            assert response.status_code == status.HTTP_409_CONFLICT
+            # This kind of error shouldn't be sent to Sentry
+            assert mock_capture_exception.call_count == 0
+
+    @patch("sentry.integrations.jira.webhooks.base.logger")
+    @patch("sentry.utils.sdk.capture_exception")
+    def test_atlassian_pen_testing_bot(
+        self, mock_capture_exception: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_endpoint = MockErroringJiraEndpoint.as_view(error=MethodNotAllowed("GET"))
+
+        request = self.make_request(method="GET")
+        request.META["HTTP_USER_AGENT"] = (
+            "CSRT (github.com/atlassian-labs/connect-security-req-tester)"
+        )
+        response = mock_endpoint(request)
+
+        assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
+        assert (
+            mock_logger.info.call_args.args[0]
+            == "Atlassian Connect Security Request Tester tried disallowed method"
+        )
+        # This kind of error shouldn't be sent to Sentry
+        assert mock_capture_exception.call_count == 0
+
+    @patch("sentry.api.base.Endpoint.handle_exception_with_details", return_value=Response())
+    def test_APIError_host_and_path_added_as_tags(
+        self, mock_super_handle_exception: MagicMock
+    ) -> None:
+        handler_error = ApiError("", url="http://maiseycharlie.jira.com/rest/api/3/dogs/tricks")
+        mock_endpoint = MockErroringJiraEndpoint.as_view(error=handler_error)
+
+        request = self.make_request(method="GET")
+        mock_endpoint(request)
+
+        # signature is super().handle_exception_with_details(request, error, handler_context, scope)
+        assert (
+            mock_super_handle_exception.call_args.args[3]._tags["jira.host"]
+            == "maiseycharlie.jira.com"
+        )
+        assert (
+            mock_super_handle_exception.call_args.args[3]._tags["jira.endpoint"]
+            == "/rest/api/3/dogs/tricks"
+        )
+
+    @patch("sentry.api.base.Endpoint.handle_exception_with_details", return_value=Response())
+    def test_handles_xml_as_error_message(self, mock_super_handle_exception: MagicMock) -> None:
+        """Moves the XML to `handler_context` and replaces it with a human-friendly message"""
+        xml_string = '<?xml version="1.0"?><status><code>500</code><message>PSQLException: too many connections</message></status>'
+
+        handler_error = ApiError(
+            xml_string, url="http://maiseycharlie.jira.com/rest/api/3/dogs/tricks"
+        )
+        mock_endpoint = MockErroringJiraEndpoint.as_view(error=handler_error)
+
+        request = self.make_request(method="GET")
+        mock_endpoint(request)
+
+        # signature is super().handle_exception_with_details(request, error, handler_context, scope)
+        assert mock_super_handle_exception.call_args.args[1] == handler_error
+        assert str(handler_error) == "Unknown error when requesting /rest/api/3/dogs/tricks"
+        assert mock_super_handle_exception.call_args.args[2]["xml_response"] == xml_string
+
+    @patch("sentry.api.base.Endpoint.handle_exception_with_details", return_value=Response())
+    def test_handles_html_as_error_message(self, mock_super_handle_exception: MagicMock) -> None:
+        """Moves the HTML to `handler_context` and replaces it with a human-friendly message"""
+        html_strings = [
+            # These aren't valid HTML (because they're cut off) but the `ApiError` constructor does
+            # that, too, if the error text is long enough (though after more characters than this)
+            '<!DOCTYPE html><html><head><title>Oops</title></head><body><div id="page"><div'
+            '<html lang="en"><head><title>Oops</title></head><body><div id="page"><div'
+        ]
+
+        for html_string in html_strings:
+            handler_error = ApiError(
+                html_string, url="http://maiseycharlie.jira.com/rest/api/3/dogs/tricks"
+            )
+            mock_endpoint = MockErroringJiraEndpoint.as_view(error=handler_error)
+
+            request = self.make_request(method="GET")
+            mock_endpoint(request)
+
+            # signature is super().handle_exception_with_details(request, error, handler_context, scope)
+            assert mock_super_handle_exception.call_args.args[1] == handler_error
+            assert str(handler_error) == "Unknown error when requesting /rest/api/3/dogs/tricks"
+            assert mock_super_handle_exception.call_args.args[2]["html_response"] == html_string
+
+    @patch("sentry.api.base.Endpoint.handle_exception_with_details", return_value=Response())
+    def test_replacement_error_messages(self, mock_super_handle_exception: MagicMock) -> None:
+        replacement_messages_by_code = {
+            429: "Rate limit hit when requesting /rest/api/3/dogs/tricks",
+            401: "Unauthorized request to /rest/api/3/dogs/tricks",
+            502: "Bad gateway when connecting to /rest/api/3/dogs/tricks",
+            504: "Gateway timeout when connecting to /rest/api/3/dogs/tricks",
+        }
+
+        for code, new_message in replacement_messages_by_code.items():
+            handler_error = ApiError(
+                "<!DOCTYPE html><html>Some HTML here</html>",
+                url="http://maiseycharlie.jira.com/rest/api/3/dogs/tricks",
+                code=code,
+            )
+            mock_endpoint = MockErroringJiraEndpoint.as_view(error=handler_error)
+
+            request = self.make_request(method="GET")
+            mock_endpoint(request)
+
+            # signature is super().handle_exception_with_details(request, error, handler_context, scope)
+            assert mock_super_handle_exception.call_args.args[1] == handler_error
+            assert str(handler_error) == new_message
+
+    @patch("sentry.integrations.jira.webhooks.base.logger")
+    @patch("sentry.api.base.Endpoint.handle_exception_with_details", return_value=Response())
+    def test_unexpected_jira_errors(
+        self, mock_super_handle_exception: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        unknown_errors = [
+            (
+                Exception(
+                    "not a known error",
+                ),
+                "not a known error",
+            ),
+            (
+                ApiError(
+                    "<!DOCTYPE html><html>Some HTML here</html>",
+                    url="http://maiseycharlie.jira.com/rest/api/3/dogs/tricks",
+                    code=403,
+                ),
+                "Unknown error when requesting /rest/api/3/dogs/tricks",
+            ),
+        ]
+
+        for unknown_error, expected_error_message in unknown_errors:
+            mock_endpoint = MockErroringJiraEndpoint.as_view(error=unknown_error)
+
+            request = self.make_request(method="GET")
+            mock_endpoint(request)
+
+            assert mock_super_handle_exception.call_args.args[1] == unknown_error
+            assert str(unknown_error) == expected_error_message
+            assert mock_logger.warning.call_args.args[0] == "Unclear JIRA exception"

@@ -1,0 +1,173 @@
+import {Fragment, useState} from 'react';
+import styled from '@emotion/styled';
+
+import {Button} from '@sentry/scraps/button';
+import {Flex, Stack} from '@sentry/scraps/layout';
+import {Pagination} from '@sentry/scraps/pagination';
+import type {TableColumnConfig} from '@sentry/scraps/table';
+import {Text} from '@sentry/scraps/text';
+
+import {Confirm} from 'sentry/components/confirm';
+import {SimilarSpectrum} from 'sentry/components/similarSpectrum';
+import {SimpleTable} from 'sentry/components/tables/simpleTable';
+import {t, tn} from 'sentry/locale';
+import type {Project} from 'sentry/types/project';
+
+import {SimilarStackTraceItem, SimilarStackTraceItemSkeleton} from './item';
+import type {SimilarItem} from './types';
+
+const SIMILAR_ISSUE_COLUMNS: TableColumnConfig[] = [
+  {key: 'merge', width: 'minmax(160px, 1fr)'},
+  {key: 'events', width: 'max-content', visible: {xs: true}},
+  {key: 'exception', width: 'max-content'},
+  {key: 'message', width: 'max-content', visible: {md: true}},
+  {key: 'actions', width: '80px', visible: {'2xs': true}},
+];
+
+const SIMILAR_ISSUE_COLUMNS_WITHOUT_MESSAGE = SIMILAR_ISSUE_COLUMNS.filter(
+  column => column.key !== 'message'
+);
+
+type Props = {
+  busyIds: ReadonlySet<string>;
+  checkedIds: ReadonlySet<string>;
+  emptyMessage: string;
+  filteredItems: SimilarItem[];
+  groupId: string;
+  hasSimilarityEmbeddingsFeature: boolean;
+  isError: boolean;
+  items: SimilarItem[];
+  loading: boolean;
+  onMerge: () => void;
+  onRetry: () => void;
+  onToggle: (id: string) => void;
+  pageLinks: string | null;
+  project: Project;
+};
+
+export function List({
+  groupId,
+  project,
+  items,
+  filteredItems,
+  pageLinks,
+  onMerge,
+  onToggle,
+  checkedIds,
+  busyIds,
+  hasSimilarityEmbeddingsFeature,
+  loading,
+  isError,
+  onRetry,
+  emptyMessage,
+}: Props) {
+  const [showAllItems, setShowAllItems] = useState(false);
+
+  const hasHiddenItems = !!filteredItems.length;
+  const itemsWithFiltered = items.concat(showAllItems ? filteredItems : []);
+  const mergeCount = checkedIds.size;
+  const isEmpty = !loading && !isError && itemsWithFiltered.length === 0;
+
+  return (
+    <Fragment>
+      <Flex justify="end">
+        <SimilarSpectrum
+          highSpectrumLabel={
+            hasSimilarityEmbeddingsFeature ? t('Most Similar') : t('Similar')
+          }
+          lowSpectrumLabel={
+            hasSimilarityEmbeddingsFeature ? t('Less Similar') : t('Not Similar')
+          }
+        />
+      </Flex>
+
+      <SimpleTable
+        columns={
+          hasSimilarityEmbeddingsFeature
+            ? SIMILAR_ISSUE_COLUMNS_WITHOUT_MESSAGE
+            : SIMILAR_ISSUE_COLUMNS
+        }
+        header={
+          <SimpleTable.HeaderRow>
+            <MergeHeaderCell>
+              <Confirm
+                disabled={mergeCount === 0}
+                message={tn(
+                  'Merge %s issue into this one?',
+                  'Merge %s issues into this one?',
+                  mergeCount
+                )}
+                onConfirm={onMerge}
+              >
+                <Button size="xs">
+                  {tn('Merge %s issue', 'Merge %s issues', mergeCount)}
+                </Button>
+              </Confirm>
+            </MergeHeaderCell>
+            <SimpleTable.HeaderCell align="center">{t('Events')}</SimpleTable.HeaderCell>
+            <SimpleTable.HeaderCell align="center">
+              {t('Exception')}
+            </SimpleTable.HeaderCell>
+            {!hasSimilarityEmbeddingsFeature && (
+              <SimpleTable.HeaderCell align="center">
+                {t('Message')}
+              </SimpleTable.HeaderCell>
+            )}
+            <SimpleTable.HeaderCell />
+          </SimpleTable.HeaderRow>
+        }
+      >
+        {loading &&
+          Array.from({length: 3}).map((_, i) => (
+            <SimilarStackTraceItemSkeleton
+              key={i}
+              hasSimilarityEmbeddingsFeature={hasSimilarityEmbeddingsFeature}
+            />
+          ))}
+        {isError && (
+          <SimpleTable.Empty>
+            <Stack align="center" gap="sm">
+              <Text>{t("Couldn't load similar issues.")}</Text>
+              <Button size="xs" onClick={onRetry}>
+                {t('Retry')}
+              </Button>
+            </Stack>
+          </SimpleTable.Empty>
+        )}
+        {isEmpty && <SimpleTable.Empty>{emptyMessage}</SimpleTable.Empty>}
+        {!loading &&
+          !isError &&
+          itemsWithFiltered.map(item => (
+            <SimilarStackTraceItem
+              key={item.issue.id}
+              groupId={groupId}
+              project={project}
+              hasSimilarityEmbeddingsFeature={hasSimilarityEmbeddingsFeature}
+              checked={checkedIds.has(item.issue.id)}
+              busy={busyIds.has(item.issue.id)}
+              onToggle={onToggle}
+              {...item}
+            />
+          ))}
+      </SimpleTable>
+
+      {hasHiddenItems && !showAllItems && !hasSimilarityEmbeddingsFeature && (
+        <Flex justify="center" padding="lg">
+          <Button onClick={() => setShowAllItems(true)}>
+            {tn(
+              'Show %s issue below threshold',
+              'Show %s issues below threshold',
+              filteredItems.length
+            )}
+          </Button>
+        </Flex>
+      )}
+
+      <Pagination pageLinks={pageLinks} />
+    </Fragment>
+  );
+}
+
+const MergeHeaderCell = styled(SimpleTable.HeaderCell)`
+  padding-left: ${p => p.theme.space.md};
+`;

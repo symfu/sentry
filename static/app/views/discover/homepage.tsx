@@ -1,0 +1,184 @@
+import {useEffect} from 'react';
+import {useQueryClient} from '@tanstack/react-query';
+import type {Query} from 'history';
+
+import {LoadingError} from 'sentry/components/loadingError';
+import {LoadingIndicator} from 'sentry/components/loadingIndicator';
+import {PageFiltersContainer} from 'sentry/components/pageFilters/container';
+import {
+  getDatetimeFromState,
+  normalizeDateTimeString,
+} from 'sentry/components/pageFilters/parse';
+import {getPageFilterStorage} from 'sentry/components/pageFilters/persistence';
+import {usePageFilters} from 'sentry/components/pageFilters/usePageFilters';
+import {
+  AiQueryProvider,
+  useAiQueryContext,
+} from 'sentry/components/searchQueryBuilder/askSeerCombobox/aiQueryContext';
+import {DataCategory} from 'sentry/types/dataCategory';
+import type {Organization, SavedQuery} from 'sentry/types/organization';
+import type {ApiQueryKey} from 'sentry/utils/api/apiQueryKey';
+import {getApiUrl} from 'sentry/utils/api/getApiUrl';
+import {EventView} from 'sentry/utils/discover/eventView';
+import {DiscoverDatasets, SavedQueryDatasets} from 'sentry/utils/discover/types';
+import {useApiQuery} from 'sentry/utils/queryClient';
+import {useApi} from 'sentry/utils/useApi';
+import {useDatePageFilterProps} from 'sentry/utils/useDatePageFilterProps';
+import {useLocation} from 'sentry/utils/useLocation';
+import {useMaxPickableDays} from 'sentry/utils/useMaxPickableDays';
+import {useNavigate} from 'sentry/utils/useNavigate';
+import {useOrganization} from 'sentry/utils/useOrganization';
+import {usePrevious} from 'sentry/utils/usePrevious';
+import {useGlobalAlerts} from 'sentry/views/app/globalAlerts';
+import {DEFAULT_EVENT_VIEW_MAP} from 'sentry/views/discover/results/data';
+import {getSavedQueryWithDataset} from 'sentry/views/discover/savedQuery/utils';
+
+import {Results} from './results';
+
+function makeDiscoverHomepageQueryKey(organization: Organization): ApiQueryKey {
+  return [
+    getApiUrl('/organizations/$organizationIdOrSlug/discover/homepage/', {
+      path: {organizationIdOrSlug: organization.slug},
+    }),
+  ];
+}
+
+function Homepage() {
+  const {addAlert} = useGlobalAlerts();
+  const organization = useOrganization();
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const {selection} = usePageFilters();
+  const {getRunIdForAnalytics} = useAiQueryContext();
+  const {data, isLoading, isError, refetch} = useApiQuery<SavedQuery>(
+    makeDiscoverHomepageQueryKey(organization),
+    {
+      staleTime: 0,
+      enabled: organization.features.includes('discover-query'),
+    }
+  );
+
+  const savedQuery = getSavedQueryWithDataset(data);
+
+  const previousSavedQuery = usePrevious(savedQuery);
+
+  const shouldHideThisTransactionsQuery =
+    savedQuery?.queryDataset === SavedQueryDatasets.TRANSACTIONS ||
+    savedQuery?.dataset === DiscoverDatasets.TRANSACTIONS;
+
+  useEffect(() => {
+    const hasFetchedSavedQuery = !previousSavedQuery && savedQuery;
+    const sidebarClicked = savedQuery && location.search === '';
+    const hasValidEventViewInURL = EventView.fromLocation(location).isValid();
+
+    if (
+      savedQuery &&
+      ((hasFetchedSavedQuery && !hasValidEventViewInURL) || sidebarClicked)
+    ) {
+      let query: Query = {};
+      const pageFilterState = getPageFilterStorage(organization.slug);
+      let dataset = savedQuery?.queryDataset;
+
+      if (shouldHideThisTransactionsQuery) {
+        // use default error view instead of homepage
+        const defaultEventView = EventView.fromNewQueryWithLocation(
+          DEFAULT_EVENT_VIEW_MAP[SavedQueryDatasets.ERRORS],
+          location
+        );
+        query = {...defaultEventView.generateQueryStringObject()};
+        dataset = SavedQueryDatasets.ERRORS;
+      } else {
+        const eventView = EventView.fromSavedQuery(savedQuery);
+        query = {
+          ...eventView.generateQueryStringObject(),
+        };
+      }
+
+      // Handle locked filters explicitly because we can't expect
+      // PageFilterContainer to properly overwrite stored filters
+      // when pushing the homepage query to the URL
+      if (pageFilterState?.pinnedFilters) {
+        pageFilterState.pinnedFilters.forEach(pinnedFilter => {
+          if (pinnedFilter === 'projects') {
+            query.project = pageFilterState.state.project?.map(String);
+          } else if (pinnedFilter === 'datetime') {
+            const {period, start, end, utc} = getDatetimeFromState(pageFilterState.state);
+            query = {
+              ...query,
+              statsPeriod: period ?? undefined,
+              utc: utc?.toString(),
+              start: normalizeDateTimeString(start),
+              end: normalizeDateTimeString(end),
+            };
+          } else if (pinnedFilter === 'environments') {
+            query.environment = pageFilterState.state.environment;
+          } else {
+            query[pinnedFilter] = pageFilterState.state[pinnedFilter];
+          }
+        });
+      }
+
+      navigate(
+        {
+          ...location,
+          query: {
+            ...query,
+            queryDataset: dataset,
+          },
+        },
+        {replace: true}
+      );
+    }
+  }, [
+    savedQuery,
+    location,
+    previousSavedQuery,
+    navigate,
+    organization.slug,
+    shouldHideThisTransactionsQuery,
+  ]);
+
+  if (isLoading) {
+    return <LoadingIndicator />;
+  }
+
+  if (isError) {
+    return <LoadingError onRetry={refetch} />;
+  }
+
+  const setSavedQuery = (newSavedQuery?: SavedQuery) => {
+    queryClient.setQueryData(makeDiscoverHomepageQueryKey(organization), newSavedQuery);
+  };
+
+  return (
+    <Results
+      addAlert={addAlert}
+      getAiQueryRunId={getRunIdForAnalytics}
+      api={api}
+      loading={isLoading}
+      location={location}
+      navigate={navigate}
+      organization={organization}
+      selection={selection}
+      setSavedQuery={setSavedQuery}
+      isHomepage
+      savedQuery={savedQuery}
+    />
+  );
+}
+
+export default function HomepageContainer() {
+  const maxPickableDays = useMaxPickableDays({
+    dataCategories: [DataCategory.ERRORS],
+  });
+  const datePageFilterProps = useDatePageFilterProps(maxPickableDays);
+  return (
+    <PageFiltersContainer skipInitializeUrlParams {...datePageFilterProps}>
+      <AiQueryProvider strategy="Errors">
+        <Homepage />
+      </AiQueryProvider>
+    </PageFiltersContainer>
+  );
+}

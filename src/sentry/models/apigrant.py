@@ -1,22 +1,37 @@
-from bitfield import BitField
-from datetime import timedelta
+import secrets
+from datetime import datetime, timedelta
+from typing import Any
+
+from django.contrib.postgres.fields.array import ArrayField
 from django.db import models
 from django.utils import timezone
-from uuid import uuid4
 
-from sentry.db.models import ArrayField, Model, FlexibleForeignKey
+from sentry.backup.dependencies import NormalizedModelName, get_model_name
+from sentry.backup.sanitize import SanitizableField, Sanitizer
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import FlexibleForeignKey, Model, control_silo_model
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
 
 DEFAULT_EXPIRATION = timedelta(minutes=10)
 
 
-def default_expiration():
+class InvalidGrantError(Exception):
+    pass
+
+
+class ExpiredGrantError(Exception):
+    pass
+
+
+def default_expiration() -> datetime:
     return timezone.now() + DEFAULT_EXPIRATION
 
 
-def generate_code():
-    return uuid4().hex
+def generate_code() -> str:
+    return secrets.token_hex(nbytes=32)  # generates a 128-bit secure token
 
 
+@control_silo_model
 class ApiGrant(Model):
     """
     A grant represents a token with a short lifetime that can
@@ -24,49 +39,58 @@ class ApiGrant(Model):
     of the OAuth 2 spec.
     """
 
-    __core__ = False
+    __relocation_scope__ = RelocationScope.Global
 
     user = FlexibleForeignKey("sentry.User")
     application = FlexibleForeignKey("sentry.ApiApplication")
     code = models.CharField(max_length=64, db_index=True, default=generate_code)
     expires_at = models.DateTimeField(db_index=True, default=default_expiration)
     redirect_uri = models.CharField(max_length=255)
-    scopes = BitField(
-        flags=(
-            ("project:read", "project:read"),
-            ("project:write", "project:write"),
-            ("project:admin", "project:admin"),
-            ("project:releases", "project:releases"),
-            ("team:read", "team:read"),
-            ("team:write", "team:write"),
-            ("team:admin", "team:admin"),
-            ("event:read", "event:read"),
-            ("event:write", "event:write"),
-            ("event:admin", "event:admin"),
-            ("org:read", "org:read"),
-            ("org:write", "org:write"),
-            ("org:admin", "org:admin"),
-            ("member:read", "member:read"),
-            ("member:write", "member:write"),
-            ("member:admin", "member:admin"),
-        )
+    scope_list = ArrayField(models.TextField(), default=list)
+    # API applications should ideally get access to only one organization of user
+    # If null, the grant is about user level access and not org level
+    organization_id = HybridCloudForeignKey(
+        "sentry.Organization",
+        db_index=True,
+        null=True,
+        on_delete="CASCADE",
     )
-    scope_list = ArrayField(of=models.TextField)
+    # PKCE (RFC 7636): code_challenge and method for Proof Key for Code Exchange.
+    # If present, the token endpoint MUST verify the code_verifier against this challenge.
+    # Reference: https://datatracker.ietf.org/doc/html/rfc7636
+    code_challenge = models.CharField(max_length=128, null=True)
+    code_challenge_method = models.CharField(max_length=10, null=True)
 
     class Meta:
         app_label = "sentry"
         db_table = "sentry_apigrant"
 
-    def get_scopes(self):
-        if self.scope_list:
-            return self.scope_list
-        return [k for k, v in self.scopes.items() if v]
+    def __str__(self) -> str:
+        return (
+            f"api_grant_id={self.id}, user_id={self.user.id}, application_id={self.application.id}"
+        )
 
-    def has_scope(self, scope):
+    def get_scopes(self) -> list[str]:
+        return self.scope_list
+
+    def has_scope(self, scope: str) -> bool:
         return scope in self.get_scopes()
 
-    def is_expired(self):
+    def is_expired(self) -> bool:
         return timezone.now() >= self.expires_at
 
-    def redirect_uri_allowed(self, uri):
+    def redirect_uri_allowed(self, uri: str) -> bool:
         return uri == self.redirect_uri
+
+    @classmethod
+    def get_lock_key(cls, grant_id: int) -> str:
+        return f"api_grant:{grant_id}"
+
+    @classmethod
+    def sanitize_relocation_json(
+        cls, json: Any, sanitizer: Sanitizer, model_name: NormalizedModelName | None = None
+    ) -> None:
+        model_name = get_model_name(cls) if model_name is None else model_name
+        super().sanitize_relocation_json(json, sanitizer, model_name)
+
+        sanitizer.set_string(json, SanitizableField(model_name, "code"), lambda _: generate_code())
